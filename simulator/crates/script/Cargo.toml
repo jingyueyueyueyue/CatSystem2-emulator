@@ -1,0 +1,11 @@
+[package]
+name = "cs2-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cs2-formats = { path = "../formats" }
+flate2.workspace = true
+thiserror.workspace = true
+serde.workspace = true

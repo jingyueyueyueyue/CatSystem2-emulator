@@ -1,0 +1,13 @@
+[package]
+name = "cs2-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cs2_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+cs2-desktop = { path = "../desktop" }
+cs2-runtime = { path = "../runtime" }

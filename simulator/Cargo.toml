@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/formats",
+    "crates/script",
+    "crates/runtime",
+    "crates/renderer",
+    "crates/desktop",
+    "crates/cli",
+    "crates/android",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+byteorder = "1"
+encoding_rs = "0.8"
+fontdue = "0.9"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[patch.crates-io]
+ttf-parser = { path = "vendor/ttf-parser-0.21.1" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Keep actual Android integration iterations out of whole-program LTO.
+[profile.android-integration]
+inherits = "dev"
+opt-level = 1
+debug = 1
+lto = false
+codegen-units = 16
+panic = "abort"
+strip = "debuginfo"
