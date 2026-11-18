@@ -952,13 +952,13 @@ impl LayerComposition {
         // Same global rectangle gate and independent local clip as the PE.
         // It deliberately uses destination width/height in the first gate.
         let left = i64::from(meta.offset[0]).max(i64::from(offset[0]));
-        let bottom = i64::from(meta.offset[1]).max(i64::from(offset[1]));
+        let top = i64::from(meta.offset[1]).max(i64::from(offset[1]));
         let right = (i64::from(meta.offset[0]) + i64::from(width)).min(bounds[2]);
-        let top = (i64::from(meta.offset[1]) + i64::from(height)).min(bounds[3]);
-        if left >= right || bottom >= top { return Ok(()); }
+        let bottom = (i64::from(meta.offset[1]) + i64::from(height)).min(bounds[3]);
+        if left >= right || top >= bottom { return Ok(()); }
         let at = [
-            (left - i64::from(offset[0]) + i64::from(base[0]) - i64::from(meta.base[0])) as i64,
-            (bottom - i64::from(offset[1]) + i64::from(base[1]) - i64::from(meta.base[1])) as i64,
+            left - i64::from(offset[0]) + i64::from(base[0]) - i64::from(meta.base[0]),
+            top - i64::from(offset[1]) + i64::from(base[1]) - i64::from(meta.base[1]),
         ];
         let target_x = at[0].max(0).min(i64::from(width));
         let target_y = at[1].max(0).min(i64::from(height));
@@ -971,8 +971,8 @@ impl LayerComposition {
         if draw_width <= 0 || draw_height <= 0 { return Ok(()); }
         let pixels = &mut self.pixels;
         for row in 0..draw_height as usize {
-            let source_start = (source.height() as usize - 1 - row) * source.width() as usize * 4;
-            let target_start = ((height as usize - 1 - target_y as usize - row) * width as usize
+            let source_start = row * source.width() as usize * 4;
+            let target_start = ((target_y as usize + row) * width as usize
                 + target_x as usize) * 4;
             if target_x > 0 {
                 super::image_blit::seed_rgb(&mut pixels[target_start - 4..target_start],
@@ -995,7 +995,7 @@ impl LayerComposition {
         Ok(())
     }
 
-    /// Internal native list layers use the normal list Alpha rule and bottom
+    /// Internal resource list layers use the normal list Alpha rule and top-origin
     /// coordinates. The output rectangle stays the retained directory union;
     /// moving frames outside it are clipped, rather than reallocating it.
     fn draw_animation(&mut self, source: &RgbaFrame, position: [i32; 2], opacity: u32) -> Result<()> {
@@ -1022,8 +1022,8 @@ impl LayerComposition {
                 let x = i64::from(at[0]) + i64::from(sx);
                 if x < 0 || x >= i64::from(self.width) { continue; }
                 if clip.is_some_and(|r| x < i64::from(r[0]) || x >= i64::from(r[2])) { continue; }
-                let input = ((source.height() - 1 - sy) as usize * source.width() as usize + sx as usize) * 4;
-                let output = ((self.height as usize - 1 - y as usize) * self.width as usize + x as usize) * 4;
+                let input = (sy as usize * source.width() as usize + sx as usize) * 4;
+                let output = (y as usize * self.width as usize + x as usize) * 4;
                 let pixel: [u8; 4] = source.pixels()[input..input + 4].try_into().unwrap();
                 if opaque && opacity == 255 {
                     self.pixels[output..output + 4].copy_from_slice(&pixel);
@@ -1034,7 +1034,7 @@ impl LayerComposition {
                             continue;
                         }
                         if neighbor >= 0 && neighbor < i64::from(self.width) {
-                            let at = ((self.height as usize - 1 - y as usize) * self.width as usize + neighbor as usize) * 4;
+                            let at = (y as usize * self.width as usize + neighbor as usize) * 4;
                             super::image_blit::seed_rgb(&mut self.pixels[at..at + 4], pixel);
                         }
                     }

@@ -63,8 +63,8 @@ fn bounds(layer: &ResourceLayer, r: &Registration, size: [u32; 2]) -> Option<Are
     if layer.animation.timeline().is_some() && layer.animation.display().visible == 0 { return None; }
     let p = placement(layer, r);
     let right = (i64::from(p[0]) + i64::from(r.size[0])).min(i64::from(size[0]));
-    let top = (i64::from(p[1]) + i64::from(r.size[1])).min(i64::from(size[1]));
-    let r = [p[0].max(0), p[1].max(0), right.max(0) as i32, top.max(0) as i32];
+    let bottom = (i64::from(p[1]) + i64::from(r.size[1])).min(i64::from(size[1]));
+    let r = [p[0].max(0), p[1].max(0), right.max(0) as i32, bottom.max(0) as i32];
     (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
 
@@ -158,7 +158,7 @@ pub(super) fn redraw(layers: &[ResourceLayer], s: &Surface, current: &RgbaFrame)
         let clipped = intersect(*r, [0, 0, target.width as i32, target.height as i32]);
         if let Some(r) = clipped {
             for y in r[1]..r[3] {
-                let start = ((target.height as usize - 1 - y as usize) * target.width as usize
+                let start = (y as usize * target.width as usize
                     + r[0] as usize) * 4;
                 target.pixels[start..start + (r[2] - r[0]) as usize * 4].fill(0);
             }
@@ -174,4 +174,68 @@ pub(super) fn redraw(layers: &[ResourceLayer], s: &Surface, current: &RgbaFrame)
         }
     }
     target.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BODY: [u8; 4] = [20, 40, 60, 255];
+    const UPPER: [u8; 4] = [200, 0, 0, 255];
+    const LOWER: [u8; 4] = [0, 200, 0, 255];
+
+    fn layer(offset: [i32; 2], width: u32, rows: &[[u8; 4]]) -> ResourceLayer {
+        let pixels = rows.iter().flat_map(|pixel| pixel.repeat(width as usize)).collect();
+        let frame = RgbaFrame::from_rgba8(width, rows.len() as u32, pixels).unwrap();
+        let metadata = FrameMetadata { offset, base: [4, 9], ..frame.metadata() };
+        ResourceLayer::new(BTreeMap::from([(0, frame.with_raw_metadata(metadata))]),
+            Default::default()).unwrap()
+    }
+
+    fn pixel(frame: &RgbaFrame, x: usize, y: usize) -> [u8; 4] {
+        let start = (y * frame.width() as usize + x) * 4;
+        frame.pixels()[start..start + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn resource_top_origin_static_selector_preserves_crop_and_row_order() {
+        let layers = [layer([2, 5], 4, &[BODY; 6]), layer([3, 6], 2, &[UPPER, LOWER])];
+        let geometry = ResourceLayers::directory_geometry(&layers).unwrap();
+        let mut target = LayerComposition::new(geometry).unwrap().unwrap();
+        for source in &layers {
+            target.draw(&source.frames[&0]).unwrap();
+        }
+        let frame = target.finish().unwrap();
+        assert_eq!(frame.metadata().offset, [2, 5]);
+        assert_eq!(pixel(&frame, 1, 1), UPPER);
+        assert_eq!(pixel(&frame, 1, 2), LOWER);
+        assert_eq!(pixel(&frame, 1, 4), BODY);
+    }
+
+    #[test]
+    fn resource_top_origin_redraw_clears_old_rows_and_clips_across_tiles() {
+        let layers = ResourceLayers::new(vec![layer([2, 5], 4, &[[0; 4]; 6]),
+            layer([3, 6], 2, &[UPPER, LOWER])]).unwrap();
+        let initial = layers.compose().unwrap().unwrap();
+        assert_eq!(pixel(&initial, 1, 1), UPPER);
+        assert_eq!(pixel(&initial, 1, 2), LOWER);
+
+        let mut surface = create(&layers.layers, &layers.geometry, Some([2, 2])).unwrap().unwrap();
+        surface.registrations[1].position[1] += 3;
+        invalidate(&mut surface, &layers.layers[1], 1, false).unwrap();
+        assert!(surface.dirty.iter().all(Option::is_some));
+
+        let mut pixels = initial.pixels().to_vec();
+        pixels[..4].copy_from_slice(&BODY);
+        let current = RgbaFrame::from_rgba8(initial.width(), initial.height(), pixels)
+            .unwrap().with_raw_metadata(initial.metadata());
+        let redrawn = redraw(&layers.layers, &surface, &current).unwrap();
+        assert_eq!(pixel(&redrawn, 0, 0), BODY);
+        for x in [1, 2] {
+            assert_eq!(pixel(&redrawn, x, 1)[3], 0);
+            assert_eq!(pixel(&redrawn, x, 2)[3], 0);
+            assert_eq!(pixel(&redrawn, x, 4), UPPER);
+            assert_eq!(pixel(&redrawn, x, 5), LOWER);
+        }
+    }
 }
