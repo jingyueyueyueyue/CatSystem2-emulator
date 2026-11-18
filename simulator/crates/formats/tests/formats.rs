@@ -1267,6 +1267,21 @@ fn parses_css_records_and_preserves_loader_inflation_diagnostics() {
 }
 
 #[test]
+fn css_drains_buffered_records_after_input_is_consumed() {
+    let mut container = CssFile::new(1000);
+    container.append(1, &vec![0; 0x2a5c2]).unwrap();
+    let mut layout = [0; 576];
+    layout[..8].copy_from_slice(b"default\0");
+    container.append(0x2000_0000, &layout).unwrap();
+    container.append(0x100, &vec![0; 10_201]).unwrap();
+    let loaded = CssFile::parse(&container.to_css().unwrap()).unwrap();
+    assert_eq!(loaded.try_record(0x2000_0000).unwrap(), Some(layout.as_slice()));
+    assert_eq!(loaded.used_bytes().unwrap(), container.used_bytes().unwrap());
+    assert_eq!(loaded.inflation_status().unwrap().output_written, loaded.used_len());
+    assert!(loaded.inflation_status().unwrap().stream_end);
+}
+
+#[test]
 fn css_container_records_serialize_and_snapshot_round_trip() {
     let mut container = CssFile::new(0x55aa);
     container.append(12, b"first").unwrap();

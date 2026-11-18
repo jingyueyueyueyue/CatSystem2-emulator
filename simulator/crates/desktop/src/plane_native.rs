@@ -2199,10 +2199,11 @@ pub(super) fn draw_plane_with_view(
         node.color
     };
     if let Some(source) = source
-        && state.blend == BlendMode::SourceOver
+        && matches!(state.blend, BlendMode::SourceOver | BlendMode::Multiply)
         && color & 0x00ff_ffff == 0x00ff_ffff
         && draw_unit_canvas_plane(
             canvas, source, services.vram_overflow.as_ref(), vertices, state.clip, (color >> 24) as u8,
+            state.blend,
         )
     {
         return Ok(true);
@@ -2357,6 +2358,7 @@ fn draw_unit_canvas_plane(
     vertices: [[f64; 6]; 4],
     clip: Option<Rect>,
     opacity: u8,
+    blend: BlendMode,
 ) -> bool {
     let [origin, right, bottom, opposite] = vertices;
     let reciprocal_w = origin[3];
@@ -2433,7 +2435,12 @@ fn draw_unit_canvas_plane(
             };
             if let Some(input) = input {
                 let start = consumed as usize * 4;
-                blend_unit_plane_span(input, &mut output[start..start + input.len()], opacity);
+                let target = &mut output[start..start + input.len()];
+                if blend == BlendMode::Multiply {
+                    multiply_unit_plane_span(input, target, opacity);
+                } else {
+                    blend_unit_plane_span(input, target, opacity);
+                }
             }
             consumed += count;
         }
@@ -2450,6 +2457,17 @@ fn blend_unit_plane_span(input: &[u8], output: &mut [u8], opacity: u8) {
         let alpha = (u16::from(pixel[3]) * u16::from(opacity) / 255) as u8;
         if alpha != 0 {
             super::list_native::blend_list_pixel(target, [pixel[0], pixel[1], pixel[2], alpha], 255);
+        }
+    }
+}
+
+fn multiply_unit_plane_span(input: &[u8], output: &mut [u8], opacity: u8) {
+    for (source, target) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+        let alpha = (u16::from(source[3]) * u16::from(opacity) / 255) as u8;
+        if alpha != 0 {
+            for (channel, sample) in target.iter_mut().zip([source[0], source[1], source[2], alpha]) {
+                *channel = ((u16::from(*channel) * u16::from(sample) + 127) / 255) as u8;
+            }
         }
     }
 }
@@ -2601,17 +2619,19 @@ mod unit_canvas_plane_tests {
             let source = RgbaFrame::from_rgba8(width, height, rgba)?;
             for opacity in [0, 1, 127, 217, 255] {
                 for clip in [None, Some(Rect::new(-3, 2, 7, 6)), Some(Rect::new(8, 8, 2, 2))] {
-                    let mut reference = background.clone();
-                    for indices in [[0, 1, 2], [2, 1, 3]] {
-                        raster_triangle(
-                            &mut reference, indices.map(|index| vertices[index]),
-                            0x00ff_ffff | (u32::from(opacity) << 24), Some(&source), None,
-                            clip, BlendMode::SourceOver,
-                        )?;
+                    for blend in [BlendMode::SourceOver, BlendMode::Multiply] {
+                        let mut reference = background.clone();
+                        for indices in [[0, 1, 2], [2, 1, 3]] {
+                            raster_triangle(
+                                &mut reference, indices.map(|index| vertices[index]),
+                                0x00ff_ffff | (u32::from(opacity) << 24), Some(&source), None,
+                                clip, blend,
+                            )?;
+                        }
+                        let mut actual = background.clone();
+                        assert!(draw_unit_canvas_plane(&mut actual, &source, None, vertices, clip, opacity, blend));
+                        assert_eq!(actual.pixels(), reference.pixels(), "{blend:?} {opacity} {clip:?}");
                     }
-                    let mut actual = background.clone();
-                    assert!(draw_unit_canvas_plane(&mut actual, &source, None, vertices, clip, opacity));
-                    assert_eq!(actual.pixels(), reference.pixels(), "{opacity} {clip:?}");
                 }
             }
         }
@@ -2633,11 +2653,11 @@ mod unit_canvas_plane_tests {
         ] {
             let mut malformed = vertices;
             malformed[vertex][field] = value;
-            assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, malformed, None, 255));
+            assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, malformed, None, 255, BlendMode::SourceOver));
         }
         let mut outside_source = vertices;
         outside_source.iter_mut().for_each(|vertex| vertex[4] += 2.);
-        assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, outside_source, None, 255));
+        assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, outside_source, None, 255, BlendMode::SourceOver));
         assert!(canvas.pixels().iter().all(|&channel| channel == 0));
         Ok(())
     }

@@ -452,12 +452,7 @@ impl RenderTaskStore {
                     task.restart(now);
                 }
                 if let Some(geometry) = task.geometry.as_mut() {
-                    geometry.configure(
-                        &task.words,
-                        task.current_geometry
-                            .context("effect geometry needs an identified receiver version")?,
-                        random,
-                    )?;
+                    geometry.configure(&task.words, task.current_geometry, random)?;
                 } else if task.kind == 50 {
                     if !self.prepare_effect_auxiliary(2, task.size, capture_policy)? {
                         task.available = false;
@@ -536,6 +531,59 @@ impl RenderTaskStore {
         }
         Ok(())
     }
+}
+
+#[test]
+fn wbreak_prepare_does_not_require_a_flip_receiver_version() {
+    let mut render = RenderTaskStore::default();
+    let effect_id = 108;
+    let wbreak_words = [
+        0,
+        45_000.0f32.to_bits(),
+        58,
+        8,
+        8,
+        15.0f32.to_bits(),
+        3.0f32.to_bits(),
+    ];
+    let wbreak_record = wbreak_words.map(u32::to_le_bytes).concat();
+    render
+        .register_frame_effect(effect_id, 52, [32, 24], None)
+        .unwrap();
+    render
+        .effect_command(
+            effect_id,
+            Operation::Prepare,
+            0,
+            Some(&wbreak_record),
+            0,
+            Some(0),
+            &mut 0,
+            &mut || 0.5,
+        )
+        .unwrap();
+
+    let flip_id = 109;
+    let flip_record = [0; 36];
+    render
+        .register_frame_effect(flip_id, 58, [32, 24], None)
+        .unwrap();
+    let error = render
+        .effect_command(
+            flip_id,
+            Operation::Prepare,
+            0,
+            Some(&flip_record),
+            0,
+            Some(0),
+            &mut 0,
+            &mut || 0.5,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "effect geometry needs an identified receiver version"
+    );
 }
 
 impl Effect {

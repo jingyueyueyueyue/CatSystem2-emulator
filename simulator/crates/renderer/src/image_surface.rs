@@ -22,7 +22,7 @@ impl RgbaFrame {
         if pixels.len() != expected {
             return Err(RendererError::BufferLength { expected, actual: pixels.len() });
         }
-        Ok(Self { width, height, pixels, metadata, attributes: HgFrameAttributes::default() })
+        Ok(Self { width, height, pixels: std::sync::Arc::new(pixels), metadata, attributes: HgFrameAttributes::default() })
     }
 
     pub fn is_empty(&self) -> bool {

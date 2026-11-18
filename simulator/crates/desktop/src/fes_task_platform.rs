@@ -1048,6 +1048,9 @@ fn apply_effect(
             if super::fes_media::apply_difimage_reference(host, runtime, driver, command, shared)? {
                 return Ok(true);
             }
+            if super::fes_media::apply_difimage_attribute(host, runtime, driver, command, shared)? {
+                return Ok(true);
+            }
             let previous_sources: Vec<_> = host.data_services.tasks.fes.platform.objects.iter()
                 .filter(|((owner, _, _), binding)| *owner == view.id && binding.kind == b"BUTTON")
                 .filter_map(|(identity, binding)| runtime.media.get(&binding.key)
@@ -1255,21 +1258,33 @@ fn difimage_refex_projects_and_releases_independent_resources() -> Result<()> {
             geometry.base = base;
             host.image_resources.insert(handle, super::DesktopImageResource {
                 image, geometry, owner: Some(parent), references: 1, has_source_layer: false,
-                updated: false, uses_alpha: true, auxiliary: 0, attributes: BTreeMap::new(),
+                updated: false, uses_alpha: true, auxiliary: 0,
+                attributes: BTreeMap::from([
+                    (99, [base[0] as u32, base[1] as u32, 0, 0, 0]),
+                    (101, [1, 2, 3, 4, 0xff80_1020]),
+                ]),
             });
         }
-        let mut bind = |host: &mut LoggingHost<'_>, runtime: &mut FesRuntime,
-                        driver: &mut FesScriptDriver, bank: &[u8], handle: Option<&[u8]>| -> Result<()> {
-            let mut parameters = vec![bank.to_vec(), b"refex".to_vec()];
-            parameters.extend(handle.map(<[u8]>::to_vec));
-            let command = FesDriverCommand { offset: 0, source: Vec::new(), parameters,
+        let mut apply = |host: &mut LoggingHost<'_>, runtime: &mut FesRuntime,
+                         driver: &mut FesScriptDriver, parameters: &[&[u8]]| -> Result<[i32; 6]> {
+            let command = FesDriverCommand { offset: 0, source: Vec::new(),
+                parameters: parameters.iter().map(|parameter| parameter.to_vec()).collect(),
                 context: driver.interpreter.context(&shared), object_event: None };
             assert!(apply_effect(host, &view, runtime, driver, &FesDriverEffect::Command(command), &mut shared)?);
-            Ok(())
+            Ok(shared.shared[850..856].try_into()?)
         };
         let key = (id, "face[1]".to_owned());
-        bind(host, &mut runtime, &mut driver, b"face[0+1]", Some(b"901"))?;
-        bind(host, &mut runtime, &mut driver, b"face[1]", Some(b"901"))?;
+        apply(host, &mut runtime, &mut driver, &[b"face[0+1]", b"refex", b"901"])?;
+        apply(host, &mut runtime, &mut driver, &[b"face[1]", b"refex", b"901"])?;
+        assert_eq!(apply(host, &mut runtime, &mut driver,
+            &[b"face[0+1]", b"attr", b"98+1", b"850", b"851"])?, [2, 3, 0, 0, 0, 0]);
+        let expected = [1, 2, 3, 4, 0xff80_1020u32 as i32, 0];
+        assert_eq!(apply(host, &mut runtime, &mut driver,
+            &[b"face[1]", b"attr", b"65637", b"850", b"851", b"852", b"853", b"854"])?, expected);
+        assert_eq!(apply(host, &mut runtime, &mut driver,
+            &[b"face[1]", b"attr", b"100", b"850", b"851"])?, expected);
+        assert_eq!(apply(host, &mut runtime, &mut driver,
+            &[b"face[0]", b"attr", b"99", b"850", b"851"])?, expected);
         assert_eq!(host.image_resources[&901].references, 2);
         assert!(runtime.media[&key.1].source.validate_checkpoint().is_err());
         assert!(finish_task_media(host, &view, &mut runtime, &mut driver)?);
@@ -1278,22 +1293,25 @@ fn difimage_refex_projects_and_releases_independent_resources() -> Result<()> {
         assert_eq!(layers[&key].frame.pixels(), &first);
         assert_eq!(layers[&key].options.position, Point::new(4, 4));
 
-        assert!(bind(host, &mut runtime, &mut driver, b"face[1]", Some(b"999")).is_err());
+        assert!(apply(host, &mut runtime, &mut driver, &[b"face[1]", b"refex", b"999"]).is_err());
         assert_eq!(host.image_resources[&901].references, 2);
-        bind(host, &mut runtime, &mut driver, b"face[1]", Some(b"902"))?;
+        apply(host, &mut runtime, &mut driver, &[b"face[1]", b"refex", b"902"])?;
+        assert_eq!(apply(host, &mut runtime, &mut driver,
+            &[b"face[-1]", b"attr", b"99", b"850", b"$850+853"])?,
+            [-2, 2, 3, 4, 1, 0]);
         assert_eq!(host.image_resources[&901].references, 1);
         assert!(finish_task_media(host, &view, &mut runtime, &mut driver)?);
         let layers = &host.data_services.tasks.fes.platform.lists[&list].layers;
         assert_eq!(layers[&key].frame.pixels(), &second);
         assert_eq!(layers[&key].options.position, Point::new(8, 6));
 
-        bind(host, &mut runtime, &mut driver, b"face[1]", None)?;
+        apply(host, &mut runtime, &mut driver, &[b"face[1]", b"refex"])?;
         assert_eq!(host.image_resources[&902].references, 1);
         assert_eq!(runtime.media[&key.1].image_base, [-2, 1]);
         assert!(finish_task_media(host, &view, &mut runtime, &mut driver)?);
         assert!(host.data_services.tasks.fes.platform.lists[&list].layers.is_empty());
 
-        bind(host, &mut runtime, &mut driver, b"face[-1]", Some(b"902"))?;
+        apply(host, &mut runtime, &mut driver, &[b"face[-1]", b"refex", b"902"])?;
         assert_eq!(host.image_resources[&902].references, 4);
         let items = plan_bank_release(host, &runtime, &driver, id, b"face", 1)?;
         for item in &items {
@@ -2193,6 +2211,35 @@ mod media_lifecycle_tests {
                 assert_eq!(&shared.shared[..3], &[-8, 12, 23]);
                 Ok(())
             })
+    }
+
+    #[test]
+    fn fes_string8_getpos_reads_local_position_into_shared_slots() -> Result<()> {
+        with_script(
+            b"STRING8 strsub",
+            &[
+                b"strsub pos2 -83 124",
+                b"strsub org 35 -19",
+                b"strsub scale 170 130",
+                b"strsub getpos 850 851",
+                b"strsub getpos ($7+=1) ($7+=1) 3",
+                b"strsub getpos 4 4 -1",
+            ],
+            |host, view, runtime, driver, shared| {
+                shared.shared[3] = 500;
+                for _ in 0..4 {
+                    command(host, view, runtime, driver, shared)?;
+                }
+                assert_eq!(&shared.shared[850..852], &[-83, 124]);
+                assert_eq!(shared.shared[3], 500);
+                command(host, view, runtime, driver, shared)?;
+                assert_eq!(&shared.shared[1..4], &[-83, 124, 0]);
+                assert_eq!(shared.shared[7], 2);
+                command(host, view, runtime, driver, shared)?;
+                assert_eq!(shared.shared[4], 124);
+                Ok(())
+            },
+        )
     }
 
     #[test]

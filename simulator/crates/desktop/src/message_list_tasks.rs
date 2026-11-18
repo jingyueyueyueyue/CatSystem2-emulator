@@ -23,6 +23,7 @@ pub struct MessageListView {
 pub(crate) struct MessageListStore {
     tasks: BTreeMap<u32, MessageListTask>,
     revision: u64,
+    base: Option<u32>,
 }
 
 struct MessageListTask {
@@ -41,6 +42,10 @@ struct MessageListTask {
 
 impl MessageListStore {
     pub(crate) fn supports(index: u32) -> bool { matches!(index, 570..=572) }
+    pub(crate) fn identify(&mut self, sha256: &str) {
+        self.base = message_base_for_pe(sha256);
+    }
+
     pub(super) fn register(&mut self, id: u32) {
         self.tasks.insert(id, MessageListTask {
             source: 0, source_snapshot: None, open: false, visible: false, rows: Vec::new(), scan: None,
@@ -330,8 +335,11 @@ impl LoggingHost<'_> {
 }
 
 fn message_base(host: &LoggingHost<'_>) -> Option<u32> {
-    let profile = cs2_runtime::native_task_profile::exact_task_native_profile(
-        host.data_services.native_profile?.pe_sha256)?;
+    host.data_services.tasks.message_lists.base
+}
+
+fn message_base_for_pe(sha256: &str) -> Option<u32> {
+    let profile = cs2_runtime::native_task_profile::exact_task_native_profile(sha256)?;
     let [create, bind, refresh] = profile.message_list?;
     // Refuse a future incompatible layout; wrapper identities alone do not
     // license assigning arbitrary operations to intervening message numbers.

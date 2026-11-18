@@ -21,6 +21,7 @@ use surface_pass::SurfacePass;
 
 const MAX_WORK_BYTES: usize = 128 * 1024 * 1024;
 const V401: &str = "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f";
+const KOKONATSU: &str = "c47c9d883126f641ce07d92eb57b6ac9833fe7495996001c12c68c55b99974d3";
 const YUKIKOI: &str = "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -456,9 +457,30 @@ impl LoggingHost<'_> {
                 record.extend_from_slice(&args[8..32]);
                 record
             }
+            527 if self
+                .data_services
+                .native_profile
+                .is_some_and(|profile| profile.pe_sha256 == V401) =>
+            {
+                let mut record = Vec::with_capacity(12);
+                record.extend_from_slice(&args[8..16]);
+                record.extend_from_slice(&args[4..8]);
+                record
+            }
             523 | 525 | 527 => args[4..].to_vec(),
             530 => {
-                let mut record = args[4..20].to_vec();
+                let mut record = Vec::with_capacity(20);
+                if self
+                    .data_services
+                    .native_profile
+                    .is_some_and(|profile| profile.pe_sha256 == KOKONATSU)
+                {
+                    record.extend_from_slice(&args[8..16]);
+                    record.extend_from_slice(&args[4..8]);
+                    record.extend_from_slice(&args[16..20]);
+                } else {
+                    record.extend_from_slice(&args[4..20]);
+                }
                 record.extend_from_slice(&0u32.to_le_bytes());
                 record
             }

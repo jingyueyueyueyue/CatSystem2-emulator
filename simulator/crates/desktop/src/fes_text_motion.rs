@@ -111,8 +111,9 @@ pub(crate) fn prepare_motion_projection(
     if view.list.is_none() || !projection.options.visible { return Ok(projection); }
     let bank = bank(&host.data_services.fes_text, view.id, &projection.name, projection.bank)?;
     if let Some(parent) = bank.parent_plane.as_ref().and_then(|name| runtime.planes.get(name)) {
-        words[6] = (f32::from_bits(words[6]) + parent.position.x as f32).to_bits();
-        words[7] = (f32::from_bits(words[7]) + parent.position.y as f32).to_bits();
+        let (position, _) = parent_projection(Some(parent), is_canvas_parent(bank, runtime));
+        words[6] = (f32::from_bits(words[6]) + position.x as f32).to_bits();
+        words[7] = (f32::from_bits(words[7]) + position.y as f32).to_bits();
     }
     // Preserve the cheap integer path for the common untransformed page.
     let plain = words[9..25] == crate::fes_motion::IDENTITY.map(f32::to_bits)

@@ -25,7 +25,8 @@ use super::{
 #[path = "fes_image_source.rs"]
 mod image_source;
 pub(crate) use image_source::ImageSourceState;
-pub(super) use image_source::{apply_difimage_reference, apply_image_source_command, request_image_file, update_image_sources};
+pub(super) use image_source::{apply_difimage_attribute, apply_difimage_reference,
+    apply_image_source_command, request_image_file, update_image_sources};
 pub(crate) use image_source::{initialize_image_idn, source_image, release_image_source,
     release_image_sources, validate_image_source_bindings, source_draw_options, prepare_raw_image_source};
 

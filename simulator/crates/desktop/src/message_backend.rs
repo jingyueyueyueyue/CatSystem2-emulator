@@ -12,13 +12,15 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use cs2_renderer::{
     Canvas, Color, FontRasterizer, GlyphEffects, GlyphMask, GlyphMetrics, ImageDrawOptions, Point,
     Rect, RendererError, RgbaFrame,
 };
-use cs2_runtime::ResourceIndex;
+use cs2_runtime::{ResourceIndex, ResourceLocation};
 use cs2_runtime::message_object::{
     MessageAtom, MessageAtomKind, MessageBackend, MessageBreakCharacters, MessageConfiguration,
     MessageCopy, MessageEncoding, MessageFontSubstitution, MessageGlyphState, MessageLayout,
@@ -82,6 +84,7 @@ pub(super) struct DesktopMessageDevice {
     /// SFNT aliases share one lazy face. System font paths are retained instead
     /// of eagerly decoding/copying every installed font into every alias.
     named_fonts: BTreeMap<String, Vec<Arc<NamedFace>>>,
+    resource_font_files: BTreeMap<String, GameFontFile>,
     fallback_faces: Vec<Arc<NamedFace>>,
     platform_substitutions: RefCell<BTreeSet<MessageFontSubstitution>>,
     fonts_loaded: bool,
@@ -99,6 +102,40 @@ pub(super) struct DesktopMessageDevice {
 enum FontSource {
     Bytes(Arc<Vec<u8>>),
     File(std::path::PathBuf),
+}
+
+#[derive(Debug)]
+struct GameFontFile {
+    path: PathBuf,
+    face: OnceLock<std::result::Result<GameFontFace, String>>,
+}
+
+#[derive(Debug)]
+struct GameFontFace {
+    font: FontRasterizer,
+    bold: bool,
+    italic: bool,
+}
+
+impl GameFontFile {
+    fn load(&self) -> std::result::Result<GameFontFace, String> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(&self.path)
+            .and_then(|file| file.take(MAX_SURFACE_BYTES as u64 + 1).read_to_end(&mut bytes))
+            .map_err(|error| format!("could not be read: {error}"))?;
+        let font = FontRasterizer::from_bytes(&bytes, 0)
+            .map_err(|error| format!("could not be decoded: {error}"))?;
+        let offset = if bytes.starts_with(b"ttcf") {
+            be32(&bytes, 12).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        Ok(GameFontFace {
+            font,
+            bold: sfnt_weight(&bytes, offset) == Some(700),
+            italic: sfnt_italic(&bytes, offset),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -156,6 +193,7 @@ impl Default for DesktopMessageDevice {
         Self {
             fonts: Vec::new(),
             named_fonts: BTreeMap::new(),
+            resource_font_files: BTreeMap::new(),
             fallback_faces: Vec::new(),
             platform_substitutions: RefCell::new(BTreeSet::new()),
             fonts_loaded: false,
@@ -241,6 +279,7 @@ impl DesktopMessageDevice {
         if !self.fonts_loaded {
             self.fonts = super::load_font(resources);
             self.load_font_names(resources);
+            self.load_game_font_files(resources);
             self.fonts_loaded = true;
         }
     }
@@ -340,6 +379,34 @@ impl DesktopMessageDevice {
             .iter()
             .cloned()
             .collect()
+    }
+
+    fn load_game_font_files(&mut self, resources: &ResourceIndex) {
+        for file in resources.files() {
+            let relative = file.relative_path.to_string_lossy().replace('\\', "/");
+            let lower = relative.to_ascii_lowercase();
+            let indexed_path = resources.root().join(&file.relative_path);
+            for (offset, _) in lower.match_indices("font/") {
+                if offset != 0 && lower.as_bytes()[offset - 1] != b'/' {
+                    continue;
+                }
+                let Ok(Some(candidate)) = resources.resolve_plain_file(&relative[offset..]) else {
+                    continue;
+                };
+                if let ResourceLocation::File { path } = &candidate.location
+                    && *path == indexed_path
+                {
+                    self.resource_font_files.insert(
+                        lower[offset + "font/".len()..].to_owned(),
+                        GameFontFile {
+                            path: path.clone(),
+                            face: OnceLock::new(),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn load_font_names(&mut self, resources: &ResourceIndex) {
@@ -717,9 +784,22 @@ impl DesktopMessageDevice {
         override_name: Option<&[u16]>,
     ) -> Result<(&FontRasterizer, bool, bool)> {
         if configuration.font_backend() != 0 {
-            return Err(invalid(
-                "message CPU font backend supports backend zero only",
-            ));
+            let units = override_name.map_or_else(|| configuration.font_name(), |name| name.to_vec());
+            let name = String::from_utf16(&units)
+                .map_err(|_| invalid("message font filename has an isolated UTF-16 surrogate"))?;
+            let key = name.replace('\\', "/").to_ascii_lowercase();
+            let file = self.resource_font_files.get(&key).ok_or_else(|| ScriptError::HostCallFailed {
+                message: format!("message font resource font/{name} not found"),
+            })?;
+            let face = file.face.get_or_init(|| file.load()).as_ref().map_err(|error| {
+                ScriptError::HostCallFailed { message: format!("message font resource font/{name} {error}") }
+            })?;
+            if !face.font.has_character(character) {
+                return Err(ScriptError::HostCallFailed {
+                    message: format!("message font resource font/{name} could not supply U+{:04X}", character as u32),
+                });
+            }
+            return Ok((&face.font, face.bold, face.italic));
         }
         // The extra DWORD is a Windows character-set selector in its LOW
         // byte, not a glyph-size multiplier or a strict zero/one flag.
@@ -2056,6 +2136,88 @@ fn sfnt_names(bytes: &[u8], face: usize) -> BTreeSet<String> {
         }
     }
     result
+}
+
+#[cfg(all(test, windows))]
+mod game_font_tests {
+    use super::*;
+    use cs2_runtime::message_object::MessageDefaults;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FontFixture(PathBuf);
+
+    impl Drop for FontFixture {
+        fn drop(&mut self) {
+            for relative in [
+                "inner/config/startup.xml",
+                "inner/font/face.ttf",
+                "inner/font/broken.ttf",
+                "inner/other/outside.ttf",
+                "font/face.ttf",
+                "font/outside.ttf",
+            ] {
+                let _ = fs::remove_file(self.0.join(relative));
+            }
+            for relative in ["inner/config", "inner/font", "inner/other", "inner", "font"] {
+                let _ = fs::remove_dir(self.0.join(relative));
+            }
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    fn configuration(name: &str, backend: u32) -> MessageConfiguration {
+        let encoding = MessageEncoding::Unicode;
+        let defaults = MessageDefaults {
+            font_name: name.encode_utf16().collect(),
+            bold: false,
+            shadow: 0,
+            outline: 0,
+            glyph_parameter: Some(128),
+            gradual: false,
+        };
+        let mut bytes = defaults.configuration(encoding).unwrap().bytes().to_vec();
+        bytes[0x118..0x11c].copy_from_slice(&backend.to_le_bytes());
+        MessageConfiguration::from_bytes(&bytes, encoding).unwrap()
+    }
+
+    #[test]
+    fn message_backend1_routes_only_the_active_loose_game_fonts() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let fixture = FontFixture(std::env::temp_dir().join(format!("cs2-font-route-{nonce}")));
+        for relative in ["inner/config", "inner/font", "inner/other", "font"] {
+            fs::create_dir_all(fixture.0.join(relative)).unwrap();
+        }
+        fs::write(
+            fixture.0.join("inner/config/startup.xml"),
+            br#"<?xml version="1.0" encoding="UTF-8"?><document/>"#,
+        ).unwrap();
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let font = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        fs::write(fixture.0.join("inner/font/face.ttf"), &font).unwrap();
+        fs::write(fixture.0.join("inner/font/broken.ttf"), b"bad font").unwrap();
+        fs::write(fixture.0.join("inner/other/outside.ttf"), &font).unwrap();
+        fs::write(fixture.0.join("font/face.ttf"), b"outer decoy").unwrap();
+        fs::write(fixture.0.join("font/outside.ttf"), &font).unwrap();
+
+        let index = ResourceIndex::scan(&fixture.0).unwrap();
+        assert!(index.startup_configuration().unwrap().is_some());
+        let mut device = DesktopMessageDevice::default();
+        device.load_game_font_files(&index);
+        device.bind_font("Test family", &font, 0).unwrap();
+
+        let by_file = device.mask(&configuration("FACE.TTF", 1), 'A', 24, false, false).unwrap();
+        let by_family = device.mask(&configuration("TEST FAMILY", 0), 'A', 24, false, false).unwrap();
+        assert!(by_file.alpha().iter().any(|&alpha| alpha != 0));
+        assert_eq!(by_file.alpha(), by_family.alpha());
+        let error = |name, character| {
+            device.mask(&configuration(name, 1), character, 24, false, false).unwrap_err().to_string()
+        };
+        assert!(error("outside.ttf", 'A').contains("not found"));
+        assert!(error("Test family", 'A').contains("not found"));
+        assert!(error("broken.ttf", 'A').contains("could not be decoded"));
+        assert!(error("face.ttf", '\u{10ffff}').contains("could not supply U+10FFFF"));
+    }
 }
 
 /// Message-specific effect path. Canvas's generic outline uses a maximum;

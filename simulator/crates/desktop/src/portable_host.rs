@@ -126,6 +126,41 @@ impl HeadlessPlayer {
         self.canvas.pixels()
     }
 
+    pub fn host_composition_diagnostic(&self) -> String {
+        use std::fmt::Write;
+
+        let planes = &self.data_services.planes;
+        let mut out = String::new();
+        for node in self.scene_nodes.values().filter(|node| node.kind == 2 && node.initialized) {
+            let source = planes.source_position(node.id, 1);
+            let sample = source.and_then(|origin| {
+                let x = (origin[0] + node.size[0] / 2.0) as i32;
+                let y = (origin[1] + node.size[1] / 2.0) as i32;
+                self.graphics_canvas.pixel(x, y).ok().or_else(|| {
+                    planes.vram_overflow.as_ref()?.pixel(x.try_into().ok()?, y.try_into().ok()?)
+                })
+            });
+            let depth = super::plane_native::plane_depth(node, planes);
+            let shape = planes.state(node.id).map(|state| state.shape);
+            let _ = writeln!(out,
+                "plane {} {} parent={} visible={} shape={shape:?} position={:?} size={:?} depth={depth} color={:#010x} source={source:?} sample={sample:?}",
+                node.id, node.name, node.parent, node.visible, node.position, node.size, node.color);
+        }
+        for (id, list) in &self.data_services.tasks.fes.platform.lists {
+            let output = self.image_handles.get(&list.output);
+            let _ = writeln!(out, "list {id} size={:?} offset={:?} enabled={} submit={} force={} nonzero_alpha={:?}",
+                list.size, list.offset, list.enabled, list.submit, list.force,
+                output.map(|frame| frame.pixels().chunks_exact(4).filter(|pixel| pixel[3] != 0).count()));
+            for ((owner, name), layer) in list.layers.iter().filter(|(_, layer)| layer.options.visible) {
+                let _ = writeln!(out, "layer {owner} {name:?} position={:?} size=[{}, {}] depth={} opacity={} clip={:?} nonzero_alpha={}",
+                    layer.options.position, layer.frame.width(), layer.frame.height(), layer.priority,
+                    layer.options.opacity, layer.options.clip,
+                    layer.frame.pixels().chunks_exact(4).filter(|pixel| pixel[3] != 0).count());
+            }
+        }
+        out
+    }
+
     /// Interactive hosts retain recent diagnostic context instead of keeping
     /// every native call for an entire multi-hour game in memory. CLI evidence
     /// collection leaves its original, complete event stream unchanged.

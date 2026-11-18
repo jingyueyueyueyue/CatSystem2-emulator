@@ -7047,6 +7047,7 @@ impl HeadlessPlayer {
         player.data_services.native_profile = player.scan.engine.primary_executable.as_ref()
             .and_then(|binary| cs2_runtime::native_profile::profile_for_pe_sha256(&binary.sha256, None));
         if let Some(binary) = player.scan.engine.primary_executable.as_ref() {
+            player.data_services.tasks.message_lists.identify(&binary.sha256);
             player.data_services.css_task_pe_sha256 = css_task_native::identified_pe_sha256(&binary.sha256);
             player.data_services.particle_external.identify(&binary.sha256);
             player.data_services.emote.initialize(&player.scan.resources, &binary.sha256)

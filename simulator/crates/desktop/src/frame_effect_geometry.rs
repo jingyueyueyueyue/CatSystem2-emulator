@@ -66,11 +66,14 @@ impl Geometry {
     pub(super) fn configure(
         &mut self,
         words: &[u32],
-        current: bool,
+        current: Option<bool>,
         random: &mut impl FnMut() -> f32,
     ) -> Result<()> {
         if let Some(flip) = self.flip.as_mut() {
-            return flip.configure(words, current);
+            return flip.configure(
+                words,
+                current.context("effect geometry needs an identified receiver version")?,
+            );
         }
         self.words = words.to_vec();
         self.configured = true;

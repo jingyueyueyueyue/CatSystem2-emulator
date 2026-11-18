@@ -9,6 +9,7 @@ CatSystem2 引擎开源实现。An independent, open-source implementation of th
 ## 目录说明
 
 - `simulator/crates/`：资源格式、脚本、引擎运行时、渲染、桌面宿主和 Android 接口。
+- `simulator/crates/desktop/examples/`：无窗口剧情回放示例，可按帧发送输入和保存截图。
 - `simulator/android/`：Android 工程及 JNI/Surface 集成。
 - `simulator/vendor/`：固定版本的第三方依赖及对应许可证。
 - `scripts/build/`：Android 构建和固定版本 FFmpeg 构建工具。

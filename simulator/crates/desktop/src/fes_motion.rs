@@ -1449,8 +1449,8 @@ fn query_position(
     };
     let media_kind = object.definition.kind_name.as_slice();
     let image = matches!(media_kind, b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON");
-    let plane = matches!(media_kind, b"PLANE" | b"CPLANE");
-    if !(image || plane && !adjusted) {
+    let local_plane = matches!(media_kind, b"PLANE" | b"CPLANE" | b"STRING" | b"STRING8");
+    if !(image || local_plane && !adjusted) {
         return Ok(None);
     }
     let bank = match bank {
@@ -1476,7 +1476,7 @@ fn query_position(
             .context("FES position query has no live motion object")?;
         let words = capture(host, view.id, owner, &id, runtime, host.text_encoding)?;
         let [x, y, z] = [6, 7, 8].map(|axis| x86_integer(f32::from_bits(words[axis])));
-        [x, y, if plane { z } else { 0 }]
+        [x, y, if local_plane { z } else { 0 }]
     };
     for (destination, value) in destinations.into_iter().zip(position) {
         if let Some(slot) = shared.shared.get_mut(destination as usize) {

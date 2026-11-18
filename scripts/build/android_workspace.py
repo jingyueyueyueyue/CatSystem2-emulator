@@ -107,13 +107,20 @@ def build_cache_directory(name: str, integration: bool) -> Path:
     stage = "integration" if integration else "complete"
     month = f"{date[:4]}-{date[4:6]}"
     cache_name = f"{date}_{name}_{stage}_cache"
-    if os.name != "nt" or str(ROOT).isascii():
+    override = os.environ.get("CS2_BUILD_CACHE_ROOT")
+    if override:
+        cache_root = Path(override)
+        if not cache_root.is_absolute() or not str(cache_root.resolve()).isascii():
+            raise RuntimeError("CS2_BUILD_CACHE_ROOT must be an absolute, physically ASCII path")
+        cache_root = cache_root.resolve()
+    elif os.name != "nt" or str(ROOT).isascii():
         return ROOT / "archive" / month / cache_name
-    # rustc canonicalizes dependency rlibs before passing them to GNU ld.
-    # A junction pointing INTO a Unicode directory therefore fixes output
-    # paths only. Keep the actual cache ASCII and link it back into archive.
-    identity = hashlib.sha256(str(ROOT).casefold().encode("utf-8")).hexdigest()[:12]
-    cache_root = Path(ROOT.anchor) / f"cs2-build-cache-{identity}"
+    else:
+        # rustc canonicalizes dependency rlibs before passing them to GNU ld.
+        # A junction pointing INTO a Unicode directory therefore fixes output
+        # paths only. Keep the actual cache ASCII and link it back into archive.
+        identity = hashlib.sha256(str(ROOT).casefold().encode("utf-8")).hexdigest()[:12]
+        cache_root = Path(ROOT.anchor) / f"cs2-build-cache-{identity}"
     marker = cache_root / "workspace.json"
     if cache_root.exists():
         if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")).get("root") != str(ROOT):
@@ -121,6 +128,10 @@ def build_cache_directory(name: str, integration: bool) -> Path:
     else:
         cache_root.mkdir()
         marker.write_text(json.dumps({"root": str(ROOT)}, ensure_ascii=True) + "\n", encoding="utf-8")
+    if override:
+        physical = cache_root / f"{name}_{stage}"
+        physical.mkdir(exist_ok=True)
+        return physical
     physical = cache_root / month / cache_name
     physical.mkdir(parents=True, exist_ok=True)
     archived = ROOT / "archive" / month / f"{cache_name}_ascii"

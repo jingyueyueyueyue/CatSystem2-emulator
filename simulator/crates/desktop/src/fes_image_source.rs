@@ -92,6 +92,51 @@ pub(crate) fn apply_difimage_reference(
     Ok(true)
 }
 
+pub(crate) fn apply_difimage_attribute(
+    host: &LoggingHost<'_>, runtime: &FesRuntime,
+    driver: &mut FesScriptDriver, command: &FesDriverCommand,
+    shared: &mut ExpressionState,
+) -> Result<bool> {
+    if !command.parameters.get(1).is_some_and(|verb| verb.eq_ignore_ascii_case(b"attr")) {
+        return Ok(false);
+    }
+    let Some(target) = command.parameters.first() else { return Ok(false); };
+    let target = if target == b"@" {
+        command.object_event.as_ref().context("DIFIMAGE @ has no event object")?.parameter()
+    } else { target.clone() };
+    let (name, bank) = split_target(&target, host.text_encoding)?;
+    let Some(object) = driver.adapter.object(name)
+        .filter(|object| object.definition.kind_name == b"DIFIMAGE") else { return Ok(false); };
+    let count = i32::try_from(object.definition.bank_count).context("DIFIMAGE bank count exceeds i32")?;
+    let bank = bank.map(|value| driver.evaluate_parameter(value, command.context.current, shared))
+        .transpose()?.unwrap_or(-1);
+    let Some(attribute) = command.parameters.get(2) else { return Ok(true); };
+    let attribute = u32::from(driver.evaluate_parameter(attribute, command.context.current, shared)? as u16);
+    let mut destinations = [-1; 5];
+    for (destination, source) in destinations.iter_mut().zip(&command.parameters[3..]) {
+        *destination = driver.evaluate_parameter(source, command.context.current, shared)?;
+    }
+    let banks = match bank {
+        -1 => 0..count,
+        bank if (0..count).contains(&bank) => bank..bank + 1,
+        _ => return Ok(true),
+    };
+    let name_string = decode(name, host.text_encoding)?;
+    for bank in banks {
+        if driver.adapter.object_bank(name, bank as usize).is_none() { break; }
+        let key = if count == 1 { name_string.clone() } else { format!("{name_string}[{bank}]") };
+        let layer = runtime.media.get(&key).context("DIFIMAGE bank has no media binding")?;
+        let Some(values) = layer.source.difimage_resource.and_then(|handle| host.image_resources.get(&handle))
+            .and_then(|resource| resource.attributes.get(&attribute)) else { continue; };
+        for (destination, value) in destinations.into_iter().zip(values) {
+            if let Some(slot) = shared.shared.get_mut(destination as usize) {
+                *slot = *value as i32;
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn replace_difimage_source(
     host: &mut LoggingHost<'_>, layer: &mut FesMediaLayer, next: Option<u32>,
 ) -> Result<()> {

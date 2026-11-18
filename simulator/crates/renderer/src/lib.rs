@@ -2078,7 +2078,7 @@ impl Canvas {
 pub struct RgbaFrame {
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pixels: std::sync::Arc<Vec<u8>>,
     metadata: FrameMetadata,
     attributes: HgFrameAttributes,
 }
@@ -2112,7 +2112,7 @@ impl RgbaFrame {
         Ok(Self {
             width,
             height,
-            pixels,
+            pixels: std::sync::Arc::new(pixels),
             metadata,
             attributes: HgFrameAttributes::default(),
         })
@@ -2399,7 +2399,7 @@ impl RgbaFrame {
     }
 
     pub fn with_alpha(&self, alpha: u8) -> Result<Self> {
-        let mut pixels = self.pixels.clone();
+        let mut pixels = self.pixels().to_vec();
         for pixel in pixels.chunks_exact_mut(4) {
             pixel[3] = modulate_alpha(pixel[3], alpha);
         }
@@ -2485,7 +2485,7 @@ impl RgbaFrame {
                 i32::try_from(y).map_err(|_| RendererError::ScaledDimensionsOverflow)?,
             ));
             options.clip = Some(Rect::new(0, 0, width, height));
-            let pixel_layer = Self::from_rgba8(layer.width, layer.height, layer.pixels.clone())?;
+            let pixel_layer = Self::from_rgba8(layer.width, layer.height, layer.pixels().to_vec())?;
             canvas.draw_frame(&pixel_layer, &options)?;
         }
         let metadata = FrameMetadata {
@@ -2679,7 +2679,7 @@ impl RgbaFrame {
     }
 
     pub fn adjust_rgb_percent(&self, rgb: [u32; 3]) -> Result<Self> {
-        let mut pixels = self.pixels.clone();
+        let mut pixels = self.pixels().to_vec();
         if rgb != [100; 3] {
             for pixel in pixels.chunks_exact_mut(4) {
                 for (value, percent) in pixel[..3].iter_mut().zip(rgb) {
@@ -2691,7 +2691,7 @@ impl RgbaFrame {
     }
 
     pub fn apply_filter(&self, filter: FrameFilter) -> Result<Self> {
-        let mut pixels = self.pixels.clone();
+        let mut pixels = self.pixels().to_vec();
         for pixel in pixels.chunks_exact_mut(4) {
             match filter {
                 FrameFilter::None => (),

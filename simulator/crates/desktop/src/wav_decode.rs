@@ -220,10 +220,18 @@ fn decode_adpcm(
             })
         })
         .ok_or_else(|| error("Microsoft ADPCM frame count overflow"))?;
-    let frames = fact.unwrap_or(maximum);
-    if frames > maximum {
-        return Err(error("Microsoft ADPCM fact exceeds encoded blocks"));
-    }
+    let frames = match fact {
+        None => maximum,
+        Some(declared) if declared <= maximum => declared,
+        Some(declared)
+            if full > 0
+                && declared % frames_per_block == 0
+                && declared - maximum <= frames_per_block =>
+        {
+            maximum
+        }
+        Some(_) => return Err(error("Microsoft ADPCM fact exceeds encoded blocks")),
+    };
     let count = frames
         .checked_mul(channels)
         .filter(|&value| value <= MAX_SAMPLES)

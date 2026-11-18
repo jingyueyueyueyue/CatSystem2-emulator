@@ -331,7 +331,7 @@ fn inflate_container(input: &[u8], storage: &mut [u8]) -> CssInflationStatus {
     let mut decoder = Decompress::new(true);
     let mut result = CssInflationStatus::default();
     let mut scratch = [0u8; 0x1000];
-    while (decoder.total_in() as usize) < input.len() {
+    loop {
         let before_in = decoder.total_in();
         let before_out = decoder.total_out();
         let status = decoder.decompress(
@@ -356,7 +356,7 @@ fn inflate_container(input: &[u8], storage: &mut [u8]) -> CssInflationStatus {
             Err(error) => { result.error = Some(error.to_string()); break; }
             _ => {}
         }
-        if produced == 0 || (decoder.total_in() == before_in && decoder.total_out() == before_out) { break; }
+        if produced == 0 && decoder.total_in() == before_in { break; }
     }
     result
 }

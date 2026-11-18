@@ -238,11 +238,7 @@ fn text(target: &mut Canvas, host: &mut LoggingHost<'_>, sources: &mut BTreeMap<
     let mut config = defaults.configuration(MessageEncoding::Unicode)?.bytes().to_vec();
     config[0x104..0x108].copy_from_slice(&400u32.to_le_bytes());
     let config = MessageConfiguration::from_bytes(&config, MessageEncoding::Unicode)?;
-    let text = match std::str::from_utf8(&content.text) {
-        Ok(text) => text.to_owned(),
-        Err(_) if host.text_encoding != ScriptTextEncoding::Cp932 => host.text_encoding.decode(&content.text),
-        Err(_) => bail!("SAVEPANEL CSS text is not valid UTF8"),
-    };
+    let text = decode_css_text(&content.text, host.text_encoding)?;
     let size_i = size as i32;
     let limit = (record.word(0x3c) as i32).wrapping_mul(size_i).wrapping_sub(size_i / 2);
     let start = position[0]; let (mut width, mut line) = (0i32, 0i32);
@@ -285,6 +281,37 @@ fn text(target: &mut Canvas, host: &mut LoggingHost<'_>, sources: &mut BTreeMap<
         }
     }
     Ok(())
+}
+
+fn decode_css_text(bytes: &[u8], encoding: ScriptTextEncoding) -> Result<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_owned()),
+        Err(_) if encoding == ScriptTextEncoding::Cp932 => encoding_rs::SHIFT_JIS
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .context("SAVEPANEL CSS text is neither valid UTF8 nor CP932")
+            .map(|text| text.into_owned()),
+        Err(_) => Ok(encoding.decode(bytes)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn css_preview_prefers_utf8_and_recovers_cp932() {
+        let encoding = ScriptTextEncoding::Cp932;
+        let expected = "\u{3042}";
+        assert_eq!(decode_css_text(expected.as_bytes(), encoding).unwrap(), expected);
+        assert_eq!(decode_css_text(&[0x82, 0xa0], encoding).unwrap(), expected);
+        assert!(decode_css_text(&[0x82], encoding).is_err());
+    }
+
+    #[test]
+    fn css_preview_preserves_gbk_fallback() {
+        let encoding = ScriptTextEncoding::Gbk;
+        assert_eq!(decode_css_text(&[0xd6, 0xd0], encoding).unwrap(), "\u{4e2d}");
+    }
 }
 
 fn user_character(code: u16) -> Option<char> {

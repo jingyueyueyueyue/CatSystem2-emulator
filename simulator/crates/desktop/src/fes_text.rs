@@ -327,11 +327,21 @@ impl FesTextStore {
             let column = initializer.columns[cursor].as_slice();
             let raw = initializer.values[cursor].as_slice();
             if column == b"PARENT" {
+                let canvas_parent = if keys.iter().any(|key| uses_canvas_atlas(&self.banks[key])) {
+                    resolve_canvas_parent(raw, encoding, driver, shared)?
+                } else {
+                    None
+                };
+                let motion_parent = canvas_parent.as_ref().map_or(raw, |(_, parent)| parent.as_slice());
                 for key in &keys {
                     super::fes_motion::initialize_field(
                         host, view, runtime, driver, shared, name, key.2,
-                        initializer.offset, cursor, column, raw,
+                        initializer.offset, cursor, column, motion_parent,
                     )?;
+                    let bank = self.banks.get_mut(key).unwrap();
+                    if uses_canvas_atlas(bank) && let Some((plane, _)) = &canvas_parent {
+                        bank.parent_plane = plane.clone();
+                    }
                 }
             } else if column == b"PL" {
                 let plane = encoding.decode(raw);
@@ -1082,9 +1092,12 @@ fn render_bank(
     let scale = device.time_scale;
     let parent = bank.parent_plane.as_ref().map(|name|
         runtime.planes.get(name).context("STRING parent PLANE does not exist")).transpose()?;
+    let canvas_parent = is_canvas_parent(bank, runtime);
+    let (parent_position, parent_clip) = parent_projection(parent, canvas_parent);
+    let display_parent = parent.filter(|_| !canvas_parent);
     let vram = [
-        bank.vram[0].wrapping_add(parent.map_or(0, |plane| plane.vram[0])),
-        bank.vram[1].wrapping_add(parent.map_or(0, |plane| plane.vram[1])),
+        bank.vram[0].wrapping_add(display_parent.map_or(0, |plane| plane.vram[0])),
+        bank.vram[1].wrapping_add(display_parent.map_or(0, |plane| plane.vram[1])),
     ];
     let canvas = canvas_fields(bank.message.encoding());
     if word(&bank.configuration, canvas) != vram[0] as u32
@@ -1149,7 +1162,7 @@ fn render_bank(
         bank.line_count = bank.message.layout().map_or(0, |layout| layout.line_count);
         bank.needs_prepare = false;
     }
-    let visible = bank.visible && parent.is_none_or(|plane| plane.visible);
+    let visible = bank.visible && display_parent.is_none_or(|plane| plane.visible);
     let display = if view.list.is_none() { MessagePlaneDisplay::Unreachable }
         else if visible { MessagePlaneDisplay::Visible } else { MessagePlaneDisplay::Hidden };
     if let Some(segment) = bank.draw {
@@ -1193,21 +1206,19 @@ fn render_bank(
     }
     let frame = RgbaFrame::from_rgba8(surface.submitted.width(), surface.submitted.height(), pixels)?;
     let mut options = ImageDrawOptions::new(Point::new(
-        bank.position[0].wrapping_sub(bank.origin[0])
-            .wrapping_add(parent.map_or(0, |plane| plane.position.x)),
-        bank.position[1].wrapping_sub(bank.origin[1])
-            .wrapping_add(parent.map_or(0, |plane| plane.position.y)),
+        bank.position[0].wrapping_sub(bank.origin[0]).wrapping_add(parent_position.x),
+        bank.position[1].wrapping_sub(bank.origin[1]).wrapping_add(parent_position.y),
     ));
     options.visible = visible && view.paused == 0 && !texture_size.contains(&0);
     if bank.novel.is_some() && view.list.is_none() {
         options.visible = false;
     }
-    options.opacity = ((u16::from(bank.alpha) * u16::from(parent.map_or(255, |plane| plane.opacity))) / 255) as u8;
+    options.opacity = ((u16::from(bank.alpha)
+        * u16::from(display_parent.map_or(255, |plane| plane.opacity))) / 255) as u8;
     options.scale_x = bank.scale[0] * registered_size[0] as f32 / texture_size[0].max(1) as f32;
     options.scale_y = bank.scale[1] * registered_size[1] as f32 / texture_size[1].max(1) as f32;
     options.rotation_radians = bank.rotation;
-    options.clip = if let Some(plane) = parent {
-        let parent_clip = Rect::new(plane.position.x, plane.position.y, plane.size[0], plane.size[1]);
+    options.clip = if let Some(parent_clip) = parent_clip {
         Some(match bank.clip {
             Some(clip) => intersect_clip(clip, parent_clip),
             None => parent_clip,
@@ -1218,6 +1229,51 @@ fn render_bank(
     });
 
     Ok(())
+}
+
+fn uses_canvas_atlas(bank: &TextBank) -> bool {
+    bank.novel.is_none() && bank.log.is_none()
+}
+
+fn is_canvas_parent(bank: &TextBank, runtime: &FesRuntime) -> bool {
+    uses_canvas_atlas(bank)
+        && bank.parent_plane.as_ref().is_some_and(|name| !runtime.media.contains_key(name))
+}
+
+fn resolve_canvas_parent(
+    raw: &[u8], encoding: ScriptTextEncoding, driver: &mut FesScriptDriver,
+    shared: &mut ExpressionState,
+) -> Result<Option<(Option<String>, Vec<u8>)>> {
+    let (name, index) = split_target(raw)?;
+    let Some(plane) = driver.adapter.object(name)
+        .filter(|object| object.definition.kind_name == b"PLANE") else { return Ok(None); };
+    let count = plane.definition.bank_count;
+    let bank = index.map(|value| driver.evaluate_parameter(value, 0, shared))
+        .transpose()?.unwrap_or(0);
+    let mut normalized = name.to_vec();
+    if index.is_some() {
+        normalized.extend_from_slice(format!("[{bank}]").as_bytes());
+    }
+    let key = (0..count as i32).contains(&bank).then(|| {
+        if count == 1 {
+            encoding.decode(name)
+        } else {
+            format!("{}[{bank}]", encoding.decode(name))
+        }
+    });
+    Ok(Some((key, normalized)))
+}
+
+fn parent_projection(
+    parent: Option<&super::FesPlaneLayer>, canvas_parent: bool,
+) -> (Point, Option<Rect>) {
+    let Some(plane) = parent else { return (Point::new(0, 0), None); };
+    let position = if canvas_parent {
+        Point::new(plane.vram[0], plane.vram[1])
+    } else {
+        plane.position
+    };
+    (position, Some(Rect::new(position.x, position.y, plane.size[0], plane.size[1])))
 }
 
 pub(super) fn release_owner(host: &mut LoggingHost<'_>, owner: u32) {

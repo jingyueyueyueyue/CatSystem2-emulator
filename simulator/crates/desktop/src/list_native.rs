@@ -2183,10 +2183,9 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
             Source::Resource { handle, .. } => Some(handle), _ => None,
         }).collect::<std::collections::BTreeSet<_>>();
     for handle in resources { host.redraw_image_resource_surface(handle)?; }
-    let Some(list) = host.data_services.tasks.fes.platform.lists.get(&id) else {
+    if !host.data_services.tasks.fes.platform.lists.contains_key(&id) {
         return Ok(());
-    };
-    let height = list.size[1] as i32;
+    }
     let mut layers = Vec::new();
     for ((target, key), entry) in host.data_services.list_native.entries.iter() {
         if *target != id {
@@ -2196,16 +2195,8 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
         let source = host.image_handles.get(&wrapper)
             .context("list entry's retained pixel wrapper disappeared")?;
         let offset = source_geometry(host, &entry, source)?.offset;
-        let mut options = ImageDrawOptions::new(Point::new(
-            truncate(entry.position[0])
-                .wrapping_sub(truncate(entry.base[0]))
-                .wrapping_add(offset[0]),
-            height
-                .wrapping_sub(truncate(entry.position[1]))
-                .wrapping_add(truncate(entry.base[1]))
-                .wrapping_sub(offset[1])
-                .wrapping_sub(source.height() as i32),
-        ));
+        let [left, top] = entry_top_left(entry.position, entry.base, offset);
+        let mut options = ImageDrawOptions::new(Point::new(left, top));
         options.visible = entry.visible;
         options.opacity = entry.opacity;
         if entry.animation.timeline().is_some() {
@@ -2736,6 +2727,14 @@ fn source_geometry(host: &LoggingHost<'_>, entry: &Entry, frame: &RgbaFrame)
     Ok(crate::image_manager::ResourceGeometry::from_frame(frame))
 }
 
+fn entry_top_left(position: [f32; 2], base: [f32; 2], offset: [i32; 2]) -> [i32; 2] {
+    std::array::from_fn(|axis| {
+        truncate(position[axis])
+            .wrapping_sub(truncate(base[axis]))
+            .wrapping_add(offset[axis])
+    })
+}
+
 fn entry_bounds(
     source: crate::image_manager::ResourceGeometry,
     entry: &Entry,
@@ -2748,22 +2747,9 @@ fn entry_bounds(
     }
     let (mut lower, mut upper) = if entry.transform != 0 {
         let raster = affine_raster(source, entry, base)?;
-        (
-            [raster.lower[0], i64::from(size[1]) - raster.upper[1]],
-            [raster.upper[0], i64::from(size[1]) - raster.lower[1]],
-        )
+        (raster.lower, raster.upper)
     } else {
-        let offset = source.offset;
-        let at = [
-            truncate(entry.position[0])
-                .wrapping_sub(truncate(base[0]))
-                .wrapping_add(offset[0]),
-            (size[1] as i32)
-                .wrapping_sub(truncate(entry.position[1]))
-                .wrapping_add(truncate(base[1]))
-                .wrapping_sub(offset[1])
-                .wrapping_sub(source.size[1] as i32),
-        ];
+        let at = entry_top_left(entry.position, base, source.offset);
         (
             at.map(i64::from),
             [
@@ -2812,10 +2798,9 @@ fn draw_affine(
     upper[1] = upper[1].min(i64::from(canvas.height()));
     if let Some(clip) = clip {
         lower[0] = lower[0].max(i64::from(clip.x));
-        lower[1] =
-            lower[1].max(i64::from(canvas.height()) - i64::from(clip.y) - i64::from(clip.height));
+        lower[1] = lower[1].max(i64::from(clip.y));
         upper[0] = upper[0].min(i64::from(clip.x) + i64::from(clip.width));
-        upper[1] = upper[1].min(i64::from(canvas.height()) - i64::from(clip.y));
+        upper[1] = upper[1].min(i64::from(clip.y) + i64::from(clip.height));
     }
     let inverse = forward.inverse();
     let origin = entry.position.map(fixed15);
@@ -2842,8 +2827,7 @@ fn draw_affine(
             ];
             if let Some(sample) = interpolate15(source, integer, point.map(|value| value & 0x7fff))
             {
-                let canvas_y = canvas.height() as i32 - 1 - y as i32;
-                blend_pixel(canvas, x as i32, canvas_y, sample, opacity)?;
+                blend_pixel(canvas, x as i32, y as i32, sample, opacity)?;
             }
         }
     }
@@ -2856,7 +2840,7 @@ fn interpolate15(source: &RgbaFrame, at: [i32; 2], fraction: [i32; 2]) -> Option
         return None;
     }
     let pixel = |x: u32, y: u32| -> [u8; 4] {
-        let index = ((source.height() - 1 - y) as usize * source.width() as usize + x as usize) * 4;
+        let index = (y as usize * source.width() as usize + x as usize) * 4;
         source.pixels()[index..index + 4].try_into().unwrap()
     };
     let (x, y) = (x as u32, y as u32);
@@ -2928,6 +2912,32 @@ fn truncate(value: f32) -> i32 {
 mod raster_tests {
     use super::*;
     use cs2_renderer::Color;
+
+    #[test]
+    fn native_entries_draw_at_the_top_of_a_taller_atlas() {
+        let source = RgbaFrame::from_rgba8(1, 2, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        let geometry = crate::image_manager::ResourceGeometry::from_frame(&source);
+        let mut entry = Entry::empty(Source::Frame);
+        entry.position = [2., 1.];
+        let clip = Rect::new(2, 1, 1, 2);
+        for transform in [0, 1] {
+            entry.transform = transform;
+            let bounds = entry_bounds(geometry, &entry, entry.base, [6, 8], Some(clip)).unwrap();
+            assert_eq!(bounds, Some(clip));
+            let mut target = Canvas::new(6, 8).unwrap();
+            if transform == 0 {
+                let [left, top] = entry_top_left(entry.position, entry.base, geometry.offset);
+                let mut options = ImageDrawOptions::new(Point::new(left, top));
+                options.clip = Some(clip);
+                draw_plain_frame(&mut target, &source, &options, 255, &mut None).unwrap();
+            } else {
+                draw_affine(&mut target, &source, geometry, &entry, 255, Some(clip)).unwrap();
+            }
+            assert_eq!(target.pixel(2, 1).unwrap(), Color::rgba(255, 0, 0, 255));
+            assert_eq!(target.pixel(2, 2).unwrap(), Color::rgba(0, 0, 255, 255));
+            assert_eq!(target.pixel(2, 6).unwrap(), Color::TRANSPARENT);
+        }
+    }
 
     fn scalar_draw(canvas: &mut Canvas, source: &RgbaFrame, options: &ImageDrawOptions, opacity: u32) {
         let contains = |x: i32, y: i32| {
