@@ -6,27 +6,52 @@ use std::time::{Duration, Instant};
 /// Keep exposure/resize events from advancing the simulation faster than 60 Hz.
 pub(super) struct WindowPacer {
     pub(super) next: Instant,
+    tick: Instant,
 }
 
 impl Default for WindowPacer {
     fn default() -> Self {
-        Self {
-            next: Instant::now(),
-        }
+        let now = Instant::now();
+        Self { next: now, tick: now }
     }
 }
 
 impl WindowPacer {
-    pub(super) fn consume(&mut self) -> bool {
-        let now = Instant::now();
-        if now < self.next {
-            return false;
-        }
-        self.next += Duration::from_nanos(1_000_000_000 / 60);
-        if now.saturating_duration_since(self.next) > Duration::from_millis(250) {
-            self.next = now + Duration::from_nanos(1_000_000_000 / 60);
-        }
-        true
+    const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+    pub(super) fn completed(&mut self, now: Instant) {
+        let oldest_tick = now.checked_sub(Self::TICK * 2).unwrap_or(now);
+        self.tick = (self.tick + Self::TICK).max(oldest_tick);
+        self.next = self.tick;
+    }
+
+    pub(super) fn retry(&mut self, now: Instant, in_progress: bool) {
+        self.next = now + if in_progress { Duration::from_millis(1) } else { Self::TICK };
+    }
+
+    pub(super) fn suspend(&mut self, now: Instant) {
+        self.next = now + Duration::from_millis(100);
+        self.tick = self.next;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_do_not_consume_ticks_and_stalls_have_bounded_debt() {
+        let start = Instant::now();
+        let mut pacer = WindowPacer { next: start, tick: start };
+        pacer.retry(start, true);
+        assert_eq!(pacer.next, start + Duration::from_millis(1));
+        pacer.completed(pacer.next);
+        assert_eq!(pacer.next, start + WindowPacer::TICK);
+        let late = start + Duration::from_secs(1);
+        pacer.completed(late);
+        assert_eq!(pacer.next, late - WindowPacer::TICK * 2);
+        for _ in 0..3 { pacer.completed(late); }
+        assert_eq!(pacer.next, late + WindowPacer::TICK);
     }
 }
 

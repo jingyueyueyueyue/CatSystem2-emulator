@@ -150,6 +150,7 @@ pub use wallpaper_native::{WallpaperApplyHandler, WallpaperExportPrompt,
 mod calendar_native;
 mod clipboard_native;
 mod frame_capture;
+mod scene_compositor;
 mod dictionary_native;
 mod task_wrapper_native;
 mod top_task_native;
@@ -6906,6 +6907,7 @@ pub struct HeadlessPlayer {
     pending_fes_events: VecDeque<PendingFesInput>,
     canvas: Canvas,
     graphics_canvas: Canvas,
+    scene_compositor: scene_compositor::SceneCompositor,
     image_frame: Option<RgbaFrame>,
     cst_images: BTreeMap<(CstImageKind, i32), Vec<CstImageLayer>>,
     fes: Option<FesRuntime>,
@@ -7010,6 +7012,7 @@ impl HeadlessPlayer {
             pending_fes_events: VecDeque::new(),
             canvas,
             graphics_canvas,
+            scene_compositor: scene_compositor::SceneCompositor::default(),
             image_frame: None,
             cst_images: BTreeMap::new(),
             fes: None,
@@ -7906,8 +7909,16 @@ impl HeadlessPlayer {
         Ok(())
     }
 
+    /// Equality token for the latest completed, provably static composition.
+    /// `None` requires normal presentation. Surface exposure still needs a redraw.
+    pub fn stable_frame_revision(&self) -> Option<u64> {
+        self.scene_compositor.revision
+    }
+
     fn render_scene(&mut self) -> Result<()> {
         let _timing = measure_host_phase(HostPhase::Compose);
+        let previous_revision = self.scene_compositor.revision.take();
+        let mut graphics_snapshot = None;
         let stale_movies = self
             .movie_host
             .begin_movie_plane_frame(&self.scene_nodes)
@@ -7917,6 +7928,7 @@ impl HeadlessPlayer {
             self.movie_resources.remove(&handle);
         }
         if self.data_services.tasks.render.has_composition() {
+            self.scene_compositor.clear_prefix();
             if self.image_frame.is_some() || self.fes.is_some() || self.cst.is_some() || !self.cst_images.is_empty() {
                 bail!("render effect needs the legacy scene's actual drawable depth bindings");
             }
@@ -7925,7 +7937,7 @@ impl HeadlessPlayer {
             let mut effects = std::mem::take(&mut self.data_services.tasks.render);
             let result = effects.compose(&mut output, &mut |target, lower, upper| {
                 std::mem::swap(&mut self.canvas, target);
-                let result = self.render_scene_depth_range(lower, upper);
+                let result = self.render_scene_depth_range(lower, upper, false, &mut graphics_snapshot);
                 std::mem::swap(&mut self.canvas, target);
                 result
             });
@@ -7933,18 +7945,54 @@ impl HeadlessPlayer {
             result.context("compose render-task feedback and scene depth ranges")?;
             self.canvas = output;
         } else {
-            self.canvas.clear(Color::rgba(0, 0, 0, 255));
-            self.render_scene_depth_range(f32::NEG_INFINITY, f32::INFINITY)?;
+            let prefix_cached = self.fes.is_none() && (self.image_frame.is_some() || !self.cst_images.is_empty());
+            let static_prefix = prefix_cached
+                && self.scene_nodes.is_empty()
+                && (self.cst.is_none() || self.font.is_empty())
+                && fes_text::novel_projections(&self.data_services, f32::NEG_INFINITY, f32::INFINITY).is_empty();
+            let unchanged = if prefix_cached {
+                let layers = self.scene_image_prefix();
+                self.scene_compositor.compose_prefix(&mut self.canvas, layers, static_prefix)?
+            } else {
+                self.scene_compositor.clear_prefix();
+                self.canvas.clear(Color::rgba(0, 0, 0, 255));
+                false
+            };
+            if static_prefix {
+                let movie = self.movie_host.draw_exclusive_movie(&mut self.canvas)
+                    .context("compose exclusive movie surface")?;
+                if !movie {
+                    self.scene_compositor.record_static(previous_revision, unchanged);
+                }
+                return Ok(());
+            }
+            self.render_scene_depth_range(f32::NEG_INFINITY, f32::INFINITY, prefix_cached, &mut graphics_snapshot)?;
         }
         self.movie_host.draw_exclusive_movie(&mut self.canvas)
             .context("compose exclusive movie surface")?;
         Ok(())
     }
 
+    fn scene_image_prefix(&self) -> Vec<scene_compositor::SceneImage> {
+        use scene_compositor::SceneImage;
+        let mut layers: Vec<_> = self.cst_images.iter().flat_map(|(&(kind, bank), images)| {
+            images.iter().map(move |image| (image_priority(kind, bank), SceneImage {
+                frame: image.image.clone(), position: image.draw_position(), opacity: image.opacity,
+            }))
+        }).collect();
+        layers.sort_by_key(|(priority, _)| *priority);
+        self.image_frame.iter().map(|frame| SceneImage {
+            frame: frame.clone(), position: Point::new(0, 0), opacity: 255,
+        }).chain(layers.into_iter().map(|(_, image)| image)).collect()
+    }
+
     /// Draw a normal scene slice into the already selected back/work buffer.
     /// Persistent logical VRAM is sampled separately and never cleared here.
-    fn render_scene_depth_range(&mut self, lower: f32, upper: f32) -> Result<()> {
-        if let Some(frame) = &self.image_frame {
+    fn render_scene_depth_range(
+        &mut self, lower: f32, upper: f32, prefix_cached: bool,
+        graphics_snapshot: &mut Option<RgbaFrame>,
+    ) -> Result<()> {
+        if !prefix_cached && let Some(frame) = &self.image_frame {
             self.canvas
                 .draw_frame(frame, &ImageDrawOptions::new(Point::new(0, 0)))
                 .map_err(|error| anyhow::anyhow!(error))?;
@@ -8012,35 +8060,31 @@ impl HeadlessPlayer {
                 .render_queue(&fes_queue)
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
-        let mut image_queue = RenderQueue::new();
-        for ((kind, bank), layers) in &self.cst_images {
-            for image in layers {
-                let mut options = ImageDrawOptions::new(image.draw_position());
-                options.opacity = image.opacity;
-                image_queue.push(RenderNode::new(
-                    image_priority(*kind, *bank),
-                    RenderCommand::Frame {
-                        frame: image.image.clone(),
-                        options,
-                    },
-                ));
+        if !prefix_cached {
+            let mut image_queue = RenderQueue::new();
+            for ((kind, bank), layers) in &self.cst_images {
+                for image in layers {
+                    let mut options = ImageDrawOptions::new(image.draw_position());
+                    options.opacity = image.opacity;
+                    image_queue.push(RenderNode::new(
+                        image_priority(*kind, *bank),
+                        RenderCommand::Frame {
+                            frame: image.image.clone(),
+                            options,
+                        },
+                    ));
+                }
             }
+            self.canvas
+                .render_queue(&image_queue)
+                .map_err(|error| anyhow::anyhow!(error))?;
         }
-        self.canvas
-            .render_queue(&image_queue)
-            .map_err(|error| anyhow::anyhow!(error))?;
         if let Some(cst) = &self.cst
             && !self.font.is_empty()
         {
             let (speaker, text) = cst.display_text();
             draw_message_text(&mut self.canvas, &self.font, &speaker, &text, cst.display_encoding())?;
         }
-        let canvas_source = RgbaFrame::from_rgba8(
-            self.graphics_canvas.width(),
-            self.graphics_canvas.height(),
-            self.graphics_canvas.pixels().to_vec(),
-        )
-        .map_err(|error| anyhow::anyhow!(error))?;
         let mut movie_depths = BTreeMap::new();
         for node in self.scene_nodes.values() {
             if self.movie_host.plane_target_handle(node.id).is_none() {
@@ -8094,8 +8138,11 @@ impl HeadlessPlayer {
             )? { continue; }
             if self.data_services.css_models.draw(id, &mut self.canvas, &self.scan.resources, self.script_encoding)? { continue; }
             if self.data_services.particle_external.draw(id, &mut self.canvas, &self.particles)? { continue; }
-            if self.draw_kx_geometry(id, &canvas_source).context("compose live KX plane mesh")? {
-                continue;
+            if self.kx_geometry(id).is_some() {
+                let source = scene_compositor::graphics_source(&self.graphics_canvas, graphics_snapshot)?;
+                if self.draw_kx_geometry(id, source).context("compose live KX plane mesh")? {
+                    continue;
+                }
             }
             let Some(node) = self.scene_nodes.get(&id) else { continue; };
             if self.data_services.emote.draw_scene_task(node, &mut self.canvas)
@@ -8120,11 +8167,16 @@ impl HeadlessPlayer {
             {
                 continue;
             }
+            let canvas_source = if node.kind == 2 && self.data_services.planes.state(id)
+                .is_some_and(|state| state.shape == plane_native::PlaneShape::Canvas)
+            {
+                Some(scene_compositor::graphics_source(&self.graphics_canvas, graphics_snapshot)?)
+            } else { None };
             if plane_native::draw_plane_with_view(
                 &mut self.canvas,
                 node,
                 &self.data_services.planes,
-                Some(&canvas_source),
+                canvas_source,
                 &self.movie_host.planes.cameras,
                 &self.movie_host.planes.projection,
             )? {
@@ -8316,10 +8368,24 @@ fn advance_window_frame(
     player: &mut HeadlessPlayer,
     window: &winit::window::Window,
     diagnostics: &mut WindowDiagnostics,
-) -> Result<()> {
+) -> Result<bool> {
     input_history_native::publish(player, window)?;
-    player.advance_host_frame(10_000)?;
-    diagnostics.check_and_limit(player)
+    let completed = player.advance_host_frame_with_retries(10_000)?;
+    diagnostics.check_and_limit(player)?;
+    Ok(completed)
+}
+
+#[cfg(windows)]
+fn update_window_title(window: &winit::window::Window, player: &HeadlessPlayer, last: &mut String) {
+    if settings_menu_windows::general_camouflaged(window) {
+        last.clear();
+    } else if let Some(title) = player.resolved_language_title() {
+        if last.as_str() != title {
+            window.set_title(title);
+            last.clear();
+            last.push_str(title);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -8605,7 +8671,7 @@ impl WindowGpu {
         let [width, height] = frame_size;
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance
-            .create_surface(window)
+            .create_surface(Arc::clone(&window))
             .context("create wgpu surface")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -8622,9 +8688,17 @@ impl WindowGpu {
             trace: wgpu::Trace::Off,
         }))
         .context("request wgpu device")?;
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, window.inner_size().width.max(1), window.inner_size().height.max(1))
             .context("surface has no supported configuration")?;
+        let supported = surface.get_capabilities(&adapter).present_modes;
+        config.present_mode = match std::env::var("CS2_WINDOW_PRESENT_MODE").as_deref() {
+            Ok("no-vsync") => wgpu::PresentMode::AutoNoVsync,
+            Ok("fifo") => wgpu::PresentMode::Fifo,
+            _ if supported.contains(&wgpu::PresentMode::Mailbox) => wgpu::PresentMode::Mailbox,
+            _ => wgpu::PresentMode::Fifo,
+        };
+        config.desired_maximum_frame_latency = 2;
         surface.configure(&device, &config);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -8868,6 +8942,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         input: WindowInputState,
         pacer: window_media::WindowPacer,
         diagnostics: WindowDiagnostics,
+        applied_title: String,
         fullscreen: bool,
         error: Option<String>,
     }
@@ -8966,12 +9041,16 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                 }
                 WindowEvent::RedrawRequested => {
                     if size.width == 0 || size.height == 0 { return; }
-                    if !self.pacer.consume() { return; }
+                    if Instant::now() < self.pacer.next { return; }
                     if let Some(player) = self.player.as_mut() {
-                        if let Err(error) = advance_window_frame(player, window, &mut self.diagnostics) {
-                            self.error = Some(format!("{error:#}"));
-                            event_loop.exit();
-                            return;
+                        match advance_window_frame(player, window, &mut self.diagnostics) {
+                            Ok(true) => self.pacer.completed(Instant::now()),
+                            Ok(false) => self.pacer.retry(Instant::now(), player.frame_in_progress()),
+                            Err(error) => {
+                                self.error = Some(format!("{error:#}"));
+                                event_loop.exit();
+                                return;
+                            }
                         }
                         if player.quit_requested() {
                             event_loop.exit();
@@ -8991,9 +9070,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                             event_loop.exit();
                             return;
                         }
-                        if let Some(title) = player.resolved_language_title() {
-                            if !settings_menu_windows::general_camouflaged(window) { window.set_title(title); }
-                        }
+                        update_window_title(window, player, &mut self.applied_title);
                     }
                 }
                 _ => {}
@@ -9006,7 +9083,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                 if Instant::now() >= self.pacer.next {
                     let size = window.inner_size();
                     if size.width == 0 || size.height == 0 {
-                        self.pacer.next = Instant::now() + Duration::from_millis(100);
+                        self.pacer.suspend(Instant::now());
                     } else { window.request_redraw(); }
                 }
             }
@@ -9022,6 +9099,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         input: WindowInputState::default(),
         pacer: window_media::WindowPacer::default(),
         diagnostics: WindowDiagnostics::default(),
+        applied_title: String::new(),
         fullscreen: false,
         error: None,
     };
@@ -9049,6 +9127,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         input: WindowInputState,
         pacer: window_media::WindowPacer,
         diagnostics: WindowDiagnostics,
+        applied_title: String,
         fullscreen: bool,
         error: Option<String>,
     }
@@ -9134,12 +9213,16 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                 WindowEvent::Resized(_) => window.request_redraw(),
                 WindowEvent::RedrawRequested => {
                     if size.width == 0 || size.height == 0 { return; }
-                    if !self.pacer.consume() { return; }
+                    if Instant::now() < self.pacer.next { return; }
                     if let Some(player) = self.player.as_mut() {
-                        if let Err(error) = advance_window_frame(player, window, &mut self.diagnostics) {
-                            self.error = Some(format!("{error:#}"));
-                            event_loop.exit();
-                            return;
+                        match advance_window_frame(player, window, &mut self.diagnostics) {
+                            Ok(true) => self.pacer.completed(Instant::now()),
+                            Ok(false) => self.pacer.retry(Instant::now(), player.frame_in_progress()),
+                            Err(error) => {
+                                self.error = Some(format!("{error:#}"));
+                                event_loop.exit();
+                                return;
+                            }
                         }
                         if player.quit_requested() {
                             event_loop.exit();
@@ -9157,9 +9240,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                             event_loop.exit();
                             return;
                         }
-                        if let Some(title) = player.resolved_language_title() {
-                            if !settings_menu_windows::general_camouflaged(window) { window.set_title(title); }
-                        }
+                        update_window_title(window, player, &mut self.applied_title);
                     }
                 }
                 _ => {}
@@ -9172,7 +9253,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                 if Instant::now() >= self.pacer.next {
                     let size = window.inner_size();
                     if size.width == 0 || size.height == 0 {
-                        self.pacer.next = Instant::now() + Duration::from_millis(100);
+                        self.pacer.suspend(Instant::now());
                     } else { window.request_redraw(); }
                 }
             }
@@ -9187,6 +9268,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         input: WindowInputState::default(),
         pacer: window_media::WindowPacer::default(),
         diagnostics: WindowDiagnostics::default(),
+        applied_title: String::new(),
         fullscreen: false,
         error: None,
     };
@@ -12337,6 +12419,7 @@ mod tests {
             let completed = player.frame_snapshot();
             assert!(player.state().script.memory.is_none());
 
+            player.frame_phase = PlayerFramePhase::Root;
             player.run_frames(1, 1).unwrap();
             assert!(player.frame_in_progress());
             assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 1);

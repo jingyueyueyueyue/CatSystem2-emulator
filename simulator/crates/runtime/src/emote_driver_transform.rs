@@ -10,6 +10,10 @@ pub struct CpuDriverTransform {
 }
 
 impl CpuDriverTransform {
+    pub(super) fn render_bits(self) -> [u32; 4] {
+        [self.position[0], self.position[1], self.scale, self.angle_degrees].map(f32::to_bits)
+    }
+
     /// SetRot receives radians. With frame=0 the driver normalizes by repeated
     /// f32 additions/subtractions, then converts to degrees for root overrides.
     pub fn new(position: [f32; 2], scale: f32, rotation: f32) -> Result<Self> {

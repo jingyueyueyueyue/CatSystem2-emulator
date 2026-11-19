@@ -72,6 +72,21 @@ pub enum RoutedSource {
 #[derive(Debug, Clone)]
 pub struct RoutedResource<T> { pub source: RoutedSource, pub value: T }
 
+pub(crate) const MAX_PATH_UNITS: usize = 259;
+pub(crate) const MAX_ARCHIVE_KEY_BYTES: usize = 2 * MAX_PATH_UNITS + 2;
+
+pub(crate) fn encode_wide_name<'a>(name: &str, scratch: &'a mut [u16; MAX_PATH_UNITS])
+    -> RuntimeResult<&'a [u16]> {
+    let mut len = 0;
+    for unit in name.encode_utf16().take_while(|&unit| unit != 0) {
+        *scratch.get_mut(len).ok_or_else(|| error("resource path exceeds 259 UTF-16 units"))? = unit;
+        len += 1;
+    }
+    Ok(&scratch[..len])
+}
+
+enum RouteSource<'a> { File(&'a [u16]), Archive(u8), Patch(usize) }
+
 impl ResourceRouter {
     pub fn route<T>(
         &self, name: &[u8], mode: ResourceMode,
@@ -81,35 +96,60 @@ impl ResourceRouter {
         let raw = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
         let (name, invalid) = SHIFT_JIS.decode_without_bom_handling(raw);
         if invalid { return Err(error("invalid CP932 resource name")); }
-        self.route_utf16(&name.encode_utf16().collect::<Vec<_>>(), mode, file, archive)
+        self.route_utf16(encode_wide_name(&name, &mut [0; MAX_PATH_UNITS])?, mode, file, archive)
     }
 
     /// Callbacks distinguish an absent/open-failed resource (None) from an
     /// actual read error (Err). A successful empty value stops the search.
     pub fn route_utf16<T>(
         &self, name: &[u16], mode: ResourceMode,
+        file: impl FnMut(&[u16]) -> RuntimeResult<Option<T>>,
+        archive: impl FnMut(usize, &[u16]) -> RuntimeResult<Option<T>>,
+    ) -> RuntimeResult<Option<RoutedResource<T>>> {
+        self.route_with(name, mode, file, archive, |source, value| RoutedResource {
+            source: match source {
+                RouteSource::File(path) => RoutedSource::File(path.to_vec()),
+                RouteSource::Archive(slot) => RoutedSource::Archive { slot },
+                RouteSource::Patch(index) => RoutedSource::Patch { index },
+            },
+            value,
+        })
+    }
+
+    pub(crate) fn route_value_utf16<T>(
+        &self, name: &[u16], mode: ResourceMode,
+        file: impl FnMut(&[u16]) -> RuntimeResult<Option<T>>,
+        archive: impl FnMut(usize, &[u16]) -> RuntimeResult<Option<T>>,
+    ) -> RuntimeResult<Option<T>> {
+        self.route_with(name, mode, file, archive, |_, value| value)
+    }
+
+    fn route_with<T, U>(
+        &self, name: &[u16], mode: ResourceMode,
         mut file: impl FnMut(&[u16]) -> RuntimeResult<Option<T>>,
         mut archive: impl FnMut(usize, &[u16]) -> RuntimeResult<Option<T>>,
-    ) -> RuntimeResult<Option<RoutedResource<T>>> {
+        mut output: impl FnMut(RouteSource<'_>, T) -> U,
+    ) -> RuntimeResult<Option<U>> {
         if self.slots.len() != 256 { return Err(error("resource router requires 256 slots")); }
         let name = terminated(name);
         check_path(name)?;
         let (prefix, internal) = split_name(name);
         for (index, mount) in self.patches.iter().enumerate() {
             if let Some(value) = archive(mount.archive, internal)? {
-                return Ok(Some(RoutedResource { source: RoutedSource::Patch { index }, value }));
+                return Ok(Some(output(RouteSource::Patch(index), value)));
             }
         }
         if mode == ResourceMode::File {
-            return Ok(file(name)?.map(|value| RoutedResource { source: RoutedSource::File(name.to_vec()), value }));
+            return Ok(file(name)?.map(|value| output(RouteSource::File(name), value)));
         }
+        let mut scratch = [0; MAX_PATH_UNITS];
         if list_prefix(prefix) {
             for group in &self.groups {
                 if !prefix_equal(prefix, &group.prefix)? { continue; }
                 for member in &group.members {
                     let mount = member.slot.and_then(|slot| self.slots[usize::from(slot)].archive.as_ref());
                     if let Some(found) = attempt(mode, member.slot, mount, internal,
-                        &member.loose_directory, member.loose_enabled, true, &mut file, &mut archive)? {
+                        &member.loose_directory, member.loose_enabled, true, &mut scratch, &mut file, &mut archive, &mut output)? {
                         return Ok(Some(found));
                     }
                 }
@@ -124,7 +164,7 @@ impl ResourceRouter {
             if !matches { continue; }
             if let Some(found) = attempt(mode, Some(index as u8), slot.archive.as_ref(), internal,
                 &slot.loose_directory, slot.loose_enabled || force_loose,
-                mode == ResourceMode::ArchiveFirst, &mut file, &mut archive)? {
+                mode == ResourceMode::ArchiveFirst, &mut scratch, &mut file, &mut archive, &mut output)? {
                 return Ok(Some(found));
             }
         }
@@ -132,33 +172,40 @@ impl ResourceRouter {
     }
 }
 
-fn attempt<T>(
+fn attempt<T, U>(
     mode: ResourceMode, slot: Option<u8>, mount: Option<&ArchiveMount>, internal: &[u16],
     directory: &[u16], enabled: bool, keep_empty_separator: bool,
+    scratch: &mut [u16; MAX_PATH_UNITS],
     file: &mut impl FnMut(&[u16]) -> RuntimeResult<Option<T>>,
     archive: &mut impl FnMut(usize, &[u16]) -> RuntimeResult<Option<T>>,
-) -> RuntimeResult<Option<RoutedResource<T>>> {
-    let read_archive = |archive: &mut dyn FnMut(usize, &[u16]) -> RuntimeResult<Option<T>>| -> RuntimeResult<Option<RoutedResource<T>>> {
+    output: &mut impl FnMut(RouteSource<'_>, T) -> U,
+) -> RuntimeResult<Option<U>> {
+    let read_archive = |archive: &mut dyn FnMut(usize, &[u16]) -> RuntimeResult<Option<T>>|
+        -> RuntimeResult<Option<(u8, T)>> {
         match (slot, mount) {
             (Some(slot), Some(mount)) => Ok(archive(mount.archive, internal)?
-                .map(|value| RoutedResource { source: RoutedSource::Archive { slot }, value })),
+                .map(|value| (slot, value))),
             _ => Ok(None),
         }
     };
     if mode != ResourceMode::LooseFirst {
-        if let Some(found) = read_archive(archive)? { return Ok(Some(found)); }
+        if let Some((slot, value)) = read_archive(archive)? { return Ok(Some(output(RouteSource::Archive(slot), value))); }
     }
     if mode != ResourceMode::Archive && enabled {
         let directory = terminated(directory);
-        let mut path = directory.to_vec();
-        if !directory.is_empty() || keep_empty_separator { path.push(u16::from(b'\\')); }
-        path.extend_from_slice(internal);
-        check_path(&path)?;
-        if let Some(value) = file(&path)? {
-            return Ok(Some(RoutedResource { source: RoutedSource::File(path), value }));
+        let internal_start = directory.len() + usize::from(!directory.is_empty() || keep_empty_separator);
+        let len = internal_start + internal.len();
+        let path = scratch.get_mut(..len).ok_or_else(|| error("resource path exceeds 259 UTF-16 units"))?;
+        path[..directory.len()].copy_from_slice(directory);
+        if internal_start != directory.len() { path[directory.len()] = u16::from(b'\\'); }
+        path[internal_start..].copy_from_slice(internal);
+        if let Some(value) = file(path)? {
+            return Ok(Some(output(RouteSource::File(path), value)));
         }
     }
-    if mode == ResourceMode::LooseFirst { return read_archive(archive); }
+    if mode == ResourceMode::LooseFirst {
+        return Ok(read_archive(archive)?.map(|(slot, value)| output(RouteSource::Archive(slot), value)));
+    }
     Ok(None)
 }
 
@@ -191,7 +238,50 @@ pub(crate) fn list_prefix(prefix: &[u16]) -> bool {
 }
 
 fn check_path(path: &[u16]) -> RuntimeResult<()> {
-    if path.len() > 259 { Err(error("resource path exceeds 259 UTF-16 units")) } else { Ok(()) }
+    if path.len() > MAX_PATH_UNITS { Err(error("resource path exceeds 259 UTF-16 units")) } else { Ok(()) }
+}
+
+#[cfg(test)]
+mod resource_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn resource_router_keeps_patch_and_loose_order_with_scratch() {
+        let mut router = ResourceRouter::default();
+        router.patches.push(ArchiveMount { archive: 3, path: Vec::new() });
+        router.slots[0] = ResourceSlot {
+            loose_directory: "data".encode_utf16().collect(),
+            ..ResourceSlot::default()
+        };
+        let mut scratch = [0; MAX_PATH_UNITS];
+        let name = encode_wide_name("entry.bin\0ignored", &mut scratch).unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let file = |path: &[u16]| {
+            calls.borrow_mut().push(1);
+            assert_eq!(String::from_utf16(path).unwrap(), "data\\entry.bin");
+            Ok(Some(7))
+        };
+        let archive = |mount, internal: &[u16]| {
+            calls.borrow_mut().push(0);
+            assert_eq!(mount, 3);
+            assert_eq!(internal, name);
+            Ok(None)
+        };
+        assert_eq!(router.route_value_utf16(name, ResourceMode::LooseFirst, file, archive).unwrap(), Some(7));
+        assert_eq!(*calls.borrow(), [0, 1]);
+        let routed = router.route_utf16(name, ResourceMode::LooseFirst, file, archive).unwrap().unwrap();
+        assert_eq!(routed.source, RoutedSource::File("data\\entry.bin".encode_utf16().collect()));
+    }
+
+    #[test]
+    fn resource_router_preserves_cp932_wide_case_rules() {
+        let mut scratch = [0; MAX_ARCHIVE_KEY_BYTES];
+        let name: Vec<_> = "\u{3042}aBc\0ignored".encode_utf16().collect();
+        assert_eq!(wide_query_key(&name, &mut scratch).unwrap(), b"\x82\xa0aBC");
+        assert_eq!(wide_query_key(&[u16::from(b'a'); MAX_PATH_UNITS], &mut scratch).unwrap(), [b'A'; MAX_PATH_UNITS]);
+        assert!(wide_query_key(&[0xd800], &mut scratch).is_err());
+        assert!(wide_query_key(&[0x2603], &mut scratch).is_err());
+    }
 }
 
 pub(crate) fn error(message: &str) -> RuntimeError { RuntimeError::Host(message.to_owned()) }
@@ -253,17 +343,33 @@ pub(crate) fn directory_key(raw: &[u8]) -> Vec<u8> {
 
 /// The original wide query skips TWO units when a unit has a nonzero high
 /// byte. Retain the consequent skipped ASCII character; no slash folding.
-pub(crate) fn wide_query_key(name: &[u16]) -> RuntimeResult<Vec<u8>> {
-    let mut units = terminated(name).to_vec();
+pub(crate) fn wide_query_key<'a>(name: &[u16], scratch: &'a mut [u8; MAX_ARCHIVE_KEY_BYTES])
+    -> RuntimeResult<&'a [u8]> {
+    let name = terminated(name);
+    check_path(name)?;
+    if name.iter().all(|&unit| unit < 128) {
+        for (byte, &unit) in scratch.iter_mut().zip(name) {
+            *byte = (unit as u8).to_ascii_uppercase();
+        }
+        return Ok(&scratch[..name.len()]);
+    }
+    if char::decode_utf16(name.iter().copied()).any(|character| character.is_err()) {
+        return Err(error("invalid UTF-16 archive name"));
+    }
+    let mut units = [0; MAX_PATH_UNITS];
+    let units = &mut units[..name.len()];
+    units.copy_from_slice(name);
     let mut at = 0;
     while at < units.len() {
         if units[at] & 0xff00 != 0 { at += 2; }
         else { if (97..=122).contains(&units[at]) { units[at] -= 32; } at += 1; }
     }
-    let text = String::from_utf16(&units).map_err(|_| error("invalid UTF-16 archive name"))?;
-    let (bytes, _, invalid) = SHIFT_JIS.encode(&text);
-    if invalid { return Err(error("archive name is not representable in CP932")); }
-    Ok(bytes.into_owned())
+    let (status, _, written) = SHIFT_JIS.new_encoder().encode_from_utf16_without_replacement(units, scratch, true);
+    match status {
+        encoding_rs::EncoderResult::InputEmpty => Ok(&scratch[..written]),
+        encoding_rs::EncoderResult::Unmappable(_) => Err(error("archive name is not representable in CP932")),
+        encoding_rs::EncoderResult::OutputFull => Err(error("archive query exceeds CP932 key capacity")),
+    }
 }
 
 impl ResourceRouter {

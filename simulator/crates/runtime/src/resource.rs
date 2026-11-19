@@ -11,14 +11,16 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use crate::resource_router::{ResourceMode, ResourceRouter, RoutedResource, directory_key, wide_query_key};
+use std::sync::{Arc, Mutex, OnceLock};
+use crate::resource_router::{MAX_ARCHIVE_KEY_BYTES, MAX_PATH_UNITS, ResourceMode, ResourceRouter, RoutedResource, directory_key, encode_wide_name, wide_query_key};
 
 const KIF_HEADER_SIZE: u64 = 8;
 const KIF_STANDARD_ENTRY_SIZE: u64 = 72;
 const KIF_LEGACY_ENTRY_SIZE: u64 = 40;
 const MAX_KIF_ENTRIES: u32 = 1_000_000;
 const MAX_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IDLE_ARCHIVES: usize = 16;
 const CONFIG_BOOTSTRAP_PREFIXES: [&str; 4] = ["config/", "", "system/config/", "system/"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,12 +119,16 @@ struct CachedResource {
     bytes: Arc<Vec<u8>>,
     references: u32,
     source: String,
+    released_at: u64,
 }
 
 pub struct ResourceCache {
     next_id: ResourceLeaseId,
     entries: BTreeMap<ResourceLeaseId, CachedResource>,
     by_source: BTreeMap<String, ResourceLeaseId>,
+    byte_budget: usize,
+    resident_bytes: usize,
+    release_order: u64,
 }
 
 impl Default for ResourceCache {
@@ -133,11 +139,22 @@ impl Default for ResourceCache {
 
 impl ResourceCache {
     pub fn new() -> Self {
+        Self::with_byte_budget(DEFAULT_CACHE_BYTES)
+    }
+
+    pub fn with_byte_budget(byte_budget: usize) -> Self {
         Self {
             next_id: 1,
             entries: BTreeMap::new(),
             by_source: BTreeMap::new(),
+            byte_budget,
+            resident_bytes: 0,
+            release_order: 0,
         }
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 
     pub fn acquire(
@@ -210,9 +227,10 @@ impl ResourceCache {
             .ok_or_else(|| RuntimeError::Host("resource lease id space exhausted".to_string()))?;
         let lease = ResourceLease {
             id,
-            name: key.clone(),
+            name: key,
             size: bytes.len() as u64,
         };
+        self.resident_bytes += bytes.capacity();
         self.entries.insert(
             id,
             CachedResource {
@@ -220,9 +238,11 @@ impl ResourceCache {
                 bytes: Arc::new(bytes),
                 references: 1,
                 source: source.clone(),
+                released_at: 0,
             },
         );
         self.by_source.insert(source, id);
+        self.trim_to_budget();
         Ok(lease)
     }
 
@@ -252,28 +272,61 @@ impl ResourceCache {
             )));
         }
         cached.references -= 1;
-        Ok(cached.references == 0)
+        let released = cached.references == 0;
+        if released {
+            self.release_order = self.release_order.saturating_add(1);
+            cached.released_at = self.release_order;
+            self.trim_to_budget();
+        }
+        Ok(released)
+    }
+
+    fn can_evict(cached: &CachedResource) -> bool {
+        cached.references == 0 && Arc::strong_count(&cached.bytes) == 1
+    }
+
+    fn remove_unused(&mut self, id: ResourceLeaseId) {
+        if let Some(cached) = self.entries.remove(&id) {
+            self.resident_bytes -= cached.bytes.capacity();
+            self.by_source.remove(&cached.source);
+        }
+    }
+
+    /// Demand can exceed the budget while leases or shared byte buffers are pinned.
+    pub fn trim_to_budget(&mut self) -> usize {
+        if self.resident_bytes <= self.byte_budget {
+            return 0;
+        }
+        let mut unused = self.entries.iter().filter_map(|(&id, cached)| {
+            (Self::can_evict(cached) && cached.bytes.capacity() != 0)
+                .then_some((cached.released_at, id))
+        }).collect::<Vec<_>>();
+        unused.sort_unstable();
+        let mut removed = 0;
+        for (_, id) in unused {
+            self.remove_unused(id);
+            removed += 1;
+            if self.resident_bytes <= self.byte_budget {
+                break;
+            }
+        }
+        removed
     }
 
     pub fn evict_unused(&mut self) -> usize {
         let unused = self
             .entries
             .iter()
-            .filter_map(|(&id, cached)| (cached.references == 0).then_some(id))
+            .filter_map(|(&id, cached)| Self::can_evict(cached).then_some(id))
             .collect::<Vec<_>>();
         for id in &unused {
-            if let Some(cached) = self.entries.remove(id) {
-                self.by_source.remove(&cached.source);
-            }
+            self.remove_unused(*id);
         }
         unused.len()
     }
 
     pub fn clear(&mut self) -> usize {
-        let count = self.entries.len();
-        self.entries.clear();
-        self.by_source.clear();
-        count
+        self.evict_unused()
     }
 
     pub fn active_leases(&self) -> impl Iterator<Item = &ResourceLease> {
@@ -289,6 +342,9 @@ impl ResourceCache {
     }
 
     pub fn validate(&self) -> RuntimeResult<()> {
+        if self.resident_bytes != self.entries.values().map(|cached| cached.bytes.capacity()).sum::<usize>() {
+            return Err(RuntimeError::Host("resource cache byte accounting is inconsistent".into()));
+        }
         if self.next_id == 0 {
             return Err(RuntimeError::Host(
                 "resource cache next lease id is zero".to_string(),
@@ -326,6 +382,16 @@ pub enum ScanDiagnosticLevel {
     Error,
 }
 
+#[derive(Debug)]
+struct ArchiveHandle {
+    path: PathBuf,
+    file: File,
+    metadata: fs::Metadata,
+}
+
+type IndexedCandidate = (String, usize);
+type ArchiveDirectoryLookup = BTreeMap<Vec<u8>, Option<IndexedCandidate>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanDiagnostic {
     pub level: ScanDiagnosticLevel,
@@ -355,7 +421,11 @@ pub struct ResourceIndex {
     #[serde(default)]
     routing_startup: Option<Vec<u8>>,
     #[serde(skip)]
-    directory_lookups: OnceLock<Vec<OnceLock<BTreeMap<Vec<u8>, usize>>>>,
+    directory_lookups: OnceLock<Vec<OnceLock<ArchiveDirectoryLookup>>>,
+    #[serde(skip)]
+    file_lookup: OnceLock<BTreeMap<String, usize>>,
+    #[serde(skip)]
+    archive_handles: Arc<Mutex<Vec<ArchiveHandle>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +582,8 @@ impl ResourceIndex {
             routing_startup: None,
             routing_error: None,
             directory_lookups: OnceLock::new(),
+            file_lookup: OnceLock::new(),
+            archive_handles: Arc::default(),
         };
 
         for path in paths {
@@ -701,8 +773,9 @@ impl ResourceIndex {
     /// registered virtual names use LooseFirst; explicit host file paths use
     /// File. All three share the same patch-first routing core.
     pub fn resolve(&self, name: &str) -> RuntimeResult<Option<&ResourceCandidate>> {
-        let wide = name.encode_utf16().collect::<Vec<_>>();
-        let (prefix, _) = crate::resource_router::split_name(crate::resource_router::terminated(&wide));
+        let mut scratch = [0; MAX_PATH_UNITS];
+        let wide = encode_wide_name(name, &mut scratch)?;
+        let (prefix, _) = crate::resource_router::split_name(wide);
         let mut virtual_name = prefix.is_empty() || crate::resource_router::list_prefix(prefix);
         if !virtual_name {
             if let Some(router) = &self.routing {
@@ -714,58 +787,82 @@ impl ResourceIndex {
                 }
             }
         }
-        self.resolve_mode_utf16(&wide, if virtual_name { ResourceMode::LooseFirst } else { ResourceMode::File })
-            .map(|found| found.map(|found| found.value))
+        self.resolve_mode_candidate_utf16(wide, if virtual_name { ResourceMode::LooseFirst } else { ResourceMode::File })
     }
 
-    pub fn resolve_mode_utf16(&self, name: &[u16], mode: ResourceMode)
-        -> RuntimeResult<Option<RoutedResource<&ResourceCandidate>>> {
-        if let Some(cause) = &self.routing_error { return Err(RuntimeError::Host(cause.clone())); }
-        let Some(router) = &self.routing else {
-            return Err(RuntimeError::Host("resource routing has not been initialized".into()));
-        };
-        router.route_utf16(name, mode,
+    pub fn resolve_mode_candidate(&self, name: &str, mode: ResourceMode)
+        -> RuntimeResult<Option<&ResourceCandidate>> {
+        self.resolve_mode_candidate_utf16(encode_wide_name(name, &mut [0; MAX_PATH_UNITS])?, mode)
+    }
+
+    fn resolve_mode_candidate_utf16(&self, name: &[u16], mode: ResourceMode)
+        -> RuntimeResult<Option<&ResourceCandidate>> {
+        self.router_for_lookup()?.route_value_utf16(name, mode,
             |path| self.routed_file_candidate(path),
             |archive, internal| self.routed_archive_candidate(archive, internal))
     }
 
+    pub fn resolve_mode_utf16(&self, name: &[u16], mode: ResourceMode)
+        -> RuntimeResult<Option<RoutedResource<&ResourceCandidate>>> {
+        self.router_for_lookup()?.route_utf16(name, mode,
+            |path| self.routed_file_candidate(path),
+            |archive, internal| self.routed_archive_candidate(archive, internal))
+    }
+
+    fn router_for_lookup(&self) -> RuntimeResult<&ResourceRouter> {
+        if let Some(cause) = &self.routing_error { return Err(RuntimeError::Host(cause.clone())); }
+        self.routing.as_ref().ok_or_else(|| RuntimeError::Host("resource routing has not been initialized".into()))
+    }
+
     pub fn read_mode(&self, name: &str, mode: ResourceMode) -> RuntimeResult<Option<Vec<u8>>> {
-        self.read_mode_utf16(&name.encode_utf16().collect::<Vec<_>>(), mode)
+        self.resolve_mode_candidate(name, mode)?.map(|candidate| self.read_candidate(candidate)).transpose()
     }
 
     pub fn read_mode_utf16(&self, name: &[u16], mode: ResourceMode) -> RuntimeResult<Option<Vec<u8>>> {
-        self.resolve_mode_utf16(name, mode)?.map(|found| self.read_candidate(found.value)).transpose()
+        self.resolve_mode_candidate_utf16(name, mode)?.map(|candidate| self.read_candidate(candidate)).transpose()
     }
 
     /// A literal file opened by an engine file object, independently of the
     /// resource service. In particular this does not apply patch archives or
     /// category completion. Access remains inside the portable game's root.
     pub fn resolve_plain_file(&self, name: &str) -> RuntimeResult<Option<&ResourceCandidate>> {
-        let wide = name.encode_utf16().collect::<Vec<_>>();
-        let wide = crate::resource_router::terminated(&wide);
-        if wide.len() > 259 {
-            return Err(RuntimeError::InvalidResourceName("plain file name exceeds 259 UTF-16 units".into()));
-        }
+        let mut scratch = [0; MAX_PATH_UNITS];
+        let wide = encode_wide_name(name, &mut scratch).map_err(|_| RuntimeError::InvalidResourceName(
+            "plain file name exceeds 259 UTF-16 units".into()))?;
         self.routed_file_candidate(wide)
     }
 
     fn routed_file_candidate(&self, name: &[u16]) -> RuntimeResult<Option<&ResourceCandidate>> {
-        let name = String::from_utf16(name).map_err(|_| RuntimeError::InvalidResourceName("invalid UTF-16 file name".into()))?;
-        let relative = PathBuf::from(name.replace('\\', "/"));
+        let mut scratch = [0; 3 * MAX_PATH_UNITS];
+        let mut len = 0;
+        for character in char::decode_utf16(name.iter().copied()) {
+            let character = character.map_err(|_| RuntimeError::InvalidResourceName("invalid UTF-16 file name".into()))?;
+            let character = if character == '\\' { '/' } else { character };
+            len += character.encode_utf8(&mut scratch[len..]).len();
+        }
+        let relative = Path::new(std::str::from_utf8(&scratch[..len]).expect("encoded UTF-8"));
         // The portable host keeps original game access inside its read-only
         // root. Do not turn a leading backslash into a relative path.
         if relative.is_absolute() || relative.components().any(|part| matches!(part,
             std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir)) {
             return Ok(None);
         }
-        let relative = if !self.routing_base.as_os_str().is_empty() && relative.starts_with(&self.routing_base) {
-            relative
-        } else { self.routing_base.join(relative) };
-        let key = relative.to_string_lossy();
-        let candidate = self.candidates(key.as_ref()).iter().find(|candidate| match &candidate.location {
-            ResourceLocation::File { path } => normalize_name(&path.to_string_lossy()) == normalize_name(&self.root.join(&relative).to_string_lossy()),
-            _ => false,
+        let lookup = self.file_lookup.get_or_init(|| {
+            self.candidates.iter().filter_map(|(key, candidates)| {
+                candidates.iter().position(|candidate| {
+                    matches!(candidate.location, ResourceLocation::File { .. })
+                        && normalize_name(&candidate.name) == *key
+                }).map(|slot| (key.clone(), slot))
+            }).collect()
         });
+        let candidate_at = |key: &str| lookup.get(key).map(|&slot| &self.candidates[key][slot]);
+        let candidate = if self.routing_base.as_os_str().is_empty() || relative.starts_with(&self.routing_base) {
+            scratch[..len].make_ascii_lowercase();
+            let key = std::str::from_utf8(&scratch[..len]).expect("encoded UTF-8");
+            candidate_at(key.trim_start_matches("./").trim_start_matches('/'))
+        } else {
+            candidate_at(&normalize_name(&self.routing_base.join(relative).to_string_lossy()))
+        };
         candidate.map(probe_candidate).transpose().map(Option::flatten)
     }
 
@@ -777,19 +874,29 @@ impl ResourceIndex {
         });
         let lookup = lookups[index].get_or_init(|| {
             let mut lookup = BTreeMap::new();
-            for (i, entry) in archive.entries.iter().enumerate() {
-                lookup.entry(directory_key(&entry.raw_name)).or_insert(i);
+            let path = self.root.join(&archive.path);
+            for entry in &archive.entries {
+                lookup.entry(directory_key(&entry.raw_name)).or_insert_with(|| {
+                    let key = normalize_name(&entry.name);
+                    let slot = self.candidates.get(&key)?.iter().position(|candidate| {
+                        matches!(&candidate.location, ResourceLocation::Archive { path: stored, offset, size, .. }
+                            if stored == &path && *offset == entry.offset && *size == entry.size)
+                    })?;
+                    Some((key, slot))
+                });
             }
             lookup
         });
-        let Some(&entry) = lookup.get(&wide_query_key(name)?) else { return Ok(None); };
-        let entry = &archive.entries[entry];
-        let path = self.root.join(&archive.path);
-        let candidate = self.candidates(&entry.name).iter().find(|candidate| {
-            matches!(&candidate.location, ResourceLocation::Archive { path: stored, offset, size, .. }
-                if stored == &path && *offset == entry.offset && *size == entry.size)
-        }).ok_or_else(|| RuntimeError::Archive("archive directory has no matching indexed payload".into()))?;
-        probe_candidate(candidate)
+        let mut scratch = [0; MAX_ARCHIVE_KEY_BYTES];
+        let Some(entry) = lookup.get(wide_query_key(name, &mut scratch)?) else { return Ok(None); };
+        let (key, slot) = entry.as_ref().ok_or_else(|| RuntimeError::Archive("archive directory has no matching indexed payload".into()))?;
+        let candidate = &self.candidates[key][*slot];
+        let ResourceLocation::Archive { path, .. } = &candidate.location else { unreachable!() };
+        match self.with_archive_file(path, |handle| Ok(handle.metadata.is_file())) {
+            Ok(is_file) => Ok(is_file.then_some(candidate)),
+            Err(RuntimeError::Io { source, .. }) if is_absent(&source) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn initialize_resource_router(&mut self) -> RuntimeResult<()> {
@@ -910,35 +1017,102 @@ impl ResourceIndex {
     }
 
     pub fn open_candidate(&self, candidate: &ResourceCandidate) -> RuntimeResult<ResourceReader> {
-        self.ensure_indexed_candidate(candidate)?;
-        if candidate.size > MAX_RESOURCE_BYTES {
-            return Err(RuntimeError::Archive(format!(
-                "resource exceeds the supported {} MiB limit",
-                MAX_RESOURCE_BYTES / (1024 * 1024)
-            )));
+        match &candidate.location {
+            ResourceLocation::File { path } => {
+                self.ensure_indexed_candidate(candidate)?;
+                if candidate.size > MAX_RESOURCE_BYTES {
+                    return Err(resource_size_error());
+                }
+                File::open(path).map(ResourceReader::File).map_err(|source| RuntimeError::Io {
+                    path: path.clone(), source,
+                })
+            }
+            ResourceLocation::Archive { .. } => self.read_candidate(candidate)
+                .map(|bytes| ResourceReader::Archive(Cursor::new(bytes))),
         }
-        ResourceReader::open(candidate)
     }
 
     pub fn read_candidate(&self, candidate: &ResourceCandidate) -> RuntimeResult<Vec<u8>> {
+        self.read_candidate_bounded(candidate, MAX_RESOURCE_BYTES as usize)?
+            .ok_or_else(resource_size_error)
+    }
+
+    /// Returns `None` for payloads too large to admit, before allocating their buffer.
+    pub fn read_candidate_bounded(
+        &self, candidate: &ResourceCandidate, max_bytes: usize,
+    ) -> RuntimeResult<Option<Vec<u8>>> {
         self.ensure_indexed_candidate(candidate)?;
-        if candidate.size > MAX_RESOURCE_BYTES {
-            return Err(RuntimeError::Archive(format!(
-                "resource exceeds the supported {} MiB limit",
-                MAX_RESOURCE_BYTES / (1024 * 1024)
-            )));
+        let limit = (max_bytes as u64).min(MAX_RESOURCE_BYTES);
+        match &candidate.location {
+            ResourceLocation::File { path } => {
+                let io = |source| RuntimeError::Io { path: path.clone(), source };
+                let mut file = File::open(path).map_err(io)?;
+                let size = file.metadata().map_err(io)?.len();
+                if size > limit { return Ok(None); }
+                let mut bytes = vec![0; size as usize];
+                let mut written = 0;
+                while written < bytes.len() {
+                    match file.read(&mut bytes[written..]) {
+                        Ok(0) => { bytes.truncate(written); return Ok(Some(bytes)); }
+                        Ok(count) => written += count,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(io(error)),
+                    }
+                }
+                let mut extra = [0];
+                if file.read(&mut extra).map_err(io)? != 0 {
+                    if file.metadata().map_err(io)?.len() > limit { return Ok(None); }
+                    return Err(RuntimeError::Archive("loose resource grew during the read".into()));
+                }
+                Ok(Some(bytes))
+            }
+            ResourceLocation::Archive { path, offset, size, payload_key, .. } => {
+                if *size > limit || candidate.size > limit { return Ok(None); }
+                self.read_indexed_archive_range(path, *offset, *size, *payload_key).map(Some)
+            }
         }
-        let mut reader = ResourceReader::open(candidate)?;
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(candidate.size)
-                .map_err(|_| RuntimeError::Archive("resource is too large".to_string()))?,
-        );
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| RuntimeError::Io {
-                path: self.root.clone(),
-                source,
-            })?;
+    }
+
+    fn with_archive_file<T>(
+        &self, path: &Path, use_file: impl FnOnce(&mut ArchiveHandle) -> RuntimeResult<T>,
+    ) -> RuntimeResult<T> {
+        let io = |source| RuntimeError::Io { path: path.to_path_buf(), source };
+        let cached = {
+            let mut handles = self.archive_handles.lock().unwrap_or_else(|poison| poison.into_inner());
+            handles.iter().position(|handle| handle.path == path).map(|slot| handles.remove(slot))
+        };
+        let cached = if let Some(handle) = cached {
+            let current = fs::metadata(path).map_err(io)?;
+            if current.is_file() && current.len() == handle.metadata.len()
+                && current.modified().ok().zip(handle.metadata.modified().ok())
+                    .is_some_and(|(current, cached)| current == cached)
+            { Some(handle) } else { None }
+        } else { None };
+        let mut handle = match cached {
+            Some(handle) => handle,
+            None => {
+                let file = File::open(path).map_err(io)?;
+                let metadata = file.metadata().map_err(io)?;
+                ArchiveHandle { path: path.to_path_buf(), file, metadata }
+            }
+        };
+        let value = use_file(&mut handle)?;
+        if handle.metadata.is_file() {
+            let mut handles = self.archive_handles.lock().unwrap_or_else(|poison| poison.into_inner());
+            if !handles.iter().any(|idle| idle.path == handle.path) {
+                if handles.len() == MAX_IDLE_ARCHIVES { handles.remove(0); }
+                handles.push(handle);
+            }
+        }
+        Ok(value)
+    }
+
+    fn read_indexed_archive_range(&self, path: &Path, offset: u64, size: u64, key: Option<u32>)
+        -> RuntimeResult<Vec<u8>> {
+        let mut bytes = self.with_archive_file(path, |handle| {
+            read_file_range(&mut handle.file, path, offset, size)
+        })?;
+        decrypt_payload_with_key(&mut bytes, key)?;
         Ok(bytes)
     }
 
@@ -1013,10 +1187,10 @@ impl ResourceIndex {
     }
 
     pub fn read(&self, name: impl AsRef<str>) -> RuntimeResult<Vec<u8>> {
-        let name = name.as_ref().to_string();
+        let name = name.as_ref();
         let candidate = self
-            .resolve(&name)?
-            .ok_or_else(|| RuntimeError::ResourceNotFound(name.clone()))?;
+            .resolve(name)?
+            .ok_or_else(|| RuntimeError::ResourceNotFound(name.to_owned()))?;
         self.read_candidate(candidate)
     }
 
@@ -1141,43 +1315,7 @@ impl ResourceIndex {
             RuntimeError::Archive("archive entry index is out of range".to_string())
         })?;
         let path = self.root.join(&archive.path);
-        let mut file = File::open(&path).map_err(|source| RuntimeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let file_length = file
-            .metadata()
-            .map_err(|source| RuntimeError::Io {
-                path: path.clone(),
-                source,
-            })?
-            .len();
-        if entry
-            .offset
-            .checked_add(entry.size)
-            .is_none_or(|end| end > file_length)
-        {
-            return Err(RuntimeError::Archive(
-                "resource points outside the archive".to_string(),
-            ));
-        }
-        let size = usize::try_from(entry.size)
-            .map_err(|_| RuntimeError::Archive("resource is too large".to_string()))?;
-        if entry.size > MAX_RESOURCE_BYTES {
-            return Err(RuntimeError::Archive(format!(
-                "resource exceeds the supported {} MiB limit",
-                MAX_RESOURCE_BYTES / (1024 * 1024)
-            )));
-        }
-        let mut bytes = vec![0_u8; size];
-        file.seek(SeekFrom::Start(entry.offset))
-            .and_then(|_| file.read_exact(&mut bytes))
-            .map_err(|source| RuntimeError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        decrypt_payload_with_key(&mut bytes, archive.payload_key)?;
-        Ok(bytes)
+        self.read_indexed_archive_range(&path, entry.offset, entry.size, archive.payload_key)
     }
 
     pub fn config_candidates(&self) -> Vec<ConfigCandidate> {
@@ -1215,36 +1353,6 @@ impl ResourceIndex {
         }
         self.candidates.entry(key).or_default().push(candidate);
         Ok(())
-    }
-}
-
-impl ResourceReader {
-    fn open(candidate: &ResourceCandidate) -> RuntimeResult<Self> {
-        match &candidate.location {
-            ResourceLocation::File { path } => {
-                File::open(path)
-                    .map(ResourceReader::File)
-                    .map_err(|source| RuntimeError::Io {
-                        path: path.clone(),
-                        source,
-                    })
-            }
-            ResourceLocation::Archive {
-                path,
-                offset,
-                size,
-                payload_key,
-                ..
-            } => {
-                let mut file = File::open(path).map_err(|source| RuntimeError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-                let mut payload = read_file_range(&mut file, path, *offset, *size)?;
-                decrypt_payload_with_key(&mut payload, *payload_key)?;
-                Ok(ResourceReader::Archive(Cursor::new(payload)))
-            }
-        }
     }
 }
 
@@ -1389,9 +1497,19 @@ fn probe_candidate(candidate: &ResourceCandidate) -> RuntimeResult<Option<&Resou
             let metadata = file.metadata().map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
             Ok(metadata.is_file().then_some(candidate))
         }
-        Err(source) if matches!(source.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) => Ok(None),
+        Err(source) if is_absent(&source) => Ok(None),
         Err(source) => Err(RuntimeError::Io { path: path.clone(), source }),
     }
+}
+
+fn is_absent(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied)
+}
+
+fn resource_size_error() -> RuntimeError {
+    RuntimeError::Archive(format!(
+        "resource exceeds the supported {} MiB limit", MAX_RESOURCE_BYTES / (1024 * 1024)
+    ))
 }
 
 fn path_sort_key(path: &Path) -> String {
@@ -2247,6 +2365,16 @@ mod tests {
         assert_eq!(archive_results.len(), 1);
         assert_eq!(archive_results[0].1.as_ref().unwrap(), payload);
         assert_eq!(index.archive_index("legacy.int").unwrap().entry_count, 1);
+        let archive_path = root.join("legacy.int");
+        assert_eq!(index.archive_handles.lock().unwrap().len(), 1);
+        index.with_archive_file(&archive_path, |_| {
+            assert!(index.archive_handles.lock().unwrap().is_empty());
+            assert_eq!(index.read_archive_entry_at(0, 0)?, payload);
+            Ok(())
+        }).unwrap();
+        assert_eq!(index.archive_handles.lock().unwrap().len(), 1);
+        fs::remove_file(&archive_path).unwrap();
+        assert!(index.read_archive_entry_at(0, 0).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2293,6 +2421,56 @@ mod tests {
         assert_eq!(cache.evict_unused(), 1);
         assert!(cache.bytes(first.id).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_cache_budget_tracks_live_allocations_and_evicts_oldest_unused() {
+        let mut cache = ResourceCache::with_byte_budget(12);
+        let first = cache.insert_loaded("first".into(), "first".into(), Vec::with_capacity(4)).unwrap();
+        let second = cache.insert_loaded("second".into(), "second".into(), vec![1; 4]).unwrap();
+        assert_eq!(cache.resident_bytes(), 8);
+        assert_eq!(cache.clear(), 0);
+        cache.release(first.id).unwrap();
+        cache.release(second.id).unwrap();
+
+        let demand = cache.insert_loaded("demand".into(), "demand".into(), vec![7; 8]).unwrap();
+        assert!(cache.lease(first.id).is_none());
+        assert!(cache.lease(second.id).is_some());
+        assert_eq!(cache.resident_bytes(), 12);
+
+        let pinned = cache.bytes(demand.id).unwrap();
+        cache.release(demand.id).unwrap();
+        let oversized = cache.insert_loaded("oversized".into(), "oversized".into(), vec![9; 16]).unwrap();
+        assert!(cache.lease(second.id).is_none());
+        assert_eq!(pinned.as_slice(), &[7; 8]);
+        assert_eq!(cache.resident_bytes(), 24);
+        cache.release(oversized.id).unwrap();
+        assert_eq!(cache.resident_bytes(), 8);
+        assert_eq!(cache.evict_unused(), 0);
+        drop(pinned);
+        assert_eq!(cache.evict_unused(), 1);
+        assert_eq!(cache.resident_bytes(), 0);
+        cache.validate().unwrap();
+    }
+
+    #[test]
+    fn resource_lookup_uses_exact_loose_path_and_current_file_size() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-resource-lookup-{stamp}"));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/same.bin"), b"x").unwrap();
+        let index = ResourceIndex::scan(&root).unwrap();
+        assert!(index.resolve_plain_file("same.bin").unwrap().is_none());
+        assert!(index.resolve_plain_file("../nested/same.bin").unwrap().is_none());
+        let candidate = index.resolve_plain_file("NESTED\\SAME.BIN\0ignored").unwrap().unwrap();
+        assert_eq!(candidate.size, 1);
+        fs::write(root.join("nested/same.bin"), b"grown").unwrap();
+        assert!(index.read_candidate_bounded(candidate, 4).unwrap().is_none());
+        let bytes = index.read_candidate_bounded(candidate, 5).unwrap().unwrap();
+        assert_eq!(bytes.capacity(), 5);
+        assert_eq!(bytes, b"grown");
+        assert_eq!(index.read_candidate(candidate).unwrap(), b"grown");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

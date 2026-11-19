@@ -8,7 +8,7 @@ use std::{
     fmt,
     io::Write,
     ops::Deref,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use cs2_formats::HgFile;
@@ -17,6 +17,8 @@ use flate2::{Compression, write::ZlibEncoder};
 mod text_layout;
 mod capture;
 mod image_surface;
+mod raster;
+mod text_cache;
 pub use capture::encode_capture_bmp;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -1323,6 +1325,18 @@ impl Canvas {
     }
 
     pub fn draw_frame(&mut self, frame: &RgbaFrame, options: &ImageDrawOptions) -> Result<()> {
+        self.draw_frame_with_workers(frame, options, 1)
+    }
+
+    /// Draws a frame with an optional worker budget for large, uncached linear
+    /// affine transforms. The budget includes the caller and is capped at four.
+    /// Other paths, including cache hits, draw serially in layer order.
+    pub fn draw_frame_with_workers(
+        &mut self,
+        frame: &RgbaFrame,
+        options: &ImageDrawOptions,
+        workers: usize,
+    ) -> Result<()> {
         if !options.visible || frame.is_empty() {
             return Ok(());
         }
@@ -1340,7 +1354,7 @@ impl Canvas {
             || options.scale_x < 0.0
             || options.scale_y < 0.0
         {
-            return self.draw_transformed_frame(frame, options);
+            return self.draw_transformed_frame(frame, options, workers);
         }
         let Some((left, top, right, bottom)) = self.drawable_bounds(
             Rect::new(
@@ -1364,31 +1378,27 @@ impl Canvas {
             let source_x = (i64::from(left) - i64::from(options.position.x)) as usize;
             let source_top = (i64::from(top) - i64::from(options.position.y)) as usize;
             let row_bytes = (right - left) as usize * 4;
+            let opaque = frame.pixels.is_opaque();
             for (row, y) in (top..bottom).enumerate() {
                 let source_at = ((source_top + row) * frame.width as usize + source_x) * 4;
                 let target_at = (y as usize * self.width as usize + left as usize) * 4;
                 let source = &frame.pixels[source_at..source_at + row_bytes];
                 let target = &mut self.pixels[target_at..target_at + row_bytes];
-                for (target, source) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
-                    blend_source_over(target.try_into().unwrap(), source.try_into().unwrap(), 255);
+                if opaque {
+                    target.copy_from_slice(source);
+                } else {
+                    for (target, source) in target
+                        .as_chunks_mut::<4>().0.iter_mut()
+                        .zip(source.as_chunks::<4>().0)
+                    {
+                        blend_source_over(target, source);
+                    }
                 }
             }
             return Ok(());
         }
 
-        for y in top..bottom {
-            for x in left..right {
-                let source_x =
-                    (f64::from(x) - f64::from(options.position.x)) / f64::from(options.scale_x);
-                let source_y =
-                    (f64::from(y) - f64::from(options.position.y)) / f64::from(options.scale_y);
-                let source = sample_frame(frame, source_x, source_y, options.filter);
-                let color = if options.blend_mode.is_list_alpha_mask() { source } else {
-                    apply_opacity_and_mask(source, options.opacity, options.mask.as_ref(), x, y)
-                };
-                self.blend_pixel_unchecked_with_mode(x, y, color, options.blend_mode);
-            }
-        }
+        raster::draw_axis_aligned(self, frame, options, (left, top, right, bottom));
         Ok(())
     }
 
@@ -1716,6 +1726,7 @@ impl Canvas {
         &mut self,
         frame: &RgbaFrame,
         options: &ImageDrawOptions,
+        workers: usize,
     ) -> Result<()> {
         let scale_x = f64::from(options.scale_x) * if options.flip_x { -1.0 } else { 1.0 };
         let scale_y = f64::from(options.scale_y) * if options.flip_y { -1.0 } else { 1.0 };
@@ -1762,12 +1773,10 @@ impl Canvas {
             return Ok(());
         };
 
-        for y in top..bottom {
-            for x in left..right {
-                let destination_x = f64::from(x) + 0.5;
-                let destination_y = f64::from(y) + 0.5;
-                let relative_x = destination_x - position_x;
-                let relative_y = destination_y - position_y;
+        raster::draw_sampled(
+            self, frame, options, (left, top, right, bottom), true, workers, |x, y| {
+                let relative_x = (f64::from(x) + 0.5) - position_x;
+                let relative_y = (f64::from(y) + 0.5) - position_y;
                 let source_x = (relative_x * cos + relative_y * sin) / scale_x + pivot_x;
                 let source_y = (-relative_x * sin + relative_y * cos) / scale_y + pivot_y;
                 if source_x < 0.0
@@ -1775,14 +1784,11 @@ impl Canvas {
                     || source_x >= f64::from(frame.width)
                     || source_y >= f64::from(frame.height)
                 {
-                    continue;
+                    return None;
                 }
-                let source = sample_frame(frame, source_x, source_y, options.filter);
-                let source =
-                    apply_opacity_and_mask(source, options.opacity, options.mask.as_ref(), x, y);
-                self.blend_pixel_unchecked_with_mode(x, y, source, options.blend_mode);
-            }
-        }
+                Some(sample_frame(frame, source_x, source_y, options.filter))
+            },
+        );
         Ok(())
     }
 
@@ -2084,15 +2090,11 @@ impl Canvas {
         blend_mode: BlendMode,
     ) {
         let index = ((y as usize) * (self.width as usize) + (x as usize)) * 4;
-        let dst = Color::rgba(
-            self.pixels[index],
-            self.pixels[index + 1],
-            self.pixels[index + 2],
-            self.pixels[index + 3],
+        blend_into(
+            self.pixels[index..].first_chunk_mut().unwrap(),
+            color,
+            blend_mode,
         );
-        let blended = blend_with_mode(dst, color, blend_mode);
-        self.pixels[index..index + 4]
-            .copy_from_slice(&[blended.r, blended.g, blended.b, blended.a]);
     }
 }
 
@@ -2100,9 +2102,46 @@ impl Canvas {
 pub struct RgbaFrame {
     width: u32,
     height: u32,
-    pixels: std::sync::Arc<Vec<u8>>,
+    pixels: Arc<FramePixels>,
     metadata: FrameMetadata,
     attributes: HgFrameAttributes,
+}
+
+#[derive(Debug)]
+struct FramePixels {
+    bytes: Vec<u8>,
+    opaque: OnceLock<bool>,
+}
+
+impl FramePixels {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            opaque: OnceLock::new(),
+        }
+    }
+
+    fn is_opaque(&self) -> bool {
+        *self.opaque.get_or_init(|| {
+            self.bytes.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255)
+        })
+    }
+}
+
+impl PartialEq for FramePixels {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for FramePixels {}
+
+impl Deref for FramePixels {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl RgbaFrame {
@@ -2134,7 +2173,7 @@ impl RgbaFrame {
         Ok(Self {
             width,
             height,
-            pixels: std::sync::Arc::new(pixels),
+            pixels: Arc::new(FramePixels::new(pixels)),
             metadata,
             attributes: HgFrameAttributes::default(),
         })
@@ -2417,7 +2456,7 @@ impl RgbaFrame {
     }
 
     pub fn has_alpha(&self) -> bool {
-        self.metadata.alpha_flag != 0 || self.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255)
+        self.metadata.alpha_flag != 0 || !self.pixels.is_opaque()
     }
 
     pub fn with_alpha(&self, alpha: u8) -> Result<Self> {
@@ -3581,7 +3620,7 @@ pub enum MaskChannel {
 pub struct GlyphMask {
     width: u32,
     height: u32,
-    alpha: Vec<u8>,
+    alpha: Arc<Vec<u8>>,
     metrics: GlyphMetrics,
 }
 
@@ -3621,7 +3660,7 @@ impl GlyphMask {
         Ok(Self {
             width,
             height,
-            alpha,
+            alpha: Arc::new(alpha),
             metrics,
         })
     }
@@ -4516,13 +4555,8 @@ fn text_color(value: u32) -> Color {
 #[derive(Debug, Clone)]
 pub struct FontRasterizer {
     font: fontdue::Font,
-    glyph_cache: Arc<Mutex<FontGlyphCache>>,
-}
-
-#[derive(Debug, Default)]
-struct FontGlyphCache {
-    glyphs: BTreeMap<(char, u32, bool, bool), GlyphMask>,
-    bytes: usize,
+    glyph_cache: Arc<Mutex<text_cache::GlyphCache>>,
+    layout_cache: Arc<Mutex<text_cache::LayoutCache>>,
 }
 
 impl FontRasterizer {
@@ -4543,7 +4577,11 @@ impl FontRasterizer {
         .map_err(|message| RendererError::Decode {
             message: format!("font decode failed: {message}"),
         })?;
-        Ok(Self { font, glyph_cache: Arc::new(Mutex::new(FontGlyphCache::default())) })
+        Ok(Self {
+            font,
+            glyph_cache: Arc::default(),
+            layout_cache: Arc::default(),
+        })
     }
 
     pub fn has_character(&self, character: char) -> bool {
@@ -4595,7 +4633,7 @@ impl FontRasterizer {
         bold: bool,
         italic: bool,
     ) -> Result<i32> {
-        let glyph = self.rasterize_styled(character, size, bold, italic)?;
+        let glyph = self.rasterize_styled_shared(character, size, bold, italic)?;
         Ok(glyph.advance())
     }
 
@@ -4607,28 +4645,80 @@ impl FontRasterizer {
         italic: bool,
     ) -> Result<GlyphMask> {
         let key = (character, size, bold, italic);
-        if let Ok(cache) = self.glyph_cache.lock()
-            && let Some(glyph) = cache.glyphs.get(&key)
+        if let Ok(mut cache) = self.glyph_cache.lock()
+            && let Some(glyph) = cache.get(key)
         {
-            return Ok(glyph.clone());
+            return Ok(glyph.as_ref().clone());
         }
+        Ok(self.rasterize_styled_miss(key)?.as_ref().clone())
+    }
+
+    /// Shares the cached mask and its immutable coverage with other draws.
+    pub fn rasterize_styled_shared(
+        &self,
+        character: char,
+        size: u32,
+        bold: bool,
+        italic: bool,
+    ) -> Result<Arc<GlyphMask>> {
+        let key = (character, size, bold, italic);
+        if let Ok(mut cache) = self.glyph_cache.lock()
+            && let Some(glyph) = cache.get(key)
+        {
+            return Ok(Arc::clone(glyph));
+        }
+        self.rasterize_styled_miss(key)
+    }
+
+    fn rasterize_styled_miss(&self, key: (char, u32, bool, bool)) -> Result<Arc<GlyphMask>> {
+        let (character, size, bold, italic) = key;
         let glyph = self.rasterize(character, size)?;
         let glyph = if bold { embolden_glyph(&glyph)? } else { glyph };
         let glyph = if italic { italicize_glyph(&glyph)? } else { glyph };
-        const CACHE_BYTES: usize = 8 * 1024 * 1024;
-        if glyph.alpha.len() <= CACHE_BYTES
-            && let Ok(mut cache) = self.glyph_cache.lock()
-        {
-            if cache.bytes + glyph.alpha.len() > CACHE_BYTES || cache.glyphs.len() >= 2048 {
-                cache.glyphs.clear();
-                cache.bytes = 0;
-            }
-            if !cache.glyphs.contains_key(&key) {
-                cache.bytes += glyph.alpha.len();
-                cache.glyphs.insert(key, glyph.clone());
-            }
+        let glyph = Arc::new(glyph);
+        if let Ok(mut cache) = self.glyph_cache.lock() {
+            return Ok(cache.insert(key, glyph));
         }
         Ok(glyph)
+    }
+
+    /// Cached layout using this font alone. `visible_tokens` is a prefix length
+    /// in parsed tokens (including controls), not a glyph or UTF-8 byte count.
+    /// Use `usize::MAX` to lay out all tokens, including when reveal is applied
+    /// after layout. Callback-based mixed-font layout is intentionally uncached.
+    pub fn layout_cached(
+        &self,
+        markup: &TextMarkup,
+        settings: &TextLayoutSettings,
+        visible_tokens: usize,
+    ) -> Result<Arc<StyledTextRun>> {
+        let tokens = &markup.tokens[..visible_tokens.min(markup.tokens.len())];
+        let encoding = markup.encoding;
+        if let Ok(mut cache) = self.layout_cache.lock()
+            && let Some(run) = cache.get(tokens, encoding, settings)
+        {
+            return Ok(run);
+        }
+        let prefix;
+        let markup = if tokens.len() == markup.tokens.len() {
+            markup
+        } else {
+            prefix = TextMarkup {
+                tokens: tokens.to_vec(),
+                encoding,
+                identifiers: BTreeMap::new(),
+            };
+            &prefix
+        };
+        let run = Arc::new(
+            markup.layout_with_settings(settings, |character, size, bold, italic| {
+                self.rasterize_styled(character, size, bold, italic)
+            })?,
+        );
+        if let Ok(mut cache) = self.layout_cache.lock() {
+            return Ok(cache.insert(tokens, encoding, settings, run));
+        }
+        Ok(run)
     }
 
     fn metrics(&self, character: char, size: u32) -> Result<fontdue::Metrics> {
@@ -5892,6 +5982,13 @@ fn blend_rgba(dst: Color, src: Color) -> Color {
 }
 
 fn blend_with_mode(dst: Color, src: Color, mode: BlendMode) -> Color {
+    let mut target = [dst.r, dst.g, dst.b, dst.a];
+    blend_into(&mut target, src, mode);
+    Color::rgba(target[0], target[1], target[2], target[3])
+}
+
+#[inline]
+fn blend_into(target: &mut [u8; 4], src: Color, mode: BlendMode) {
     let mask = match mode {
         BlendMode::ListAlphaFromBlue => Some(src.b),
         BlendMode::ListAlphaFromGreen => Some(src.g),
@@ -5900,23 +5997,20 @@ fn blend_with_mode(dst: Color, src: Color, mode: BlendMode) -> Color {
         _ => None,
     };
     if let Some(mask) = mask {
-        let alpha = (((u32::from(dst.a) + 1) * (u32::from(mask) + 1) - 1) >> 8) as u8;
-        return Color::rgba(dst.r, dst.g, dst.b, alpha);
+        target[3] = (((u32::from(target[3]) + 1) * (u32::from(mask) + 1) - 1) >> 8) as u8;
+        return;
     }
-    if mode == BlendMode::SourceOver {
-        let mut target = [dst.r, dst.g, dst.b, dst.a];
-        let source = [src.r, src.g, src.b, src.a];
-        blend_source_over(&mut target, &source, 255);
-        return Color::rgba(target[0], target[1], target[2], target[3]);
-    }
-    let mut target = [dst.r, dst.g, dst.b, dst.a];
     let source = [src.r, src.g, src.b, src.a];
-    blend_special(&mut target, &source, mode);
-    Color::rgba(target[0], target[1], target[2], target[3])
+    if mode == BlendMode::SourceOver {
+        blend_source_over(target, &source);
+    } else {
+        blend_special(target, &source, mode);
+    }
 }
 
-fn blend_source_over(target: &mut [u8; 4], source: &[u8; 4], opacity: u32) {
-    let alpha = (((opacity & 0xffff) * (u32::from(source[3]) + 1)) >> 8) & 0xff;
+#[inline]
+fn blend_source_over(target: &mut [u8; 4], source: &[u8; 4]) {
+    let alpha = u32::from(source[3]);
     if alpha == 0 {
         return;
     }
@@ -5928,9 +6022,7 @@ fn blend_source_over(target: &mut [u8; 4], source: &[u8; 4], opacity: u32) {
     if target[3] == 255 {
         for (destination, value) in target[..3].iter_mut().zip(&source[..3]) {
             let difference = i32::from(*value) - i32::from(*destination);
-            *destination = i32::from(*destination)
-                .saturating_add((difference * alpha as i32) >> 8)
-                .clamp(0, 255) as u8;
+            *destination = (i32::from(*destination) + ((difference * alpha as i32) >> 8)) as u8;
         }
         return;
     }
@@ -5948,40 +6040,47 @@ fn blend_source_over(target: &mut [u8; 4], source: &[u8; 4], opacity: u32) {
     target[3] = output_alpha as u8;
 }
 
+#[inline]
 fn blend_special(target: &mut [u8; 4], source: &[u8; 4], mode: BlendMode) {
     if source[3] == 0 {
         return;
     }
-    let alpha = f64::from(source[3]) / 255.0;
+    let alpha = u32::from(source[3]);
+    match mode {
+        BlendMode::AddSource => {
+            blend_channels(target, source, |src, dst| src * alpha + dst * 255)
+        }
+        BlendMode::AddDestination => {
+            blend_channels(target, source, |src, dst| src * 255 + dst * (255 - alpha))
+        }
+        BlendMode::Multiply => blend_channels(target, source, |src, dst| src * dst),
+        BlendMode::InvertDestination => blend_channels(target, source, |src, dst| src * (255 - dst)),
+        BlendMode::AddMultiply => blend_channels(target, source, |src, dst| dst * (src + 255)),
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+fn blend_channels(target: &mut [u8; 4], source: &[u8; 4], numerator: impl Fn(u32, u32) -> u32) {
     for (destination, value) in target.iter_mut().zip(source) {
-        let source = f64::from(*value);
-        let destination_value = f64::from(*destination);
-        let result = match mode {
-            BlendMode::AddSource => source * alpha + destination_value,
-            BlendMode::AddDestination => source + destination_value * (1.0 - alpha),
-            BlendMode::Multiply => source * destination_value / 255.0,
-            BlendMode::InvertDestination => source * (255.0 - destination_value) / 255.0,
-            BlendMode::AddMultiply => source * destination_value / 255.0 + destination_value,
-            BlendMode::SourceOver | BlendMode::ListAlphaFromBlue | BlendMode::ListAlphaFromGreen
-            | BlendMode::ListAlphaFromRed | BlendMode::ListAlphaFromAlpha => unreachable!(),
-        };
-        *destination = result.clamp(0.0, 255.0).round() as u8;
+        *destination = ((numerator(u32::from(*value), u32::from(*destination)) + 127) / 255)
+            .min(255) as u8;
     }
 }
 
 fn sample_frame(frame: &RgbaFrame, x: f64, y: f64, filter: ScaleFilter) -> Color {
     match filter {
         ScaleFilter::Nearest => frame.pixel_unchecked(
-            x.floor().clamp(0.0, f64::from(frame.width - 1)) as u32,
-            y.floor().clamp(0.0, f64::from(frame.height - 1)) as u32,
+            (x as u32).min(frame.width - 1),
+            (y as u32).min(frame.height - 1),
         ),
         ScaleFilter::Linear => sample_linear(frame, x - 0.5, y - 0.5),
     }
 }
 
 fn sample_linear(frame: &RgbaFrame, x: f64, y: f64) -> Color {
-    let x0 = x.floor().clamp(0.0, f64::from(frame.width - 1)) as u32;
-    let y0 = y.floor().clamp(0.0, f64::from(frame.height - 1)) as u32;
+    let x0 = (x as u32).min(frame.width - 1);
+    let y0 = (y as u32).min(frame.height - 1);
     let x1 = x0.saturating_add(1).min(frame.width - 1);
     let y1 = y0.saturating_add(1).min(frame.height - 1);
     let tx = (x - f64::from(x0)).clamp(0.0, 1.0);

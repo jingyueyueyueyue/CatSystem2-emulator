@@ -1,6 +1,6 @@
 //! Native pixel allocations may be bound even when either extent is zero.
 //! This constructor is separate from decoded file/canvas dimension checks.
-use super::{FrameMetadata, HgFrameAttributes, RendererError, Result, RgbaFrame};
+use super::{Arc, FrameMetadata, FramePixels, HgFrameAttributes, RendererError, Result, RgbaFrame};
 
 impl RgbaFrame {
     /// Builds a bound native surface, retaining raw geometry (including zero
@@ -22,7 +22,7 @@ impl RgbaFrame {
         if pixels.len() != expected {
             return Err(RendererError::BufferLength { expected, actual: pixels.len() });
         }
-        Ok(Self { width, height, pixels: std::sync::Arc::new(pixels), metadata, attributes: HgFrameAttributes::default() })
+        Ok(Self { width, height, pixels: Arc::new(FramePixels::new(pixels)), metadata, attributes: HgFrameAttributes::default() })
     }
 
     pub fn is_empty(&self) -> bool {

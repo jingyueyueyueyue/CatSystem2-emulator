@@ -1,12 +1,14 @@
 //! Real mesh raster sink: homogeneous clipping, perspective UVs, depth and
 //! the recovered SHD equations. No proxy rectangle or guessed shader name.
+use std::cell::RefCell;
 use anyhow::{Result,anyhow,ensure};
 use cs2_renderer::{Canvas,RgbaFrame};
-use super::css_dae::{Matrix,Camera,multiply,transform};
+use cs2_runtime::model_state::ModelTransformOverrides;
+use super::css_dae::{Matrix,Camera,Node,Scene,multiply,transform};
 use super::css_model::Owner;
 use super::css_model_shader::{Shader,Diffuse,Texture,Cull,Blend};
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,Default)]
 struct Vertex{clip:[f32;4],uv:[f32;2],color:[f32;4]}
 #[derive(Clone,Copy)]
 struct Screen{point:[f32;3],rhw:f32,uv:[f32;2],color:[f32;4]}
@@ -18,18 +20,71 @@ fn inverse(matrix:Matrix)->Result<Matrix>{
     }
     Ok(std::array::from_fn(|r|std::array::from_fn(|c|rows[r][c+4] as f32)))
 }
-fn clip(input:Vec<Vertex>,plane:usize)->Vec<Vertex>{
+fn clip(input:&[Vertex],plane:usize,out:&mut Vec<Vertex>){
+    out.clear();
     let distance=|v:Vertex|match plane{0=>v.clip[0]+v.clip[3],1=>v.clip[3]-v.clip[0],2=>v.clip[1]+v.clip[3],3=>v.clip[3]-v.clip[1],4=>v.clip[2],_=>v.clip[3]-v.clip[2]};
-    let mut out=Vec::new();let Some(mut previous)=input.last().copied()else{return out;};let mut before=distance(previous);
-    for next in input{let after=distance(next);
+    let Some(mut previous)=input.last().copied()else{return;};let mut before=distance(previous);
+    for &next in input{let after=distance(next);
         if (before>=0.)!=(after>=0.){let t=before/(before-after);out.push(Vertex{clip:std::array::from_fn(|i|previous.clip[i]+t*(next.clip[i]-previous.clip[i])),uv:std::array::from_fn(|i|previous.uv[i]+t*(next.uv[i]-previous.uv[i])),color:std::array::from_fn(|i|previous.color[i]+t*(next.color[i]-previous.color[i]))});}
         if after>=0.{out.push(next);}previous=next;before=after;
-    }out
+    }
 }
+
+#[derive(PartialEq, Eq)]
+struct WorldInput {
+    parent: Option<usize>,
+    local: [[u32; 4]; 4],
+    channels: [[u32; 11]; 2],
+    overrides: ModelTransformOverrides,
+}
+
+impl From<&Node> for WorldInput {
+    fn from(node: &Node) -> Self {
+        Self {
+            parent: node.parent,
+            local: node.local.map(|row| row.map(f32::to_bits)),
+            channels: [node.channels.primary, node.channels.secondary],
+            overrides: node.overrides.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DrawScratch {
+    depth: Vec<f32>,
+    world_inputs: Vec<WorldInput>,
+    worlds: Vec<Matrix>,
+    polygon: Vec<Vertex>,
+    clipped: Vec<Vertex>,
+}
+
+impl DrawScratch {
+    fn update_worlds(&mut self, scene: &Scene) -> Result<()> {
+        if self.world_inputs.len() != scene.nodes.len()
+            || self.world_inputs.iter().zip(&scene.nodes).any(|(key, node)| *key != WorldInput::from(node))
+        {
+            self.worlds = scene.worlds()?;
+            self.world_inputs.clear();
+            self.world_inputs.extend(scene.nodes.iter().map(WorldInput::from));
+        }
+        Ok(())
+    }
+
+}
+
+thread_local! {
+    static DRAW_SCRATCH: RefCell<DrawScratch> = RefCell::new(DrawScratch::default());
+}
+
 pub(super) fn draw(owner:&Owner,canvas:&mut Canvas)->Result<()>{
+    DRAW_SCRATCH.with(|scratch| draw_with_scratch(owner, canvas, &mut scratch.borrow_mut()))
+}
+
+fn draw_with_scratch(owner: &Owner, canvas: &mut Canvas, scratch: &mut DrawScratch) -> Result<()> {
     let scene=owner.scene.as_ref().ok_or_else(||anyhow!("DAE draw has no live scene"))?;
     if scene.nodes.iter().all(|node|node.instances.is_empty()){return Ok(());}
-    let worlds=scene.worlds()?;let camera=owner.camera.ok_or_else(||anyhow!("legacy DAE has no explicitly selected camera; no default projection is invented"))?;
+    scratch.update_worlds(scene)?;
+    let worlds=&scratch.worlds;let camera=owner.camera.ok_or_else(||anyhow!("legacy DAE has no explicitly selected camera; no default projection is invented"))?;
     let view=inverse(*worlds.get(camera).ok_or_else(||anyhow!("DAE selected camera node was released"))?)?;
     let projection=match scene.nodes[camera].camera.as_ref().ok_or_else(||anyhow!("DAE selected node is not a camera"))?{
         Camera::Perspective{yfov,aspect,near,far}=>{
@@ -39,7 +94,13 @@ pub(super) fn draw(owner:&Owner,canvas:&mut Canvas)->Result<()>{
         Camera::Orthographic{xmag,ymag,near,far}=>[[1. / *xmag,0.,0.,0.],[0.,1. / *ymag,0.,0.],[0.,0.,1./(*near-*far),0.],[0.,0.,*near/(*near-*far),1.]],
     };
     let count=(canvas.width() as usize).checked_mul(canvas.height() as usize).ok_or_else(||anyhow!("DAE depth surface overflow"))?;
-    ensure!(count<=64*1024*1024,"DAE depth surface limit");let mut depth=vec![1f32;count];
+    ensure!(count<=64*1024*1024,"DAE depth surface limit");
+    let mut oversized = Vec::new();
+    let depth = if count <= 8 * 1024 * 1024 { &mut scratch.depth } else { &mut oversized };
+    depth.clear();
+    depth.reserve_exact(count);
+    depth.resize(count, 1.0);
+    let (polygon, clipped) = (&mut scratch.polygon, &mut scratch.clipped);
     for(index,node)in scene.nodes.iter().enumerate(){
         let mut current=Some(index);let mut visible=true;while let Some(i)=current{visible&=scene.nodes[i].visible;current=scene.nodes[i].parent;}if !visible{continue;}
         let matrix=multiply(multiply(worlds[index],view),projection);
@@ -56,18 +117,23 @@ pub(super) fn draw(owner:&Owner,canvas:&mut Canvas)->Result<()>{
                     Texture::Base=>Some(owner.base.as_ref().and_then(|(_,image)|image.as_ref()).ok_or_else(||anyhow!("DAE Shader reads missing tlts base image"))?),
                     Texture::Material=>Some(owner.images.get(material.texture.as_ref().ok_or_else(||anyhow!("DAE Shader reads tex0 but material has no image"))?).ok_or_else(||anyhow!("DAE material image is not loaded"))?),};
                 for triangle in primitive.vertices.chunks_exact(3){
-                    let mut polygon=Vec::with_capacity(3);
-                    for vertex in triangle{
+                    let mut vertices = [Vertex::default(); 3];
+                    for (output, vertex) in vertices.iter_mut().zip(triangle) {
                         let color=match shader.diffuse{Diffuse::Material=>material.color,Diffuse::Vertex=>vertex.color,Diffuse::Product=>std::array::from_fn(|i|material.color[i]*vertex.color[i])};
                         let position=transform([vertex.position[0],vertex.position[1],vertex.position[2],1.],matrix);
                         ensure!(position.iter().chain(color.iter()).all(|v|v.is_finite()),"DAE transformed vertex is nonfinite");
-                        polygon.push(Vertex{clip:position,uv:vertex.uv,color});
+                        *output = Vertex{clip:position,uv:vertex.uv,color};
                     }
-                    for plane in 0..6{polygon=clip(polygon,plane);}
+                    clip(&vertices, 0, polygon);
+                    for plane in 1..6 {
+                        if polygon.is_empty() { break; }
+                        clip(polygon, plane, clipped);
+                        std::mem::swap(polygon, clipped);
+                    }
                     for i in 1..polygon.len().saturating_sub(1){
                         let vertices=[polygon[0],polygon[i],polygon[i+1]].map(|v|{
                             let rhw=1./v.clip[3];Screen{point:[(v.clip[0]*rhw+1.)*canvas.width() as f32*0.5,(1.-v.clip[1]*rhw)*canvas.height() as f32*0.5,v.clip[2]*rhw],rhw,uv:v.uv,color:v.color}
-                        });raster(canvas,&mut depth,vertices,shader,texture)?;
+                        });raster(canvas,depth,vertices,shader,texture)?;
                     }
                 }
             }
@@ -123,4 +189,61 @@ fn sample(frame:&RgbaFrame,uv:[f64;2],wrap:bool,linear:bool)->[f64;4]{
         let at=(address(py,height)*width+address(px,width)) as usize*4;
         for c in 0..4{result[c]+=weight*frame.pixels()[at+c] as f64/255.;}
     }result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css_dae::{Instance, Material, Mesh, Primitive, Vertex as MeshVertex, identity};
+
+    #[test]
+    fn sidecar_css_cached_draw_matches_fresh_with_live_transforms_and_resized_depth() -> Result<()> {
+        let node = || Node {
+            id: Vec::new(), name: Vec::new(), parent: None, local: identity(),
+            channels: Default::default(), overrides: Default::default(), instances: Vec::new(),
+            camera: None, shader: Vec::new(), visible: true,
+        };
+        let mut parent = node();
+        parent.camera = Some(Camera::Orthographic { xmag: 1.0, ymag: 1.0, near: 0.0, far: 1.0 });
+        let mut child = node();
+        child.parent = Some(0);
+        child.instances.push(Instance { geometry: "mesh".into(), materials: [("symbol".into(), "material".into())].into() });
+        let vertices = [[-1.5, -0.8, -0.25], [0.8, -0.8, -0.25], [0.0, 0.8, -0.25]]
+            .map(|position| MeshVertex { position, uv: [0.0; 2], color: [1.0; 4] }).to_vec();
+        let scene = Scene {
+            nodes: vec![parent, child],
+            meshes: [("mesh".into(), Mesh { primitives: vec![Primitive { vertices, material: "symbol".into(), attributes: 0 }] })].into(),
+            materials: [("material".into(), Material {
+                id: Vec::new(), name: Vec::new(), color: [1.0, 0.0, 0.0, 1.0], texture: None, shader: b"shader".to_vec(),
+            })].into(),
+        };
+        let shader = Shader {
+            diffuse: Diffuse::Material, texture: Texture::None, blend: Blend::Opaque,
+            z_test: true, z_write: true, cull: Cull::None, wrap: false, alpha_ref: None, linear: false,
+        };
+        let mut owner = Owner { camera: Some(0), scene: Some(scene), shaders: [((b"shader".to_vec(), 0), shader)].into(), ..Default::default() };
+        let mut scratch = DrawScratch::default();
+        let mut canvas = Canvas::new(8, 8)?;
+        draw_with_scratch(&owner, &mut canvas, &mut scratch)?;
+        let initial = canvas.pixels().to_vec();
+        assert!(initial.contains(&255));
+        let worlds = scratch.worlds.as_ptr();
+        let depth = scratch.depth.as_ptr();
+        draw_with_scratch(&owner, &mut canvas, &mut scratch)?;
+        assert_eq!(scratch.worlds.as_ptr(), worlds);
+        assert_eq!(scratch.depth.as_ptr(), depth);
+
+        owner.scene.as_mut().unwrap().nodes[1].channels.primary[2] = (-0.5_f32).to_bits();
+        for (width, height) in [(8, 8), (4, 6), (8, 8)] {
+            let mut reused = Canvas::new(width, height)?;
+            let mut fresh = Canvas::new(width, height)?;
+            draw_with_scratch(&owner, &mut reused, &mut scratch)?;
+            draw_with_scratch(&owner, &mut fresh, &mut DrawScratch::default())?;
+            assert!(reused.pixels().contains(&255));
+            assert_eq!(reused.pixels(), fresh.pixels());
+        }
+        assert_eq!(scratch.depth.as_ptr(), depth);
+        assert!(scratch.depth.contains(&0.75));
+        Ok(())
+    }
 }

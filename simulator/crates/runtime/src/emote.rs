@@ -5,7 +5,7 @@
 //! unsupported features. No blank-frame or constant-success backend exists.
 //! Evidence: reports/recovery_A_20261116_emote.json.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::{Arc, OnceLock}};
 
 use flate2::{Decompress, FlushDecompress, Status};
 
@@ -354,7 +354,13 @@ pub struct EmoteRasterFrame {
     width: u32,
     height: u32,
     origin: [i32; 2],
+    pixels: Arc<EmotePixels>,
+}
+
+#[derive(Debug, Clone)]
+struct EmotePixels {
     rgba: Vec<u8>,
+    alpha_bounds: OnceLock<Option<[u32; 4]>>,
 }
 
 impl EmoteRasterFrame {
@@ -371,7 +377,7 @@ impl EmoteRasterFrame {
             width,
             height,
             origin,
-            rgba,
+            pixels: Arc::new(EmotePixels { rgba, alpha_bounds: OnceLock::new() }),
         })
     }
 
@@ -385,7 +391,36 @@ impl EmoteRasterFrame {
         self.origin
     }
     pub fn rgba(&self) -> &[u8] {
-        &self.rgba
+        &self.pixels.rgba
+    }
+
+    fn rgba_mut(&mut self) -> &mut [u8] {
+        let pixels = Arc::make_mut(&mut self.pixels);
+        pixels.alpha_bounds.take();
+        &mut pixels.rgba
+    }
+
+    fn try_recycle(self) -> Option<Vec<u8>> {
+        Arc::try_unwrap(self.pixels).ok().map(|pixels| pixels.rgba)
+    }
+
+    /// Nonzero-alpha bounds in local pixels, with exclusive right and bottom.
+    pub fn alpha_bounds(&self) -> Option<[u32; 4]> {
+        *self.pixels.alpha_bounds.get_or_init(|| {
+            let mut bounds = [self.width, self.height, 0, 0];
+            for (row, pixels) in self.rgba().chunks_exact(self.width as usize * 4).enumerate() {
+                let mut pixels = pixels.chunks_exact(4);
+                if let Some(first) = pixels.position(|pixel| pixel[3] != 0) {
+                    let last = pixels.rposition(|pixel| pixel[3] != 0)
+                        .map_or(first, |remaining| first + 1 + remaining);
+                    bounds[0] = bounds[0].min(first as u32);
+                    bounds[1] = bounds[1].min(row as u32);
+                    bounds[2] = bounds[2].max(last as u32 + 1);
+                    bounds[3] = row as u32 + 1;
+                }
+            }
+            (bounds[0] < bounds[2]).then_some(bounds)
+        })
     }
 }
 

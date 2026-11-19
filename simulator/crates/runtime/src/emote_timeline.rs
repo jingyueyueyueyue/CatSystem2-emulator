@@ -30,6 +30,11 @@ struct ReferenceClock {
     playing: bool,
 }
 
+pub(super) fn same_variable_bits(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|((left_name, left_value), (right_name, right_value))|
+        left_name == right_name && left_value.to_bits() == right_value.to_bits())
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CpuReferenceSample {
     pub path: Vec<usize>,
@@ -40,6 +45,17 @@ pub(super) struct CpuReferenceSample {
 }
 
 impl CpuReferenceTimelines {
+    pub(super) fn same_render_state(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.updated_tick.map(f32::to_bits) == other.updated_tick.map(f32::to_bits)
+            && same_variable_bits(&self.updated_variables, &other.updated_variables)
+            && self.owners.len() == other.owners.len()
+            && self.owners.iter().zip(&other.owners).all(|((left_path, left), (right_path, right))|
+                left_path == right_path && left.selected == right.selected && left.playing == right.playing
+                    && [left.raw, left.sample, left.observed_tick].map(f32::to_bits)
+                        == [right.raw, right.sample, right.observed_tick].map(f32::to_bits))
+    }
+
     pub fn begin(&mut self, object: &str, motion: &str) {
         let identity = (object.to_owned(), motion.to_owned());
         if self.root.as_ref() != Some(&identity) {

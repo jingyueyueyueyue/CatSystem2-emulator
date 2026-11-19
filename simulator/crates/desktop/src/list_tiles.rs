@@ -214,6 +214,14 @@ fn options_equal(a: &ImageDrawOptions, b: &ImageDrawOptions) -> bool {
         && a.filter == b.filter
 }
 
+fn same_render_frame(left: &RgbaFrame, right: &RgbaFrame) -> bool {
+    left.width() == right.width()
+        && left.height() == right.height()
+        && std::ptr::eq(left.pixels(), right.pixels())
+        && left.metadata() == right.metadata()
+        && left.hg_attributes() == right.hg_attributes()
+}
+
 fn bounds(
     host: &LoggingHost<'_>,
     id: u32,
@@ -315,7 +323,7 @@ fn compose_inner(
         let changed = explicit
             || old.as_ref().is_none_or(|old| {
                 !native
-                    && (old.frame != layer.frame
+                    && (!same_render_frame(&old.frame, &layer.frame)
                         || !options_equal(&old.options, &layer.options)
                         || old.priority != layer.priority)
             });

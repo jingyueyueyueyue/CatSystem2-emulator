@@ -346,19 +346,20 @@ impl CpuStencilBuffer {
                 let src = (sy as usize * source.width() as usize + sx as usize) * 4;
                 let dst = index * 4;
                 let alpha = f64::from(source.rgba()[src + 3]) / 255.0;
-                let old_alpha = f64::from(destination.rgba[dst + 3]) / 255.0;
+                let old_alpha = f64::from(destination.rgba()[dst + 3]) / 255.0;
                 let combined = alpha + old_alpha * (1.0 - alpha);
                 if combined == 0.0 {
                     continue;
                 }
+                let pixels = destination.rgba_mut();
                 for c in 0..3 {
-                    destination.rgba[dst + c] = ((f64::from(source.rgba()[src + c]) * alpha
-                        + f64::from(destination.rgba[dst + c]) * old_alpha * (1.0 - alpha))
+                    pixels[dst + c] = ((f64::from(source.rgba()[src + c]) * alpha
+                        + f64::from(pixels[dst + c]) * old_alpha * (1.0 - alpha))
                         / combined)
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }
-                destination.rgba[dst + 3] = (combined * 255.0).round().clamp(0.0, 255.0) as u8;
+                pixels[dst + 3] = (combined * 255.0).round().clamp(0.0, 255.0) as u8;
                 submitted += 1;
             }
         }

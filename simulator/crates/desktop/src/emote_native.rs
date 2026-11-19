@@ -1279,27 +1279,65 @@ pub(super) fn submit_rgba(
     if right <= left || bottom <= top {
         return Ok(0);
     }
-    let mut written = 0;
+    let submitted = ((right - left) * (bottom - top)) as usize;
+    let source_over = blend == BlendMode::SourceOver;
+    let (left, top, right, bottom) = if source_over {
+        let Some([first_x, first_y, end_x, end_y]) = frame.alpha_bounds() else {
+            return Ok(submitted);
+        };
+        (left.max(i64::from(origin_x) + i64::from(first_x)),
+         top.max(i64::from(origin_y) + i64::from(first_y)),
+         right.min(i64::from(origin_x) + i64::from(end_x)),
+         bottom.min(i64::from(origin_y) + i64::from(end_y)))
+    } else {
+        (left, top, right, bottom)
+    };
     for y in top..bottom {
         for x in left..right {
             let source_x = (x - i64::from(origin_x)) as usize;
             let source_y = (y - i64::from(origin_y)) as usize;
             let offset = (source_y * frame.width() as usize + source_x) * 4;
             let p = &frame.rgba()[offset..offset + 4];
+            if source_over && p[3] == 0 {
+                continue;
+            }
             let x = i32::try_from(x).map_err(|_| EmoteError::InvalidFrame)?;
             let y = i32::try_from(y).map_err(|_| EmoteError::InvalidFrame)?;
             canvas
                 .blend_pixel_with_mode(x, y, Color::rgba(p[0], p[1], p[2], p[3]), blend)
                 .map_err(|error| EmoteError::Backend(error.to_string()))?;
-            written += 1;
         }
     }
-    Ok(written)
+    Ok(submitted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecar_emote_submission_preserves_clipping_and_mask_modes() {
+        let transparent = [200, 100, 50, 0];
+        let opaque = [40, 50, 60, 255];
+        let half = [90, 60, 10, 128];
+        let pixels = [transparent, transparent, transparent, transparent,
+            transparent, opaque, transparent, half, transparent, transparent, transparent, transparent];
+        let frame = EmoteRasterFrame::new(4, 3, [-1, -1], pixels.concat()).unwrap();
+        assert_eq!(frame.alpha_bounds(), Some([1, 1, 4, 2]));
+        for blend in [BlendMode::SourceOver, BlendMode::ListAlphaFromAlpha, BlendMode::ListAlphaFromRed] {
+            let mut fast = Canvas::new(3, 2).unwrap();
+            fast.clear(Color::rgba(20, 30, 40, 200));
+            let mut reference = fast.clone();
+            for row in 0..2 {
+                for column in 0..3 {
+                    let [red, green, blue, alpha] = pixels[(row + 1) * 4 + column + 1];
+                    reference.blend_pixel_with_mode(column as i32, row as i32, Color::rgba(red, green, blue, alpha), blend).unwrap();
+                }
+            }
+            assert_eq!(submit_rgba(&mut fast, &frame, blend).unwrap(), 6);
+            assert_eq!(fast.pixels(), reference.pixels());
+        }
+    }
 
     #[test]
     fn native85_keeps_m2_base_depth_and_consumes_the_xy_setter() -> anyhow::Result<()> {

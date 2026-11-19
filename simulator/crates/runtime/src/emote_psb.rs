@@ -76,6 +76,12 @@ pub struct PsbDocument {
 }
 
 impl PsbDocument {
+    #[cfg(test)]
+    pub(super) fn from_test_root(root: PsbValue) -> Self {
+        Self { version: 2, recovered_header_key: None, value_count: 0, root,
+            bytes: Arc::from([]), chunks: Vec::new(), extra_chunks: Vec::new() }
+    }
+
     pub fn from_resource(resource: &EmoteResource) -> Result<Self> {
         Self::parse(resource.bytes())
     }

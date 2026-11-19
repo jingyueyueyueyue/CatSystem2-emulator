@@ -124,19 +124,30 @@ pub struct RuntimeTask {
     pub status: TaskStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskScheduler {
     #[serde(default = "first_task_id")]
     next_id: TaskId,
     #[serde(default)]
     tasks: BTreeMap<TaskId, RuntimeTask>,
+    #[serde(skip)]
+    deadlines: Option<BTreeSet<(u64, TaskId)>>,
 }
+
+impl PartialEq for TaskScheduler {
+    fn eq(&self, other: &Self) -> bool {
+        self.next_id == other.next_id && self.tasks == other.tasks
+    }
+}
+
+impl Eq for TaskScheduler {}
 
 impl Default for TaskScheduler {
     fn default() -> Self {
         Self {
             next_id: 1,
             tasks: BTreeMap::new(),
+            deadlines: Some(BTreeSet::new()),
         }
     }
 }
@@ -171,6 +182,9 @@ impl TaskScheduler {
                 status: TaskStatus::Sleeping,
             },
         );
+        if let Some(deadlines) = &mut self.deadlines {
+            deadlines.insert((wake_frame, id));
+        }
         Ok(id)
     }
 
@@ -208,6 +222,7 @@ impl TaskScheduler {
     }
 
     pub fn task_mut(&mut self, id: TaskId) -> Option<&mut RuntimeTask> {
+        self.deadlines = None;
         self.tasks.get_mut(&id)
     }
 
@@ -241,6 +256,10 @@ impl TaskScheduler {
         if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
             return Err(RuntimeError::Host(format!("task {id} is already terminal")));
         }
+        if let Some(deadlines) = &mut self.deadlines {
+            deadlines.remove(&(task.wake_frame, id));
+            deadlines.insert((frame, id));
+        }
         task.wake_frame = frame;
         task.status = TaskStatus::Ready;
         Ok(())
@@ -253,6 +272,9 @@ impl TaskScheduler {
             .ok_or_else(|| RuntimeError::Host(format!("unknown task {id}")))?;
         if task.status == TaskStatus::Running {
             task.status = TaskStatus::Ready;
+            if let Some(deadlines) = &mut self.deadlines {
+                deadlines.insert((task.wake_frame, id));
+            }
         }
         Ok(())
     }
@@ -264,15 +286,19 @@ impl TaskScheduler {
     }
 
     pub fn poll_ready(&mut self, frame: u64) -> Vec<TaskId> {
+        let deadlines = self.deadlines.get_or_insert_with(|| {
+            self.tasks.values().filter_map(|task| {
+                matches!(task.status, TaskStatus::Sleeping | TaskStatus::Ready)
+                    .then_some((task.wake_frame, task.id))
+            }).collect()
+        });
         let mut ready = Vec::new();
-        for task in self.tasks.values_mut() {
-            if matches!(task.status, TaskStatus::Sleeping | TaskStatus::Ready)
-                && task.wake_frame <= frame
-            {
-                task.status = TaskStatus::Running;
-                ready.push(task.id);
-            }
+        while deadlines.first().is_some_and(|&(wake, _)| wake <= frame) {
+            let (_, id) = deadlines.pop_first().expect("deadline was checked");
+            self.tasks.get_mut(&id).expect("deadline has a live task").status = TaskStatus::Running;
+            ready.push(id);
         }
+        ready.sort_unstable();
         ready
     }
 
@@ -291,6 +317,9 @@ impl TaskScheduler {
         if let Some(interval) = task.interval_frames {
             task.wake_frame = frame.saturating_add(interval);
             task.status = TaskStatus::Sleeping;
+            if let Some(deadlines) = &mut self.deadlines {
+                deadlines.insert((task.wake_frame, id));
+            }
         } else {
             task.status = TaskStatus::Completed;
         }
@@ -304,6 +333,9 @@ impl TaskScheduler {
             .ok_or_else(|| RuntimeError::Host(format!("unknown task {id}")))?;
         if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
             return Ok(());
+        }
+        if let Some(deadlines) = &mut self.deadlines {
+            deadlines.remove(&(task.wake_frame, id));
         }
         task.status = TaskStatus::Cancelled;
         Ok(())
@@ -322,6 +354,7 @@ impl TaskScheduler {
 
     pub fn recover_after_restart(&mut self, frame: u64) -> RuntimeResult<()> {
         self.validate()?;
+        self.deadlines = None;
         for task in self.tasks.values_mut() {
             if task.status == TaskStatus::Running {
                 task.status = if task.wake_frame <= frame {
@@ -402,6 +435,24 @@ mod tests {
         scheduler.recover_after_restart(2).unwrap();
         assert_eq!(scheduler.task(id).unwrap().status, TaskStatus::Ready);
         assert_eq!(scheduler.poll_ready(2), vec![id]);
+    }
+
+    #[test]
+    fn indexed_deadlines_keep_id_order_and_rebuild_after_mutation() {
+        let mut scheduler = TaskScheduler::default();
+        let first = scheduler.schedule("late", 5, None).unwrap();
+        let second = scheduler.schedule("early", 2, None).unwrap();
+        let cancelled = scheduler.schedule("cancelled", 2, None).unwrap();
+        let future = scheduler.schedule("future", 1000, None).unwrap();
+        scheduler.cancel(cancelled).unwrap();
+        scheduler.task_mut(future).unwrap().wake_frame = 4;
+        assert!(scheduler.poll_ready(1).is_empty());
+        assert_eq!(scheduler.poll_ready(5), vec![first, second, future]);
+        scheduler.suspend(first).unwrap();
+        assert_eq!(scheduler.poll_ready(5), vec![first]);
+        scheduler.wake(second, 10).unwrap();
+        assert!(scheduler.poll_ready(9).is_empty());
+        assert_eq!(scheduler.poll_ready(10), vec![second]);
     }
 
     #[test]

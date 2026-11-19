@@ -25,7 +25,7 @@ impl Blend {
         // 19c8f0 runs at fraction zero. Fill only fully transparent RGB;
         // neither source's alpha changes. The OR uses the incoming alpha.
         let mut incoming_alpha = 0_u8;
-        for (a, b) in old.rgba.chunks_exact_mut(4).zip(new.rgba.chunks_exact_mut(4)) {
+        for (a, b) in old.rgba_mut().chunks_exact_mut(4).zip(new.rgba_mut().chunks_exact_mut(4)) {
             incoming_alpha |= b[3];
             if a[3] == 0 && b[3] != 0 {
                 a[..3].copy_from_slice(&b[..3]);
@@ -56,14 +56,14 @@ impl Blend {
         let old_weight = 256 - new_weight;
         if self.new_is_transparent {
             // 19c7f0 preserves RGB rather than lerping toward black.
-            for (out, old) in self.shown.rgba.chunks_exact_mut(4)
-                .zip(self.old.rgba.chunks_exact(4)) {
+            for (out, old) in self.shown.rgba_mut().chunks_exact_mut(4)
+                .zip(self.old.rgba().chunks_exact(4)) {
                 out[..3].copy_from_slice(&old[..3]);
                 out[3] = ((u32::from(old[3]) * old_weight) >> 8) as u8;
             }
         } else {
-            for ((out, old), new) in self.shown.rgba.iter_mut()
-                .zip(&self.old.rgba).zip(&self.new.rgba) {
+            for ((out, old), new) in self.shown.rgba_mut().iter_mut()
+                .zip(self.old.rgba()).zip(self.new.rgba()) {
                 *out = ((u32::from(*old) * old_weight
                     + u32::from(*new) * new_weight) >> 8) as u8;
             }
@@ -156,7 +156,9 @@ impl CpuM2SurfaceOwner {
         self.frame().or(self.presented.as_ref())
     }
 
-    pub(super) fn remember(&mut self, frame: EmoteRasterFrame) { self.presented = Some(frame); }
+    pub(super) fn remember(&mut self, frame: EmoteRasterFrame) -> Option<EmoteRasterFrame> {
+        self.presented.replace(frame)
+    }
 
     pub(super) fn clear(&mut self) {
         self.pending = None;
