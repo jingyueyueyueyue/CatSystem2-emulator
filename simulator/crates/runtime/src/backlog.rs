@@ -449,10 +449,11 @@ fn put_string(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 
 fn unit(data: &[u8], offset: usize) -> Result<usize> {
     let byte = *data.get(offset).ok_or(BacklogError::TruncatedCharacter)?;
-    if matches!(byte, 0x81..=0x9f | 0xe0..=0xef) {
-        if offset + 1 >= data.len() { return Err(BacklogError::TruncatedCharacter); }
-        Ok(2)
-    } else if byte == b'\\' && matches!(data.get(offset + 1), Some(b'[' | b'\\' | b'n')) {
+    let next = data.get(offset + 1);
+    let double_byte = matches!(byte, 0x81..=0x9f | 0xe0..=0xef)
+        && matches!(next, Some(0x40..=0x7e | 0x80..=0xfc));
+    let escape = byte == b'\\' && matches!(next, Some(b'[' | b'\\' | b'n'));
+    if double_byte || escape {
         Ok(2)
     } else { Ok(1) }
 }
@@ -521,6 +522,27 @@ fn preprocess(data: &[u8], escape: bool) -> Result<Vec<u8>> {
         offset += width;
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backlog_keeps_unpaired_bytes_and_still_consumes_valid_pairs() -> Result<()> {
+        assert_eq!(unit(b"\xe3", 0)?, 1);
+        assert_eq!(unit(b"\x81\x7f", 0)?, 1);
+        assert_eq!(unit(b"\x81\x40", 0)?, 2);
+        let mut backlog = Backlog::new(Settings::default())?;
+        let name = b"Sample";
+        let text = b"\xe3\x80\x8cA sample line for history. \xe2\x99\xaa\xe3\x80\x8d";
+        assert!(backlog.append(b"01", 0, name, text, 1, 0, 0)?);
+        assert_eq!(backlog.names()[0], name);
+        let restored_text: Vec<u8> = backlog.lines().iter().skip(1)
+            .flat_map(|line| line.text.iter().copied()).collect();
+        assert_eq!(restored_text, text);
+        Ok(())
+    }
 }
 
 fn layout(text: &[u8], prefix: &[u8], settings: &Settings) -> Result<Vec<Vec<u8>>> {

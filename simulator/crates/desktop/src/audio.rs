@@ -302,7 +302,7 @@ pub fn audio_host_for_resources(resources: &ResourceIndex) -> DesktopAudioHost {
 enum WavWorkerCommand {
     Pause(bool, mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>),
     Suspend(bool, mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>),
-    Stop(mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>),
+    Stop,
     Capture(mpsc::SyncSender<cs2_runtime::RuntimeResult<checkpoint::WorkerState>>),
     ReleaseCapture,
     CommitRestore,
@@ -322,8 +322,7 @@ struct ActiveWavPlayback {
 impl Drop for ActiveWavPlayback {
     fn drop(&mut self) {
         if self.thread.is_some() {
-            let (acknowledge, _) = mpsc::sync_channel(1);
-            let _ = self.commands.send(WavWorkerCommand::Stop(acknowledge));
+            let _ = self.commands.send(WavWorkerCommand::Stop);
             join_worker(&mut self.thread);
         }
     }
@@ -428,32 +427,19 @@ impl WavAudioHost {
         let Some(mut playback) = self.active.remove(&handle) else {
             return Ok(());
         };
-        if let Ok(result) = playback.finished.try_recv() {
-            join_worker(&mut playback.thread);
-            return result;
-        }
-        let (acknowledge, response) = mpsc::sync_channel(1);
-        if playback
-            .commands
-            .send(WavWorkerCommand::Stop(acknowledge))
-            .is_err()
-        {
-            join_worker(&mut playback.thread);
-            return playback.finished.recv().unwrap_or_else(|_| {
-                Err(RuntimeError::Host(
-                    "WAV playback worker stopped unexpectedly".to_string(),
-                ))
-            });
-        }
-        let device_result = response
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| RuntimeError::Host("WAV worker dropped stop response".to_string()))?;
+        let _ = playback.commands.send(WavWorkerCommand::Stop);
+        let worker_result = playback.finished.recv_timeout(Duration::from_secs(5));
+        let worker_result = match worker_result {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(RuntimeError::Host("WAV worker dropped result".to_string()))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(RuntimeError::Host("WAV worker stop timed out".to_string()));
+            }
+        };
         join_worker(&mut playback.thread);
-        let worker_result = playback
-            .finished
-            .recv()
-            .unwrap_or_else(|_| Err(RuntimeError::Host("WAV worker dropped result".to_string())));
-        device_result.and(worker_result)
+        worker_result
     }
 }
 
@@ -661,6 +647,55 @@ impl Drop for WavAudioHost {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_uses_the_result_of_a_worker_finishing_concurrently() {
+        let mut host = WavAudioHost::new(|_| unreachable!());
+        for (handle, result) in [
+            (1, Ok(())),
+            (2, Err(RuntimeError::Host("device cleanup failed".into()))),
+        ] {
+            let (commands, pending) = mpsc::channel();
+            let (finished_sender, finished) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                pending.recv().unwrap();
+                drop(pending);
+                finished_sender.send(result).unwrap();
+            });
+            host.active.insert(
+                handle,
+                ActiveWavPlayback {
+                    channel: AudioChannel::SoundEffect,
+                    paused: false,
+                    commands,
+                    finished,
+                    thread: Some(worker),
+                    _parameters: AudioParameters::new(1.0, 0.0).unwrap(),
+                    resource: String::new(),
+                    prepared: Arc::new(DecodedAudio {
+                        probe: AudioProbe {
+                            codec: AudioCodec::WavPcm,
+                            sample_rate: 44_100,
+                            channels: 1,
+                            frames: 0,
+                        },
+                        samples: Arc::from([]),
+                    }),
+                },
+            );
+        }
+        host.stop(1).unwrap();
+        assert!(matches!(
+            host.stop(2),
+            Err(RuntimeError::Host(message)) if message == "device cleanup failed"
+        ));
+        assert!(host.active.is_empty());
+    }
+}
+
 fn apply_pcm_volume_pan(mut samples: Vec<i16>, channels: u8, volume: f32, pan: f32) -> Vec<i16> {
     let volume = volume.clamp(0.0, 1.0);
     let pan = pan.clamp(-1.0, 1.0);
@@ -777,11 +812,7 @@ mod pcm_worker {
         loop {
             if !restore_hold && !capture_hold { repeats.refresh(&parameters); }
             match commands.recv_timeout(Duration::from_millis(2)) {
-                Ok(WavWorkerCommand::Stop(acknowledge)) => {
-                    let result = output.stop();
-                    let _ = acknowledge.send(result.as_ref().map(|_| ()).map_err(clone_error));
-                    return result;
-                }
+                Ok(WavWorkerCommand::Stop) => return output.stop(),
                 Ok(WavWorkerCommand::Pause(value, acknowledge)) => {
                     let result = output.pause(value || suspended || restore_hold || capture_hold);
                     let _ = acknowledge.send(result.as_ref().map(|_| ()).map_err(clone_error));

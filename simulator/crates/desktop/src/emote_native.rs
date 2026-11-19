@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use cs2_renderer::{Canvas, Color};
+use cs2_renderer::{BlendMode, Canvas, Color};
 use cs2_runtime::ResourceIndex;
 use cs2_runtime::emote::{
     CpuEmoteBackend, CpuEmoteResources, CpuM2ActionConfig, CpuM2Config, CpuM2ControllerConfig,
@@ -40,7 +40,7 @@ pub(super) fn receive(
     output: &mut u32,
     _budget: usize,
 ) -> Result<Option<cs2_runtime::TaskCommandOutcome>> {
-    if !matches!(addressed.code, 51 | 55 | 66 | 524..=553) {
+    if !matches!(addressed.code, 49 | 51 | 55 | 61 | 66 | 81 | 524..=553) {
         return Ok(None);
     }
     let target = addressed.target as u32;
@@ -50,6 +50,15 @@ pub(super) fn receive(
         .is_none_or(|node| node.kind != 54)
     {
         return Ok(None);
+    }
+    if matches!(addressed.code, 49 | 61) {
+        return host.receive_emote_base(addressed, buffers).map(Some);
+    }
+    if addressed.code == 81 {
+        let placement = host.data_services.emote.placements.get_mut(&target)
+            .ok_or_else(|| super::native_state_error("M2 blend command has no owned placement state"))?;
+        placement.blend = BlendMode::from_raw(addressed.data[1]);
+        return Ok(Some(cs2_runtime::TaskCommandOutcome { done: true, propagate: false }));
     }
     if let Some(outcome) = host.receive_emote_geometry(addressed, buffers.data1())? {
         return Ok(Some(outcome));
@@ -255,6 +264,14 @@ fn load_m2_resource_plan_impl(
     )?)?;
     let profile_category = single(&view, b"profilepath")?;
     let data_category = single(&view, b"datapath")?;
+    let archive_category = if data_category.eq_ignore_ascii_case(b"psz")
+        && resources.optional_category_names(b"m2psb", "probe")
+            .map_err(|cause| EmoteError::Backend(cause.to_string()))?.is_some()
+    {
+        b"m2psb".as_slice()
+    } else {
+        &data_category
+    };
     let extension = single(&view, b"dataext")?;
     let load_spec = CpuM2LoadSpec::parse_unquoted(formatted_spec)?;
     let filename = view.profile_file(&load_spec.profile_alias_cp932)?.to_vec();
@@ -328,7 +345,7 @@ fn load_m2_resource_plan_impl(
     } else {
         Some(EmoteResource::decode(&read(
             resources,
-            &data_category,
+            archive_category,
             &resource_name,
         )?)?)
     };
@@ -1087,7 +1104,8 @@ impl EmoteNativeServices {
         canvas: &mut Canvas,
     ) -> std::result::Result<usize, EmoteError> {
         let frame = self.state.render_rgba(resolved_target)?;
-        let submitted = submit_rgba(canvas, &frame)?;
+        let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
+        let submitted = submit_rgba(canvas, &frame, blend)?;
         if submitted != 0 {
             self.state.record_pixel_submission(resolved_target)?;
         }
@@ -1251,6 +1269,7 @@ fn error(error: EmoteError) -> ScriptError {
 pub(super) fn submit_rgba(
     canvas: &mut Canvas,
     frame: &EmoteRasterFrame,
+    blend: BlendMode,
 ) -> std::result::Result<usize, EmoteError> {
     let [origin_x, origin_y] = frame.origin();
     let left = i64::from(origin_x).max(0);
@@ -1270,7 +1289,7 @@ pub(super) fn submit_rgba(
             let x = i32::try_from(x).map_err(|_| EmoteError::InvalidFrame)?;
             let y = i32::try_from(y).map_err(|_| EmoteError::InvalidFrame)?;
             canvas
-                .blend_pixel(x, y, Color::rgba(p[0], p[1], p[2], p[3]))
+                .blend_pixel_with_mode(x, y, Color::rgba(p[0], p[1], p[2], p[3]), blend)
                 .map_err(|error| EmoteError::Backend(error.to_string()))?;
             written += 1;
         }
@@ -1283,16 +1302,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native85_keeps_m2_base_depth_and_consumes_the_xy_setter() -> anyhow::Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-emote-base-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = player?;
+        player.with_host(|host| {
+            let emote = &mut host.data_services.emote;
+            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
+            let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
+            emote.state.set_backend(Box::new(backend)).map_err(error)?;
+            emote.surface_fade_default = Some(0);
+            let target = host.create_task_object(54, host.current_task_id, b"m2plane", b"")?;
+            let ordinary = host.create_task_object(2, host.current_task_id, b"plane", b"")?;
+            let command = cs2_runtime::TaskCommand { target: target as i32,
+                sender: host.current_task_id as i32, code: 49, data: [0, 0, 1] };
+            let base = [100.0_f32, -200.0, 273.5];
+            let mut buffers = crate::native_tasks::OwnedTaskBuffers::new(None,
+                Some(base.into_iter().flat_map(f32::to_le_bytes).collect()))?;
+            let mut output = 0x1234_5678;
+            assert!(host.dispatch_registered_task_buffers(command, &mut buffers, &mut output, 4096)?.done);
+            assert_eq!(host.scene_nodes[&target].position, [0.0, 0.0, 273.5]);
+            let arguments: Vec<u8> = [target, 5.0_f32.to_bits(), 6.0_f32.to_bits(), 0]
+                .into_iter().flat_map(u32::to_le_bytes).collect();
+            assert!(matches!(host.emote_geometry_native(85, &arguments)?, Some(NativeReturn::Continue)));
+            assert!(host.emote_geometry_native(85, &arguments[..12]).is_err());
+            assert!(host.emote_geometry_native(85, &ordinary.to_le_bytes())?.is_none());
+            assert_eq!(host.scene_nodes[&target].position, [0.0, 0.0, 273.5]);
+            let mut query = crate::native_tasks::OwnedTaskBuffers::new(None, Some(vec![0xff; 12]))?;
+            assert!(host.dispatch_registered_task_buffers(cs2_runtime::TaskCommand { code: 61, ..command },
+                &mut query, &mut output, 4096)?.done);
+            let expected: Vec<u8> = [0.0_f32, 0.0, 273.5].into_iter().flat_map(f32::to_le_bytes).collect();
+            assert_eq!(query.data1(), Some(expected.as_slice()));
+            assert_eq!(output, 0x1234_5678);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn real_rgba_submission_clips_source_pixels_without_a_placeholder() {
         let mut canvas = Canvas::new(2, 1).unwrap();
         canvas.clear(Color::rgba(0, 0, 0, 255));
         let frame =
             EmoteRasterFrame::new(2, 1, [-1, 0], vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
-        assert_eq!(submit_rgba(&mut canvas, &frame).unwrap(), 1);
+        assert_eq!(submit_rgba(&mut canvas, &frame, BlendMode::SourceOver).unwrap(), 1);
         assert_eq!(canvas.pixel(0, 0).unwrap(), Color::rgba(0, 255, 0, 255));
         assert_eq!(canvas.pixel(1, 0).unwrap(), Color::rgba(0, 0, 0, 255));
         let outside = EmoteRasterFrame::new(1, 1, [2, 0], vec![255; 4]).unwrap();
-        assert_eq!(submit_rgba(&mut canvas, &outside).unwrap(), 0);
+        assert_eq!(submit_rgba(&mut canvas, &outside, BlendMode::SourceOver).unwrap(), 0);
         assert_eq!(canvas.pixel(1, 0).unwrap(), Color::rgba(0, 0, 0, 255));
+    }
+
+    #[test]
+    fn native402_sets_the_m2_final_surface_blend() -> anyhow::Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-emote-blend-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = player?;
+        player.with_host(|host| {
+            let emote = &mut host.data_services.emote;
+            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
+            let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
+            emote.state.set_backend(Box::new(backend)).map_err(error)?;
+            emote.surface_fade_default = Some(0);
+            let target = host.create_task_object(54, host.current_task_id, b"m2plane", b"")?;
+            let ordinary = host.create_task_object(2, host.current_task_id, b"plane", b"")?;
+            let arguments = |task: u32, blend: u32| [task.to_le_bytes(), blend.to_le_bytes()].concat();
+            assert!(host.emote_geometry_native(402, &arguments(ordinary, 1))?.is_none());
+            assert!(host.emote_geometry_native(402, &target.to_le_bytes()).is_err());
+            let mut canvas = Canvas::new(1, 1).unwrap();
+            let background = Color::rgba(5, 10, 15, 255);
+            let frame = EmoteRasterFrame::new(1, 1, [0, 0], vec![40, 50, 60, 255]).unwrap();
+            for (raw, mode, pixel) in [
+                (1, BlendMode::AddSource, Color::rgba(45, 60, 75, 255)),
+                (0, BlendMode::SourceOver, Color::rgba(40, 50, 60, 255)),
+                (u32::MAX, BlendMode::SourceOver, Color::rgba(40, 50, 60, 255)),
+            ] {
+                assert!(matches!(host.emote_geometry_native(402, &arguments(target, raw))?, Some(NativeReturn::Continue)));
+                let blend = host.data_services.emote.placements[&target].blend;
+                assert_eq!(blend, mode);
+                canvas.clear(background);
+                assert_eq!(submit_rgba(&mut canvas, &frame, blend).unwrap(), 1);
+                assert_eq!(canvas.pixel(0, 0).unwrap(), pixel);
+            }
+            Ok(())
+        })
     }
 }

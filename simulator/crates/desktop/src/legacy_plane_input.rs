@@ -10,7 +10,7 @@ const UTATE_SHA256: &str =
     "a9f8b08713aac278671853b2293a13b2623a122ede9341cb921901b09601cb52";
 
 impl LoggingHost<'_> {
-    pub(super) fn bind_utate_plane_input_profile(&mut self) -> Result<bool> {
+    pub(crate) fn bind_utate_plane_input_profile(&mut self) -> Result<bool> {
         if let Some(sha) = self.data_services.css_task_pe_sha256 {
             return Ok(sha == UTATE_SHA256);
         }

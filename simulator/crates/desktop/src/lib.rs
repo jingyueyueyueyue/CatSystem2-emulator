@@ -4083,7 +4083,7 @@ impl Host for LoggingHost<'_> {
             )),
             1 | 1040 if arguments.len() >= 4 => {
                 let source = vm.read_string(word(0).unwrap())?;
-                let text = expand_kcs_format_inner(vm, &source, 0, index == 1)?;
+                let text = expand_kcs_format_inner(vm, &source, 0, true)?;
                 if let Some(event) = self.events.last_mut() {
                     event.detail.push_str(&format!(" debug={:?}", String::from_utf8_lossy(&text)));
                 }
@@ -4894,7 +4894,7 @@ impl Host for LoggingHost<'_> {
                     .ok_or_else(|| audio_script_error("CST context handle is invalid"))?;
                 Ok(NativeReturn::Continue)
             }
-            385 if arguments.len() >= 20 => {
+            385 if arguments.len() == 16 || arguments.len() >= 20 => {
                 let container_handle = word(0).unwrap();
                 let record_id = word(4).unwrap();
                 let context_handle = word(8).unwrap();
@@ -4902,13 +4902,18 @@ impl Host for LoggingHost<'_> {
                     return Ok(NativeReturn::Value(0));
                 }
                 let table_index = word(12).unwrap();
-                let include_data = word(16).unwrap() != 0;
+                let layout = match word(16) {
+                    Some(include_data) => CstTableLayout::Current {
+                        include_data: include_data != 0,
+                    },
+                    None => CstTableLayout::Legacy,
+                };
                 let entries = self
                     .cst_contexts
                     .get(&context_handle)
                     .ok_or_else(|| audio_script_error("CST context handle is invalid"))?
                     .table(table_index);
-                let bytes = serialize_cst_table(entries, include_data)?;
+                let bytes = serialize_cst_table_with_layout(entries, layout)?;
                 let container = self
                     .css_handles
                     .get_mut(&container_handle)
@@ -4939,7 +4944,11 @@ impl Host for LoggingHost<'_> {
                 let Some(bytes) = bytes else {
                     return Ok(NativeReturn::Value(0));
                 };
-                let entries = parse_cst_table(&bytes)?;
+                let entries = if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    parse_cst_table(&bytes)?
+                };
                 if table_index == 0 && entries.iter().any(|entry| !entry.data.is_empty()) {
                     return Err(save_script_error(
                         "CST registration data restore needs the absent second input block in the original ABI",
@@ -7048,6 +7057,7 @@ impl HeadlessPlayer {
             .and_then(|binary| cs2_runtime::native_profile::profile_for_pe_sha256(&binary.sha256, None));
         if let Some(binary) = player.scan.engine.primary_executable.as_ref() {
             player.data_services.tasks.message_lists.identify(&binary.sha256);
+            player.data_services.ordinary.identify(&binary.sha256);
             player.data_services.css_task_pe_sha256 = css_task_native::identified_pe_sha256(&binary.sha256);
             player.data_services.particle_external.identify(&binary.sha256);
             player.data_services.emote.initialize(&player.scan.resources, &binary.sha256)
@@ -9829,14 +9839,29 @@ fn save_script_error(message: &'static str) -> cs2_script::ScriptError {
     cs2_script::ScriptError::InvalidStructuredText { offset: 0, message }
 }
 
+enum CstTableLayout {
+    Legacy,
+    Current { include_data: bool },
+}
+
 fn serialize_cst_table(
     entries: &[CstRegistration],
     include_data: bool,
 ) -> cs2_script::Result<Vec<u8>> {
+    serialize_cst_table_with_layout(entries, CstTableLayout::Current { include_data })
+}
+
+fn serialize_cst_table_with_layout(
+    entries: &[CstRegistration],
+    layout: CstTableLayout,
+) -> cs2_script::Result<Vec<u8>> {
     if entries.len() > 1_000_000 {
         return Err(save_script_error("CST table exceeds one million entries"));
     }
-    let mut output = vec![0, 0, 0, 0];
+    let (mut output, header_length, include_data) = match layout {
+        CstTableLayout::Legacy => (Vec::new(), 40, false),
+        CstTableLayout::Current { include_data } => (vec![0, 0, 0, 0], 48, include_data),
+    };
     for entry in entries {
         if !entry.name.contains(&0) {
             return Err(save_script_error("CST table name has no terminator"));
@@ -9856,7 +9881,7 @@ fn serialize_cst_table(
             0
         };
         let mut header = [0u8; 48];
-        output.len().checked_add(48)
+        output.len().checked_add(header_length)
             .and_then(|length| length.checked_add(attachment_bytes))
             .and_then(|length| length.checked_add(if include_data { entry.data.len() } else { 0 }))
             .filter(|&length| length <= 64 * 1024 * 1024)
@@ -9876,7 +9901,7 @@ fn serialize_cst_table(
                 .map_err(|_| save_script_error("CST data offset exceeds DWORD"))?
                 .to_le_bytes(),
         );
-        output.extend_from_slice(&header);
+        output.extend_from_slice(&header[..header_length]);
         for attachment in &entry.attachments {
             output.extend_from_slice(attachment);
         }
@@ -12480,6 +12505,25 @@ mod tests {
         assert_eq!(restored.value, 42);
         assert_eq!(restored.attachments, vec![[0x33; 72]]);
         assert_eq!(restored.data, b"payload");
+
+        let legacy_args: Vec<u8> = [container, 100, context, 1]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(host.call(385, &legacy_args, &mut vm).unwrap(), NativeReturn::Value(1));
+        let legacy = host.css_handles[&container].record(100).unwrap();
+        assert_eq!(legacy.len(), 40 + 72);
+        assert_eq!(&legacy[32..40], &[42, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&legacy[40..], &[0x33; 72]);
+        assert_eq!(host.call(386, &legacy_args, &mut vm).unwrap(), NativeReturn::Value(1));
+        assert!(host.cst_contexts[&context].history[0].data.is_empty());
+
+        let empty_args: Vec<u8> = [container, 101, context, 0]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(host.call(385, &empty_args, &mut vm).unwrap(), NativeReturn::Value(1));
+        assert_eq!(host.css_handles[&container].record(101), Some(&[][..]));
+        let mut clear_history_args = empty_args;
+        clear_history_args[12..16].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(host.call(386, &clear_history_args, &mut vm).unwrap(), NativeReturn::Value(1));
+        assert!(host.cst_contexts[&context].history.is_empty());
     }
 
     #[test]

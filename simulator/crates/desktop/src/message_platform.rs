@@ -2652,6 +2652,14 @@ impl LoggingHost<'_> {
         if empty_source {
             return Ok(NativeReturn::Continue);
         }
+        let target = arguments
+            .get(..4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()));
+        let utate_string_receiver = matches!(index, 611..=621)
+            && target
+                .and_then(|id| self.data_services.tasks.message_task_state(id))
+                .is_some_and(|(kind, _, _)| kind == super::message_native::UTATE_STRING_KIND)
+            && self.bind_utate_plane_input_profile()?;
         self.data_services.message_device.load_fonts(self.resources);
         if !self.data_services.message_device.settings_loaded {
             initialize_settings(self.data_services, self.resources, Some(self.save_root))?;
@@ -2666,6 +2674,7 @@ impl LoggingHost<'_> {
             parents: self.task_parents,
             sender: self.current_task_id,
             drawing_available: self.canvas.is_some(),
+            utate_string_receiver,
         };
         let result = data
             .messages
@@ -2678,6 +2687,18 @@ impl LoggingHost<'_> {
         {
             let id = u32::from_le_bytes(arguments[..4].try_into().unwrap());
             data.messages.legacy.paint_pending(id, context.device)?;
+        }
+        if result.is_ok() && index == 612 && utate_string_receiver {
+            let id = target.unwrap();
+            if let Some((size, _)) = data
+                .messages
+                .object(id)
+                .and_then(|object| object.registered_geometry())
+                && let Some(node) = self.scene_nodes.get_mut(&id)
+            {
+                node.size = size.map(|extent| extent as f32);
+                node.initialized = true;
+            }
         }
         result
     }
@@ -4040,6 +4061,9 @@ impl LoggingHost<'_> {
         if self.data_services.messages.key_selection_done {
             return Ok(true);
         }
+        let retained_selection = self.data_services.messages.input_selection_frame
+            .filter(|previous| previous.checked_add(1) == Some(self.frame))
+            .and(self.input_task.selected_region);
         let mut dispatch = if let Some(pending) = self.data_services.messages.key_selection.take() {
             pending
         } else {
@@ -4049,6 +4073,7 @@ impl LoggingHost<'_> {
                     && !messages.input_geometry.is_dirty()
                     && !messages.input_selection_forced
                     && !messages.device_pointer_moving
+                    && retained_selection.is_none()
                     && messages.input_selection_previous_device.unwrap_or([0; 2])
                         == messages.device_pointer)
             {
@@ -4147,7 +4172,9 @@ impl LoggingHost<'_> {
                                 || self.input_task.selected_region == dispatch.selected)
                         {
                             self.input_task.selected_region = dispatch.selected;
-                            if dispatch.routed_any {
+                            if dispatch.routed_any || retained_selection.is_some_and(|region| {
+                                dispatch.selected == Some(region)
+                            }) {
                                 self.data_services.messages.input_selection_frame =
                                     Some(self.frame);
                             }
@@ -4449,6 +4476,32 @@ impl LoggingHost<'_> {
                         .observe_existing(92, arguments, self.scene_nodes)?;
                 }
             }
+            if self.data_services.messages.owns_utate_string(target)
+                && let Some((super::message_native::UTATE_STRING_KIND, 0, elapsed)) =
+                    self.data_services.tasks.message_task_state(target)
+            {
+                let display = if self.canvas.is_none()
+                    || !self.data_services.message_device.drawing_enabled
+                {
+                    MessagePlaneDisplay::Unreachable
+                } else if self
+                    .scene_nodes
+                    .get(&target)
+                    .is_some_and(|node| node.visible)
+                {
+                    MessagePlaneDisplay::Visible
+                } else {
+                    MessagePlaneDisplay::Hidden
+                };
+                let device = &mut self.data_services.message_device;
+                self.data_services.messages.update_utate_display(
+                    target,
+                    display,
+                    elapsed,
+                    device.time_scale,
+                    device,
+                )?;
+            }
             // Existing plane recursion accepts kind2; forwarding into text is
             // consumed here after those receivers finish their own effects.
             self.forward_message_plane_display(target, value, 0, false)?;
@@ -4701,6 +4754,7 @@ impl LoggingHost<'_> {
             parents: self.task_parents,
             sender: self.current_task_id,
             drawing_available: self.canvas.is_some(),
+            utate_string_receiver: false,
         };
         let Some(route) = context
             .route_message(target)?
@@ -4981,9 +5035,8 @@ impl HeadlessPlayer {
             .get(&owner)
     }
 
-    /// All changed pointer-selection notifications for this frame completed
-    /// through their concrete owners. The legacy focus queue can skip its
-    /// selection fallback, independently of per-physical-event key receipts.
+    /// A typed focus change completed or the typed picker revalidated the
+    /// previous frame's focus. This gates focus only, not physical key edges.
     pub fn host_input_selection_routed(&self) -> bool {
         self.data_services.messages.input_selection_frame == Some(self.state.clock.frame)
     }
@@ -5686,12 +5739,16 @@ impl HeadlessPlayer {
             .collect();
         for id in ids {
             let state = self.data_services.tasks.message_task_state(id);
-            let live = state
-                .is_some_and(|(kind, deletion, _)| matches!(kind, 48 | 63) && deletion == 0)
-                && self
-                    .scene_nodes
-                    .get(&id)
-                    .is_some_and(|node| matches!(node.kind, 48 | 63));
+            let utate = self.data_services.messages.owns_utate_string(id);
+            let live = state.is_some_and(|(kind, deletion, _)| {
+                deletion == 0
+                    && (matches!(kind, 48 | 63)
+                        || (utate && kind == super::message_native::UTATE_STRING_KIND))
+                    && self
+                        .scene_nodes
+                        .get(&id)
+                        .is_some_and(|node| node.kind == kind)
+            });
             if !live {
                 self.data_services.messages.release(id);
                 self.data_services.message_device.release(id as i32);
@@ -5708,6 +5765,7 @@ impl HeadlessPlayer {
                 parents: &self.task_parents,
                 sender: self.current_task_id,
                 drawing_available: true,
+                utate_string_receiver: utate,
             };
             data.messages
                 .frame_update(id, elapsed, &self.scene_nodes, deletion, &mut context)?;
@@ -5798,10 +5856,9 @@ impl HeadlessPlayer {
             let Some(node) = self.scene_nodes.get(&id) else {
                 continue;
             };
-            if !(lower <= node.position[2] && node.position[2] < upper) {
-                continue;
-            }
-            if !matches!(node.kind, 48 | 63) || !node.visible {
+            let utate = node.kind == super::message_native::UTATE_STRING_KIND
+                && self.data_services.messages.owns_utate_string(id);
+            if (!matches!(node.kind, 48 | 63) && !utate) || !node.visible {
                 continue;
             }
             if self
@@ -5810,6 +5867,23 @@ impl HeadlessPlayer {
                 .message_task_state(id)
                 .is_none_or(|(kind, deletion, _)| kind != node.kind || deletion != 0)
             {
+                continue;
+            }
+            let projection = if utate {
+                let mut projected = node.clone();
+                if self.data_services.planes.state(id).is_some() {
+                    let view =
+                        super::plane_native::kx_plane_view(node, &self.data_services.planes)?;
+                    projected.position[0] -= f32::from_bits(view.words[3]);
+                    projected.position[1] -= f32::from_bits(view.words[4]);
+                    projected.position[2] = f32::from_bits(view.words[5]);
+                }
+                Some(projected)
+            } else {
+                None
+            };
+            let node = projection.as_ref().unwrap_or(node);
+            if !(lower <= node.position[2] && node.position[2] < upper) {
                 continue;
             }
             let Some(object) = self.data_services.messages.object(id) else {
@@ -5916,6 +5990,7 @@ struct MessagePlatformContext<'a> {
     parents: &'a BTreeMap<u32, u32>,
     sender: u32,
     drawing_available: bool,
+    utate_string_receiver: bool,
 }
 
 impl MessageBackend for MessagePlatformContext<'_> {
@@ -5951,7 +6026,11 @@ impl MessageBackend for MessagePlatformContext<'_> {
         self.device.layout(configuration, atoms, previous)
     }
     fn decode_user_glyph(&mut self, source: &[u8], frame: u32) -> Result<Option<MessageUserGlyph>> {
-        self.device.decode_user_glyph(source, frame)
+        if self.utate_string_receiver {
+            super::message_native::decode_utate_user_glyph(source, frame)
+        } else {
+            self.device.decode_user_glyph(source, frame)
+        }
     }
     fn paint(&mut self, request: MessageRenderRequest<'_>) -> Result<MessagePaintResult> {
         self.device.paint(request)
@@ -5959,6 +6038,10 @@ impl MessageBackend for MessagePlatformContext<'_> {
 }
 
 impl MessageNativeContext for MessagePlatformContext<'_> {
+    fn utate_string_receiver(&self) -> bool {
+        self.utate_string_receiver
+    }
+
     fn route_message(&mut self, raw_target: u32) -> Result<Option<MessageRoute>> {
         // Mirror TaskTree::route's subtree-then-parent search using the
         // desktop's live parent map. This searches raw zero too.
@@ -5986,12 +6069,12 @@ impl MessageNativeContext for MessagePlatformContext<'_> {
         };
         // Wrong-type handling is left to the adapter's SceneNode check; retain
         // the raw target and deletion so quantity queries get a diagnostic.
-        let display = if !matches!(
+        let text_plane = matches!(
             kind,
             48 | 63 | super::legacy_text_native::LEGACY_STRING_KIND
-        ) || !self.drawing_available
-            || !self.device.drawing_enabled
-        {
+        ) || (self.utate_string_receiver
+            && kind == super::message_native::UTATE_STRING_KIND);
+        let display = if !text_plane || !self.drawing_available || !self.device.drawing_enabled {
             MessagePlaneDisplay::Unreachable
         } else if self.nodes.get(&raw_target).is_some_and(|node| node.visible) {
             MessagePlaneDisplay::Visible
@@ -6275,4 +6358,95 @@ fn decode_font_name(bytes: &[u8]) -> Result<String> {
         text.into_owned()
     };
     Ok(text.trim().to_owned())
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use cs2_runtime::{InputEvent, InputKey};
+
+    #[test]
+    fn typed_focus_survives_overlapping_legacy_region_and_touch_release() {
+        let fixture = std::env::temp_dir().join(format!(
+            "cs2-focus-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos(),
+        ));
+        std::fs::create_dir(&fixture).unwrap();
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = std::fs::remove_dir(&self.0); }
+        }
+        let fixture = Fixture(fixture);
+        let mut player = HeadlessPlayer::open_with_save_root(&fixture.0, fixture.0.join("profile"))
+            .unwrap();
+        let owner = player.current_task_id;
+        let document = cs2_script::FesDocument {
+            sections: vec![cs2_script::FesSection {
+                header: b"START".to_vec(),
+                lines: vec![cs2_script::FesLine { offset: 0, bytes: b"wait 20".to_vec() }],
+            }],
+        };
+        player.with_host(|host| {
+            Ok(host.begin_direct_fes_entry(owner, document, Default::default())?)
+        }).unwrap();
+        player.run_frames(1, 10_000).unwrap();
+        let typed = player.input_task.regions.iter_mut().find(|region| {
+            player.scene_nodes[&region.id()].name == "low button"
+        }).unwrap();
+        let typed_id = typed.id();
+        typed.words[3..7].copy_from_slice(&[5, 5, 25, 25]);
+        let mut legacy = typed.words;
+        legacy[0] = 0x7fff_ffff;
+        legacy[1] = i32::MAX as u32;
+        legacy[7] = 0;
+        legacy[9] = 0;
+        player.input_task.regions.insert(0, crate::InputRegionState { words: legacy });
+        player.apply_host_input(InputEvent::FocusChanged(true)).unwrap();
+        let inside = InputEvent::MouseMove { x: 10, y: 10 };
+        assert_eq!(player.input_region_at([10, 10]).unwrap()[0], legacy[0]);
+        assert_eq!(player.masked_input_region_at([10, 10]).unwrap().unwrap()[0], typed_id);
+        player.apply_host_input(inside.clone()).unwrap();
+        player.run_frames(1, 10_000).unwrap();
+        assert_eq!(player.input_task.selected_region, Some(typed_id));
+
+        for _ in 0..2 {
+            player.run_frames(1, 10_000).unwrap();
+            assert_eq!(player.input_task.selected_region, Some(typed_id));
+            assert!(player.host_input_selection_routed());
+        }
+        player.set_host_input_geometry_tracking(true);
+        let mut binding = DeviceBinding { enabled: true, ..Default::default() };
+        binding.codes[ButtonSource::Mouse.index()][0] = 1;
+        player.set_device_key_binding(0, binding).unwrap();
+        let button = InputKey::MouseButton(0);
+        player.apply_host_input(InputEvent::KeyDown(button.clone())).unwrap();
+        player.run_frames(1, 10_000).unwrap();
+        assert!(player.state.input.is_pressed(&button));
+        assert_eq!(player.device_key_scan_state().records()[0][0].mask, 2);
+        player.apply_host_input(inside.clone()).unwrap();
+        player.apply_host_input(InputEvent::KeyUp(button.clone())).unwrap();
+        player.run_frames(1, 10_000).unwrap();
+        assert!(!player.state.input.is_pressed(&button));
+        assert_eq!(player.input_task.selected_region, Some(typed_id));
+        player.run_frames(1, 10_000).unwrap();
+        assert_eq!(player.device_key_scan_state().records()[0][0].mask, 0);
+        assert!(player.host_input_route_receipts().iter().any(|receipt| {
+            receipt.region == typed_id && receipt.pressed == 0
+                && receipt.physical.iter().any(|button| button.source == ButtonSource::Mouse)
+        }));
+        assert_eq!(player.input_task.selected_region, Some(typed_id));
+
+        player.apply_host_input(InputEvent::MouseMove { x: 40, y: 32 }).unwrap();
+        player.run_frames(1, 10_000).unwrap();
+        assert_eq!(player.input_task.selected_region, None);
+        player.apply_host_input(inside).unwrap();
+        player.run_frames(1, 10_000).unwrap();
+        assert_eq!(player.input_task.selected_region, Some(typed_id));
+        player.input_task.regions.retain(|region| region.id() != typed_id);
+        player.run_frames(1, 10_000).unwrap();
+        assert!(!player.host_input_selection_routed());
+        assert_eq!(player.input_task.selected_region, Some(legacy[0]));
+    }
 }

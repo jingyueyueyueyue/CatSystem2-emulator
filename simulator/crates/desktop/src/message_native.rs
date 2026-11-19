@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use cs2_renderer::{AnimationFrameSelection, HgContainer, HgTagKind, RgbaFrame, inspect_hg};
 use cs2_runtime::message_object::{
     ButtonSource, DeviceKeys, InputHitMask, InputRouteReceipt, Keys, MESSAGE_CONFIGURATION_SIZE,
-    MESSAGE_OBJECT_TYPE, MessageBackend, MessageCommandResult, MessageDefaults, MessageEncoding,
-    MessageObject, MessageObjectSnapshot, MessagePlaneDisplay, MessageRevealUpdate,
-    MessageTextInputState, MessageUserGlyph, PointerMoveState, WheelButtons, extract_message_body,
+    MESSAGE_OBJECT_TYPE, MessageBackend, MessageCommandResult, MessageCopy, MessageDefaults,
+    MessageEncoding, MessageObject, MessageObjectSnapshot, MessagePlaneDisplay,
+    MessageRevealUpdate, MessageTextInputState, MessageUserGlyph, PointerMoveState, WheelButtons,
+    extract_message_body,
 };
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
@@ -23,6 +24,8 @@ pub(super) const SUPPORTED_SLOTS: [u32; 13] = [
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OBJECTS: usize = 65_536;
+pub(super) const UTATE_STRING_KIND: u32 = 47;
+const UTATE_CONFIG_SIZE: usize = 0xbc;
 
 const BODY_NATIVES: &[(u32, usize, MessageEncoding)] = &[
     (392, 2, MessageEncoding::Cp932),
@@ -89,6 +92,9 @@ pub(super) struct MessageRoute {
 /// single-frame image handle does not carry the correct lifetime or frame ids.
 pub(super) trait MessageNativeContext: MessageBackend {
     fn route_message(&mut self, raw_target: u32) -> Result<Option<MessageRoute>>;
+    fn utate_string_receiver(&self) -> bool {
+        false
+    }
     fn raw_message_image(&mut self, handle: u32) -> Result<Vec<u8>>;
     /// Old command117 takes the current pixels of an image wrapper, unlike
     /// new command464's retained, multi-frame raw image resource.
@@ -112,6 +118,7 @@ pub(super) struct MessageNativeServices {
     /// Resource/startup font defaults, captured before private user overrides.
     pub(super) font_panel_defaults: Option<MessageDefaults>,
     pub(super) legacy: super::legacy_text_native::LegacyTextNativeServices,
+    utate_visibility: BTreeMap<u32, bool>,
     pub(super) text_input: MessageTextInputState,
     pub(super) device_keys: DeviceKeys,
     pub(super) device_keys_loaded: bool,
@@ -202,6 +209,32 @@ impl MessageNativeServices {
     pub(super) fn owns_task(&self, id: u32) -> bool {
         self.objects.contains_key(&id) || self.legacy.object(id).is_some()
     }
+    pub(super) fn owns_utate_string(&self, id: u32) -> bool {
+        self.utate_visibility.contains_key(&id)
+    }
+
+    pub(super) fn update_utate_display(
+        &mut self,
+        id: u32,
+        display: MessagePlaneDisplay,
+        elapsed: u32,
+        scale: Option<u32>,
+        backend: &mut impl MessageBackend,
+    ) -> Result<Option<MessageRevealUpdate>> {
+        let Some(previous) = self.utate_visibility.get_mut(&id) else {
+            return Ok(None);
+        };
+        *previous = display == MessagePlaneDisplay::Visible;
+        let object = self.objects.get_mut(&id).unwrap();
+        start_utate_string(
+            object,
+            object.segment_limit(),
+            display,
+            elapsed,
+            scale,
+            backend,
+        )
+    }
     pub(super) fn supports(index: u32) -> bool {
         SUPPORTED_SLOTS.contains(&index)
             || matches!(
@@ -278,6 +311,7 @@ impl MessageNativeServices {
         self.fes_button_controllers.remove(&id);
         self.fes_button_owners.remove(&id);
         self.legacy.release(id);
+        self.utate_visibility.remove(&id);
         self.plane_show.remove(&id);
         self.pending_display.retain(|(target, _)| *target != id);
         self.objects.remove(&id)
@@ -336,6 +370,31 @@ impl MessageNativeServices {
         deletion: u32,
         context: &mut impl MessageNativeContext,
     ) -> Result<Option<MessageRevealUpdate>> {
+        if let Some(previous) = self.utate_visibility.get_mut(&id) {
+            if deletion != 0 {
+                return Ok(None);
+            }
+            let Some(node) = nodes.get(&id).filter(|node| node.kind == UTATE_STRING_KIND) else {
+                return Ok(None);
+            };
+            let scale = context.message_time_scale();
+            if node.visible != *previous {
+                let display = if node.visible {
+                    MessagePlaneDisplay::Visible
+                } else {
+                    MessagePlaneDisplay::Hidden
+                };
+                return self.update_utate_display(id, display, elapsed, scale, context);
+            }
+            if !node.visible {
+                return Ok(None);
+            }
+            return self
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .frame_update(elapsed, scale, context);
+        }
         if deletion != 0
             || nodes
                 .get(&id)
@@ -392,6 +451,21 @@ impl MessageNativeServices {
         // the target, clear an existing source, or touch the image registry.
         if index == 620 && word(1) == 0 {
             return Ok(NativeReturn::Continue);
+        }
+        if matches!(index, 611..=621) && context.utate_string_receiver() {
+            let route = context.route_message(word(0))?.filter(|route| {
+                route.deletion == 0
+                    && nodes
+                        .get(&route.id)
+                        .is_some_and(|node| node.kind == UTATE_STRING_KIND)
+            });
+            return match route {
+                Some(route) => self.call_utate_string(index, arguments, vm, route, context),
+                None if index == 616 => Err(invalid(
+                    "Utate layout query has no reachable live kind-47 handler",
+                )),
+                None => Ok(NativeReturn::Continue),
+            };
         }
 
         // Buffer packaging happens before command dispatch. A valid nonzero
@@ -501,11 +575,387 @@ impl MessageNativeServices {
         }
         result
     }
+
+    fn call_utate_string(
+        &mut self,
+        index: u32,
+        arguments: &[u8],
+        vm: &mut Vm,
+        route: MessageRoute,
+        context: &mut impl MessageNativeContext,
+    ) -> Result<NativeReturn> {
+        let word = |index: usize| {
+            u32::from_le_bytes(arguments[index * 4..index * 4 + 4].try_into().unwrap())
+        };
+        let scale = context.message_time_scale();
+        if index == 611 {
+            if vm.read(word(1), 4)? == (UTATE_CONFIG_SIZE as u32).to_le_bytes() {
+                let defaults = self.defaults.as_ref().ok_or_else(|| {
+                    invalid("message default configuration has not been supplied")
+                })?;
+                vm.write(word(1), &utate_config_defaults(defaults)?)?;
+            }
+            return Ok(NativeReturn::Continue);
+        }
+        if index == 612 {
+            self.register(route.id)?;
+            self.utate_visibility.entry(route.id).or_insert(false);
+        }
+        let object = self
+            .objects
+            .get_mut(&route.id)
+            .filter(|_| self.utate_visibility.contains_key(&route.id));
+        let Some(object) = object else {
+            return if index == 616 {
+                Err(invalid(
+                    "Utate layout query requires native612 initialization",
+                ))
+            } else {
+                Ok(NativeReturn::Continue)
+            };
+        };
+        match index {
+            612 | 613 => {
+                let address = word(1);
+                if vm.read(address, 4)? == (UTATE_CONFIG_SIZE as u32).to_le_bytes() {
+                    let bytes = translate_utate_config(&vm.read(address, UTATE_CONFIG_SIZE)?)?;
+                    if index == 612 {
+                        object.recreate(&bytes, scale, context)?;
+                    } else if object.configured() {
+                        object.reconfigure(&bytes, scale, context)?;
+                        start_utate_string(
+                            object,
+                            object.segment_limit(),
+                            route.display,
+                            route.elapsed,
+                            scale,
+                            context,
+                        )?;
+                    }
+                } else if index == 612 {
+                    object.clear_with_backend(context)?;
+                }
+            }
+            616 => {
+                let complete = !object.configured() || object.remaining_all()? == 0;
+                return Ok(NativeReturn::Value(u32::from(complete)));
+            }
+            _ if !object.configured() => {}
+            614 => {
+                let text = expand_kcs_format(vm, &vm.read_string(word(1))?, 0)?;
+                let text = text.split(|&byte| byte == 0).next().unwrap_or_default();
+                object.append(text)?;
+                object.prepare(scale, context)?;
+            }
+            615 => {
+                object.clear_with_backend(context)?;
+                object.prepare(scale, context)?;
+            }
+            617 if route.display == MessagePlaneDisplay::Visible => {
+                let limit = object.segment_limit();
+                object.start(
+                    u32::MAX,
+                    MessagePlaneDisplay::Hidden,
+                    route.elapsed,
+                    scale,
+                    context,
+                )?;
+                object.advance_display(u32::MAX, MessageCopy::Full, context)?;
+                object.start(
+                    limit,
+                    MessagePlaneDisplay::Hidden,
+                    route.elapsed,
+                    scale,
+                    context,
+                )?;
+            }
+            617 => {}
+            618 => {
+                object.append_separator()?;
+                object.prepare(scale, context)?;
+            }
+            619 => {
+                start_utate_string(
+                    object,
+                    word(1),
+                    route.display,
+                    route.elapsed,
+                    scale,
+                    context,
+                )?;
+            }
+            620 => object.set_user_glyph_source(Some(context.raw_message_image(word(1))?))?,
+            621 => object.map_user_glyph(word(1), word(2), context)?,
+            _ => return Err(ScriptError::UnimplementedNativeCall { index }),
+        }
+        if index == 612 && object.configured() {
+            object.prepare(scale, context)?;
+        }
+        Ok(NativeReturn::Continue)
+    }
+}
+
+fn start_utate_string(
+    object: &mut MessageObject,
+    limit: u32,
+    display: MessagePlaneDisplay,
+    elapsed: u32,
+    scale: Option<u32>,
+    backend: &mut impl MessageBackend,
+) -> Result<Option<MessageRevealUpdate>> {
+    if display == MessagePlaneDisplay::Visible
+        && object
+            .configuration()
+            .is_some_and(|config| config.display_mode() == 0)
+    {
+        object.start(limit, MessagePlaneDisplay::Hidden, elapsed, scale, backend)?;
+        object.prepare(scale, backend)?;
+        return object
+            .advance_display(u32::MAX, MessageCopy::Full, backend)
+            .map(Some);
+    }
+    object.start(limit, display, elapsed, scale, backend)
+}
+
+fn utate_config_defaults(defaults: &MessageDefaults) -> Result<[u8; UTATE_CONFIG_SIZE]> {
+    let modern = defaults.configuration(MessageEncoding::Cp932)?;
+    let mut bytes = [0; UTATE_CONFIG_SIZE];
+    bytes[..4].copy_from_slice(&(UTATE_CONFIG_SIZE as u32).to_le_bytes());
+    bytes[4..0x80].copy_from_slice(&modern.bytes()[8..0x84]);
+    let name = String::from_utf16_lossy(&modern.font_name());
+    let (encoded, _, _) = encoding_rs::SHIFT_JIS.encode(&name);
+    let mut length = encoded.len().min(31);
+    while encoding_rs::SHIFT_JIS
+        .decode_without_bom_handling_and_without_replacement(&encoded[..length])
+        .is_none()
+    {
+        length -= 1;
+    }
+    bytes[0x80..0x80 + length].copy_from_slice(&encoded[..length]);
+    bytes[0xa0..0xb0].copy_from_slice(&modern.bytes()[0xc4..0xd4]);
+    Ok(bytes)
+}
+
+fn translate_utate_config(legacy: &[u8]) -> Result<[u8; MESSAGE_CONFIGURATION_SIZE]> {
+    let mut bytes = [0; MESSAGE_CONFIGURATION_SIZE];
+    bytes[..4].copy_from_slice(&(MESSAGE_CONFIGURATION_SIZE as u32).to_le_bytes());
+    let gradual = legacy[0x6c..0x70] != [0; 4];
+    bytes[4..8].copy_from_slice(&u32::from(gradual).to_le_bytes());
+    bytes[8..0x84].copy_from_slice(&legacy[4..0x80]);
+    let name = legacy[0x80..0xa0]
+        .split(|&byte| byte == 0)
+        .next()
+        .unwrap_or_default();
+    let name = encoding_rs::SHIFT_JIS
+        .decode_without_bom_handling_and_without_replacement(name)
+        .ok_or_else(|| invalid("Utate layout font name is not valid CP932"))?;
+    for (target, unit) in bytes[0x84..0xc4]
+        .chunks_exact_mut(2)
+        .take(31)
+        .zip(name.encode_utf16())
+    {
+        target.copy_from_slice(&unit.to_le_bytes());
+    }
+    bytes[0xc4..0xd4].copy_from_slice(&legacy[0xa0..0xb0]);
+    bytes[0xe4..0xe8].copy_from_slice(&legacy[0xb8..0xbc]);
+    Ok(bytes)
 }
 
 struct ConfigurationBorrow {
     address: u32,
     bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+mod utate_tests {
+    use super::*;
+    use cs2_runtime::message_object::{
+        MessageAtom, MessageConfiguration, MessageLayout, MessageLayoutEntry, MessagePaintResult,
+        MessageRenderRequest,
+    };
+
+    struct Backend {
+        legacy: bool,
+        deletion: u32,
+        display: MessagePlaneDisplay,
+        completed_glyphs: usize,
+    }
+
+    impl MessageBackend for Backend {
+        fn layout(
+            &mut self,
+            _config: &MessageConfiguration,
+            atoms: &[MessageAtom],
+            _previous: Option<&MessageLayout>,
+        ) -> Result<MessageLayout> {
+            Ok(MessageLayout {
+                entries: (0..atoms.len())
+                    .map(|atom| MessageLayoutEntry {
+                        atom: Some(atom),
+                        position: [0, 0],
+                        size: [1, 1],
+                        line: 0,
+                        display_anchor: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        }
+
+        fn clear_message(&mut self, _object: &MessageObject) -> Result<()> {
+            self.completed_glyphs = 0;
+            Ok(())
+        }
+
+        fn decode_user_glyph(
+            &mut self,
+            _source: &[u8],
+            _frame: u32,
+        ) -> Result<Option<MessageUserGlyph>> {
+            Ok(None)
+        }
+
+        fn paint(&mut self, request: MessageRenderRequest<'_>) -> Result<MessagePaintResult> {
+            self.completed_glyphs += request.process.len();
+            Ok(MessagePaintResult {
+                prepared: request.prepare.to_vec(),
+                completed: request.process.to_vec(),
+                ..Default::default()
+            })
+        }
+    }
+
+    impl MessageNativeContext for Backend {
+        fn route_message(&mut self, id: u32) -> Result<Option<MessageRoute>> {
+            Ok(Some(MessageRoute {
+                id,
+                deletion: self.deletion,
+                display: self.display,
+                elapsed: 5,
+            }))
+        }
+        fn utate_string_receiver(&self) -> bool {
+            self.legacy
+        }
+        fn raw_message_image(&mut self, _handle: u32) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn message_time_scale(&self) -> Option<u32> {
+            Some(60)
+        }
+        fn legacy_frame_rate(&self) -> u32 {
+            60
+        }
+    }
+
+    #[test]
+    fn utate_layout_native616_reports_pending_glyphs_across_segments() {
+        let mut services = MessageNativeServices {
+            defaults: Some(MessageDefaults {
+                font_name: "\u{ff2d}\u{ff33} Gothic".encode_utf16().collect(),
+                bold: true,
+                shadow: 2,
+                outline: 1,
+                glyph_parameter: None,
+                gradual: true,
+            }),
+            ..Default::default()
+        };
+        let program = cs2_script::KcsProgram::from_code(&[0x3b], Vec::new(), 0).unwrap();
+        let mut vm = Vm::from_program(program).unwrap();
+        let mut original = [0xee; UTATE_CONFIG_SIZE + 4];
+        original[..4].copy_from_slice(&(UTATE_CONFIG_SIZE as u32).to_le_bytes());
+        let config = vm.allocate_region(&original).unwrap();
+        let bad = vm.allocate_region(&[4, 0, 0, 0]).unwrap();
+        let text = vm.allocate_region(b"AB\0").unwrap();
+        let id = 17u32;
+        let mut nodes = BTreeMap::from([(
+            id,
+            SceneNode::new(id, UTATE_STRING_KIND, 10, "string".into()),
+        )]);
+        let mut backend = Backend {
+            legacy: false,
+            deletion: 0,
+            display: MessagePlaneDisplay::Hidden,
+            completed_glyphs: 0,
+        };
+        let invoke = |services: &mut MessageNativeServices,
+                      index,
+                      extra: &[u32],
+                      vm: &mut Vm,
+                      nodes: &BTreeMap<_, _>,
+                      backend: &mut Backend| {
+            let args: Vec<u8> = std::iter::once(id)
+                .chain(extra.iter().copied())
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            services.call(index, &args, vm, nodes, backend)
+        };
+        let mut call = |index, extra: &[u32]| {
+            invoke(&mut services, index, extra, &mut vm, &nodes, &mut backend)
+        };
+        assert!(call(616, &[]).is_err());
+        backend.legacy = true;
+        let mut call = |index, extra: &[u32]| {
+            invoke(&mut services, index, extra, &mut vm, &nodes, &mut backend).unwrap()
+        };
+        call(611, &[bad]);
+        call(611, &[config]);
+        assert_eq!(vm.read(bad, 4).unwrap(), [4, 0, 0, 0]);
+        let defaults = vm.read(config, original.len()).unwrap();
+        assert_eq!(&defaults[4..12], &[0x20, 3, 0, 0, 0x58, 2, 0, 0]);
+        assert_eq!(&defaults[0x6c..0x70], &[0; 4]);
+        assert_eq!(&defaults[0x80..0x84], &[0x82, 0x6c, 0x82, 0x72]);
+        assert_eq!(&defaults[0xa0..0xa4], &700u32.to_le_bytes());
+        assert_eq!(&defaults[UTATE_CONFIG_SIZE..], &[0xee; 4]);
+        let mut call = |index, extra: &[u32]| {
+            invoke(&mut services, index, extra, &mut vm, &nodes, &mut backend).unwrap()
+        };
+        call(612, &[config]);
+        call(618, &[]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(1));
+        call(614, &[text]);
+        call(613, &[bad]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(0));
+        call(617, &[]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(0));
+        backend.display = MessagePlaneDisplay::Visible;
+        let mut call = |index, extra: &[u32]| {
+            invoke(&mut services, index, extra, &mut vm, &nodes, &mut backend).unwrap()
+        };
+        call(619, &[0]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(0));
+        call(619, &[1]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(1));
+        assert_eq!(backend.completed_glyphs, 2);
+        let mut call = |index, extra: &[u32]| {
+            invoke(&mut services, index, extra, &mut vm, &nodes, &mut backend).unwrap()
+        };
+        call(614, &[text]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(0));
+        call(615, &[]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(1));
+        call(614, &[text]);
+        call(612, &[config]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(1));
+        backend.deletion = 1;
+        assert!(invoke(&mut services, 616, &[], &mut vm, &nodes, &mut backend).is_err());
+        assert!(services.release(id).is_some());
+        assert!(!services.owns_utate_string(id));
+
+        backend.legacy = false;
+        backend.deletion = 0;
+        nodes.get_mut(&id).unwrap().kind = MESSAGE_OBJECT_TYPE;
+        let mut modern = [0; MESSAGE_CONFIGURATION_SIZE];
+        modern[..4].copy_from_slice(&(MESSAGE_CONFIGURATION_SIZE as u32).to_le_bytes());
+        let modern = vm.allocate_region(&modern).unwrap();
+        let mut call = |index, extra: &[u32]| {
+            invoke(&mut services, index, extra, &mut vm, &nodes, &mut backend).unwrap()
+        };
+        call(611, &[modern]);
+        call(612, &[modern]);
+        assert_eq!(call(616, &[]), NativeReturn::Value(0));
+    }
 }
 
 impl ConfigurationBorrow {
@@ -539,25 +989,41 @@ pub(super) fn decode_inline_image(source: &[u8], frame_id: u32) -> Result<Option
 }
 
 pub(super) fn decode_user_glyph(source: &[u8], frame_id: u32) -> Result<Option<MessageUserGlyph>> {
+    decode_user_glyph_frame(source, frame_id, false)
+}
+
+pub(super) fn decode_utate_user_glyph(
+    source: &[u8],
+    frame_id: u32,
+) -> Result<Option<MessageUserGlyph>> {
+    decode_user_glyph_frame(source, frame_id, true)
+}
+
+fn decode_user_glyph_frame(
+    source: &[u8],
+    frame_id: u32,
+    legacy: bool,
+) -> Result<Option<MessageUserGlyph>> {
     let inspection = inspect_hg(source)
         .map_err(|_| invalid("message user glyph source is not a supported HG image"))?;
-    if inspection.container != HgContainer::Hg3V300 {
+    if !legacy && inspection.container != HgContainer::Hg3V300 {
         return Err(invalid("message user glyph requires native 32-bit HG-3"));
     }
     let Some(info) = inspection.frame(frame_id) else {
         return Ok(None);
     };
-    if info.bit_depth != 32
-        || !info
-            .tags
-            .iter()
-            .any(|tag| tag.kind == HgTagKind::NativeImage)
-        || info.tags.iter().any(|tag| {
-            matches!(
-                tag.kind,
-                HgTagKind::Jpeg | HgTagKind::Wbp | HgTagKind::Jpa | HgTagKind::ImageSlice
-            )
-        })
+    if !legacy
+        && (info.bit_depth != 32
+            || !info
+                .tags
+                .iter()
+                .any(|tag| tag.kind == HgTagKind::NativeImage)
+            || info.tags.iter().any(|tag| {
+                matches!(
+                    tag.kind,
+                    HgTagKind::Jpeg | HgTagKind::Wbp | HgTagKind::Jpa | HgTagKind::ImageSlice
+                )
+            }))
     {
         return Err(invalid(
             "message user glyph frame is not native 32-bit HG-3",

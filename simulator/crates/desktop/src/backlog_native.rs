@@ -228,7 +228,11 @@ impl LoggingHost<'_> {
         let mut words = command.split(|&byte| byte == b' ').filter(|word| !word.is_empty());
         if words.next() != Some(configured) { return Ok(false); }
         for argument in words {
-            if self.backlog_resource(b"sound", argument, true)?.is_some() { return Ok(true); }
+            let source = String::from_utf8(cp932_to_utf8(argument)).expect("CP932 conversion emits UTF-8");
+            let names = self.media_category_candidates(b"sound", &source)?.unwrap_or_default();
+            for name in names {
+                if self.backlog_read(&name, true)?.is_some() { return Ok(true); }
+            }
         }
         Ok(false)
     }
@@ -241,7 +245,9 @@ impl LoggingHost<'_> {
         // same legacy category resolver, without an implicit conversion.
         let name = String::from_utf8(cp932_to_utf8(bytes)).expect("CP932 conversion emits UTF-8");
         let names = self.resources.category_names(category, &name)
-            .map_err(|_| native_state_error("backlog resource category resolution failed"))?;
+            .map_err(|cause| super::native_state_error_owned(format!(
+                "backlog resource {category:?}/{name:?} category resolution failed: {cause}"
+            )))?;
         for name in names {
             if let Some(bytes) = self.backlog_read(&name, existence)? { return Ok(Some((name, bytes))); }
         }
@@ -296,4 +302,34 @@ fn append_bounded(target: &mut Vec<u8>, source: &[u8], capacity: usize) -> Resul
     }
     target.extend_from_slice(source);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn backlog_resolves_voice_by_its_configured_archive() -> anyhow::Result<()> {
+        let serial = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-backlog-{}-{serial}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let result = (|| {
+            std::fs::create_dir(root.join("config"))?;
+            std::fs::create_dir(root.join("voice"))?;
+            std::fs::write(root.join("config/startup.xml"), concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><document>",
+                "<VOICE><v00><head>voice_</head><int>pcm_a</int></v00></VOICE>",
+                "<INT><int01><name>pcm_a</name><int>pcm_a.int</int><ext>ogg</ext>",
+                "<dir>voice</dir></int01></INT></document>"
+            ))?;
+            std::fs::write(root.join("voice/voice_001.ogg"), [])?;
+            let mut player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"))?;
+            player.with_host(|host| {
+                assert!(host.backlog_sound_exists(b"pcm", b"pcm voice_001")?);
+                assert!(!host.backlog_sound_exists(b"pcm", b"pcm voice_002")?);
+                assert!(!host.backlog_sound_exists(b"pcm", b"pcm no_such_category")?);
+                Ok(())
+            })
+        })();
+        std::fs::remove_dir_all(root)?;
+        result
+    }
 }

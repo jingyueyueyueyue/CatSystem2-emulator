@@ -150,12 +150,41 @@ impl FesRuntime {
         let bank = bank
             .map(|source| driver.evaluate_parameter(source, command.context.current, expression))
             .transpose()?;
+        let subcommand = ascii_command(subcommand)?;
+        if subcommand == "getsize" && driver.adapter.object(name_bytes).is_some_and(|object|
+            object.definition.kind_name == b"IMAGE"
+        ) {
+            let bank = match bank {
+                Some(bank) if bank >= 0 => bank,
+                None if driver.adapter.object(name_bytes).is_some_and(|object|
+                    object.definition.bank_count == 1
+                ) => 0,
+                _ => return Ok(true),
+            };
+            let targets = self.driver_media_targets(&name, name_bytes, Some(bank), driver)?;
+            let [Target::Image(key)] = targets.as_slice() else { return Ok(true); };
+            let [width, height] = self.media[key].navigation.size;
+            let mut destinations = [-1; 3];
+            for (destination, source) in destinations.iter_mut().zip(&command.parameters[2..]) {
+                *destination = driver.evaluate_parameter(source, command.context.current, expression)?;
+            }
+            for (destination, value) in destinations.into_iter().zip([width, height, 0]) {
+                if let Some(slot) = expression.shared.get_mut(destination as usize) {
+                    *slot = value;
+                }
+            }
+            events.push(LogicEvent {
+                frame,
+                kind: "fes-media".into(),
+                detail: format!("object={name:?} bank={bank} command=getsize size={width},{height}"),
+            });
+            return Ok(true);
+        }
         let targets = self.driver_media_targets(&name, name_bytes, bank, driver)?;
         if targets.is_empty() {
             driver.fallback_command(command, expression)?;
             return Ok(true);
         }
-        let subcommand = ascii_command(subcommand)?;
         if !matches!(
             subcommand.as_str(),
             "pos"

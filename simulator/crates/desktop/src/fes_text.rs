@@ -11,7 +11,7 @@ use cs2_runtime::message_object::{
     MessageCopy, MessageDefaults, MessageEncoding, MessageObject,
     MessagePlaneDisplay,
 };
-use cs2_script::{ExpressionState, FesEvent, FesObjectDefinition, FesObjectInitialization};
+use cs2_script::{Expression, ExpressionState, FesEvent, FesObjectDefinition, FesObjectInitialization};
 
 use super::fes_driver::{
     FesDriverCommand, FesDriverEffect, FesDriverWait, FesScriptDriver,
@@ -613,6 +613,22 @@ impl FesTextStore {
                     }
                 }
             }
+            b"pos2" if args.first().is_some_and(|source| !numeric_position_parameter(source)) => {
+                let Some(resource) = args.first() else { return Ok(true) };
+                if resource.len() > 127 || resource.contains(&0) {
+                    bail!("STRING POS2 resource exceeds its bounded field");
+                }
+                let frame = optional_number(args, 1, 0, driver, shared)? as u32;
+                let reference = cs2_runtime::fes_controls::MetadataReference {
+                    name: host.data_services.language.languages.expand_image(resource)?,
+                    frame,
+                };
+                for key in &keys {
+                    let record = self.banks.get_mut(key).unwrap();
+                    record.metadata.position_source = Some(reference.clone());
+                    if let Some(log) = &mut record.log { log.geometry_dirty = true; }
+                }
+            }
             b"pos" | b"pos2" | b"org" | b"vram" | b"size" | b"size2" | b"scale" => {
                 let old = &self.banks[&keys[0]];
                 let current = match verb {
@@ -625,7 +641,10 @@ impl FesTextStore {
                 for key in &keys {
                     let record = self.banks.get_mut(key).unwrap();
                     match verb {
-                        b"pos" | b"pos2" => record.position = values,
+                        b"pos" | b"pos2" => {
+                            record.position = values;
+                            record.metadata.position_source = None;
+                        }
                         b"org" => record.origin = values,
                         b"vram" => { record.vram = values; record.dirty = true; }
                         b"size" | b"size2" => record.set_size(values)?,
@@ -1399,6 +1418,10 @@ fn write_shared(shared: &mut ExpressionState, index: i32, value: i32) {
 }
 fn optional_number(args: &[Vec<u8>], index: usize, default: i32, driver: &mut FesScriptDriver, shared: &mut ExpressionState) -> Result<i32> {
     match args.get(index) { Some(value) => driver.evaluate_parameter(value, default, shared), None => Ok(default) }
+}
+fn numeric_position_parameter(source: &[u8]) -> bool {
+    matches!(source.first(), Some(b'0'..=b'9' | b'+' | b'-' | b'#' | b'$' | b'(' | b'@'))
+        && Expression::parse(source).is_ok()
 }
 fn property_number(args: &[Vec<u8>], index: usize, current: i32, driver: &mut FesScriptDriver, shared: &mut ExpressionState) -> Result<i32> {
     optional_number(args, index, current, driver, shared)

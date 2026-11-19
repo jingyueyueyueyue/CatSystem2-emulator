@@ -3,12 +3,14 @@
 use super::EmoteNativeServices;
 use crate::{LoggingHost, native_state_error, read_u32};
 use crate::native_tasks::OwnedTaskBuffers;
+use cs2_renderer::BlendMode;
 use cs2_runtime::{TaskCommand, TaskCommandOutcome};
 use cs2_runtime::emote::{CpuDriverTransform, EmoteError};
 use cs2_script::{NativeReturn, Result, Vm};
 
 #[derive(Clone, Copy)]
 pub(super) struct Placement {
+    pub blend: BlendMode,
     pub profile_position: [f32; 2],
     pub profile_scale: f32,
     pub scale_offset: [f32; 2],
@@ -20,7 +22,7 @@ pub(super) struct Placement {
 
 impl Default for Placement {
     fn default() -> Self {
-        Self { profile_position: [0.0; 2], profile_scale: 1.0,
+        Self { blend: BlendMode::SourceOver, profile_position: [0.0; 2], profile_scale: 1.0,
             scale_offset: [0.0; 2], position: [0.0; 2], position_linked: false, scale: [1.0; 2], rotation: 0.0 }
     }
 }
@@ -52,10 +54,32 @@ impl LoggingHost<'_> {
     pub(crate) fn emote_geometry_native(
         &mut self, index: u32, arguments: &[u8],
     ) -> Result<Option<NativeReturn>> {
-        if !matches!(index, 84 | 93 | 101) || arguments.len() < 4 { return Ok(None); }
+        if !matches!(index, 84 | 85 | 93 | 101 | 402) || arguments.len() < 4 { return Ok(None); }
         let target = read_u32(arguments, 0)?;
         if !self.scene_nodes.get(&target).is_some_and(|node| node.kind == 54) {
             return Ok(None);
+        }
+        if index == 402 {
+            let command = TaskCommand { target: target as i32, sender: self.current_task_id as i32,
+                code: 81, data: [0, read_u32(arguments, 4)?, 0] };
+            let mut buffers = OwnedTaskBuffers::new(None, None)?;
+            let mut output = 0;
+            self.dispatch_registered_task_buffers(command, &mut buffers, &mut output, 4096)?;
+            return Ok(Some(NativeReturn::Continue));
+        }
+        if index == 85 {
+            let selector = read_u32(arguments, 12)?;
+            let query = TaskCommand { target: target as i32, sender: self.current_task_id as i32,
+                code: 61, data: [selector, 0, 1] };
+            let mut buffers = OwnedTaskBuffers::new(None, Some(vec![0; 12]))?;
+            let mut output = 0;
+            self.route_task_command_buffers(query, &mut buffers, &mut output, 4096)?;
+            let mut base = buffers.data1().unwrap().to_vec();
+            base[..8].copy_from_slice(&arguments[4..12]);
+            let mut buffers = OwnedTaskBuffers::new(None, Some(base))?;
+            self.route_task_command_buffers(TaskCommand { code: 49, ..query },
+                &mut buffers, &mut output, 4096)?;
+            return Ok(Some(NativeReturn::Continue));
         }
         if arguments.len() < 20 {
             return Err(native_state_error("M2 geometry wrapper needs five DWORDs"));
@@ -69,6 +93,27 @@ impl LoggingHost<'_> {
             return Ok(Some(NativeReturn::Retry));
         }
         Ok(Some(NativeReturn::Continue))
+    }
+
+    pub(super) fn receive_emote_base(
+        &mut self, command: TaskCommand, buffers: &mut OwnedTaskBuffers,
+    ) -> Result<TaskCommandOutcome> {
+        let node = self.scene_nodes.get_mut(&(command.target as u32))
+            .ok_or_else(|| native_state_error("M2 base command has no live scene node"))?;
+        match command.code {
+            49 => {
+                let depth = buffers.data1().and_then(|bytes| bytes.get(8..12))
+                    .ok_or_else(|| native_state_error("M2 base requires its third owned float word"))?;
+                node.position[2] = f32::from_le_bytes(depth.try_into().unwrap());
+            }
+            61 => {
+                let mut base = [0; 12];
+                base[8..].copy_from_slice(&node.position[2].to_le_bytes());
+                buffers.write_data1(&base)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(TaskCommandOutcome { done: true, propagate: false })
     }
 
     /// These commands place the actual driver player, never its final quad or
