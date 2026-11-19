@@ -1342,7 +1342,7 @@ impl Canvas {
         {
             return self.draw_transformed_frame(frame, options);
         }
-        let Some(bounds) = self.drawable_bounds(
+        let Some((left, top, right, bottom)) = self.drawable_bounds(
             Rect::new(
                 options.position.x,
                 options.position.y,
@@ -1354,8 +1354,30 @@ impl Canvas {
             return Ok(());
         };
 
-        for y in bounds.1..bounds.3 {
-            for x in bounds.0..bounds.2 {
+        if options.scale_x == 1.0
+            && options.scale_y == 1.0
+            && options.filter == ScaleFilter::Nearest
+            && options.blend_mode == BlendMode::SourceOver
+            && options.opacity == 255
+            && options.mask.is_none()
+        {
+            let source_x = (i64::from(left) - i64::from(options.position.x)) as usize;
+            let source_top = (i64::from(top) - i64::from(options.position.y)) as usize;
+            let row_bytes = (right - left) as usize * 4;
+            for (row, y) in (top..bottom).enumerate() {
+                let source_at = ((source_top + row) * frame.width as usize + source_x) * 4;
+                let target_at = (y as usize * self.width as usize + left as usize) * 4;
+                let source = &frame.pixels[source_at..source_at + row_bytes];
+                let target = &mut self.pixels[target_at..target_at + row_bytes];
+                for (target, source) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+                    blend_source_over(target.try_into().unwrap(), source.try_into().unwrap(), 255);
+                }
+            }
+            return Ok(());
+        }
+
+        for y in top..bottom {
+            for x in left..right {
                 let source_x =
                     (f64::from(x) - f64::from(options.position.x)) / f64::from(options.scale_x);
                 let source_y =

@@ -11,6 +11,7 @@
 #include <time.h>
 
 enum { PERF_SCRIPT_DETAIL = 5, PERF_PHASES = 13, PERF_BATCH = 8 };
+enum { FRAME_CHANGED = 1, FRAME_UNCHANGED = 4 };
 
 typedef struct {
     uint64_t phase_ns[PERF_PHASES];
@@ -48,11 +49,13 @@ extern int32_t cs2_android_dialog_result(uint64_t, uint64_t, int32_t);
 extern int32_t cs2_android_input(uint64_t, uint32_t, int32_t, int32_t);
 extern int32_t cs2_android_text(uint64_t, uint32_t, const uint8_t *, size_t, int32_t, int32_t);
 extern int32_t cs2_android_copy_frame(uint64_t, uint8_t *, int32_t, int32_t, int32_t);
+extern int32_t cs2_android_frame_posted(uint64_t);
 extern const char *cs2_android_last_error(void);
 
 #define JNI(name) Java_org_catsystem2_player_PlayerActivity_##name
 #define UNUSED_TYPES (void)type
 #define PERF_TAG "CS2Perf"
+#define STORY_TAG "CS2Story"
 
 typedef struct {
     uint64_t frame;
@@ -94,9 +97,27 @@ static void perf_flush(void) {
     perf.log_rows = 0;
 }
 
+static void perf_append_row(const char *row, size_t length) {
+    if (perf.log_size + length >= sizeof(perf.log_batch)) perf_flush();
+    memcpy(perf.log_batch + perf.log_size, row, length + 1);
+    perf.log_size += length;
+    perf.log_rows++;
+    if (perf.log_rows == PERF_BATCH) perf_flush();
+}
+
+static void perf_record_unchanged(void) {
+    char row[160];
+    const int length = snprintf(row, sizeof(row), "unchanged session=%" PRIu64
+        " frame=%" PRIu64 " step_us=%" PRIu64 " compose_us=%" PRIu64 "\n", perf.handle,
+        perf.tick.frame, perf.tick.step_ns / 1000, perf.tick.timing.phase_ns[4] / 1000);
+    if (length > 0 && (size_t)length < sizeof(row)) perf_append_row(row, (size_t)length);
+    perf.tick = (PerfTick){0};
+}
+
 static void perf_record_post(uint64_t present_start, uint64_t lock_start, uint64_t copy_start,
                              uint64_t post_start, uint64_t posted_at, uint64_t present_end) {
-    const PerfTick *tick = &perf.tick;
+    const PerfTick no_completed_tick = {0};
+    const PerfTick *tick = perf.tick.frame ? &perf.tick : &no_completed_tick;
     const uint64_t interval = perf.last_post_ns ? (posted_at - perf.last_post_ns) / 1000 : 0;
     perf.last_post_ns = posted_at;
     perf.post_sequence++;
@@ -123,13 +144,10 @@ static void perf_record_post(uint64_t present_start, uint64_t lock_start, uint64
         phase[5] / 1000, phase[6] / 1000, phase[7] / 1000, phase[8] / 1000,
         phase[9] / 1000, phase[10] / 1000, phase[11] / 1000, phase[12] / 1000);
     if (length > 0 && (size_t)length < sizeof(row)) {
-        if (perf.log_size + (size_t)length >= sizeof(perf.log_batch)) perf_flush();
-        memcpy(perf.log_batch + perf.log_size, row, (size_t)length + 1);
-        perf.log_size += (size_t)length;
-        perf.log_rows++;
-        if (perf.post_sequence == 1 || perf.log_rows == PERF_BATCH) perf_flush();
+        perf_append_row(row, (size_t)length);
+        if (perf.post_sequence == 1) perf_flush();
     }
-    perf.tick = (PerfTick){0};
+    if (perf.tick.frame) perf.tick = (PerfTick){0};
 }
 
 static char *path_bytes(JNIEnv *env, jbyteArray bytes) {
@@ -190,7 +208,10 @@ JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, j
     for (size_t phase = 0; phase < PERF_PHASES; phase++) {
         perf.tick.timing.phase_ns[phase] += sample.phase_ns[phase];
     }
-    if (result == 1) perf.tick.frame = ++perf.frame_sequence;
+    if (result == FRAME_CHANGED || result == FRAME_UNCHANGED) {
+        perf.tick.frame = ++perf.frame_sequence;
+        if (result == FRAME_UNCHANGED) perf_record_unchanged();
+    }
     return result;
 }
 JNIEXPORT jint JNICALL JNI(nativeSize)(JNIEnv *env, jclass type, jlong handle, jint axis) {
@@ -475,7 +496,7 @@ JNIEXPORT jint JNICALL JNI(nativePresent)(JNIEnv *env, jclass type, jlong handle
             if (timed) post_start = perf_now_ns();
             const int posted = ANativeWindow_unlockAndPost(window);
             if (timed && posted == 0) posted_at = perf_now_ns();
-            if (result == 0) result = posted;
+            if (result == 0) result = posted == 0 ? cs2_android_frame_posted((uint64_t)handle) : posted;
         }
     }
     ANativeWindow_release(window);

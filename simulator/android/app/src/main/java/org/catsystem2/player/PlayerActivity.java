@@ -107,6 +107,10 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
 
     private static final int SELECT_GAME = 1;
     private static final int EXPORT_DIAGNOSTICS = 2;
+    private static final int GAME_TICK_HZ = 60;
+    private static final long MAX_CATCH_UP_MS = 4_000 / GAME_TICK_HZ;
+    private static final int FRAME_CHANGED = 1;
+    private static final int FRAME_UNCHANGED = 4;
     private static final int GAME_MENU_EFFECT_SETTINGS = 40027;
     private static final int GAME_MENU_MESSAGE_LIST = 40047;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -804,7 +808,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                         }
                     });
                 }
-                if (state == 1) {
+                if (state == FRAME_CHANGED) {
                     int width = nativeSize(session, 0);
                     int height = nativeSize(session, 1);
                     if (width > 0 && height > 0 && (frameWidth != width || frameHeight != height)) {
@@ -817,15 +821,13 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                             resizeSurface();
                         });
                     }
-                    long now = SystemClock.uptimeMillis();
-                    completedFrames++;
-                    nextFrame = clockOrigin + completedFrames * 1000 / 60;
-                    if (now - nextFrame > 250) {
-                        clockOrigin += now - nextFrame;
-                        nextFrame = now;
-                    }
                     hasFrame = framePending = true;
-                    presentFrame(target);
+                }
+                if (state == FRAME_CHANGED || state == FRAME_UNCHANGED) {
+                    long planned = clockOrigin + ++completedFrames * 1000 / GAME_TICK_HZ;
+                    nextFrame = Math.max(planned, SystemClock.uptimeMillis() - MAX_CATCH_UP_MS);
+                    clockOrigin += nextFrame - planned;
+                    if (framePending) presentFrame(target);
                 } else {
                     // Script budget continuation stays at the same game tick.
                     nextFrame = SystemClock.uptimeMillis() + 1;

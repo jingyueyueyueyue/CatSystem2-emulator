@@ -19,7 +19,7 @@ use cs2_script::{
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod text;
 use text::{load_font, draw_message_text};
@@ -6868,6 +6868,7 @@ struct PendingFesInput {
 pub struct HeadlessPlayer {
     root: GameRoot,
     scan: GameScan,
+    compatibility: OnceLock<CompatibilityReport>,
     current_task_id: u32,
     save_root: PathBuf,
     default_entry: Option<String>,
@@ -6912,6 +6913,7 @@ pub struct HeadlessPlayer {
     xml_handles: BTreeMap<u32, ConfigXml>,
     next_xml_handle: u32,
     state: RuntimeState,
+    capture_script_evidence: bool,
     loaded: Option<LoadedEntry>,
     vm: Option<Vm>,
     audio_host: DesktopAudioHost,
@@ -6970,6 +6972,7 @@ impl HeadlessPlayer {
         let mut player = Self {
             root,
             scan,
+            compatibility: OnceLock::new(),
             current_task_id: 0,
             save_root,
             default_entry: None,
@@ -7014,6 +7017,7 @@ impl HeadlessPlayer {
             xml_handles: BTreeMap::new(),
             next_xml_handle: 1,
             state: RuntimeState::default(),
+            capture_script_evidence: true,
             loaded: None,
             vm: None,
             audio_host,
@@ -7260,7 +7264,9 @@ impl HeadlessPlayer {
     }
 
     pub fn compatibility_report(&self) -> CompatibilityReport {
-        CompatibilityReport::from_scan(&self.scan)
+        self.compatibility
+            .get_or_init(|| CompatibilityReport::from_scan(&self.scan))
+            .clone()
     }
 
     pub fn queue_message(&mut self, message: [u32; 4]) {
@@ -7699,8 +7705,10 @@ impl HeadlessPlayer {
                         ),
                     }),
                 }
-                self.state.script = ScriptState::from_vm(vm);
-                self.state.script.current_script = self.state.scene.current_script.clone();
+                if self.capture_script_evidence {
+                    self.state.script = ScriptState::from_vm(vm);
+                    self.state.script.current_script = self.state.scene.current_script.clone();
+                }
                 if root_budget_yield {
                     continue;
                 }
@@ -8169,8 +8177,8 @@ impl HeadlessPlayer {
             sound_config_enabled: self.sound_config_enabled,
             frame_hash: self.canvas.hash(),
             frame_size: self.logical_size(),
-            frame_in_progress: self.frame_phase != PlayerFramePhase::Start,
-            frame_rgba: self.canvas.snapshot().rgba().to_vec(),
+            frame_in_progress: self.frame_in_progress(),
+            frame_rgba: self.frame_rgba().to_vec(),
             fes_exit_code: self.data_services.tasks.fes.direct_exit_code(self.current_task_id)
                 .or_else(|| self.fes.as_ref().and_then(|fes| fes.exit_code)),
             events: self.events.clone(),
@@ -8264,6 +8272,7 @@ pub fn run() -> Result<()> {
 fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     let mut player = HeadlessPlayer::open(path)
         .with_context(|| format!("open game directory `{}`", path.display()))?;
+    player.capture_script_evidence = false;
     player.enable_host_window_requests();
     player.initialize_general_window_host(1)?;
     // Both Windows presenters consume one logical input tick at 60 Hz.
@@ -8272,27 +8281,45 @@ fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     Ok(player)
 }
 
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct WindowDiagnostics {
+    checked_events: usize,
+}
+
+#[cfg(any(windows, test))]
+impl WindowDiagnostics {
+    fn check_and_limit(&mut self, player: &mut HeadlessPlayer) -> Result<()> {
+        const NOT_IMPLEMENTED: &[u8] = b"is not implemented";
+        let new_events = &player.events()[self.checked_events..];
+        let failure = new_events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == "vm-error"
+                    || event.kind == "native-call"
+                        && event.detail.as_bytes().windows(NOT_IMPLEMENTED.len())
+                            .any(|text| text.eq_ignore_ascii_case(NOT_IMPLEMENTED))
+            })
+            .map(|event| anyhow::anyhow!(
+                "runtime reported a failure at frame {}: {} {}",
+                event.frame, event.kind, event.detail
+            ));
+        player.limit_host_diagnostics(10_000, 1_000);
+        self.checked_events = player.events().len();
+        failure.map_or(Ok(()), Err)
+    }
+}
+
 #[cfg(windows)]
-fn advance_window_frame(player: &mut HeadlessPlayer, window: &winit::window::Window) -> Result<HeadlessReport> {
+fn advance_window_frame(
+    player: &mut HeadlessPlayer,
+    window: &winit::window::Window,
+    diagnostics: &mut WindowDiagnostics,
+) -> Result<()> {
     input_history_native::publish(player, window)?;
     player.advance_host_frame(10_000)?;
-    let report = player.report();
-    if let Some(event) = report.events.iter().rev().find(|event| {
-        event.kind == "vm-error"
-            || event.kind == "native-call"
-                && event
-                    .detail
-                    .to_ascii_lowercase()
-                    .contains("is not implemented")
-    }) {
-        bail!(
-            "runtime reported a failure at frame {}: {} {}",
-            event.frame,
-            event.kind,
-            event.detail
-        );
-    }
-    Ok(report)
+    diagnostics.check_and_limit(player)
 }
 
 #[cfg(windows)]
@@ -8840,6 +8867,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         gpu: Option<WindowGpu>,
         input: WindowInputState,
         pacer: window_media::WindowPacer,
+        diagnostics: WindowDiagnostics,
         fullscreen: bool,
         error: Option<String>,
     }
@@ -8940,24 +8968,21 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     if size.width == 0 || size.height == 0 { return; }
                     if !self.pacer.consume() { return; }
                     if let Some(player) = self.player.as_mut() {
-                        let report = match advance_window_frame(player, window) {
-                            Ok(report) => report,
-                            Err(error) => {
-                                self.error = Some(format!("{error:#}"));
-                                event_loop.exit();
-                                return;
-                            }
-                        };
-                        if report.state.input.quit_requested || report.events.iter().any(|event| event.kind == "window-close-request") {
+                        if let Err(error) = advance_window_frame(player, window, &mut self.diagnostics) {
+                            self.error = Some(format!("{error:#}"));
+                            event_loop.exit();
+                            return;
+                        }
+                        if player.quit_requested() {
                             event_loop.exit();
                             return;
                         }
                         let presentation = (|| -> Result<()> {
                             apply_window_control_requests(player, window, &mut self.fullscreen)?;
                             apply_window_pointer_request(player, window, &mut self.input)?;
-                            let frame = window_media::prepare(player, &report)?;
+                            let frame = window_media::prepare(player);
                             if let Some(gpu) = self.gpu.as_mut() {
-                                if gpu.draw(&frame.rgba)? { frame.acknowledge()?; }
+                                if gpu.draw(frame.rgba)? { frame.acknowledge()?; }
                             }
                             Ok(())
                         })();
@@ -8996,6 +9021,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         gpu: None,
         input: WindowInputState::default(),
         pacer: window_media::WindowPacer::default(),
+        diagnostics: WindowDiagnostics::default(),
         fullscreen: false,
         error: None,
     };
@@ -9022,6 +9048,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         window: Option<Window>,
         input: WindowInputState,
         pacer: window_media::WindowPacer,
+        diagnostics: WindowDiagnostics,
         fullscreen: bool,
         error: Option<String>,
     }
@@ -9109,23 +9136,20 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     if size.width == 0 || size.height == 0 { return; }
                     if !self.pacer.consume() { return; }
                     if let Some(player) = self.player.as_mut() {
-                        let report = match advance_window_frame(player, window) {
-                            Ok(report) => report,
-                            Err(error) => {
-                                self.error = Some(format!("{error:#}"));
-                                event_loop.exit();
-                                return;
-                            }
-                        };
-                        if report.state.input.quit_requested || report.events.iter().any(|event| event.kind == "window-close-request") {
+                        if let Err(error) = advance_window_frame(player, window, &mut self.diagnostics) {
+                            self.error = Some(format!("{error:#}"));
+                            event_loop.exit();
+                            return;
+                        }
+                        if player.quit_requested() {
                             event_loop.exit();
                             return;
                         }
                         let presentation = (|| -> Result<()> {
                             apply_window_control_requests(player, window, &mut self.fullscreen)?;
                             apply_window_pointer_request(player, window, &mut self.input)?;
-                            let frame = window_media::prepare(player, &report)?;
-                            blit_rgba_to_window(window, &frame.rgba, report.frame_size)?;
+                            let frame = window_media::prepare(player);
+                            blit_rgba_to_window(window, frame.rgba, player.logical_size())?;
                             frame.acknowledge()
                         })();
                         if let Err(error) = presentation {
@@ -9162,6 +9186,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         window: None,
         input: WindowInputState::default(),
         pacer: window_media::WindowPacer::default(),
+        diagnostics: WindowDiagnostics::default(),
         fullscreen: false,
         error: None,
     };
@@ -12265,6 +12290,107 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn report_perf_compatibility_is_lazy_and_scoped_to_a_player() {
+        let temp = TempDir::new();
+        let executable = temp.0.join("cs2.exe");
+        fs::write(&executable, b"not a PE").unwrap();
+        let player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
+        assert!(player.compatibility.get().is_none());
+
+        let mut pe = [0; 0x5a];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c] = 0x40;
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        pe[0x44..0x46].copy_from_slice(&0x014c_u16.to_le_bytes());
+        pe[0x54] = 2;
+        pe[0x58..0x5a].copy_from_slice(&0x010b_u16.to_le_bytes());
+        fs::write(&executable, pe).unwrap();
+
+        let report = player.compatibility_report();
+        assert_eq!(report.pe_architecture.as_deref(), Some("x86"));
+        fs::write(&executable, b"not a PE").unwrap();
+        assert_eq!(player.report().compatibility, report);
+        let reopened = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
+        assert_eq!(reopened.compatibility_report().pe_architecture, None);
+    }
+
+    #[test]
+    fn report_perf_partial_frame_keeps_root_checkpoint_and_completed_pixels() {
+        let temp = TempDir::new();
+        for capture_script_evidence in [true, false] {
+            let mut player =
+                HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
+            player.capture_script_evidence = capture_script_evidence;
+            let vm = Vm::from_program(
+                KcsProgram::from_code(&[0x00, 0x00, 0x3b], vec![0; 8], 64).unwrap(),
+            ).unwrap();
+            player.data_services.tasks.set_factory_external(vm.external_binding());
+            player.data_services.tasks.register_external_task(
+                player.current_task_id, 0, &player.data_services.language.languages,
+            ).unwrap();
+            player.vm = Some(vm);
+            player.state.scene.current_script = Some("main.kcs".into());
+            player.state.script.current_script = Some("main.kcs".into());
+            let completed = player.frame_snapshot();
+            assert!(player.state().script.memory.is_none());
+
+            player.run_frames(1, 1).unwrap();
+            assert!(player.frame_in_progress());
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 1);
+            assert_eq!(player.frame_rgba(), completed.rgba());
+            if capture_script_evidence {
+                let mut expected = ScriptState::from_vm(player.vm.as_ref().unwrap());
+                expected.current_script = Some("main.kcs".into());
+                player.vm.as_mut().unwrap().write(0, &[0x73]).unwrap();
+                let report = player.report();
+                assert_eq!(report.state.script, expected);
+                assert!(report.frame_in_progress);
+                assert_eq!(report.frame_hash, completed.hash());
+                assert_eq!(report.frame_rgba, completed.rgba());
+            } else {
+                assert!(player.state().script.memory.is_none());
+                assert!(player.compatibility.get().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn report_perf_window_checks_new_failures_before_trimming_diagnostics() {
+        let temp = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
+        player.events.push(LogicEvent {
+            frame: 1,
+            kind: "native-call".into(),
+            detail: "native Is Not Implemented".into(),
+        });
+        player.events.extend((2..=20_001).map(|frame| LogicEvent {
+            frame,
+            kind: "logic-frame".into(),
+            detail: String::new(),
+        }));
+        player.log.resize(2_001, "retained".into());
+        let report = player.report();
+        assert_eq!(report.events.len(), 20_001);
+        assert_eq!(report.log.len(), 2_001);
+
+        let mut diagnostics = WindowDiagnostics::default();
+        let failure = diagnostics.check_and_limit(&mut player).unwrap_err();
+        assert!(failure.to_string().contains("failure at frame 1"));
+        assert!(player.events().len() <= 10_000);
+        assert!(player.log().len() <= 1_000);
+        assert_eq!(player.events().last().unwrap().frame, 20_001);
+        diagnostics.check_and_limit(&mut player).unwrap();
+
+        player.events.push(LogicEvent {
+            frame: 20_002,
+            kind: "vm-error".into(),
+            detail: "new failure".into(),
+        });
+        assert!(diagnostics.check_and_limit(&mut player).unwrap_err().to_string()
+            .contains("vm-error new failure"));
     }
 
     fn packed_cst(inputs: &[Vec<(u8, &[u8])>]) -> Vec<u8> {

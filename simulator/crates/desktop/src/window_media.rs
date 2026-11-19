@@ -1,6 +1,5 @@
-use crate::{HeadlessPlayer, HeadlessReport, MovieFrameSurface};
+use crate::{HeadlessPlayer, MovieFrameSurface};
 use anyhow::{Context, Result};
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +31,7 @@ impl WindowPacer {
 }
 
 pub(super) struct WindowFrame<'a> {
-    pub(super) rgba: Cow<'a, [u8]>,
+    pub(super) rgba: &'a [u8],
     movies: Vec<(Arc<MovieFrameSurface>, u64, f64)>,
 }
 
@@ -47,17 +46,14 @@ impl WindowFrame<'_> {
     }
 }
 
-pub(super) fn prepare<'a>(
-    player: &HeadlessPlayer,
-    report: &'a HeadlessReport,
-) -> Result<WindowFrame<'a>> {
-    Ok(WindowFrame {
-        rgba: Cow::Borrowed(&report.frame_rgba),
+pub(super) fn prepare(player: &HeadlessPlayer) -> WindowFrame<'_> {
+    WindowFrame {
+        rgba: player.frame_rgba(),
         movies: player
             .movie_host
             .scene_movie_presentations()
             .into_iter()
             .map(|receipt| (receipt.surface, receipt.playback, receipt.time))
             .collect(),
-    })
+    }
 }

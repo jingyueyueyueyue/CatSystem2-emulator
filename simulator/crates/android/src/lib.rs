@@ -13,6 +13,7 @@ use cs2_runtime::message_object::MessageTextInputEvent;
 struct Sessions {
     next: u64,
     players: BTreeMap<u64, HeadlessPlayer>,
+    displayed_frames: BTreeMap<u64, DisplayedFrame>,
     error: CString,
     clipboard: CString,
     clipboard_units: Vec<u16>,
@@ -26,6 +27,27 @@ struct Sessions {
     window_ui: Vec<u8>,
     stalled_steps: usize,
 }
+
+#[derive(Default)]
+struct DisplayedFrame {
+    size: [u32; 2],
+    rgba: Vec<u8>,
+}
+
+impl DisplayedFrame {
+    fn matches(&self, size: [u32; 2], rgba: &[u8]) -> bool {
+        self.size == size && self.rgba == rgba
+    }
+
+    fn record(&mut self, size: [u32; 2], rgba: &[u8]) {
+        self.rgba.clear();
+        self.rgba.extend_from_slice(rgba);
+        self.size = size;
+    }
+}
+
+const FRAME_CHANGED: i32 = 1;
+const FRAME_UNCHANGED: i32 = 4;
 
 thread_local! {
     static SESSIONS: RefCell<Sessions> = RefCell::new(Sessions::default());
@@ -61,6 +83,7 @@ pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_c
         let saves = unsafe { path(saves)? };
         let mut player = HeadlessPlayer::open_with_save_root(&game, &saves)
             .map_err(|error| format!("Open game: {error:#}"))?;
+        player.disable_script_evidence_capture();
         player.enable_host_window_requests();
         player.initialize_general_window_host(1).map_err(|error| format!("Window configuration: {error:#}"))?;
         // Java schedules completed logical ticks at 60 Hz; budget retries
@@ -82,6 +105,7 @@ pub extern "C" fn cs2_android_close(id: u64) -> i32 {
     call(-1, |sessions| {
         sessions.players.get_mut(&id).ok_or("Android session is absent")?.cancel_host_tweet_requests();
         sessions.players.remove(&id).ok_or("Android session is absent")?;
+        sessions.displayed_frames.remove(&id);
         sessions.message_revisions.remove(&id);
         sessions.scene_revisions.remove(&id);
         Ok(0)
@@ -369,11 +393,11 @@ fn step(id: u64, budget: u32, timing: Option<&mut HostFrameTiming>) -> i32 {
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
         let step = if let Some(timing) = timing {
-            let (result, sample) = HostFrameTiming::capture(|| player.advance_host_frame(budget as usize));
+            let (result, sample) = HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
             *timing = sample;
             result
         } else {
-            player.advance_host_frame(budget as usize)
+            player.advance_host_frame_with_retries(budget as usize)
         };
         let completed = match step {
             Ok(completed) => completed,
@@ -399,7 +423,17 @@ fn step(id: u64, budget: u32, timing: Option<&mut HostFrameTiming>) -> i32 {
             }
         }
         player.limit_host_diagnostics(10_000, 1_000);
-        Ok(if player.quit_requested() { 2 } else if completed { 1 } else { 0 })
+        Ok(if player.quit_requested() {
+            2
+        } else if !completed {
+            0
+        } else if sessions.displayed_frames.get(&id)
+            .is_some_and(|frame| frame.matches(player.logical_size(), player.frame_rgba()))
+        {
+            FRAME_UNCHANGED
+        } else {
+            FRAME_CHANGED
+        })
     })
 }
 
@@ -677,8 +711,37 @@ pub unsafe extern "C" fn cs2_android_copy_frame(
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_frame_posted(id: u64) -> i32 {
+    call(-1, |sessions| {
+        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
+        sessions.displayed_frames.entry(id).or_default().record(player.logical_size(), player.frame_rgba());
+        Ok(0)
+    })
+}
+
 /// Valid until the next failing operation on this same worker thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn cs2_android_last_error() -> *const c_char {
     SESSIONS.with(|sessions| sessions.borrow().error.as_ptr())
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::DisplayedFrame;
+
+    #[test]
+    fn suppresses_only_identical_frames_at_the_same_dimensions() {
+        let pixels = [0, 1, 2, 255, 3, 4, 5, 255];
+        let mut frame = DisplayedFrame::default();
+        assert!(!frame.matches([2, 1], &pixels));
+        frame.record([2, 1], &pixels);
+        assert!(frame.matches([2, 1], &pixels));
+        assert!(!frame.matches([1, 2], &pixels));
+        let mut changed = pixels;
+        changed[7] = 254;
+        assert!(!frame.matches([2, 1], &changed));
+        frame.record([2, 1], &changed);
+        assert!(frame.matches([2, 1], &changed));
+    }
 }

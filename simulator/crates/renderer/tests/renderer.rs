@@ -86,6 +86,53 @@ fn image_mask_and_nearest_scale_are_applied_in_destination_space() {
 }
 
 #[test]
+fn unscaled_nearest_source_over_matches_masked_raster_at_clipped_edges() {
+    let source_alphas = [0, 1, 2, 127, 128, 254, 255];
+    let source = (0_u8..20)
+        .flat_map(|index| {
+            [
+                index * 11,
+                255 - index * 7,
+                index * 3,
+                source_alphas[usize::from(index) % source_alphas.len()],
+            ]
+        })
+        .collect();
+    let frame = RgbaFrame::from_rgba8(5, 4, source).unwrap();
+    let target = (0_u8..48)
+        .flat_map(|index| {
+            [
+                index * 3,
+                200 - index * 2,
+                index * 5,
+                [0, 73, 255][usize::from(index) % 3],
+            ]
+        })
+        .collect();
+    let base = Canvas::from_rgba8(8, 6, target).unwrap();
+    let opaque_mask = AlphaMask::new(8, 6, vec![255; 48]).unwrap();
+
+    for (position, clip) in [
+        (Point::new(1, 1), None),
+        (Point::new(-2, -1), None),
+        (Point::new(6, 4), None),
+        (Point::new(0, 0), Some(Rect::new(1, 1, 3, 2))),
+        (Point::new(-1, 0), Some(Rect::new(2, 2, 1, 1))),
+        (Point::new(i32::MIN, i32::MAX), None),
+    ] {
+        let mut options = ImageDrawOptions::new(position);
+        options.clip = clip;
+        let mut actual = base.clone();
+        actual.draw_frame(&frame, &options).unwrap();
+
+        options.mask = Some(opaque_mask.clone());
+        let mut expected = base.clone();
+        expected.draw_frame(&frame, &options).unwrap();
+        assert_eq!(actual.pixels(), expected.pixels(), "{position:?}, {clip:?}");
+    }
+}
+
+#[test]
 fn glyph_and_particle_paths_use_masks_and_alpha() {
     let glyph = GlyphMask::from_alpha(2, 1, vec![255, 128]).unwrap();
     let mask = AlphaMask::new(3, 1, vec![255, 128, 0]).unwrap();

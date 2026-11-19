@@ -3,7 +3,7 @@
 use anyhow::Result;
 use cs2_runtime::{AudioHost, InputEvent, InputKey};
 use std::cell::RefCell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use super::{HeadlessPlayer, PlayerFramePhase};
 
 #[derive(Default)]
@@ -106,6 +106,10 @@ pub(super) fn measure_script_detail(phase: HostPhase) -> HostPhaseTimer {
 }
 
 impl HeadlessPlayer {
+    pub fn disable_script_evidence_capture(&mut self) {
+        self.capture_script_evidence = false;
+    }
+
     pub fn set_host_windowed_mode(&mut self, mode: u32) {
         self.data_services.configuration.set_actual_window_mode(mode);
         self.data_services.fes_settings.windowed_mode = Some(mode);
@@ -244,6 +248,18 @@ impl HeadlessPlayer {
         let completed = !self.frame_in_progress() && (continued || self.state.clock.frame != before);
         if completed { self.state.input.commit(); }
         Ok(completed)
+    }
+
+    pub fn advance_host_frame_with_retries(&mut self, instruction_budget: usize) -> Result<bool> {
+        let start = Instant::now();
+        if self.advance_host_frame(instruction_budget)? { return Ok(true); }
+        for _ in 0..3 {
+            if !self.frame_in_progress() || self.quit_requested() || self.data_services.host_pause.paused
+                || start.elapsed() >= Duration::from_millis(2)
+            { break; }
+            if self.advance_host_frame(instruction_budget)? { return Ok(true); }
+        }
+        Ok(false)
     }
 }
 
