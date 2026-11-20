@@ -1,6 +1,7 @@
 use super::read_entry_with_fallback;
 use crate::audio_control::{self, AudioParameters};
-use crate::audio_decode::{AudioCodec, AudioProbe, DecodedAudio, prepare_audio};
+use crate::audio_decode::{AudioCodec, AudioProbe, PreparedAudio, prepare_audio};
+use crate::perf_detail::audio::{self as audio_profile, Stage};
 use cs2_runtime::{
     AudioChannel, AudioHost, AudioRequest, PlaybackState, ResourceIndex, RuntimeError,
 };
@@ -15,7 +16,7 @@ pub(crate) mod checkpoint;
 
 struct PreparedRequest {
     resource: String,
-    audio: Arc<DecodedAudio>,
+    audio: Arc<PreparedAudio>,
     silence_millis: u32,
     play_count: u32,
     signal_enabled: bool,
@@ -38,7 +39,7 @@ impl Drop for PreparedRequestGuard {
 pub(super) fn play_loaded_audio(
     host: &mut dyn AudioHost,
     request: AudioRequest,
-    prepared: Option<Arc<DecodedAudio>>,
+    prepared: Option<Arc<PreparedAudio>>,
     silence_millis: u32,
 ) -> cs2_runtime::RuntimeResult<PlaybackState> {
     let count = if request.looped { 0 } else { 1 };
@@ -48,7 +49,7 @@ pub(super) fn play_loaded_audio(
 pub(super) fn play_loaded_sound(
     host: &mut dyn AudioHost,
     request: AudioRequest,
-    prepared: Option<Arc<DecodedAudio>>,
+    prepared: Option<Arc<PreparedAudio>>,
     silence_millis: u32,
     play_count: u32,
     signal_enabled: bool,
@@ -70,7 +71,7 @@ pub(super) fn play_loaded_sound(
 pub(super) fn play_loaded_sound_range(
     host: &mut dyn AudioHost,
     request: AudioRequest,
-    prepared: Option<Arc<DecodedAudio>>,
+    prepared: Option<Arc<PreparedAudio>>,
     silence_millis: u32,
     play_count: u32,
     signal_enabled: bool,
@@ -169,7 +170,7 @@ impl DesktopAudioHost {
     fn play_backend(
         &mut self,
         request: AudioRequest,
-        prepared: Arc<DecodedAudio>,
+        prepared: Arc<PreparedAudio>,
         silence_millis: u32,
         play_count: u32,
         signal_enabled: bool,
@@ -300,9 +301,9 @@ pub fn audio_host_for_resources(resources: &ResourceIndex) -> DesktopAudioHost {
 }
 
 enum WavWorkerCommand {
-    Pause(bool, mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>),
+    Pause(bool, mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>, Option<audio_profile::Shared>),
     Suspend(bool, mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>),
-    Stop,
+    Stop(Option<audio_profile::Shared>),
     Capture(mpsc::SyncSender<cs2_runtime::RuntimeResult<checkpoint::WorkerState>>),
     ReleaseCapture,
     CommitRestore,
@@ -316,13 +317,13 @@ struct ActiveWavPlayback {
     thread: Option<JoinHandle<()>>,
     _parameters: Arc<AudioParameters>,
     resource: String,
-    prepared: Arc<DecodedAudio>,
+    prepared: Arc<PreparedAudio>,
 }
 
 impl Drop for ActiveWavPlayback {
     fn drop(&mut self) {
         if self.thread.is_some() {
-            let _ = self.commands.send(WavWorkerCommand::Stop);
+            let _ = self.commands.send(WavWorkerCommand::Stop(None));
             join_worker(&mut self.thread);
         }
     }
@@ -334,6 +335,8 @@ pub struct WavAudioHost {
     resolve: Arc<dyn Fn(&str) -> cs2_runtime::RuntimeResult<Vec<u8>> + Send + Sync + 'static>,
     active: HashMap<u64, ActiveWavPlayback>,
     suspended: bool,
+    #[cfg(target_os = "android")]
+    standby: crate::audio_android::StandbyPool,
 }
 
 impl WavAudioHost {
@@ -344,6 +347,8 @@ impl WavAudioHost {
             resolve: Arc::new(resolve),
             active: HashMap::new(),
             suspended: false,
+            #[cfg(target_os = "android")]
+            standby: crate::audio_android::StandbyPool::default(),
         }
     }
 
@@ -362,6 +367,10 @@ impl WavAudioHost {
 
     pub fn set_suspended(&mut self, suspended: bool) -> cs2_runtime::RuntimeResult<()> {
         self.suspended = suspended;
+        #[cfg(target_os = "android")]
+        if suspended {
+            self.standby = crate::audio_android::StandbyPool::default();
+        }
         self.reap_finished()?;
         let mut first_error = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -427,7 +436,8 @@ impl WavAudioHost {
         let Some(mut playback) = self.active.remove(&handle) else {
             return Ok(());
         };
-        let _ = playback.commands.send(WavWorkerCommand::Stop);
+        let _timing = Stage::Ack.begin();
+        let _ = playback.commands.send(WavWorkerCommand::Stop(audio_profile::active()));
         let worker_result = playback.finished.recv_timeout(Duration::from_secs(5));
         let worker_result = match worker_result {
             Ok(result) => result,
@@ -477,7 +487,14 @@ impl AudioHost for WavAudioHost {
     }
 
     fn stop(&mut self, handle: u64) -> cs2_runtime::RuntimeResult<()> {
-        self.stop_playback(handle)
+        #[cfg(target_os = "android")]
+        let source = self.active.get(&handle).map(|playback| playback.prepared.probe);
+        let result = self.stop_playback(handle);
+        #[cfg(target_os = "android")]
+        if result.is_ok() && let Some(source) = source {
+            self.warm_device_for(source);
+        }
+        result
     }
 
     fn pause(&mut self, handle: u64, paused: bool) -> cs2_runtime::RuntimeResult<()> {
@@ -486,9 +503,10 @@ impl AudioHost for WavAudioHost {
             RuntimeError::Host(format!("WAV playback handle {handle} is not active"))
         })?;
         let (acknowledge, response) = mpsc::sync_channel(1);
+        let _timing = Stage::Ack.begin();
         playback
             .commands
-            .send(WavWorkerCommand::Pause(paused, acknowledge))
+            .send(WavWorkerCommand::Pause(paused, acknowledge, audio_profile::active()))
             .map_err(|_| RuntimeError::Host("WAV playback worker stopped".to_string()))?;
         response
             .recv_timeout(Duration::from_secs(5))
@@ -518,21 +536,29 @@ impl AudioHost for WavAudioHost {
 }
 
 impl WavAudioHost {
+    #[cfg(target_os = "android")]
+    fn warm_device_for(&mut self, source: AudioProbe) {
+        if !self.suspended && source.codec == AudioCodec::OggVorbis {
+            self.standby.prepare(source.sample_rate, source.channels);
+        }
+    }
+
     fn play_prepared(
         &mut self,
         request: AudioRequest,
-        prepared: Arc<DecodedAudio>,
+        prepared: Arc<PreparedAudio>,
         silence_millis: u32,
         play_count: u32,
         signal_enabled: bool,
     ) -> cs2_runtime::RuntimeResult<PlaybackState> {
         self.reap_finished()?;
-        let parameters = AudioParameters::new(request.volume, request.pan)?;
-        parameters.reset_repeat_count(play_count)?;
-        parameters.enable_signal(signal_enabled);
-        let sample_rate = prepared.probe.sample_rate;
-        let channels = prepared.probe.channels;
-        let samples = prepared.samples.clone();
+        let parameters = {
+            let _timing = Stage::Register.begin();
+            let parameters = AudioParameters::new(request.volume, request.pan)?;
+            parameters.reset_repeat_count(play_count)?;
+            parameters.enable_signal(signal_enabled);
+            parameters
+        };
         let loop_spec = PREPARED_REQUEST
             .with(|slot| {
                 slot.borrow()
@@ -548,11 +574,9 @@ impl WavAudioHost {
         #[cfg(not(any(windows, target_os = "android")))]
         {
             let _ = (
-                samples,
+                prepared,
                 request,
                 parameters,
-                sample_rate,
-                channels,
                 silence_millis,
                 loop_spec,
                 initial_suspended,
@@ -564,43 +588,63 @@ impl WavAudioHost {
 
         #[cfg(any(windows, target_os = "android"))]
         {
-            let handle = audio_control::allocate_handle()?;
-            audio_control::register(handle, &parameters)?;
+            #[cfg(target_os = "android")]
+            let standby = if !initial_suspended {
+                self.standby.take(prepared.probe.sample_rate, prepared.probe.channels)
+            } else {
+                None
+            };
+            let handle = {
+                let _timing = Stage::Register.begin();
+                let handle = audio_control::allocate_handle()?;
+                audio_control::register(handle, &parameters)?;
+                handle
+            };
             let (commands, command_receiver) = mpsc::channel();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
             let (finished_sender, finished) = mpsc::channel();
             let retained_prepared = prepared.clone();
-            let worker = thread::Builder::new()
-                .name(format!("cs2-pcm-{handle}"))
-                // Keep a control owner even if a very short worker finishes
-                // before its handle is returned to the script thread.
-                .spawn({
-                    let parameters = parameters.clone();
-                    move || {
-                        let startup_error = started_sender.clone();
-                        let result = pcm_worker::run_playback(
-                            sample_rate,
-                            channels,
-                            samples,
-                            prepared,
-                            parameters,
-                            silence_millis,
-                            loop_spec,
-                            initial_suspended,
-                            command_receiver,
-                            started_sender,
-                            None,
-                        );
-                        if let Err(cause) = &result {
-                            let _ =
-                                startup_error.try_send(Err(RuntimeError::Host(cause.to_string())));
+            let worker_timing = audio_profile::active();
+            let worker = {
+                let _timing = Stage::Spawn.begin();
+                thread::Builder::new()
+                    .name(format!("cs2-pcm-{handle}"))
+                    // Keep a control owner even if a very short worker finishes
+                    // before its handle is returned to the script thread.
+                    .spawn({
+                        let parameters = parameters.clone();
+                        move || {
+                            let startup_error = started_sender.clone();
+                            let result = audio_profile::with_worker(worker_timing, || {
+                                pcm_worker::run_playback(
+                                    prepared,
+                                    parameters,
+                                    silence_millis,
+                                    loop_spec,
+                                    initial_suspended,
+                                    command_receiver,
+                                    started_sender,
+                                    None,
+                                    #[cfg(target_os = "android")]
+                                    standby,
+                                )
+                            });
+                            if let Err(cause) = &result {
+                                let _ = startup_error.try_send(Err(pcm_worker::clone_error(cause)));
+                            }
+                            let _ = finished_sender.send(result);
                         }
-                        let _ = finished_sender.send(result);
-                    }
-                })
-                .map_err(|error| RuntimeError::Host(format!("start WAV worker: {error}")))?;
-            match started_receiver.recv_timeout(Duration::from_secs(10)) {
+                    })
+                    .map_err(|error| RuntimeError::Host(format!("start WAV worker: {error}")))?
+            };
+            let ready = {
+                let _timing = Stage::Ack.begin();
+                started_receiver.recv_timeout(Duration::from_secs(10))
+            };
+            match ready {
                 Ok(Ok(())) => {
+                    #[cfg(target_os = "android")]
+                    self.warm_device_for(retained_prepared.probe);
                     self.active.insert(
                         handle,
                         ActiveWavPlayback {
@@ -675,7 +719,7 @@ mod tests {
                     thread: Some(worker),
                     _parameters: AudioParameters::new(1.0, 0.0).unwrap(),
                     resource: String::new(),
-                    prepared: Arc::new(DecodedAudio {
+                    prepared: Arc::new(PreparedAudio::from_pcm(crate::audio_decode::DecodedAudio {
                         probe: AudioProbe {
                             codec: AudioCodec::WavPcm,
                             sample_rate: 44_100,
@@ -683,7 +727,7 @@ mod tests {
                             frames: 0,
                         },
                         samples: Arc::from([]),
-                    }),
+                    })),
                 },
             );
         }
@@ -722,19 +766,17 @@ fn apply_pcm_volume_pan(mut samples: Vec<i16>, channels: u8, volume: f32, pan: f
 #[cfg(any(windows, target_os = "android"))]
 mod pcm_worker {
     use super::{
-        AudioParameters, DecodedAudio, RuntimeError, WavWorkerCommand, apply_pcm_volume_pan,
+        AudioParameters, PreparedAudio, RuntimeError, WavWorkerCommand, apply_pcm_volume_pan,
     };
     use crate::audio_control::{AudioLoop, PcmCursor, PlaybackRepeats, SignalMeter};
     use crate::movie_audio::MovieAudioOutput;
+    use crate::perf_detail::audio::{self as audio_profile, Stage};
     use std::sync::Arc;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
 
     pub(super) fn run_playback(
-        sample_rate: u32,
-        channels: u8,
-        samples: Arc<[i16]>,
-        _prepared: Arc<DecodedAudio>,
+        prepared: Arc<PreparedAudio>,
         parameters: Arc<AudioParameters>,
         silence_millis: u32,
         loop_spec: AudioLoop,
@@ -742,15 +784,22 @@ mod pcm_worker {
         commands: mpsc::Receiver<WavWorkerCommand>,
         started: mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>,
         saved: Option<super::checkpoint::WorkerState>,
+        #[cfg(target_os = "android")] standby: Option<crate::audio_android::Standby>,
     ) -> cs2_runtime::RuntimeResult<()> {
+        let sample_rate = prepared.probe.sample_rate;
+        let channels = prepared.probe.channels;
         if !matches!(channels, 1 | 2) {
             let error = RuntimeError::Host("unsupported PCM source channel count".into());
             let _ = started.send(Err(clone_error(&error)));
             return Err(error);
         }
+        let mut source = {
+            let _timing = Stage::Reader.begin();
+            prepared.reader()?
+        };
         let restoring = saved.is_some();
         let mut cursor = match saved.as_ref().map(|state| Ok(state.cursor.clone())).unwrap_or_else(|| PcmCursor::new(
-            samples.len() / usize::from(channels),
+            prepared.probe.frames as usize,
             loop_spec,
         )).and_then(|cursor| {
             cursor.end(&parameters)?;
@@ -762,7 +811,27 @@ mod pcm_worker {
                 return Err(error);
             }
         };
-        let mut output = match super::checkpoint::TrackedOutput::open(sample_rate, channels, saved.as_ref().map(|s| &s.queue)) {
+        let opened = {
+            let _timing = Stage::Open.begin();
+            let saved_queue = saved.as_ref().map(|s| &s.queue);
+            #[cfg(target_os = "android")]
+            let warmed = standby.and_then(|standby| {
+                let _timing = Stage::Standby.begin();
+                standby.claim()
+            });
+            #[cfg(target_os = "android")]
+            let output = if let Some(warmed) = warmed {
+                super::checkpoint::TrackedOutput::from_output(
+                    sample_rate, channels, saved_queue, Box::new(warmed),
+                )
+            } else {
+                super::checkpoint::TrackedOutput::open(sample_rate, channels, saved_queue)
+            };
+            #[cfg(windows)]
+            let output = super::checkpoint::TrackedOutput::open(sample_rate, channels, saved_queue);
+            output
+        };
+        let mut output = match opened {
             Ok(output) => output,
             Err(error) => {
                 let _ = started.send(Err(clone_error(&error)));
@@ -770,15 +839,16 @@ mod pcm_worker {
             }
         };
         output.pause(true)?;
-        let chunk = (sample_rate as usize / 100).max(1) * usize::from(channels);
+        let chunk_frames = (sample_rate as usize / 100).max(1);
         let mut signal = saved.as_ref().map_or_else(|| SignalMeter::new(sample_rate), |s| s.signal.clone());
         let mut pass_marked = saved.as_ref().is_some_and(|s| s.pass_marked);
         let initial_silence = saved.as_ref().map_or(u64::from(sample_rate) * u64::from(silence_millis) / 1000, |s| s.initial_silence);
         let mut silent_frames = saved.as_ref().map_or(initial_silence, |s| s.silent_frames);
         // Prime a bounded 80 ms queue before starting the hardware clock.
+        let priming = Stage::Prime.begin();
         while !restoring && (cursor.position < cursor.end(&parameters)? || silent_frames != 0) {
             if silent_frames != 0 {
-                let frames = silent_frames.min((chunk / usize::from(channels)) as u64) as usize;
+                let frames = silent_frames.min(chunk_frames as u64) as usize;
                 if !output.submit(&vec![0; frames * usize::from(channels)])? {
                     break;
                 }
@@ -790,20 +860,22 @@ mod pcm_worker {
                 );
                 continue;
             }
-            let start = cursor.position * usize::from(channels);
-            let end = (start + chunk).min(cursor.end(&parameters)? * usize::from(channels));
+            let end = (cursor.position + chunk_frames).min(cursor.end(&parameters)?);
+            let samples = source.read(cursor.position, end)?;
             let (volume, pan) = parameters.values();
-            let chunk = apply_pcm_volume_pan(samples[start..end].to_vec(), channels, volume, pan);
+            let chunk = apply_pcm_volume_pan(samples.to_vec(), channels, volume, pan);
             if !output.submit(&chunk)? {
                 break;
             }
-            cursor.position = end / usize::from(channels);
-            signal.submitted(&samples[end - chunk.len()..end], channels, &parameters);
+            cursor.position = end;
+            signal.submitted(samples, channels, &parameters);
         }
+        drop(priming);
         let mut paused = saved.as_ref().is_some_and(|s| s.paused);
         let mut restore_hold = restoring;
         let mut capture_hold = false;
         output.pause(initial_suspended || paused || restore_hold)?;
+        audio_profile::clear();
         if started.send(Ok(())).is_err() {
             return output.stop();
         }
@@ -812,9 +884,13 @@ mod pcm_worker {
         loop {
             if !restore_hold && !capture_hold { repeats.refresh(&parameters); }
             match commands.recv_timeout(Duration::from_millis(2)) {
-                Ok(WavWorkerCommand::Stop) => return output.stop(),
-                Ok(WavWorkerCommand::Pause(value, acknowledge)) => {
-                    let result = output.pause(value || suspended || restore_hold || capture_hold);
+                Ok(WavWorkerCommand::Stop(timing)) => {
+                    return audio_profile::with_worker(timing, || output.stop());
+                }
+                Ok(WavWorkerCommand::Pause(value, acknowledge, timing)) => {
+                    let result = audio_profile::with_worker(timing, || {
+                        output.pause(value || suspended || restore_hold || capture_hold)
+                    });
                     let _ = acknowledge.send(result.as_ref().map(|_| ()).map_err(clone_error));
                     result?;
                     paused = value;
@@ -861,7 +937,7 @@ mod pcm_worker {
                 // including while an earlier finite policy is draining.
                 repeats.refresh(&parameters);
                 if silent_frames != 0 {
-                    let frames = silent_frames.min((chunk / usize::from(channels)) as u64) as usize;
+                    let frames = silent_frames.min(chunk_frames as u64) as usize;
                     if !output.submit(&vec![0; frames * usize::from(channels)])? {
                         break;
                     }
@@ -889,16 +965,15 @@ mod pcm_worker {
                         break;
                     }
                 }
-                let start = cursor.position * usize::from(channels);
-                let end = (start + chunk).min(cursor.end(&parameters)? * usize::from(channels));
+                let end = (cursor.position + chunk_frames).min(cursor.end(&parameters)?);
+                let samples = source.read(cursor.position, end)?;
                 let (volume, pan) = parameters.values();
-                let chunk =
-                    apply_pcm_volume_pan(samples[start..end].to_vec(), channels, volume, pan);
+                let chunk = apply_pcm_volume_pan(samples.to_vec(), channels, volume, pan);
                 if !output.submit(&chunk)? {
                     break;
                 }
-                cursor.position = end / usize::from(channels);
-                signal.submitted(&samples[end - chunk.len()..end], channels, &parameters);
+                cursor.position = end;
+                signal.submitted(samples, channels, &parameters);
             }
             if repeats.exhausted()
                 && cursor.position == cursor.end(&parameters)?
@@ -919,7 +994,10 @@ mod pcm_worker {
         }
     }
 
-    fn clone_error(error: &RuntimeError) -> RuntimeError {
-        RuntimeError::Host(error.to_string())
+    pub(super) fn clone_error(error: &RuntimeError) -> RuntimeError {
+        match error {
+            RuntimeError::AudioStartTimeout(cause) => RuntimeError::AudioStartTimeout(cause.clone()),
+            _ => RuntimeError::Host(error.to_string()),
+        }
     }
 }

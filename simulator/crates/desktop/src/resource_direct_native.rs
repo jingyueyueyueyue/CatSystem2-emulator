@@ -105,9 +105,9 @@ impl LoggingHost<'_> {
                     // The ANM test chooses the object kind, but attach reads
                     // the HG body. Timeline loading/playback remains 624/625
                     // -> list 299/301 on the SAME shared entry object.
-                    let Some(bytes) = host.read_managed_image_bytes(&plan.name)? else { return Ok(()); };
+                    let Some((path, bytes)) = host.read_managed_image_asset(&plan.name, false)? else { return Ok(()); };
                     check_record_capacity(created.len(), count)?;
-                    host.create_unowned_list_entry_source(&bytes)
+                    host.create_unowned_list_entry_source(&bytes, Some(&path))
                         .map_err(|_| native_state_error("native 703 multi-frame image object construction failed"))?
                 } else {
                     // Both single images and runs of static selectors use

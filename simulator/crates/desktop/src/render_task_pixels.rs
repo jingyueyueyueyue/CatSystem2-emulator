@@ -192,6 +192,15 @@ pub(super) fn composite(
         && (1..=4096).contains(&source.height())
         && source.width() * source.height() <= MAX_EXACT_HALF_PIXEL_AREA
     {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if alpha > 0 && (alpha < 255 || target.device_pixels().is_some()) {
+            use crate::gpu_raster::{Draw, RasterRect, draw};
+            if draw(target, Some(source), RasterRect { origin: [0; 2], size: [source.width(), source.height()] },
+                Draw::DiffuseFrame { alpha })
+            {
+                return Ok(());
+            }
+        }
         composite_unit_diffuse(target, source, alpha);
         return Ok(());
     }

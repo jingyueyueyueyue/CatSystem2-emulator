@@ -927,21 +927,23 @@ impl LoggingHost<'_> {
                     self.input_task.regions[at].words[field] = command.data[1];
                 }
             }
-            146 => {
-                for region in &mut self.input_task.regions {
-                    region.words[7] = 0;
-                }
-                self.input_task.selected_region = None;
-                self.input_task.pointer_position = [-1; 2];
-                self.data_services.messages.input_selection_forced = true;
-                self.data_services.messages.input_selection_previous_device = Some([-1; 2]);
-            }
+            146 => self.clear_input_region_selection(),
             147 => {
                 self.replace_input_hit_mask(id, command.data[1])?;
             }
             _ => return Err(invalid("input region command is outside its receiver")),
         }
         Ok(())
+    }
+
+    fn clear_input_region_selection(&mut self) {
+        for region in &mut self.input_task.regions {
+            region.words[7] = 0;
+        }
+        self.input_task.selected_region = None;
+        self.input_task.pointer_position = [-1; 2];
+        self.data_services.messages.input_selection_forced = true;
+        self.data_services.messages.input_selection_previous_device = Some([-1; 2]);
     }
 
     pub(super) fn replace_input_hit_mask(&mut self, id: u32, handle: u32) -> Result<()> {
@@ -1223,24 +1225,10 @@ impl LoggingHost<'_> {
                         pending.stage = 2;
                     }
                     2 => {
-                        if pending.clear_selection {
-                            let input = self
-                                .input_task
-                                .owner_id
-                                .ok_or_else(|| invalid("FES BUTTON release has no input task"))?;
-                            self.receive_device_input_buffers(
-                                cs2_runtime::TaskCommand {
-                                    target: input as i32,
-                                    sender: owner as i32,
-                                    code: 146,
-                                    data: [0; 3],
-                                },
-                                &mut Default::default(),
-                                &mut 0,
-                            )?
-                            .ok_or_else(|| {
-                                invalid("FES BUTTON release input receiver is absent")
-                            })?;
+                        if pending.clear_selection && self.input_task.alive {
+                            // Host-provided input can own regions without a
+                            // kind-11 script task. Apply the same state update as 146.
+                            self.clear_input_region_selection();
                         }
                         pending.stage = 3;
                     }
@@ -1378,24 +1366,8 @@ impl LoggingHost<'_> {
                         pending.stage = 3;
                     }
                     3 => {
-                        if pending.clear_selection {
-                            let input = self
-                                .input_task
-                                .owner_id
-                                .ok_or_else(|| invalid("FES BUTTON release has no input task"))?;
-                            self.receive_device_input_buffers(
-                                cs2_runtime::TaskCommand {
-                                    target: input as i32,
-                                    sender: owner as i32,
-                                    code: 146,
-                                    data: [0; 3],
-                                },
-                                &mut Default::default(),
-                                &mut 0,
-                            )?
-                            .ok_or_else(|| {
-                                invalid("FES BUTTON release input receiver is absent")
-                            })?;
+                        if pending.clear_selection && self.input_task.alive {
+                            self.clear_input_region_selection();
                         }
                         pending.stage = 4;
                     }
@@ -5921,9 +5893,6 @@ impl HeadlessPlayer {
                 continue;
             };
             self.data_services.message_device.sync_object(object)?;
-            let Some(view) = self.data_services.message_device.surface(id as i32) else {
-                continue;
-            };
             let Some(configuration) = object.configuration() else {
                 continue;
             };
@@ -5941,37 +5910,20 @@ impl HeadlessPlayer {
                 ));
             }
             let current_offset = configuration.canvas_offset();
-            let [texture_width, texture_height] = [view.submitted.width(), view.submitted.height()];
-            let mut pixels = vec![0; view.submitted.pixels().len()];
-            // Registration has a fixed source offset. Reconfigure changes the
-            // copy destination but retains geometry, so represent that shift
-            // in the submitted texture rather than moving its primitive.
-            let shift_x = i64::from(current_offset[0]) - i64::from(registered_offset[0]);
-            let shift_y = i64::from(current_offset[1]) - i64::from(registered_offset[1]);
-            for y in 0..texture_height {
-                for x in 0..texture_width {
-                    let sx = i64::from(x) - shift_x;
-                    let sy = i64::from(y) - shift_y;
-                    if sx < 0
-                        || sy < 0
-                        || sx >= i64::from(texture_width)
-                        || sy >= i64::from(texture_height)
-                    {
-                        continue;
-                    }
-                    let source = ((sy as usize * texture_width as usize) + sx as usize) * 4;
-                    let target = ((y as usize * texture_width as usize) + x as usize) * 4;
-                    pixels[target..target + 4]
-                        .copy_from_slice(&view.submitted.pixels()[source..source + 4]);
-                }
-            }
-            let frame = RgbaFrame::from_rgba8(texture_width, texture_height, pixels)?;
-            super::message_backend::draw_message_plane(
+            // Reconfigure can move the copied pixels inside the fixed source
+            // rectangle. Keep that clip before scaling the registered plane.
+            let shift = std::array::from_fn(|axis| i64::from(current_offset[axis]) - i64::from(registered_offset[axis]));
+            let tint = super::message_backend::message_plane_tint(node);
+            let Some(frame) = self.data_services.message_device.projection_frame_shifted(id as i32, tint, shift)? else {
+                continue;
+            };
+            super::message_backend::draw_message_plane_with_tint(
                 &mut self.canvas,
                 frame,
                 node,
                 registered_offset,
                 registered_size,
+                u32::MAX,
             )?;
         }
         let mut legacy_ids: Vec<_> = self

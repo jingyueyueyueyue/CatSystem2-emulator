@@ -941,7 +941,7 @@ impl FesRuntime {
                     // Use the same category/router as the source producer;
                     // no extension/path guesses or ANM-operand max fallback.
                     for candidate in host.resources.category_names(b"image", name)? {
-                        if let Some(image) = host.load_managed_image(&candidate, frame, false)? {
+                        if let Some(image) = host.load_managed_image_projection(&candidate, frame)? {
                             image_source::install_ordinary_frame(layer, image);
                             break;
                         }

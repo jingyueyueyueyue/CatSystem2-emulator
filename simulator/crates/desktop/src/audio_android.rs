@@ -10,6 +10,11 @@ use cs2_runtime::RuntimeResult;
 
 use crate::media_process::error;
 use crate::movie_audio::MovieAudioOutput;
+use crate::perf_detail::audio::Stage;
+
+#[path = "audio_android_standby.rs"]
+mod standby;
+pub(crate) use standby::{Standby, StandbyPool};
 
 const OK: i32 = 0;
 const OUTPUT: i32 = 0;
@@ -18,12 +23,18 @@ const SHARED: i32 = 1;
 const LOW_LATENCY: i32 = 12;
 const PERFORMANCE_NONE: i32 = 10;
 const OPEN: i32 = 2;
+const STARTING: i32 = 3;
 const STARTED: i32 = 4;
 const PAUSED: i32 = 6;
 const STOPPED: i32 = 10;
 const DISCONNECTED: i32 = 13;
 const WOULD_BLOCK: i32 = -884;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const START_BUFFER_RETRY_DELAY: Duration = Duration::from_millis(100);
+const STATE_WAIT_SLICE: Duration = Duration::from_millis(20);
+const START_PROGRESS_SLICE: Duration = Duration::from_millis(5);
+const INITIAL_PROGRESS_WINDOW: Duration = Duration::from_millis(8);
+const INITIAL_PROGRESS_SLICE: Duration = Duration::from_millis(1);
 const MAX_CHUNK_SAMPLES: usize = 48_000;
 const MAX_CHUNKS: usize = 8;
 
@@ -71,6 +82,7 @@ unsafe extern "C" {
     fn AAudioStream_getBufferCapacityInFrames(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_getFramesRead(stream: *mut AAudioStream) -> i64;
     fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
+    fn AAudioStream_getXRunCount(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_write(
         stream: *mut AAudioStream,
         data: *const c_void,
@@ -96,15 +108,24 @@ struct Pending {
     offset: usize,
 }
 
+enum StagedDevice {
+    Open,
+    Started(i32),
+}
+
 pub(crate) struct Output {
     stream: Option<NonNull<AAudioStream>>,
     pending: VecDeque<Pending>,
     rate: u32,
     channels: u8,
+    device_buffer_capacity: i32,
+    device_buffer_size: i32,
     max_queued_frames: u64,
     pending_frames: u64,
     accepted_frames: u64,
     last_consumed: u64,
+    frame_origin: u64,
+    staged_device: Option<StagedDevice>,
     paused: bool,
     started: bool,
     failed: Option<String>,
@@ -160,10 +181,14 @@ impl Output {
             pending: VecDeque::new(),
             rate,
             channels,
+            device_buffer_capacity: 0,
+            device_buffer_size: 0,
             max_queued_frames: u64::from(rate / 5).max(1),
             pending_frames: 0,
             accepted_frames: 0,
             last_consumed: 0,
+            frame_origin: 0,
+            staged_device: None,
             paused: true,
             started: false,
             failed: None,
@@ -192,6 +217,8 @@ impl Output {
         if size <= 0 {
             return Err(output.device_error("configure buffer size", size));
         }
+        output.device_buffer_capacity = capacity;
+        output.device_buffer_size = size;
         // A driver may choose a minimum buffer larger than requested. Include
         // that known capacity in the bound while retaining a finite PCM queue.
         output.max_queued_frames = output
@@ -225,6 +252,11 @@ impl Output {
     /// Nonblocking writes may consume only a prefix. Keep that exact cursor;
     /// never report false after accepting samples or repeat a written prefix.
     fn pump(&mut self) -> RuntimeResult<()> {
+        if self.staged_device.is_some() {
+            // Program PCM remains private until activation validates the
+            // silent device's origin and allows the first real write.
+            return Ok(());
+        }
         let stream = self.validate_device()?;
         while let Some(pending) = self.pending.front_mut() {
             let channels = usize::from(self.channels);
@@ -259,24 +291,36 @@ impl Output {
     }
 
     fn counters(&mut self) -> RuntimeResult<(u64, u64)> {
+        if self.staged_device.is_some() {
+            return Ok((0, 0));
+        }
         let stream = self.validate_device()?;
         let read = unsafe { AAudioStream_getFramesRead(stream.as_ptr()) };
         let written = unsafe { AAudioStream_getFramesWritten(stream.as_ptr()) };
-        if read < 0 || written < 0 || (read as u64) < self.last_consumed {
+        if read < 0 || written < 0 {
             return Err(error(
                 "AAudio returned invalid or regressing device frame counters",
             ));
         }
+        let read = (read as u64).saturating_sub(self.frame_origin);
+        let written = (written as u64).saturating_sub(self.frame_origin);
+        if read < self.last_consumed {
+            return Err(error("AAudio returned invalid or regressing device frame counters"));
+        }
         // Endpoint counters are the actual audio consumer, not the game frame
         // clock. Clamp underrun silence to samples the app submitted.
-        let consumed = (read as u64).min(written as u64).min(self.accepted_frames);
+        let consumed = read.min(written).min(self.accepted_frames);
         self.last_consumed = self.last_consumed.max(consumed);
-        Ok((self.last_consumed, written as u64))
+        Ok((self.last_consumed, written))
     }
 
-    fn wait_state(&mut self, expected: i32) -> RuntimeResult<()> {
+    fn wait_state(&mut self, expected: i32, start_position: Option<u64>) -> RuntimeResult<()> {
+        let _timing = Stage::Confirm.begin();
         let stream = self.validate_device()?;
-        let deadline = Instant::now() + CONTROL_TIMEOUT;
+        let start = Instant::now();
+        let deadline = start + CONTROL_TIMEOUT;
+        let mut can_expand_start_buffer = expected == STARTED
+            && self.device_buffer_size < self.device_buffer_capacity;
         loop {
             let state = unsafe { AAudioStream_getState(stream.as_ptr()) };
             if state == expected {
@@ -285,17 +329,64 @@ impl Output {
             if state == DISCONNECTED {
                 return Err(self.device_error("device disconnected during control", -899));
             }
+            // Some shared AudioTrack streams consume submitted PCM while
+            // still reporting STARTING. Measured playback is enough to proceed.
+            if state == STARTING && let Some(position) = start_position
+                && self.counters()?.0 > position
+            {
+                return Ok(());
+            }
+            if expected == STARTED {
+                // A shared AudioTrack may still be waiting for enough PCM to
+                // start. Feed the queued tail while its request is in flight.
+                if can_expand_start_buffer && !self.pending.is_empty()
+                    && start.elapsed() >= START_BUFFER_RETRY_DELAY
+                {
+                    can_expand_start_buffer = false;
+                    let size = unsafe {
+                        AAudioStream_setBufferSizeInFrames(stream.as_ptr(), self.device_buffer_capacity)
+                    };
+                    if size > self.device_buffer_size && size <= self.device_buffer_capacity {
+                        self.device_buffer_size = size;
+                        self.max_queued_frames = self.max_queued_frames
+                            .max(size as u64 + u64::from(self.rate / 10));
+                    }
+                }
+                self.pump()?;
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                if let Some(position) = start_position {
+                    let (consumed, written) = self.counters()?;
+                    let cause = format!("AAudio state={state}, start_position={position}, consumed={consumed}, written={written}: {}", result_text(-885));
+                    self.failed = Some(cause.clone());
+                    return Err(cs2_runtime::RuntimeError::AudioStartTimeout(cause));
+                }
                 return Err(self.device_error("control state acknowledgement timed out", -885));
             }
             let mut next = state;
+            // Legacy shared AudioTrack may keep reporting STARTING even
+            // while it consumes real PCM. Bound the first progress probes
+            // more tightly during the first device period. Return to the
+            // normal control cadence if startup stalls.
+            let slice = if state == STARTING
+                && start_position.is_some()
+                && start.elapsed() < START_BUFFER_RETRY_DELAY
+            {
+                if start.elapsed() < INITIAL_PROGRESS_WINDOW {
+                    INITIAL_PROGRESS_SLICE
+                } else {
+                    START_PROGRESS_SLICE
+                }
+            } else {
+                STATE_WAIT_SLICE
+            };
             let result = unsafe {
                 AAudioStream_waitForStateChange(
                     stream.as_ptr(),
                     state,
                     &mut next,
-                    left.min(Duration::from_millis(20)).as_nanos() as i64,
+                    left.min(slice).as_nanos() as i64,
                 )
             };
             if result < 0 && next == state {
@@ -361,21 +452,55 @@ impl MovieAudioOutput for Output {
     }
 
     fn pause(&mut self, paused: bool) -> RuntimeResult<()> {
+        if paused && self.staged_device.is_some() {
+            return Ok(());
+        }
+        if let Some(staged) = self.staged_device.take() {
+            if let StagedDevice::Started(xruns) = staged
+                && self.can_activate_standby(xruns)
+            {
+                self.pump()?;
+                let stream = self.validate_device()?;
+                if unsafe { AAudioStream_getXRunCount(stream.as_ptr()) } != xruns {
+                    // Programming PCM has already been offered. Restarting
+                    // it could duplicate an audible prefix, and the lost
+                    // device origin can no longer prove exact progress.
+                    let cause = "AAudio standby lost its device clock during activation".to_owned();
+                    self.failed = Some(cause.clone());
+                    return Err(cs2_runtime::RuntimeError::AudioStartTimeout(cause));
+                }
+                self.wait_state(STARTED, Some(0))?;
+                self.paused = false;
+                return Ok(());
+            }
+            if !matches!(staged, StagedDevice::Open) || !self.can_activate_opened() {
+                // No program PCM has reached the expired or disconnected
+                // standby. Transfer the exact staged PCM to a fresh device.
+                let mut fresh = Self::open_pcm(self.rate, self.channels)?;
+                fresh.pending = std::mem::take(&mut self.pending);
+                fresh.pending_frames = self.pending_frames;
+                fresh.accepted_frames = self.accepted_frames;
+                drop(std::mem::replace(self, fresh));
+            }
+        }
         let stream = self.validate_device()?;
         if paused == self.paused {
             return Ok(());
         }
         if paused {
-            check("request pause", unsafe {
-                AAudioStream_requestPause(stream.as_ptr())
-            })?;
-            self.wait_state(PAUSED)?;
+            {
+                let _timing = Stage::Request.begin();
+                check("request pause", unsafe { AAudioStream_requestPause(stream.as_ptr()) })?;
+            }
+            self.wait_state(PAUSED, None)?;
         } else {
             self.pump()?;
-            check("request start", unsafe {
-                AAudioStream_requestStart(stream.as_ptr())
-            })?;
-            self.wait_state(STARTED)?;
+            let (position, _) = self.counters()?;
+            {
+                let _timing = Stage::Request.begin();
+                check("request start", unsafe { AAudioStream_requestStart(stream.as_ptr()) })?;
+            }
+            self.wait_state(STARTED, Some(position))?;
             self.started = true;
         }
         self.paused = paused;
@@ -392,11 +517,12 @@ impl MovieAudioOutput for Output {
             .map_or(Ok(()), |cause| Err(error(cause)));
         let state = unsafe { AAudioStream_getState(stream.as_ptr()) };
         if self.started && !matches!(state, OPEN | STOPPED | DISCONNECTED) {
-            let requested = check("request stop", unsafe {
-                AAudioStream_requestStop(stream.as_ptr())
-            });
+            let requested = {
+                let _timing = Stage::Request.begin();
+                check("request stop", unsafe { AAudioStream_requestStop(stream.as_ptr()) })
+            };
             if requested.is_ok() && self.failed.is_none() {
-                result = result.and(self.wait_state(STOPPED));
+                result = result.and(self.wait_state(STOPPED, None));
             } else {
                 result = result.and(requested);
             }
@@ -404,9 +530,10 @@ impl MovieAudioOutput for Output {
         // No callback or blocking writer can retain this stream. Close once
         // even after disconnection/stop failure; never fake a successful close.
         self.stream = None;
-        let closed = check("close output stream", unsafe {
-            AAudioStream_close(stream.as_ptr())
-        });
+        let closed = {
+            let _timing = Stage::Close.begin();
+            check("close output stream", unsafe { AAudioStream_close(stream.as_ptr()) })
+        };
         self.pending.clear();
         self.pending_frames = 0;
         result.and(closed)

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
-use cs2_desktop::{HeadlessPlayer, HostFrameTiming};
+use cs2_desktop::{HeadlessPlayer, HostFrameTiming, HostPerfDetails};
 use cs2_runtime::{InputEvent, InputKey};
 use cs2_runtime::message_object::MessageTextInputEvent;
 
@@ -17,6 +17,7 @@ struct Sessions {
     displayed_frames: BTreeMap<u64, DisplayedFrame>,
     story_traces: BTreeMap<u64, StoryTrace>,
     error: CString,
+    perf_details: CString,
     clipboard: CString,
     clipboard_units: Vec<u16>,
     message_lists: Vec<u8>,
@@ -34,17 +35,35 @@ struct Sessions {
 struct DisplayedFrame {
     size: [u32; 2],
     rgba: Vec<u8>,
+    device_revision: Option<u64>,
 }
 
 impl DisplayedFrame {
     fn matches(&self, size: [u32; 2], rgba: &[u8]) -> bool {
-        self.size == size && self.rgba == rgba
+        self.device_revision.is_none() && self.size == size && self.rgba == rgba
     }
 
     fn record(&mut self, size: [u32; 2], rgba: &[u8]) {
         self.rgba.clear();
         self.rgba.extend_from_slice(rgba);
         self.size = size;
+        self.device_revision = None;
+    }
+
+    fn matches_player(&self, player: &HeadlessPlayer) -> bool {
+        if let Some(revision) = player.host_device_frame_revision() {
+            return self.device_revision == Some(revision);
+        }
+        self.device_revision.is_none() && self.matches(player.logical_size(), player.frame_rgba())
+    }
+
+    fn record_player(&mut self, player: &HeadlessPlayer) {
+        if let Some(revision) = player.host_device_frame_revision() {
+            self.device_revision = Some(revision);
+            self.rgba.clear();
+        } else {
+            self.record(player.logical_size(), player.frame_rgba());
+        }
     }
 }
 
@@ -138,6 +157,7 @@ pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_c
     call(0, |sessions| {
         let game = unsafe { path(game)? };
         let saves = unsafe { path(saves)? };
+        HeadlessPlayer::enable_host_gpu_raster();
         let mut player = HeadlessPlayer::open_with_save_root(&game, &saves)
             .map_err(|error| format!("Open game: {error:#}"))?;
         player.disable_script_evidence_capture();
@@ -163,6 +183,32 @@ pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_c
         }
         Ok(id)
     })
+}
+
+/// Reads a device timestamp from the engine thread. Both outputs must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_gpu_timing(sequence: *mut u64, elapsed_ns: *mut u64) -> i32 {
+    if sequence.is_null() || elapsed_ns.is_null() { return 0; }
+    let Some((next_sequence, ns)) = HeadlessPlayer::latest_host_gpu_timing() else { return 0; };
+    unsafe {
+        sequence.write(next_sequence);
+        elapsed_ns.write(ns);
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_open_profiled_v3(
+    game: *const c_char, saves: *const c_char, story: i32, timing: *mut HostFrameTiming,
+) -> u64 {
+    let open = || unsafe { cs2_android_open(game, saves, story) };
+    if let Some(timing) = unsafe { timing.as_mut() } {
+        let (id, sample) = HostFrameTiming::capture(open);
+        *timing = sample;
+        id
+    } else {
+        open()
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -447,17 +493,33 @@ pub extern "C" fn cs2_android_message_list_action(
 
 /// The optional story row is borrowed from the session; consume it before the next native call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cs2_android_step(
+pub unsafe extern "C" fn cs2_android_step_profiled_v4(
     id: u64, budget: u32, timing: *mut HostFrameTiming, story_row: *mut *const c_char,
+    frame: u64, step_call: u64, detail_rows: *mut *const c_char,
 ) -> i32 {
     let story_row = unsafe { story_row.as_mut() }.map(|output| {
+        *output = std::ptr::null();
+        output
+    });
+    let detail_rows = unsafe { detail_rows.as_mut() }.map(|output| {
         *output = std::ptr::null();
         output
     });
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
         let step = if let Some(timing) = unsafe { timing.as_mut() } {
-            let (result, sample) = HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
+            let mut advance = || HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
+            let (result, sample) = if let Some(output) = detail_rows {
+                let (step, detail) = HostPerfDetails::capture(frame == 1 || frame % 60 == 0, advance);
+                let rows = detail.rows(id, frame, step_call);
+                if !rows.is_empty() {
+                    sessions.perf_details = CString::new(rows).unwrap_or_default();
+                    *output = sessions.perf_details.as_ptr();
+                }
+                step
+            } else {
+                advance()
+            };
             *timing = sample;
             result
         } else {
@@ -492,7 +554,7 @@ pub unsafe extern "C" fn cs2_android_step(
         } else if !completed {
             0
         } else if sessions.displayed_frames.get(&id)
-            .is_some_and(|frame| frame.matches(player.logical_size(), player.frame_rgba()))
+            .is_some_and(|frame| frame.matches_player(player))
         {
             FRAME_UNCHANGED
         } else {
@@ -785,9 +847,47 @@ pub unsafe extern "C" fn cs2_android_copy_frame(
 pub extern "C" fn cs2_android_frame_posted(id: u64) -> i32 {
     call(-1, |sessions| {
         let player = sessions.players.get(&id).ok_or("Android session is absent")?;
-        sessions.displayed_frames.entry(id).or_default().record(player.logical_size(), player.frame_rgba());
+        sessions.displayed_frames.entry(id).or_default().record_player(player);
         Ok(0)
     })
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_vulkan_candidate(window: *mut std::ffi::c_void) -> i32 {
+    i32::from(std::ptr::NonNull::new(window).is_some_and(HeadlessPlayer::android_surface_candidate))
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_present_vulkan(id: u64, window: *mut std::ffi::c_void) -> i32 {
+    call(-1, |sessions| {
+        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
+        let Some(window) = std::ptr::NonNull::new(window) else { return Ok(-2) };
+        Ok(unsafe { player.present_android_surface(window) })
+    })
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_detach_vulkan() {
+    HeadlessPlayer::detach_android_surface();
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_vulkan_display_stats_enable(enabled: i32) {
+    HeadlessPlayer::set_android_vulkan_display_stats(enabled != 0);
+}
+
+/// The output must accommodate seven consecutive u64 values.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_vulkan_display_stats(output: *mut u64) -> i32 {
+    if output.is_null() { return 0; }
+    let Some(stats) = HeadlessPlayer::android_vulkan_display_stats() else { return 0; };
+    unsafe { std::ptr::copy_nonoverlapping(stats.as_ptr(), output, stats.len()) };
+    1
 }
 
 /// Valid until the next failing operation on this same worker thread.

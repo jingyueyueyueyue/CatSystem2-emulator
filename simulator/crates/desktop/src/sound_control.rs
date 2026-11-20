@@ -4,7 +4,7 @@ use crate::{
     HeadlessPlayer, LoggingHost, SoundChannelState, audio_script_error, native_play_looped,
     read_u32, should_resume_playback, sound_audio_channel,
 };
-use cs2_runtime::{AudioChannel, AudioRequest, TaskCommand, TaskCommandBuffers};
+use cs2_runtime::{AudioChannel, AudioRequest, RuntimeError, TaskCommand, TaskCommandBuffers};
 use cs2_script::{NativeReturn, Vm};
 
 /// Platform lifecycle is independent of the game's saved clock/pause state.
@@ -258,6 +258,16 @@ impl LoggingHost<'_> {
         }
         let now_millis = self.host_millis();
         let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
+        let _audio = match index {
+            156..=159 => Some(crate::perf_detail::audio::Profile::new(
+                self.current_task_id,
+                channel,
+                "control",
+                Some(index),
+                state.resource.as_deref().unwrap_or(""),
+            )),
+            _ => None,
+        };
         let result = (|| {
             if matches!(index, 157..=166)
                 && let Some(handle) = state.handle
@@ -330,7 +340,8 @@ impl LoggingHost<'_> {
                             pan: state.request_pan(),
                             looped: native_play_looped(value),
                         };
-                        let playback = crate::audio::play_loaded_sound_range(
+                        let sound_effect = request.channel == AudioChannel::SoundEffect;
+                        let playback = match crate::audio::play_loaded_sound_range(
                             self.audio_host,
                             request,
                             state.prepared_audio.clone(),
@@ -341,8 +352,20 @@ impl LoggingHost<'_> {
                                 range: state.task.loop_range,
                                 whole: state.task.whole_buffer,
                             },
-                        )
-                        .map_err(|cause| self.sound_host_error(cause))?;
+                        ) {
+                            Ok(playback) => playback,
+                            Err(RuntimeError::AudioStartTimeout(cause)) if sound_effect => {
+                                state.paused = false;
+                                state.repeat_remaining = 0;
+                                state.task.signal = None;
+                                state.source_query_stopped();
+                                if let Some(event) = self.events.last_mut() {
+                                    event.detail.push_str(&format!(" sound_effect_start_skipped channel={channel}: {cause}"));
+                                }
+                                return Ok(NativeReturn::Continue);
+                            }
+                            Err(cause) => return Err(self.sound_host_error(cause)),
+                        };
                         state.handle = Some(playback.handle);
                         state.paused = false;
                         state.looped = playback.looped;

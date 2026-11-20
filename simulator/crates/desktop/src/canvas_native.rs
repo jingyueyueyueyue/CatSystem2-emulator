@@ -65,9 +65,156 @@ pub(super) struct VramOverflow {
     tile: [u32; 2],
     grid: [u32; 2],
     pixels: BTreeMap<u32, Vec<u8>>,
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    #[serde(skip)]
+    packed: std::cell::RefCell<PackedRegions>,
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    #[serde(skip)]
+    texture_updates: std::cell::RefCell<AtlasUpdates>,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+#[derive(Debug, Default)]
+struct AtlasUpdates {
+    id: u64,
+    version: u64,
+    dirty: std::collections::BTreeSet<u32>,
+    versions: BTreeMap<u32, u64>,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+impl Clone for AtlasUpdates {
+    fn clone(&self) -> Self { Self::default() }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+#[derive(Default, Debug)]
+struct PackedRegions {
+    entries: std::collections::VecDeque<PackedRegion>,
+    all_dirty: bool,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+impl Clone for PackedRegions {
+    fn clone(&self) -> Self { Self::default() }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+#[derive(Debug)]
+struct PackedRegion {
+    origin: [u32; 2],
+    size: [u32; 2],
+    viewport: Option<cs2_renderer::FramePixelIdentity>,
+    frame: RgbaFrame,
+    valid: bool,
 }
 
 impl VramOverflow {
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn dimensions(&self) -> [u32; 2] {
+        [self.tile[0] * self.grid[0], self.tile[1] * self.grid[1]]
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn gpu_version(&self) -> (u64, u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ATLAS: AtomicU64 = AtomicU64::new(1);
+        let mut updates = self.texture_updates.borrow_mut();
+        if updates.id == 0 { updates.id = NEXT_ATLAS.fetch_add(1, Ordering::Relaxed); }
+        if !updates.dirty.is_empty() {
+            updates.version += 1;
+            let version = updates.version;
+            for tile in std::mem::take(&mut updates.dirty) { updates.versions.insert(tile, version); }
+        }
+        (updates.id, updates.version)
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn visit_gpu_tiles(&self, after: Option<u64>, mut visit: impl FnMut([u32; 2], [u32; 2], &[u8])) {
+        let updates = self.texture_updates.borrow();
+        for (&index, pixels) in &self.pixels {
+            if after.is_some_and(|version| updates.versions.get(&index).copied().unwrap_or(0) <= version) {
+                continue;
+            }
+            let origin = [(index % self.grid[0]) * self.tile[0], (index / self.grid[0]) * self.tile[1]];
+            visit(origin, self.tile, pixels);
+        }
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    fn mark_gpu_tile(&mut self, index: u32) {
+        let updates = self.texture_updates.get_mut();
+        if updates.id != 0 { updates.dirty.insert(index); }
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn pack_region(&self, viewport: &RgbaFrame, origin: [u32; 2], size: [u32; 2]) -> Result<RgbaFrame> {
+        let [width, height] = size;
+        let depends_on_viewport = origin[0] < viewport.width() && origin[1] < viewport.height();
+        let mut cache = self.packed.borrow_mut();
+        if std::mem::take(&mut cache.all_dirty) {
+            for entry in &mut cache.entries { entry.valid = false; }
+        }
+        let previous = cache.entries.iter().position(|entry| entry.origin == origin && entry.size == size)
+            .and_then(|index| cache.entries.remove(index));
+        if let Some(entry) = previous.as_ref().filter(|entry| entry.valid
+            && if depends_on_viewport { entry.viewport.as_ref().is_some_and(|pixels| pixels.matches(viewport)) }
+                else { entry.viewport.is_none() })
+        {
+            let frame = entry.frame.clone();
+            cache.entries.push_back(previous.unwrap());
+            return Ok(frame);
+        }
+        let mut canvas = Canvas::new(width, height)?;
+        let source_width = viewport.width();
+        for y in 0..height {
+            let sample_y = origin[1] + y;
+            let row = y as usize * width as usize * 4;
+            let mut x = 0;
+            while x < width {
+                let sample_x = origin[0] + x;
+                let (count, input) = if sample_y < viewport.height() && sample_x < source_width {
+                    let count = (width - x).min(source_width - sample_x);
+                    let start = (sample_y as usize * source_width as usize + sample_x as usize) * 4;
+                    (count, Some(&viewport.pixels()[start..start + count as usize * 4]))
+                } else {
+                    self.row_span(sample_x, sample_y, width - x)
+                };
+                if let Some(input) = input {
+                    let start = row + x as usize * 4;
+                    canvas.pixels_mut()[start..start + input.len()].copy_from_slice(input);
+                }
+                x += count;
+            }
+        }
+        // Dirty regions can be written more than once with the same pixels.
+        // Preserve the immutable identity if repacking proves output equality.
+        let frame = match previous {
+            Some(entry) if entry.frame.pixels() == canvas.pixels() => entry.frame,
+            _ => canvas.into_frame(),
+        };
+        let bytes = frame.pixels().len();
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        if bytes <= MAX_BYTES {
+            let mut resident: usize = cache.entries.iter().map(|entry| entry.frame.pixels().len()).sum();
+            while resident + bytes > MAX_BYTES || cache.entries.len() >= 16 {
+                resident -= cache.entries.pop_front().unwrap().frame.pixels().len();
+            }
+            cache.entries.push_back(PackedRegion { origin, size, frame: frame.clone(), valid: true,
+                viewport: depends_on_viewport.then(|| viewport.pixel_identity()) });
+        }
+        Ok(frame)
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    fn invalidate_packed(&mut self, origin: [u32; 2], end: [u32; 2]) {
+        for entry in &mut self.packed.get_mut().entries {
+            if (0..2).all(|axis| origin[axis] < entry.origin[axis] + entry.size[axis] && entry.origin[axis] < end[axis]) {
+                entry.valid = false;
+            }
+        }
+    }
+
     fn byte_offset(&self, x: u32, y: u32) -> usize {
         ((y % self.tile[1]) as usize * self.tile[0] as usize + (x % self.tile[0]) as usize) * 4
     }
@@ -79,15 +226,22 @@ impl VramOverflow {
     fn set(&mut self, index: u32, x: u32, y: u32, color: Color) {
         let offset = self.byte_offset(x, y);
         let length = self.tile_bytes();
+        let rgba = [color.r, color.g, color.b, color.a];
         match self.pixels.entry(index) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                entry.get_mut()[offset..offset + 4].copy_from_slice(&[color.r, color.g, color.b, color.a]);
+                if entry.get()[offset..offset + 4] == rgba { return; }
+                entry.get_mut()[offset..offset + 4].copy_from_slice(&rgba);
             }
             std::collections::btree_map::Entry::Vacant(entry) if color != Color::TRANSPARENT => {
                 entry.insert(vec![0; length])[offset..offset + 4]
-                    .copy_from_slice(&[color.r, color.g, color.b, color.a]);
+                    .copy_from_slice(&rgba);
             }
-            _ => {}
+            _ => return,
+        }
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        {
+            self.packed.get_mut().all_dirty = true;
+            self.mark_gpu_tile(index);
         }
     }
 
@@ -190,6 +344,10 @@ impl CanvasNativeState {
             if !in_viewport && (overflow.is_some() || color != Color::TRANSPARENT) {
                 overflow.get_or_insert_with(|| VramOverflow {
                     tile: self.tile, grid: self.grid, pixels: BTreeMap::new(),
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    packed: Default::default(),
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    texture_updates: Default::default(),
                 }).set(index, x as u32, y as u32, color);
             }
         }
@@ -218,9 +376,46 @@ impl CanvasNativeState {
         ) else {
             return Ok(());
         };
-        for y in top..bottom {
-            for x in left..right {
-                self.write_pixel(target, overflow, x, y, Color::TRANSPARENT)?;
+        let [left, top, right, bottom] = [left, top, right, bottom].map(|value| value as u32);
+        if !self.initialized {
+            zero_tile(target, left, top, [right - left, bottom - top]);
+            return Ok(());
+        }
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if let Some(atlas) = overflow.as_mut() { atlas.invalidate_packed([left, top], [right, bottom]); }
+
+        let [tile_width, tile_height] = self.tile;
+        let viewport = [target.width(), target.height()];
+        for row in top / tile_height..=(bottom - 1) / tile_height {
+            for column in left / tile_width..=(right - 1) / tile_width {
+                let index = row * self.grid[0] + column;
+                let Some(tile) = self.tiles.get_mut(index as usize).and_then(Option::as_mut) else { continue };
+                tile.dirty = true;
+                let [tile_x, tile_y] = [column * tile_width, row * tile_height];
+                let [x0, y0] = [left.max(tile_x), top.max(tile_y)];
+                let [x1, y1] = [right.min(tile_x + tile_width), bottom.min(tile_y + tile_height)];
+                zero_tile(target, x0, y0, [x1 - x0, y1 - y0]);
+                if let Some(atlas) = overflow.as_mut() && let Some(bytes) = atlas.pixels.get_mut(&index) {
+                    // Only the part outside the viewport is owned by the
+                    // sparse atlas. Clearing unused space never allocates it.
+                    let stride = tile_width as usize * 4;
+                    let end = (x1 - tile_x) as usize * 4;
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    let mut changed = false;
+                    for y in y0..y1 {
+                        let left = if y < viewport[1] { x0.max(viewport[0]) } else { x0 };
+                        if left < x1 {
+                            let start = (left - tile_x) as usize * 4;
+                            let row = (y - tile_y) as usize * stride;
+                            let pixels = &mut bytes[row + start..row + end];
+                            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                            { changed |= list_span_occupies_tile(pixels, 32); }
+                            pixels.fill(0);
+                        }
+                    }
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    if changed { atlas.mark_gpu_tile(index); }
+                }
             }
         }
         Ok(())
@@ -304,6 +499,11 @@ impl CanvasNativeState {
 
         let destination_left = (source_left + offset_x) as u32;
         let destination_right = (source_right + offset_x) as u32;
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if let Some(atlas) = overflow.as_mut() {
+            atlas.invalidate_packed([destination_left, (source_top + offset_y) as u32],
+                [destination_right, (source_bottom + offset_y) as u32]);
+        }
         let (target_width, target_height) = target.dimensions();
         let source_stride = source.width() as usize * 4;
         let target_stride = target_width as usize * 4;
@@ -339,21 +539,41 @@ impl CanvasNativeState {
                     let start = destination_y as usize * target_stride + destination_x as usize * 4;
                     copy_list_span(&mut target.pixels_mut()[start..start + byte_count], input, depth);
                 } else if overflow.as_ref().is_some_and(|atlas| atlas.pixels.contains_key(&tile_index))
-                    || input.iter().any(|&byte| if depth == 16 { byte >= 16 } else { byte != 0 })
+                    || list_span_occupies_tile(input, depth)
                 {
                     let atlas = overflow.get_or_insert_with(|| VramOverflow {
                         tile: self.tile, grid: self.grid, pixels: BTreeMap::new(),
+                        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                        packed: Default::default(),
+                        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                        texture_updates: Default::default(),
                     });
                     let start = atlas.byte_offset(destination_x, destination_y);
                     let tile_bytes = atlas.tile_bytes();
                     let output = atlas.pixels.entry(tile_index).or_insert_with(|| vec![0; tile_bytes]);
-                    copy_list_span(&mut output[start..start + byte_count], input, depth);
+                    let pixels = &mut output[start..start + byte_count];
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    let changed = if depth == 16 { pixels.iter().zip(input).any(|(&old, &new)| old != (new >> 4) * 17) }
+                        else { pixels != input };
+                    copy_list_span(pixels, input, depth);
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    if changed { atlas.mark_gpu_tile(tile_index); }
                 }
                 destination_x = end;
             }
         }
         Ok(())
     }
+}
+
+fn list_span_occupies_tile(input: &[u8], depth: u32) -> bool {
+    // The overflow atlas stores RGB even at zero alpha. A 16-bit tile
+    // discards the low nibble of every channel, including alpha.
+    let mask = if depth == 16 { 0xf0u8 } else { u8::MAX };
+    let word_mask = u64::from_ne_bytes([mask; 8]);
+    let (words, tail) = input.as_chunks::<8>();
+    words.iter().any(|&word| u64::from_ne_bytes(word) & word_mask != 0)
+        || tail.iter().any(|&byte| byte & mask != 0)
 }
 
 fn copy_list_span(target: &mut [u8], source: &[u8], depth: u32) {

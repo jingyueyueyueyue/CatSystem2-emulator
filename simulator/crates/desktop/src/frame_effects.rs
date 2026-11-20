@@ -294,7 +294,7 @@ impl FrameEffects {
             task.active = 0;
         }
         // Commit both pixels and activity only after both live ranges succeed.
-        target.pixels_mut().copy_from_slice(frame.pixels());
+        *target = frame;
         self.tasks.insert(id, task);
         Ok(())
     }

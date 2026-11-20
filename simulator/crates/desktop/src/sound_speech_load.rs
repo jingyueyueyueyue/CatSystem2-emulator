@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, audio_script_error, read_u32};
-use super::audio_decode::{AudioCodec, AudioProbe, DecodedAudio};
+use super::audio_decode::{AudioCodec, AudioProbe, DecodedAudio, PreparedAudio};
 
 pub(super) const RECORD_BYTES: usize = 292;
 pub(super) const MAX_TEXT: usize = 4096;
@@ -29,17 +29,17 @@ impl LoggingHost<'_> {
         let used = self.sound_channels.iter()
             .filter(|(id, state)| **id != channel && state.task.is_speech)
             .filter_map(|(_, state)| state.prepared_audio.as_ref())
-            .try_fold(0usize, |total, audio| total.checked_add(audio.samples.len() * 2))
+            .try_fold(0usize, |total, audio| total.checked_add(audio.sample_count() * 2))
             .ok_or_else(|| audio_script_error("speech PCM ownership accounting overflow"))?;
         if used.checked_add(pcm.samples.len() * 2).is_none_or(|total| total > MAX_LIVE_PCM) {
             return Err(audio_script_error("live generated speech PCM exceeds128 MiB"));
         }
-        let prepared = Arc::new(DecodedAudio {
+        let prepared = Arc::new(PreparedAudio::from_pcm(DecodedAudio {
             probe: AudioProbe { codec: AudioCodec::SpeechPcm, sample_rate: pcm.sample_rate,
                 channels: pcm.channels,
                 frames: (pcm.samples.len() / usize::from(pcm.channels)) as u64 },
             samples: pcm.samples,
-        });
+        }));
         let identity = super::sound_native::next_sound_resource_identity()?;
         let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
         if let Some(handle) = state.handle {

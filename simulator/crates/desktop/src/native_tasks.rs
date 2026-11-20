@@ -30,6 +30,8 @@ mod scene_tool_tasks;
 pub(super) use task_commands2::{OwnedTaskBuffers, TaskBufferReceiver};
 pub(crate) use task_commands2::PreparedBufferedCommands;
 pub(super) use render_tasks::RenderTaskStore;
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) use render_tasks::WipeStep;
 pub(super) use export_tasks::ExportTaskStore;
 pub(crate) use export_tasks::{ExportSoundPrompt, ExportSoundQuestion};
 pub(crate) use render_tasks::RenderTaskOperation;
@@ -1608,6 +1610,8 @@ impl LoggingHost<'_> {
             let next = match phase {
                 Phase::Begin => {
                     self.ensure_task_record(id)?;
+                    let _detail = super::perf_detail::SlowTask::new(id,
+                        || self.data_services.tasks.records[&id].kind as i32, "child_begin");
                     self.data_services
                         .tasks
                         .records
@@ -1642,6 +1646,7 @@ impl LoggingHost<'_> {
                         continue;
                     }
                     let kind = self.data_services.tasks.records[&id].kind;
+                    let _detail = super::perf_detail::SlowTask::new(id, || kind as i32, "child_body");
                     // Deletion is checked before entering the original body,
                     // not between artificial instruction-budget slices. A
                     // nested native67 can mark the detached record while its
@@ -1732,8 +1737,12 @@ impl LoggingHost<'_> {
                         if ordinary_kind(record.kind)
                             && record.loading.is_none()
                             && !self.with_ordinary_task(id, |host, task| {
+                                let _detail = super::perf_detail::SlowTask::new(id,
+                                    || kind as i32, "kcs_body");
+                                let profile = super::perf_detail::KcsBody::new(id,
+                                    task.vm.as_ref().map(|vm| vm.instruction_pointer));
                                 task.system_time_ms = host.host_millis();
-                                task.update_body_with_messages(
+                                let result = task.update_body_with_messages(
                                     traversal.increment,
                                     host,
                                     budget,
@@ -1745,8 +1754,9 @@ impl LoggingHost<'_> {
                                             .map(|record| record.queued.drain(..).collect())
                                             .unwrap_or_default()
                                     },
-                                )
-                                .map_err(|error| host.task_error(id, error))
+                                );
+                                profile.end_pc(task.vm.as_ref().map(|vm| vm.instruction_pointer));
+                                result.map_err(|error| host.task_error(id, error))
                             })?
                         {
                             return Ok(false);
@@ -1786,6 +1796,9 @@ impl LoggingHost<'_> {
                     Phase::Release
                 }
                 Phase::Release => {
+                    let _detail = super::perf_detail::SlowTask::new(id,
+                        || self.data_services.tasks.records.get(&id).map_or(-1, |record| record.kind as i32),
+                        "child_release");
                     if !self.release_scene_tool_task(id)? {
                         return Ok(false);
                     }
@@ -1865,6 +1878,9 @@ impl LoggingHost<'_> {
     }
 
     fn notify_task_delete(&mut self, id: u32, budget: usize) -> Result<bool> {
+        let _detail = super::perf_detail::SlowTask::new(id,
+            || self.data_services.tasks.records.get(&id).map_or(-1, |record| record.kind as i32),
+            "child_notify_delete");
         self.ensure_task_record(id)?;
         if self.data_services.tasks.records[&id].deletion != 0 {
             return Ok(true);

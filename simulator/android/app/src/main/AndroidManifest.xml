@@ -7,7 +7,7 @@
     <application android:label="CatSystem2 Player"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:allowBackup="false" android:supportsRtl="true" android:requestLegacyExternalStorage="true">
-        <provider android:name=".PlayerActivity$GameFilesProvider"
+        <provider android:name=".PlayerEngineActivity$GameFilesProvider"
             android:authorities="${applicationId}.gamefiles"
             android:exported="false" android:grantUriPermissions="true" />
         <activity android:name=".PlayerActivity" android:exported="true"

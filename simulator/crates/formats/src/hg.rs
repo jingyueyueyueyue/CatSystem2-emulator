@@ -532,6 +532,41 @@ enum NativeRowOrder {
     BottomUp,
 }
 
+// A plane byte contains one pair of bits from each of four adjacent output
+// bytes. Put each pair at the bottom of its own byte lane before combining
+// the four planes and undoing signed residual coding.
+const PLANE_LANES: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut byte = 0;
+    while byte < table.len() {
+        let packed = byte as u32;
+        table[byte] = (packed & 3)
+            | ((packed & 0x0c) << 6)
+            | ((packed & 0x30) << 12)
+            | ((packed & 0xc0) << 18);
+        byte += 1;
+    }
+    table
+};
+
+fn unpack_native_planes(planes: &[u8], pixels: &mut [[u8; 4]]) {
+    let size = planes.len() / 4;
+    let (high, rest) = planes.split_at(size);
+    let (mid_high, rest) = rest.split_at(size);
+    let (mid_low, low) = rest.split_at(size);
+    for (pixel, (((&high, &mid_high), &mid_low), &low)) in pixels
+        .iter_mut()
+        .zip(high.iter().zip(mid_high).zip(mid_low).zip(low))
+    {
+        let word = PLANE_LANES[high as usize] << 6
+            | PLANE_LANES[mid_high as usize] << 4
+            | PLANE_LANES[mid_low as usize] << 2
+            | PLANE_LANES[low as usize];
+        let sign = (word & 0x0101_0101).wrapping_mul(255);
+        *pixel = (((word >> 1) & 0x7f7f_7f7f) ^ sign).to_le_bytes();
+    }
+}
+
 fn decode_native_pixels(
     literals: &[u8],
     commands: &[u8],
@@ -547,34 +582,19 @@ fn decode_native_pixels(
         .checked_mul(height)
         .ok_or(HgError::PixelOutputTooLarge)?;
     let planes = expand_runs(literals, commands, minimum_size)?;
-    let mut decoded = vec![0; planes.len()];
-    let plane_size = planes.len() / 4;
-    if plane_size == 0 || planes.len() % 4 != 0 {
-        return Err(HgError::InvalidPixelCommands);
-    }
-
-    for (index, pixel) in decoded.chunks_exact_mut(4).enumerate() {
-        for (channel, value) in pixel.iter_mut().enumerate() {
-            let mut packed = 0u8;
-            for plane in 0..4 {
-                let source = planes[plane * plane_size + index];
-                let pair = (source >> (channel * 2)) & 3;
-                packed |= pair << (6 - plane * 2);
-            }
-            *value = (packed >> 1) ^ 0u8.wrapping_sub(packed & 1);
-        }
-    }
-
+    let mut decoded = vec![0; minimum_size.next_multiple_of(4)];
+    unpack_native_planes(&planes, decoded.as_chunks_mut::<4>().0);
+    decoded.truncate(minimum_size);
+    let mut rows = decoded.chunks_exact_mut(layout.stride);
+    let mut previous = rows.next().ok_or(HgError::InvalidDimensions)?;
     for index in layout.depth_bytes..layout.stride {
-        decoded[index] = decoded[index].wrapping_add(decoded[index - layout.depth_bytes]);
+        previous[index] = previous[index].wrapping_add(previous[index - layout.depth_bytes]);
     }
-    for row in 1..height {
-        let start = row * layout.stride;
-        let previous = start - layout.stride;
-        for offset in 0..layout.stride {
-            decoded[start + offset] =
-                decoded[start + offset].wrapping_add(decoded[previous + offset]);
+    for row in rows {
+        for (value, &predictor) in row.iter_mut().zip(previous.iter()) {
+            *value = value.wrapping_add(predictor);
         }
+        previous = row;
     }
     if channel_precision != 0 {
         // HG-2's high WORD is a separate signed channel-precision field.
@@ -599,28 +619,42 @@ fn decode_native_pixels(
         }
     }
 
-    let mut output = Vec::with_capacity(layout.visible_bytes);
-    for row in 0..height {
+    if layout.depth_bytes == 4 {
+        if matches!(row_order, NativeRowOrder::BottomUp) {
+            let (first, last) = decoded.split_at_mut((height / 2) * layout.stride);
+            for (first, last) in first
+                .chunks_exact_mut(layout.stride)
+                .zip(last.rchunks_exact_mut(layout.stride))
+            {
+                first.swap_with_slice(last);
+            }
+        }
+        if format == HgPixelFormat::Rgba8 {
+            for pixel in decoded.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+        return Ok(decoded);
+    }
+
+    let mut output = vec![0; layout.visible_bytes];
+    let output_stride = layout.visible_bytes / height;
+    let (first, third) = if format == HgPixelFormat::Bgra8 {
+        (0, 2)
+    } else {
+        (2, 0)
+    };
+    for (row, output) in output.chunks_exact_mut(output_stride).enumerate() {
         let source_row = match row_order {
             NativeRowOrder::TopDown => row,
             NativeRowOrder::BottomUp => height - 1 - row,
         };
         let start = source_row * layout.stride;
-        for pixel in decoded[start..start + layout.stride].chunks_exact(layout.depth_bytes) {
-            match (layout.depth_bytes, format) {
-                (3, HgPixelFormat::Bgra8) => {
-                    output.extend_from_slice(pixel);
-                    output.push(255);
-                }
-                (3, HgPixelFormat::Rgba8) => {
-                    output.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
-                }
-                (4, HgPixelFormat::Bgra8) => output.extend_from_slice(pixel),
-                (4, HgPixelFormat::Rgba8) => {
-                    output.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-                }
-                _ => return Err(HgError::InvalidFrame),
-            }
+        let source = &decoded[start..start + layout.stride];
+        let (source_pixels, _) = source.as_chunks::<3>();
+        let (output_pixels, _) = output.as_chunks_mut::<4>();
+        for (out, pixel) in output_pixels.iter_mut().zip(source_pixels) {
+            *out = [pixel[first], pixel[1], pixel[third], 255];
         }
     }
     Ok(output)
@@ -665,42 +699,86 @@ fn usize_from_u64(value: u64) -> Result<usize, HgError> {
 }
 
 struct BitReader<'a> {
-    bytes: &'a [u8],
-    position: usize,
+    remaining: &'a [u8],
+    buffer: u64,
+    available: u32,
 }
 
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
+        Self {
+            remaining: bytes,
+            buffer: 0,
+            available: 0,
+        }
+    }
+
+    fn refill(&mut self) -> Result<(), HgError> {
+        if let Some((word, remaining)) = self.remaining.split_first_chunk::<8>() {
+            self.buffer = u64::from_le_bytes(*word);
+            self.available = 64;
+            self.remaining = remaining;
+        } else if self.remaining.is_empty() {
+            return Err(HgError::Truncated);
+        } else {
+            let mut word = [0; 8];
+            word[..self.remaining.len()].copy_from_slice(self.remaining);
+            self.buffer = u64::from_le_bytes(word);
+            self.available = self.remaining.len() as u32 * 8;
+            self.remaining = &[];
+        }
+        Ok(())
+    }
+
+    fn consume(&mut self, count: u32) {
+        self.buffer = self.buffer.checked_shr(count).unwrap_or(0);
+        self.available -= count;
     }
 
     fn bit(&mut self) -> Result<bool, HgError> {
-        let byte = self.position / 8;
-        let shift = self.position % 8;
-        let value = *self.bytes.get(byte).ok_or(HgError::Truncated)?;
-        self.position = self
-            .position
-            .checked_add(1)
-            .ok_or(HgError::InvalidPixelCommands)?;
-        Ok(value & (1 << shift) != 0)
+        if self.available == 0 {
+            self.refill()?;
+        }
+        let bit = self.buffer & 1 != 0;
+        self.consume(1);
+        Ok(bit)
     }
 
     fn gamma(&mut self) -> Result<usize, HgError> {
-        let mut zeros = 0u32;
-        while !self.bit()? {
-            zeros = zeros.checked_add(1).ok_or(HgError::InvalidPixelCommands)?;
+        let mut zeros = 0;
+        loop {
+            if self.available == 0 {
+                self.refill()?;
+            }
+            let prefix = self.buffer.trailing_zeros().min(self.available);
+            self.consume(prefix);
+            zeros += prefix;
             if zeros >= usize::BITS {
                 return Err(HgError::InvalidPixelCommands);
             }
-        }
-        let mut value = 1usize;
-        for _ in 0..zeros {
-            value = value.checked_shl(1).ok_or(HgError::InvalidPixelCommands)?;
-            if self.bit()? {
-                value |= 1;
+            if self.available != 0 {
+                self.consume(1);
+                break;
             }
         }
-        Ok(value)
+        if zeros == 0 {
+            return Ok(1);
+        }
+        // The bitstream stores the gamma suffix most-significant-bit first,
+        // but those bits occupy the low end of each little-endian word.
+        let mut suffix = self.buffer;
+        let mut count = zeros;
+        if count > self.available {
+            let first = self.available;
+            count -= first;
+            self.refill()?;
+            if count > self.available {
+                return Err(HgError::Truncated);
+            }
+            suffix |= self.buffer << first;
+        }
+        self.consume(count);
+        Ok((1usize << zeros) | (suffix.reverse_bits() >> (64 - zeros)) as usize)
     }
 }
 

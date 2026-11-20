@@ -5,19 +5,30 @@ use cs2_renderer::RgbaFrame;
 use cs2_script::ExpressionState;
 
 use super::{FesDriverCommand, FesScriptDriver, decode, split_target};
-use crate::{FesMediaLayer, FesRuntime, LoggingHost};
+use crate::{FesMediaLayer, FesRuntime, LoggingHost, ScriptTextEncoding};
 use crate::fes_tasks::FesTaskView;
+use crate::perf_detail::{ImageSourceStage, ImageSourceStep, ImageSourceTrace, SlowTask};
+
+#[derive(Clone, Debug)]
+struct NameExpansion {
+    prefixes: [Option<Vec<u8>>; 2],
+    encoding: ScriptTextEncoding,
+}
 
 #[derive(Clone, Debug, Default, cs2_runtime::graph_serde::Serialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub(crate) struct ImageSourceState {
     requested: Option<Vec<u8>>,
     expanded: Option<Vec<u8>>,
+    #[serde(skip)]
+    expansion: Option<NameExpansion>,
     selected_frame: Option<u32>,
     dirty: bool,
     // The encoded source and the canonical list frame directory have separate
     // lifetimes from the optional ordinary pixels on FesMediaLayer.
     raw_bytes: Option<Vec<u8>>,
+    #[serde(skip)]
+    raw_path: Option<String>,
     raw_entry: Option<u32>,
     raw_pending: bool,
     #[serde(skip)]
@@ -45,9 +56,11 @@ impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ImageSourceState {
                 Ok(ImageSourceState {
                     requested: seq.next_element()?.ok_or_else(missing)?,
                     expanded: seq.next_element()?.ok_or_else(missing)?,
+                    expansion: None,
                     selected_frame: seq.next_element()?.ok_or_else(missing)?,
                     dirty: seq.next_element()?.ok_or_else(missing)?,
                     raw_bytes: seq.next_element()?.ok_or_else(missing)?,
+                    raw_path: None,
                     raw_entry: seq.next_element()?.ok_or_else(missing)?,
                     raw_pending: seq.next_element()?.ok_or_else(missing)?,
                     difimage_resource: None,
@@ -234,14 +247,30 @@ pub(crate) fn request_image_file(
     if filename.is_empty() { return Ok(()); }
     if filename.len() > 255 { bail!("FES IMAGE request exceeds 255 original bytes"); }
     decode(filename, host.text_encoding)?;
-    layer.source.requested = Some(filename.to_vec());
+    if layer.source.requested.as_deref() != Some(filename) {
+        layer.source.requested = Some(filename.to_vec());
+        layer.source.expansion = None;
+    }
     refresh_name(host, layer)
 }
 
 fn refresh_name(host: &LoggingHost<'_>, layer: &mut FesMediaLayer) -> Result<()> {
+    expand_name(layer, &host.data_services.language.languages, host.text_encoding)
+}
+
+fn expand_name(
+    layer: &mut FesMediaLayer, languages: &cs2_runtime::language::LanguageState, encoding: ScriptTextEncoding,
+) -> Result<()> {
     let Some(requested) = &layer.source.requested else { return Ok(()); };
-    let expanded = host.data_services.language.languages.expand_image(requested)?;
-    let name = decode(&expanded, host.text_encoding)?;
+    let prefixes = [languages.prefix(0), languages.prefix(1)];
+    if layer.source.expansion.as_ref().is_some_and(|previous| {
+        previous.encoding == encoding && previous.prefixes.each_ref().map(|prefix| prefix.as_deref()) == prefixes
+    }) {
+        return Ok(());
+    }
+    let expanded = languages.expand_image(requested)?;
+    let name = decode(&expanded, encoding)?;
+    layer.source.expansion = Some(NameExpansion { prefixes: prefixes.map(|prefix| prefix.map(<[u8]>::to_vec)), encoding });
     if layer.source.expanded.as_ref() != Some(&expanded) {
         layer.file = Some(name);
         layer.source.expanded = Some(expanded);
@@ -314,10 +343,16 @@ pub(crate) fn apply_image_source_command(
 pub(crate) fn update_image_sources(
     host: &mut LoggingHost<'_>, view: &FesTaskView, runtime: &mut FesRuntime,
 ) -> Result<()> {
-    let buttons = crate::fes_task_platform::navigation_bindings(host, view.id);
-    for (key, layer) in &mut runtime.media {
+    let trace = ImageSourceTrace::begin(view.id);
+    let mut buttons = None;
+    for (ordinal, (key, layer)) in runtime.media.iter_mut().enumerate() {
         if !matches!(layer.kind.as_str(), "IMAGE" | "BUTTON") { continue; }
-        refresh_name(host, layer)?;
+        {
+            let _detail = SlowTask::new(view.id, || 34, "fes_img_expand_name").named(key.as_bytes(), Some(ordinal));
+            let _stage = ImageSourceStep::new(ImageSourceStage::Expand);
+            refresh_name(host, layer)?;
+        }
+        trace.branch(layer.source.dirty);
         if !layer.source.dirty { continue; }
         let Some(name) = layer.file.clone() else {
             // No FILE has ever been supplied; keep the original empty source.
@@ -325,46 +360,59 @@ pub(crate) fn update_image_sources(
             continue;
         };
         let frame = selected_frame(layer);
+        let _detail = SlowTask::new(view.id, || 34, "fes_img_source_layer")
+            .named(key.as_bytes(), Some(ordinal)).code(frame);
+        let scope = |operation| SlowTask::new(view.id, || 34, operation)
+            .named(name.as_bytes(), Some(ordinal)).code(frame);
         if frame == u32::MAX {
-            rebuild_raw_source(host, layer, &name)?;
-            if layer.kind == "BUTTON" {
-                let (target, _, _) = buttons.iter().find(|(_, binding, _)| binding == key)
-                    .context("BUTTON raw source has no original live input binding")?;
-                crate::fes_task_platform::mark_button_source_changed(host, view.id, &target.name, target.bank)?;
+            rebuild_raw_source(host, layer, &name, scope)?;
+        } else {
+            let mut parts = name.split(' ').filter(|part| !part.is_empty());
+            let first = parts.next();
+            if parts.next().is_some() {
+                bail!("FES IMAGE file list requires the zero-alpha color-composition receiver");
             }
-            layer.source.selected_frame = Some(frame);
-            layer.source.dirty = false;
-            continue;
-        }
-        let parts: Vec<_> = name.split(' ').filter(|name| !name.is_empty()).collect();
-        if parts.len() > 1 {
-            bail!("FES IMAGE file list requires the zero-alpha color-composition receiver");
-        }
-        // Missing files/frames consume the request with an empty source, not
-        // an old image or an invented transparent image. Geometry survives.
-        layer.image = None;
-        let mut image = None;
-        if let Some(name) = parts.first() {
-            for name in host.resources.category_names(b"image", name)? {
-                if let Some(loaded) = host.load_managed_image(&name, frame, false)? {
-                    image = Some(loaded);
-                    break;
+            // An absent image consumes the request and preserves geometry.
+            {
+                let _detail = scope("fes_img_clear_previous");
+                layer.image = None;
+            }
+            let mut image = None;
+            if let Some(first) = first {
+                let candidates = {
+                    let _detail = scope("fes_img_category_route");
+                    let _stage = ImageSourceStep::new(ImageSourceStage::Route);
+                    host.resources.category_names(b"image", first)?
+                };
+                for candidate in candidates {
+                    let _detail = scope("fes_img_load_frame");
+                    if let Some(loaded) = host.load_managed_image_projection(&candidate, frame)? {
+                        image = Some(loaded);
+                        break;
+                    }
                 }
             }
-        }
-        if let Some(image) = image {
-            if matches!(layer.source.btype, 0 | 1) {
-                let size = layer.clip.map(|clip| [clip.width as i32, clip.height as i32])
-                    .unwrap_or([image.width() as i32, image.height() as i32]);
-                layer.navigation.set_size(size);
+            if let Some(image) = image {
+                let _detail = scope("fes_img_install_frame");
+                if matches!(layer.source.btype, 0 | 1) {
+                    let size = layer.clip.map(|clip| [clip.width as i32, clip.height as i32])
+                        .unwrap_or([image.width() as i32, image.height() as i32]);
+                    layer.navigation.set_size(size);
+                }
+                install_ordinary_frame(layer, image);
             }
-            install_ordinary_frame(layer, image);
         }
         // Publish each completed bank before trying the next resource, so a
         // later IO error cannot lose an earlier BUTTON's source receipt.
         if layer.kind == "BUTTON" {
+            let buttons = buttons.get_or_insert_with(|| {
+                let _detail = scope("fes_img_button_bindings");
+                crate::fes_task_platform::navigation_bindings(host, view.id)
+            });
+            let _detail = scope("fes_img_publish_button");
             let (target, _, _) = buttons.iter().find(|(_, binding, _)| binding == key)
-                .context("BUTTON source has no original live input binding")?;
+                .context(if frame == u32::MAX { "BUTTON raw source has no original live input binding" }
+                    else { "BUTTON source has no original live input binding" })?;
             crate::fes_task_platform::mark_button_source_changed(host, view.id, &target.name, target.bank)?;
         }
         layer.source.selected_frame = Some(frame);
@@ -399,29 +447,45 @@ pub(super) fn install_ordinary_frame(layer: &mut FesMediaLayer, image: RgbaFrame
     layer.image = Some(image.with_raw_metadata(metadata));
 }
 
-fn rebuild_raw_source(host: &mut LoggingHost<'_>, layer: &mut FesMediaLayer, name: &str) -> Result<()> {
+fn rebuild_raw_source(
+    host: &mut LoggingHost<'_>, layer: &mut FesMediaLayer, name: &str,
+    scope: impl Fn(&'static str) -> SlowTask,
+) -> Result<()> {
     if name.is_empty() { return Ok(()); }
     // FILE remains whole (including spaces); PATHMODE is deliberately absent
     // from this raw-source receiver. Read errors leave the previous raw source.
     if !layer.source.raw_pending {
-        let mut bytes = None;
-        for candidate in host.resources.category_names(b"image", name)? {
-            if let Some(found) = host.read_managed_raw_image_bytes(&candidate)? {
-                bytes = Some(found);
+        let mut asset = None;
+        let candidates = {
+            let _detail = scope("fes_img_category_route");
+            let _stage = ImageSourceStep::new(ImageSourceStage::Route);
+            host.resources.category_names(b"image", name)?
+        };
+        for candidate in candidates {
+            let _detail = scope("fes_img_raw_read");
+            let _stage = ImageSourceStep::new(ImageSourceStage::Ingress);
+            if let Some(found) = host.read_managed_image_asset(&candidate, true)? {
+                asset = Some(found);
                 break;
             }
         }
         if let Some(old) = layer.source.raw_entry {
+            let _detail = scope("fes_img_raw_release");
+            let _stage = ImageSourceStep::new(ImageSourceStage::Release);
             host.release_list_entry_source(old)?;
             layer.source.raw_entry = None;
         }
+        let (path, bytes) = asset.unzip();
+        layer.source.raw_path = path;
         layer.source.raw_bytes = bytes;
         layer.source.raw_pending = layer.source.raw_bytes.is_some();
     }
     let replacement = match layer.source.raw_bytes.as_deref() {
         Some(bytes) => {
             if !bytes.starts_with(b"HG-3") { bail!("FES raw IMAGE source requires an HG-3 frame directory"); }
-            Some(host.create_unowned_list_entry_source(bytes)?)
+            let _detail = scope("fes_img_raw_attach");
+            let _stage = ImageSourceStep::new(ImageSourceStage::Attach);
+            Some(host.create_unowned_list_entry_source(bytes, layer.source.raw_path.as_deref())?)
         }
         None => None,
     };
@@ -476,7 +540,10 @@ pub(crate) fn prepare_raw_image_source<'a>(host: &mut LoggingHost<'_>, layer: &'
     let frame = selected_frame(layer);
     if frame == u32::MAX && layer.source.dirty {
         if let Some(name) = layer.file.clone() {
-            rebuild_raw_source(host, layer, &name)?;
+            let task = host.current_task_id;
+            rebuild_raw_source(host, layer, &name, |operation| {
+                SlowTask::new(task, || 34, operation).named(name.as_bytes(), None).code(frame)
+            })?;
             layer.source.selected_frame = Some(frame);
             layer.source.dirty = false;
         }

@@ -1,5 +1,7 @@
 //! Ordinary 674: filename/category formatting and the startup INT slot query.
 //! Independently recovered from Yukikoi RVA 0x191670 and 0x26c920.
+use std::collections::BTreeMap;
+
 use cs2_formats::ConfigXml;
 use cs2_script::{NativeReturn, Result, Vm};
 
@@ -51,8 +53,14 @@ impl LoggingHost<'_> {
         } else {
             category.to_vec()
         };
-        let startup = self.read_legacy_sound_xml("startup.xml")?;
-        startup_slot(startup.as_ref(), &selected)
+        if self.data_services.startup_int_slots.is_none() {
+            let startup = self.read_legacy_sound_xml("startup.xml")?;
+            self.data_services.startup_int_slots = Some(startup_slots(startup.as_ref())?);
+        }
+        Ok(self.data_services.startup_int_slots.as_ref()
+            .and_then(|slots| slots.get(&normalize_sound_name(&selected)))
+            .copied()
+            .unwrap_or(u32::MAX))
     }
 
     /// Sound loading shares674's real INT-name selection, including an
@@ -94,18 +102,20 @@ fn formatted(vm: &Vm, address: u32) -> Result<Vec<u8>> {
     Ok(name.to_vec())
 }
 
-fn startup_slot(config: Option<&ConfigXml>, category: &[u8]) -> Result<u32> {
-    let category = normalize_sound_name(category);
-    let mut selected = None;
-    for slot in 0..128u32 {
-        let key = format!("int{slot:02}");
-        let path = [b"document".as_slice(), b"INT", key.as_bytes(), b"name"];
-        // Missing fields are the original zero-initialized empty slots.
-        // Later occurrences overwrite the same field without discarding
-        // other fields from an earlier INT/slot element.
-        let name = config
-            .and_then(|xml| last_field(xml, &path))
-            .map_or(b"".as_slice(), trim_nul);
+fn startup_slots(config: Option<&ConfigXml>) -> Result<BTreeMap<Vec<u8>, u32>> {
+    // The startup snapshot is fixed for the session. Keep the last name for
+    // each slot, including the original empty defaults for omitted fields.
+    let mut names = [b"".as_slice(); 128];
+    for field in config.into_iter().flat_map(|xml| &xml.fields) {
+        let [document, int, key, name] = field.path.as_slice() else { continue };
+        if document != b"document" || int != b"INT" || name != b"name" {
+            continue;
+        }
+        let Some(slot) = key.strip_prefix(b"int").and_then(startup_slot_number) else { continue };
+        names[slot] = trim_nul(&field.text);
+    }
+    let mut slots = BTreeMap::new();
+    for (slot, name) in names.into_iter().enumerate() {
         if name.len() >= 32 {
             return Err(native_state_error(
                 "native 674 startup INT name exceeds 31 bytes",
@@ -113,15 +123,19 @@ fn startup_slot(config: Option<&ConfigXml>, category: &[u8]) -> Result<u32> {
         }
         // This folding skips both bytes of CP932 double-byte characters;
         // an ASCII-range trail byte must not be folded independently.
-        if selected.is_none() && normalize_sound_name(name) == category {
-            selected = Some(slot);
-        }
+        slots.entry(normalize_sound_name(name)).or_insert(slot as u32);
     }
-    Ok(selected.unwrap_or(u32::MAX))
+    Ok(slots)
 }
 
-fn last_field<'a>(config: &'a ConfigXml, path: &[&[u8]]) -> Option<&'a [u8]> {
-    config.fields.iter().rev().find(|field| {
-        field.path.iter().map(Vec::as_slice).eq(path.iter().copied())
-    }).map(|field| field.text.as_slice())
+fn startup_slot_number(digits: &[u8]) -> Option<usize> {
+    match digits {
+        [tens @ b'0'..=b'9', ones @ b'0'..=b'9'] =>
+            Some(usize::from(tens - b'0') * 10 + usize::from(ones - b'0')),
+        [b'1', tens @ b'0'..=b'2', ones @ b'0'..=b'9'] => {
+            let slot = 100 + usize::from(tens - b'0') * 10 + usize::from(ones - b'0');
+            (slot < 128).then_some(slot)
+        }
+        _ => None,
+    }
 }

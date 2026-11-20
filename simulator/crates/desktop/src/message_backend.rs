@@ -11,7 +11,7 @@
 //! separate from this portable pixel/layout implementation.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -30,6 +30,9 @@ use cs2_runtime::message_object::{
 use cs2_script::{Result, ScriptError};
 
 use super::message_native::{decode_inline_image, decode_user_glyph, scale_user_glyph};
+use super::perf_detail::{TextStage, TextTimer};
+#[cfg(any(windows, target_os = "android"))]
+use super::perf_detail::{TextFallbackEvent, text_fallback_event};
 use super::text::{FontOrigin, LoadedFont};
 
 const MAX_SURFACE_BYTES: usize = 64 * 1024 * 1024;
@@ -94,9 +97,12 @@ pub(super) struct DesktopMessageDevice {
     named_fonts: BTreeMap<String, Vec<Arc<NamedFace>>>,
     resource_font_files: BTreeMap<String, GameFontFile>,
     fallback_faces: Vec<Arc<NamedFace>>,
+    #[cfg(any(windows, target_os = "android"))]
+    fallback_cache: RefCell<FontFallbackCache>,
     platform_substitutions: RefCell<BTreeSet<MessageFontSubstitution>>,
     fonts_loaded: bool,
     surfaces: BTreeMap<i32, MessageSurface>,
+    composited_glyphs: RefCell<CompositedGlyphCache>,
     pixel_less_message: Option<i32>,
     pub(super) time_scale: Option<u32>,
     pub(super) drawing_enabled: bool,
@@ -105,6 +111,103 @@ pub(super) struct DesktopMessageDevice {
     raw_font_controls: Option<[u32; 5]>,
     cursor_visible: bool,
     cursor_visibility_request: Option<bool>,
+}
+
+/// Ranking has at most 64 policies. Keep the character table separately
+/// bounded because requested names and message text come from scripts.
+#[cfg(any(windows, target_os = "android"))]
+#[derive(Debug, Default)]
+struct FontFallbackCache {
+    ranked: BTreeMap<FallbackPolicy, Vec<usize>>,
+    selected: BTreeMap<Vec<u16>, BTreeMap<FallbackCharacter, usize>>,
+    selections: usize,
+}
+
+#[cfg(any(windows, target_os = "android"))]
+impl FontFallbackCache {
+    fn remember(&mut self, name: &[u16], key: FallbackCharacter, face: usize) {
+        const MAX_SELECTIONS: usize = 4096;
+        const MAX_NAME_UNITS: usize = 64;
+        if name.len() > MAX_NAME_UNITS {
+            return;
+        }
+        if self.selections == MAX_SELECTIONS {
+            self.selected.clear();
+            self.selections = 0;
+        }
+        let selections = self.selected.entry(name.to_vec()).or_default();
+        if selections.insert(key, face).is_none() {
+            self.selections += 1;
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FallbackCharacter {
+    charset: u8,
+    bold: bool,
+    italic: bool,
+    character: char,
+}
+
+#[cfg(any(windows, target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FallbackPolicy {
+    cjk: bool,
+    serif: bool,
+    mono: bool,
+    bold: bool,
+    italic: bool,
+    japanese_cjk: bool,
+}
+
+#[cfg(any(windows, target_os = "android"))]
+impl FallbackPolicy {
+    fn new(requested_name: &str, key: FallbackCharacter) -> Self {
+        let cjk = is_east_asian_message_character(key.character);
+        let japanese = key.charset == 128
+            || requested_name.contains("gothic")
+            || requested_name.contains("mincho")
+            || requested_name.contains("ゴシック")
+            || requested_name.contains("明朝");
+        Self {
+            cjk,
+            serif: requested_name.contains("mincho")
+                || requested_name.contains("明朝")
+                || requested_name.contains("serif") && !requested_name.contains("sans"),
+            mono: requested_name.contains("mono")
+                || requested_name.contains("ｍｓ ゴシック")
+                || requested_name == "ms gothic",
+            bold: key.bold,
+            italic: key.italic,
+            japanese_cjk: cjk && japanese,
+        }
+    }
+
+    fn rank(self, faces: &[Arc<NamedFace>]) -> Vec<usize> {
+        let weight = if self.bold { 700 } else { 400 };
+        let mut candidates: Vec<_> = faces.iter().enumerate()
+            .filter_map(|(index, face)| (!face.last_resort).then_some(index))
+            .collect();
+        // Keep the earlier stable order when two faces have the same score.
+        candidates.sort_by_cached_key(|&index| {
+            let face = &faces[index];
+            let family = face.face_name.to_ascii_lowercase();
+            let japanese_face = family.contains("cjkjp") || family.contains("cjk jp")
+                || family.contains("sansjp") || family.contains("serifjp");
+            (
+                !face.private,
+                face.cjk != self.cjk,
+                face.serif != self.serif,
+                self.mono && !face.monospace,
+                face.italic != self.italic,
+                (i32::from(face.weight) - weight).abs(),
+                self.japanese_cjk && !japanese_face,
+            )
+        });
+        candidates
+    }
 }
 
 #[derive(Debug)]
@@ -128,21 +231,29 @@ struct GameFontFace {
 
 impl GameFontFile {
     fn load(&self) -> std::result::Result<GameFontFace, String> {
+        let face = self.path.file_name().map_or(&[][..], std::ffi::OsStr::as_encoded_bytes);
+        let _load = TextTimer::new(TextStage::FaceLoad).face(face, 0);
         let mut bytes = Vec::new();
-        std::fs::File::open(&self.path)
-            .and_then(|file| file.take(MAX_SURFACE_BYTES as u64 + 1).read_to_end(&mut bytes))
-            .map_err(|error| format!("could not be read: {error}"))?;
-        let font = FontRasterizer::from_bytes(&bytes, 0)
-            .map_err(|error| format!("could not be decoded: {error}"))?;
+        {
+            let _read = TextTimer::new(TextStage::FaceRead);
+            std::fs::File::open(&self.path)
+                .and_then(|file| file.take(MAX_SURFACE_BYTES as u64 + 1).read_to_end(&mut bytes))
+                .map_err(|error| format!("could not be read: {error}"))?;
+        }
         let offset = if bytes.starts_with(b"ttcf") {
             be32(&bytes, 12).unwrap_or(0) as usize
         } else {
             0
         };
+        let bold = sfnt_weight(&bytes, offset) == Some(700);
+        let italic = sfnt_italic(&bytes, offset);
+        let font = {
+            let _decode = TextTimer::new(TextStage::FaceDecode);
+            FontRasterizer::from_shared_bytes(Arc::new(bytes), 0)
+                .map_err(|error| format!("could not be decoded: {error}"))?
+        };
         Ok(GameFontFace {
-            font,
-            bold: sfnt_weight(&bytes, offset) == Some(700),
-            italic: sfnt_italic(&bytes, offset),
+            font, bold, italic,
         })
     }
 }
@@ -159,45 +270,46 @@ struct NamedFace {
     cjk: bool,
     serif: bool,
     monospace: bool,
-    font: OnceLock<Option<Arc<FontRasterizer>>>,
-    control_font: OnceLock<Option<fontdue::Font>>,
+    cmap: Option<Arc<[u8]>>,
+    font: Arc<OnceLock<Option<Arc<FontRasterizer>>>>,
 }
 
 impl NamedFace {
+    fn get_if_covers(&self, characters: impl IntoIterator<Item = char> + Clone) -> Option<&FontRasterizer> {
+        if self.font.get().is_none()
+            && self.cmap.as_deref().and_then(ttf_parser::cmap::Table::parse).is_some_and(|table| {
+                characters.clone().into_iter().any(|character| {
+                    // fontdue accepts all raw cmap subtables, including legacy
+                    // symbol encodings. Allow the full decoder to resolve hits.
+                    !table.subtables.into_iter().any(|subtable| subtable.glyph_index(character as u32).is_some())
+                })
+            })
+        {
+            return None;
+        }
+        self.get().filter(|font| characters.into_iter().all(|character| font.has_character(character)))
+    }
+
     fn get(&self) -> Option<&FontRasterizer> {
+        if let Some(font) = self.font.get() {
+            return font.as_deref();
+        }
+        let _load = TextTimer::new(TextStage::FaceLoad).face(self.face_name.as_bytes(), self.index);
         self.font
             .get_or_init(|| {
-                let font = match self.source.as_ref() {
-                    FontSource::Bytes(bytes) => FontRasterizer::from_bytes(bytes, self.index).ok()?,
+                let bytes = match self.source.as_ref() {
+                    FontSource::Bytes(bytes) => Arc::clone(bytes),
                     FontSource::File(path) => {
-                        let bytes = std::fs::read(path).ok()?;
-                        FontRasterizer::from_bytes(&bytes, self.index).ok()?
+                        let _read = TextTimer::new(TextStage::FaceRead);
+                        Arc::new(std::fs::read(path).ok()?)
                     }
                 };
-                Some(Arc::new(font))
+                let _decode = TextTimer::new(TextStage::FaceDecode);
+                FontRasterizer::from_shared_bytes(bytes, self.index).ok().map(Arc::new)
             })
             .as_deref()
     }
 
-    fn control_font(&self) -> Option<&fontdue::Font> {
-        self.control_font
-            .get_or_init(|| {
-                let bytes = match self.source.as_ref() {
-                    FontSource::Bytes(bytes) => bytes.as_ref().clone(),
-                    FontSource::File(path) => std::fs::read(path).ok()?,
-                };
-                fontdue::Font::from_bytes(
-                    bytes,
-                    fontdue::FontSettings {
-                        collection_index: self.index,
-                        load_substitutions: false,
-                        ..Default::default()
-                    },
-                )
-                .ok()
-            })
-            .as_ref()
-    }
 }
 
 impl Default for DesktopMessageDevice {
@@ -207,9 +319,12 @@ impl Default for DesktopMessageDevice {
             named_fonts: BTreeMap::new(),
             resource_font_files: BTreeMap::new(),
             fallback_faces: Vec::new(),
+            #[cfg(any(windows, target_os = "android"))]
+            fallback_cache: RefCell::default(),
             platform_substitutions: RefCell::new(BTreeSet::new()),
             fonts_loaded: false,
             surfaces: BTreeMap::new(),
+            composited_glyphs: RefCell::default(),
             pixel_less_message: None,
             time_scale: None,
             drawing_enabled: true,
@@ -229,10 +344,36 @@ struct MessageSurface {
     source: Option<Canvas>,
     /// Drawing-context texture: changes only after real full/dirty copies.
     submitted: Canvas,
+    projection: RefCell<Option<MessageProjection>>,
     dirty: Option<Rect>,
     /// Local ink bounds and reveal starts survive clock reversal and failures.
     glyphs: BTreeMap<usize, RevealGlyph>,
     restore_pending: bool,
+}
+
+impl MessageSurface {
+    fn submit_full(&mut self) {
+        if self.projection.get_mut().is_some() && self.submitted.pixels() == self.visible.pixels() {
+            return;
+        }
+        self.submitted.pixels_mut().copy_from_slice(self.visible.pixels());
+        *self.projection.get_mut() = None;
+    }
+
+    fn submit_dirty(&mut self, rectangle: Rect) {
+        copy_rectangle(&mut self.submitted, &self.visible, rectangle);
+        if let Some(projection) = self.projection.get_mut() {
+            add_dirty(&mut projection.dirty, Some(rectangle));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MessageProjection {
+    tint: u32,
+    shift: [i64; 2],
+    frame: RgbaFrame,
+    dirty: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -335,14 +476,18 @@ impl DesktopMessageDevice {
                 .any(|name| name.to_ascii_lowercase().contains("cjk")),
             serif: sfnt_serif(bytes, offset),
             monospace: sfnt_monospace(bytes, offset),
-            font: cached,
-            control_font: OnceLock::new(),
+            cmap: None,
+            font: Arc::new(cached),
         });
         self.named_fonts
             .entry(name.to_lowercase())
             .or_default()
             .push(face.clone());
         self.fallback_faces.push(face);
+        #[cfg(any(windows, target_os = "android"))]
+        {
+            *self.fallback_cache.get_mut() = FontFallbackCache::default();
+        }
         Ok(())
     }
 
@@ -354,7 +499,7 @@ impl DesktopMessageDevice {
         let candidates = installed_settings_fonts();
         #[cfg(not(windows))]
         let candidates: Vec<_> = self.fallback_faces.iter().filter(|face| !face.last_resort && !face.italic)
-            .filter(|face| face.get().is_some_and(|font| "ABC\u{3042}\u{3044}\u{3046}\u{3048}\u{304a}".chars().all(|c| font.has_character(c))))
+            .filter(|face| face.get_if_covers("ABC\u{3042}\u{3044}\u{3046}\u{3048}\u{304a}".chars()).is_some())
             .map(|face| (face.face_name.clone(), face.monospace)).collect();
         let mut seen = BTreeSet::new();
         candidates.into_iter().filter(|(name, _)| !name.starts_with('@') && name.encode_utf16().count() <= 63
@@ -515,11 +660,16 @@ impl DesktopMessageDevice {
         if bytes.len() > MAX_SURFACE_BYTES {
             return;
         }
+        #[cfg(any(windows, target_os = "android"))]
+        {
+            *self.fallback_cache.get_mut() = FontFallbackCache::default();
+        }
         let count = if bytes.starts_with(b"ttcf") {
             be32(bytes, 8).unwrap_or(0).min(64)
         } else {
             1
         };
+        let mut cmaps = BTreeMap::<(usize, usize), Arc<[u8]>>::new();
         for face in 0..count {
             let offset = if bytes.starts_with(b"ttcf") {
                 let Some(offset) = be32(bytes, 12 + face as usize * 4) else {
@@ -561,12 +711,18 @@ impl DesktopMessageDevice {
                         || name.contains("明朝")
                         || name.contains("serif") && !name.contains("sans")
                 });
-            let cached = OnceLock::new();
-            if let Some(loaded) = self.fonts.iter().find(|loaded| {
+            let cached = self.fonts.iter().find(|loaded| {
                 loaded.origin.as_ref() == origin && loaded.index == face
-            }) {
-                let _ = cached.set(Some(Arc::clone(&loaded.rasterizer)));
-            }
+            }).map_or_else(|| Arc::new(OnceLock::new()), |loaded| Arc::clone(&loaded.rasterizer));
+            let cmap = if cached.get().is_none() {
+                ttf_parser::RawFace::parse(bytes, face).ok()
+                    .and_then(|raw| raw.table(ttf_parser::Tag::from_bytes(b"cmap")))
+                    .filter(|table| table.len() <= 1024 * 1024)
+                    .map(|table| Arc::clone(cmaps.entry((table.as_ptr() as usize, table.len()))
+                        .or_insert_with(|| Arc::from(table))))
+            } else {
+                None
+            };
             let font = Arc::new(NamedFace {
                 source: source.clone(),
                 index: face,
@@ -578,8 +734,8 @@ impl DesktopMessageDevice {
                 cjk,
                 serif,
                 monospace: sfnt_monospace(bytes, offset),
+                cmap,
                 font: cached,
-                control_font: OnceLock::new(),
             });
             self.fallback_faces.push(font.clone());
             for name in aliases {
@@ -599,6 +755,42 @@ impl DesktopMessageDevice {
             submitted: &surface.submitted,
             dirty: surface.dirty,
         })
+    }
+
+    /// Immutable submitted texture shared by the FES bank and its list layer.
+    pub(super) fn projection_frame(&self, id: i32, tint: u32) -> cs2_renderer::Result<Option<RgbaFrame>> {
+        self.projection_frame_shifted(id, tint, [0; 2])
+    }
+
+    pub(super) fn projection_frame_shifted(
+        &self, id: i32, tint: u32, shift: [i64; 2],
+    ) -> cs2_renderer::Result<Option<RgbaFrame>> {
+        let Some(surface) = self.surfaces.get(&id) else { return Ok(None); };
+        let mut projection = surface.projection.borrow_mut();
+        if let Some(cached) = projection.as_mut()
+            && cached.tint == tint && cached.shift == shift
+        {
+            if let Some(dirty) = cached.dirty {
+                if let Some((rectangle, mut rgba)) = message_projection_region(&surface.submitted, dirty, shift) {
+                    if tint != u32::MAX {
+                        tint_message_rgba(&mut rgba, tint);
+                    }
+                    cached.frame = cached.frame.replace_region_rgba(rectangle, &rgba)?;
+                }
+                cached.dirty = None;
+            }
+            return Ok(Some(cached.frame.clone()));
+        }
+        let mut pixels = surface.submitted.pixels().to_vec();
+        if tint != u32::MAX {
+            tint_message_rgba(&mut pixels, tint);
+        }
+        let mut frame = RgbaFrame::from_rgba8(surface.submitted.width(), surface.submitted.height(), pixels)?;
+        if shift != [0; 2] {
+            frame = shift_message_texture(&frame, shift)?;
+        }
+        *projection = Some(MessageProjection { tint, shift, frame: frame.clone(), dirty: None });
+        Ok(Some(frame))
     }
 
     pub(super) fn snapshot_pixels(&self, id: i32) -> Option<MessagePixelSnapshot> {
@@ -700,6 +892,7 @@ impl DesktopMessageDevice {
             visible: canvas(snapshot.visible_rgba)?,
             source: snapshot.source_rgba.map(canvas).transpose()?,
             submitted: canvas(snapshot.submitted_rgba)?,
+            projection: RefCell::default(),
             dirty,
             glyphs,
             restore_pending: false,
@@ -819,6 +1012,7 @@ impl DesktopMessageDevice {
                 visible: canvas()?,
                 source,
                 submitted: canvas()?,
+                projection: RefCell::default(),
                 dirty: None,
                 glyphs: BTreeMap::new(),
                 restore_pending: object
@@ -838,6 +1032,7 @@ impl DesktopMessageDevice {
         italic: bool,
         override_name: Option<&[u16]>,
     ) -> Result<(&FontRasterizer, bool, bool)> {
+        let _select = TextTimer::new(TextStage::FontSelect);
         if configuration.font_backend() != 0 {
             let units = override_name.map_or_else(|| configuration.font_name(), |name| name.to_vec());
             let name = String::from_utf16(&units)
@@ -901,7 +1096,7 @@ impl DesktopMessageDevice {
                 )
             });
             for face in candidates {
-                if let Some(font) = face.get().filter(|font| font.has_character(character)) {
+                if let Some(font) = face.get_if_covers([character]) {
                     return Ok((font, face.weight == 700, face.italic));
                 }
             }
@@ -911,8 +1106,7 @@ impl DesktopMessageDevice {
                 .fonts
                 .iter()
                 .filter(|_| self.fallback_faces.is_empty())
-                .map(|face| face.rasterizer.as_ref())
-                .find(|font| font.has_character(character))
+                .find_map(|face| face.for_character(character))
                 .map(|font| (font, false, false))
                 .ok_or_else(|| ScriptError::HostCallFailed {
                     message: format!("no available message font covers U+{:04X} for the default family", character as u32),
@@ -934,7 +1128,7 @@ impl DesktopMessageDevice {
             )
         });
         for face in candidates {
-            if let Some(font) = face.get().filter(|font| font.has_character(character)) {
+            if let Some(font) = face.get_if_covers([character]) {
                 return Ok((font, face.weight == 700, face.italic));
             }
         }
@@ -957,63 +1151,60 @@ impl DesktopMessageDevice {
         bold: bool,
         italic: bool,
     ) -> Result<(&FontRasterizer, bool, bool)> {
+        let _fallback = TextTimer::new(TextStage::FontFallback);
+        let key = FallbackCharacter {
+            charset: configuration.glyph_parameter() as u8,
+            bold, italic, character,
+        };
+        let cached = self.fallback_cache.borrow().selected.get(requested)
+            .and_then(|selections| selections.get(&key)).copied();
+        if let Some(index) = cached && let Some(font) = self.fallback_faces[index].get() {
+            let face = &self.fallback_faces[index];
+            text_fallback_event(TextFallbackEvent::SelectionHit);
+            return Ok((font, face.weight == 700, face.italic));
+        }
+
         let requested_name = String::from_utf16_lossy(requested).to_lowercase();
-        let serif = requested_name.contains("mincho")
-            || requested_name.contains("明朝")
-            || requested_name.contains("serif") && !requested_name.contains("sans");
-        let mono = requested_name.contains("mono")
-            || requested_name.contains("ＭＳ ゴシック".to_lowercase().as_str())
-            || requested_name == "ms gothic";
-        let cjk = is_east_asian_message_character(character);
-        let japanese = configuration.glyph_parameter() as u8 == 128
-            || requested_name.contains("gothic")
-            || requested_name.contains("mincho")
-            || requested_name.contains("ゴシック")
-            || requested_name.contains("明朝");
-        let weight = if bold { 700 } else { 400 };
-        let mut candidates: Vec<_> = self
-            .fallback_faces
-            .iter()
-            .filter(|face| !face.last_resort)
-            .collect();
-        candidates.sort_by_key(|face| {
-            let family = face.face_name.to_ascii_lowercase();
-            let japanese_face = family.contains("cjkjp")
-                || family.contains("cjk jp")
-                || family.contains("sansjp")
-                || family.contains("serifjp");
-            (
-                !face.private,
-                face.cjk != cjk,
-                face.serif != serif,
-                mono && !face.monospace,
-                face.italic != italic,
-                (i32::from(face.weight) - weight).abs(),
-                cjk && japanese && !japanese_face,
-            )
-        });
-        for face in candidates {
-            let Some(font) = face.get().filter(|font| font.has_character(character)) else {
-                continue;
+        let policy = FallbackPolicy::new(&requested_name, key);
+        let selected = {
+            use std::collections::btree_map::Entry;
+            let mut cache = self.fallback_cache.borrow_mut();
+            let candidates = match cache.ranked.entry(policy) {
+                Entry::Occupied(entry) => {
+                    text_fallback_event(TextFallbackEvent::RankHit);
+                    entry.into_mut()
+                }
+                Entry::Vacant(entry) => {
+                    text_fallback_event(TextFallbackEvent::RankBuild);
+                    entry.insert(policy.rank(&self.fallback_faces))
+                }
             };
-            let source = match face.source.as_ref() {
-                FontSource::File(path) => path.to_string_lossy().into_owned(),
-                FontSource::Bytes(_) => String::from("private SFNT bytes"),
-            };
-            let substitution = MessageFontSubstitution {
-                requested_name: requested.to_vec(),
-                selected_name: face.face_name.clone(),
-                source,
-                collection_index: face.index,
-                weight: face.weight,
-                italic: face.italic,
-                synthesized_bold: bold && face.weight != 700,
-                synthesized_italic: italic && !face.italic,
-            };
+            candidates.iter().find_map(|&index| {
+                self.fallback_faces[index].get_if_covers([character]).map(|font| (index, font))
+            })
+        };
+        if let Some((index, font)) = selected {
+            let face = &self.fallback_faces[index];
             let mut substitutions = self.platform_substitutions.borrow_mut();
+            // A successful cache entry has already had its one chance to
+            // enter the existing append-only, chronologically capped report.
             if substitutions.len() < 256 {
-                substitutions.insert(substitution);
+                let source = match face.source.as_ref() {
+                    FontSource::File(path) => path.to_string_lossy().into_owned(),
+                    FontSource::Bytes(_) => String::from("private SFNT bytes"),
+                };
+                substitutions.insert(MessageFontSubstitution {
+                    requested_name: requested.to_vec(),
+                    selected_name: face.face_name.clone(),
+                    source,
+                    collection_index: face.index,
+                    weight: face.weight,
+                    italic: face.italic,
+                    synthesized_bold: bold && face.weight != 700,
+                    synthesized_italic: italic && !face.italic,
+                });
             }
+            self.fallback_cache.borrow_mut().remember(requested, key, index);
             return Ok((font, face.weight == 700, face.italic));
         }
         Err(ScriptError::HostCallFailed {
@@ -1035,6 +1226,7 @@ impl DesktopMessageDevice {
         }
         let bold = configuration.font_weight() == 700;
         let (font, selected_bold, _) = self.font(configuration, character, bold, false, None)?;
+        let _measure = TextTimer::new(TextStage::GlyphMeasure);
         let measured = font
             .measure_styled(character, size, bold && !selected_bold, false)
             .map_err(|_| invalid("message glyph measurement failed"))?;
@@ -1063,24 +1255,20 @@ impl DesktopMessageDevice {
         // independently of the decoded image's width. SFNT's actual cmap (or
         // glyph zero) supplies this metric even when LF has no visible glyph.
         let (font, selected_bold, _) = self.font(configuration, ' ', bold, false, None)?;
+        let _measure = TextTimer::new(TextStage::GlyphMeasure);
         let measured = if font.has_character('\n') {
             font.measure_styled('\n', size, bold && !selected_bold, false)
                 .map_err(|_| invalid("inline image control metric failed"))?
         } else {
-            let face = self
-                .fallback_faces
-                .iter()
-                .find(|face| {
+            if !self.fallback_faces.iter().any(|face| {
                     face.font
                         .get()
                         .and_then(Option::as_deref)
                         .is_some_and(|loaded| std::ptr::eq(loaded, font))
-                })
-                .ok_or_else(|| invalid("inline image selected font has no retained SFNT source"))?;
-            let font = face
-                .control_font()
-                .ok_or_else(|| invalid("inline image SFNT metric load failed"))?;
-            let advance = font.metrics('\n', size as f32).advance_width.round();
+            }) {
+                return Err(invalid("inline image selected font has no retained SFNT source"));
+            }
+            let advance = font.missing_glyph_advance(size).round();
             if !advance.is_finite()
                 || f64::from(advance) > f64::from(i32::MAX)
                 || advance < i32::MIN as f32
@@ -1116,30 +1304,39 @@ impl DesktopMessageDevice {
         italic: bool,
         override_name: Option<&[u16]>,
     ) -> Result<GlyphMask> {
+        let glyph = self.rasterize_mask(configuration, character, size, bold, italic, override_name)?;
+        if configuration.font_weight() != 700 {
+            return Ok(glyph);
+        }
+        let alpha = glyph.alpha().iter().map(|&alpha| alpha.saturating_mul(2)).collect();
+        GlyphMask::from_alpha_with_metrics(glyph.width(), glyph.height(), alpha, glyph.metrics())
+            .map_err(|_| invalid("message doubled coverage construction failed"))
+    }
+
+    fn rasterize_mask(
+        &self,
+        configuration: &MessageConfiguration,
+        character: char,
+        size: u32,
+        bold: bool,
+        italic: bool,
+        override_name: Option<&[u16]>,
+    ) -> Result<GlyphMask> {
         if size == 0 {
             return GlyphMask::from_alpha_with_metrics(0, 0, Vec::new(), GlyphMetrics::default())
                 .map_err(|_| invalid("empty message glyph construction failed"));
         }
         let (font, selected_bold, selected_italic) =
             self.font(configuration, character, bold, italic, override_name)?;
-        let glyph = font
+        let _raster = TextTimer::new(TextStage::GlyphRaster);
+        font
             .rasterize_styled(
                 character,
                 size,
                 bold && !selected_bold,
                 italic && !selected_italic,
             )
-            .map_err(|_| invalid("message font rasterization failed"))?;
-        if configuration.font_weight() != 700 {
-            return Ok(glyph);
-        }
-        let alpha = glyph
-            .alpha()
-            .iter()
-            .map(|&alpha| alpha.saturating_mul(2))
-            .collect();
-        GlyphMask::from_alpha_with_metrics(glyph.width(), glyph.height(), alpha, glyph.metrics())
-            .map_err(|_| invalid("message doubled coverage construction failed"))
+            .map_err(|_| invalid("message font rasterization failed"))
     }
 
     fn paint_entry(
@@ -1157,7 +1354,11 @@ impl DesktopMessageDevice {
             let Some(source) = request.object.inline_image_source() else {
                 return Ok([0; 4]);
             };
-            let Some(frame) = decode_inline_image(source, frame_id)? else {
+            let frame = {
+                let _decode = TextTimer::new(TextStage::DecodeInline);
+                decode_inline_image(source, frame_id)?
+            };
+            let Some(frame) = frame else {
                 return Ok([0; 4]);
             };
             let width = i32::try_from(frame.width())
@@ -1213,7 +1414,7 @@ impl DesktopMessageDevice {
             }
             None => {
                 let name = request.object.atom_font_name(entry.atom.unwrap());
-                let glyph = self.mask_with_name(
+                let glyph = self.rasterize_mask(
                     request.configuration,
                     *character,
                     size,
@@ -1226,7 +1427,7 @@ impl DesktopMessageDevice {
                 } else {
                     style.text_color
                 };
-                paint_message_mask(
+                paint_font_glyph(
                     target,
                     &glyph,
                     [x, y],
@@ -1234,6 +1435,8 @@ impl DesktopMessageDevice {
                     color,
                     style.shadow_color,
                     effects,
+                    request.configuration.font_weight() == 700,
+                    Some(&self.composited_glyphs),
                 )
             }
         }
@@ -1306,10 +1509,7 @@ impl MessageBackend for DesktopMessageDevice {
             ));
             let submit = configuration.ordinary_submit() && self.drawing_enabled;
             if submit {
-                surface
-                    .submitted
-                    .pixels_mut()
-                    .copy_from_slice(surface.visible.pixels());
+                surface.submit_full();
                 surface.dirty = None;
             }
             surface.restore_pending = false;
@@ -1333,10 +1533,7 @@ impl MessageBackend for DesktopMessageDevice {
             source.clear(Color::rgba(0, 0, 0, 0));
         }
         if configuration.ordinary_submit() && self.drawing_enabled {
-            surface
-                .submitted
-                .pixels_mut()
-                .copy_from_slice(surface.visible.pixels());
+            surface.submit_full();
         }
         // Full clear helper neither consumes dirty nor refreshes completion.
         surface.glyphs.clear();
@@ -1345,6 +1542,7 @@ impl MessageBackend for DesktopMessageDevice {
     }
 
     fn decode_user_glyph(&mut self, source: &[u8], frame: u32) -> Result<Option<MessageUserGlyph>> {
+        let _decode = TextTimer::new(TextStage::DecodeUser);
         decode_user_glyph(source, frame)
     }
 
@@ -1481,15 +1679,12 @@ impl DesktopMessageDevice {
         match request.copy {
             MessageCopy::None => {}
             MessageCopy::Full => {
-                surface
-                    .submitted
-                    .pixels_mut()
-                    .copy_from_slice(surface.visible.pixels());
+                surface.submit_full();
                 surface.dirty = None;
             }
             MessageCopy::Dirty => {
                 if let Some(rectangle) = surface.dirty.take() {
-                    copy_rectangle(&mut surface.submitted, &surface.visible, rectangle);
+                    surface.submit_dirty(rectangle);
                     result.copied_dirty = true;
                 }
             }
@@ -1541,6 +1736,7 @@ fn layout_atoms(
     previous: Option<&MessageLayout>,
     characters: &MessageBreakCharacters,
 ) -> Result<MessageLayout> {
+    let _layout = TextTimer::new(TextStage::Layout);
     let width = configuration.size()[0];
     if width > i32::MAX as u32 {
         return Err(invalid("message CPU layout width exceeds i32"));
@@ -2131,6 +2327,36 @@ fn copy_rectangle(target: &mut Canvas, source: &Canvas, rectangle: Rect) {
     }
 }
 
+fn message_projection_region(
+    source: &Canvas, dirty: Rect, shift: [i64; 2],
+) -> Option<(Rect, Vec<u8>)> {
+    let left = i64::from(dirty.x).saturating_add(shift[0]);
+    let top = i64::from(dirty.y).saturating_add(shift[1]);
+    let right = left.saturating_add(i64::from(dirty.width)).min(i64::from(source.width()));
+    let bottom = top.saturating_add(i64::from(dirty.height)).min(i64::from(source.height()));
+    let left = left.max(0);
+    let top = top.max(0);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let row_bytes = (right - left) as usize * 4;
+    let mut pixels = Vec::with_capacity(row_bytes * (bottom - top) as usize);
+    for y in top..bottom {
+        let start = ((y - shift[1]) as usize * source.width() as usize + (left - shift[0]) as usize) * 4;
+        pixels.extend_from_slice(&source.pixels()[start..start + row_bytes]);
+    }
+    Some((Rect::new(left as i32, top as i32, (right - left) as u32, (bottom - top) as u32), pixels))
+}
+
+pub(super) fn shift_message_texture(frame: &RgbaFrame, shift: [i64; 2]) -> cs2_renderer::Result<RgbaFrame> {
+    let mut canvas = Canvas::new(frame.width(), frame.height())?;
+    let [x, y] = shift.map(i32::try_from);
+    if let (Ok(x), Ok(y)) = (x, y) {
+        canvas.copy_frame(frame, &ImageDrawOptions::new(Point::new(x, y)))?;
+    }
+    Ok(canvas.into_frame())
+}
+
 fn be16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes(
         bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
@@ -2338,7 +2564,8 @@ mod game_font_tests {
         device.fonts = vec![LoadedFont {
             origin: Arc::clone(&origin),
             index: 0,
-            rasterizer: Arc::clone(&rasterizer),
+            bytes: Arc::clone(&bytes),
+            rasterizer: Arc::new(OnceLock::from(Some(Arc::clone(&rasterizer)))),
         }].into();
 
         let source = Arc::new(FontSource::Bytes(Arc::clone(&bytes)));
@@ -2402,6 +2629,47 @@ mod game_font_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CompositedGlyphKey {
+    mask: usize,
+    compact_shadow: bool,
+    doubled: bool,
+    color: u32,
+    shadow_color: u32,
+    outline: bool,
+    shadow: bool,
+    shadow_offset: [i32; 2],
+}
+
+#[derive(Debug, Default)]
+struct CompositedGlyphCache {
+    frames: BTreeMap<CompositedGlyphKey, (GlyphMask, RgbaFrame)>,
+    order: VecDeque<CompositedGlyphKey>,
+    bytes: usize,
+}
+
+impl CompositedGlyphCache {
+    fn insert(&mut self, key: CompositedGlyphKey, glyph: &GlyphMask, frame: &RgbaFrame) {
+        const MAX_GLYPH_CACHE_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_GLYPH_CACHE_ENTRIES: usize = 1024;
+        let size = glyph.alpha().len().saturating_add(frame.pixels().len());
+        if size > MAX_GLYPH_CACHE_BYTES {
+            return;
+        }
+        while self.bytes + size > MAX_GLYPH_CACHE_BYTES || self.frames.len() >= MAX_GLYPH_CACHE_ENTRIES {
+            let Some(old) = self.order.pop_front() else { return };
+            if let Some((mask, frame)) = self.frames.remove(&old) {
+                self.bytes -= mask.alpha().len() + frame.pixels().len();
+            }
+        }
+        // Retaining the underlying alpha allocation keeps its address unique
+        // even after the original font's mask cache has evicted this glyph.
+        self.frames.insert(key, (glyph.clone(), frame.clone()));
+        self.order.push_back(key);
+        self.bytes += size;
+    }
+}
+
 /// Message-specific effect path. Canvas's generic outline uses a maximum;
 /// this documented legacy path accumulates three horizontal and then three
 /// vertical Alpha samples, saturating after each pass.
@@ -2417,23 +2685,25 @@ pub(super) fn paint_message_user_glyph(
         return Ok([0; 4]);
     }
     let glyph = scale_user_glyph(mapped, size)?;
-    let mut foreground = vec![0; GLYPH_SIDE * GLYPH_SIDE * 4];
-    for y in 0..size.min(GLYPH_SIDE as u32 - 1) {
-        for x in 0..size.min(GLYPH_SIDE as u32 - 1) {
-            let from = (y as usize * size as usize + x as usize) * 4;
-            let to = ((y as usize + 1) * GLYPH_SIDE + x as usize + 1) * 4;
-            let pixel = &glyph.bgra[from..from + 4];
-            foreground[to..to + 4].copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-        }
-    }
     paint_glyph_pixels(
         target,
-        foreground,
         position,
         [1, 1, size as i32, size as i32],
         size,
         shadow_color,
         effects,
+        None,
+        |foreground, width, height| {
+            let size = size as usize;
+            for y in 0..size.min(height - 1) {
+                for x in 0..size.min(width - 1) {
+                    let from = (y * size + x) * 4;
+                    let to = ((y + 1) * width + x + 1) * 4;
+                    let pixel = &glyph.bgra[from..from + 4];
+                    foreground[to..to + 4].copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+            }
+        },
     )
 }
 
@@ -2446,32 +2716,37 @@ pub(super) fn paint_message_mask(
     shadow_color: u32,
     effects: GlyphEffects,
 ) -> Result<[i32; 4]> {
+    paint_font_glyph(target, glyph, position, size, color, shadow_color, effects, false, None)
+}
+
+fn paint_font_glyph(
+    target: &mut Canvas,
+    glyph: &GlyphMask,
+    position: [i32; 2],
+    size: u32,
+    color: u32,
+    shadow_color: u32,
+    effects: GlyphEffects,
+    doubled: bool,
+    cache: Option<&RefCell<CompositedGlyphCache>>,
+) -> Result<[i32; 4]> {
     if glyph.width() == 0 || glyph.height() == 0 {
         return Ok([0; 4]);
     }
-    let mut pixels = vec![0; GLYPH_SIDE * GLYPH_SIDE * 4];
     let rgb = [color as u8, (color >> 8) as u8, (color >> 16) as u8];
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel[..3].copy_from_slice(&rgb);
-    }
     let offset = [glyph.metrics().bearing_x, glyph.metrics().bearing_y];
-    for y in 0..glyph.height() {
-        let dy = i64::from(offset[1]) + i64::from(y);
-        if dy < 0 || dy >= GLYPH_SIDE as i64 {
-            continue;
-        }
-        for x in 0..glyph.width() {
-            let dx = i64::from(offset[0]) + i64::from(x);
-            if dx < 0 || dx >= GLYPH_SIDE as i64 {
-                continue;
-            }
-            let source = y as usize * glyph.width() as usize + x as usize;
-            pixels[(dy as usize * GLYPH_SIDE + dx as usize) * 4 + 3] = glyph.alpha()[source];
-        }
-    }
+    let cached = cache.map(|cache| (cache, CompositedGlyphKey {
+        mask: glyph.alpha().as_ptr() as usize,
+        compact_shadow: size < 20,
+        doubled,
+        color: color & 0x00ff_ffff,
+        shadow_color: shadow_color & 0x00ff_ffff,
+        outline: effects.outline,
+        shadow: effects.shadow,
+        shadow_offset: effects.shadow_offset,
+    }, glyph));
     paint_glyph_pixels(
         target,
-        pixels,
         position,
         [
             offset[0],
@@ -2482,22 +2757,110 @@ pub(super) fn paint_message_mask(
         size,
         shadow_color,
         effects,
+        cached,
+        |pixels, width, height| {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel[..3].copy_from_slice(&rgb);
+            }
+            for y in 0..glyph.height() {
+                let dy = i64::from(offset[1]) + i64::from(y);
+                if dy < 0 || dy >= height as i64 {
+                    continue;
+                }
+                for x in 0..glyph.width() {
+                    let dx = i64::from(offset[0]) + i64::from(x);
+                    if dx < 0 || dx >= width as i64 {
+                        continue;
+                    }
+                    let source = y as usize * glyph.width() as usize + x as usize;
+                    let alpha = glyph.alpha()[source];
+                    let alpha = if doubled { alpha.saturating_mul(2) } else { alpha };
+                    pixels[(dy as usize * width + dx as usize) * 4 + 3] = alpha;
+                }
+            }
+        },
     )
 }
 
 fn paint_glyph_pixels(
     target: &mut Canvas,
-    foreground: Vec<u8>,
     position: [i32; 2],
     extent: [i32; 4],
     font_size: u32,
     shadow_color: u32,
     effects: GlyphEffects,
+    cached: Option<(&RefCell<CompositedGlyphCache>, CompositedGlyphKey, &GlyphMask)>,
+    write_foreground: impl FnOnce(&mut [u8], usize, usize),
 ) -> Result<[i32; 4]> {
-    let side = GLYPH_SIDE;
-    let enabled = effects.outline || effects.shadow;
-    let mut result = vec![0; side * side * 4];
-    if enabled {
+    let shadow = if effects.shadow {
+        let offset = effects.shadow_offset.map(|value| {
+            if font_size < 20 {
+                value.wrapping_add(1) >> 1
+            } else {
+                value
+            }
+        });
+        if offset.iter().any(|&value| value < 0) {
+            return Err(invalid(
+                "message shadow offset would access before its glyph surface",
+            ));
+        }
+        Some(offset.map(|value| value as usize))
+    } else {
+        None
+    };
+    // Paint bounds use raw shadow offsets, including disabled effects and
+    // small fonts whose effective shadow processing uses halved offsets.
+    let right = extent[0]
+        .wrapping_add(extent[2])
+        .wrapping_add(effects.shadow_offset[0])
+        .wrapping_add(2);
+    let bottom = extent[1]
+        .wrapping_add(extent[3])
+        .wrapping_add(effects.shadow_offset[1])
+        .wrapping_add(2);
+    let bounds = [0, 0, right, bottom];
+    let Some(clip) = clipped_bounds(target, position, bounds) else {
+        return Ok(bounds);
+    };
+    let frame = match cached.and_then(|(cache, key, _)| {
+        cache.borrow().frames.get(&key).map(|(_, frame)| frame.clone())
+    }) {
+        Some(frame) => frame,
+        None => {
+            let frame = bake_glyph_pixels(right, bottom, shadow_color, effects.outline, shadow, write_foreground)?;
+            if let Some((cache, key, mask)) = cached {
+                cache.borrow_mut().insert(key, mask, &frame);
+            }
+            frame
+        }
+    };
+    let mut options = ImageDrawOptions::new(Point::new(position[0], position[1]));
+    options.clip = Some(clip);
+    target
+        .draw_frame(&frame, &options)
+        .map_err(|_| invalid("message composited glyph pixel submission failed"))?;
+    Ok(bounds)
+}
+
+fn bake_glyph_pixels(
+    right: i32,
+    bottom: i32,
+    shadow_color: u32,
+    outline: bool,
+    shadow: Option<[usize; 2]>,
+    write_foreground: impl FnOnce(&mut [u8], usize, usize),
+) -> Result<RgbaFrame> {
+    let _effect = TextTimer::new(TextStage::GlyphEffects);
+    // The outline reads one pixel past the submitted right and bottom edges.
+    // Shadow reads only from above or to the left, including same-row overlap.
+    let padding = usize::from(outline);
+    let width = (right as usize + padding).min(GLYPH_SIDE);
+    let height = (bottom as usize + padding).min(GLYPH_SIDE);
+    let mut foreground = vec![0; width * height * 4];
+    write_foreground(&mut foreground, width, height);
+    if outline || shadow.is_some() {
+        let mut result = vec![0; width * height * 4];
         // AABBGGRR's low bytes enter BGRA without swapping for the effect
         // plane. In RGBA storage this deliberately reverses shadow red/blue.
         let shadow_rgb = [
@@ -2508,46 +2871,33 @@ fn paint_glyph_pixels(
         for pixel in result.chunks_exact_mut(4) {
             pixel[..3].copy_from_slice(&shadow_rgb);
         }
-        if effects.outline {
-            let mut horizontal = vec![0u8; side * side];
-            for y in 0..side {
-                for x in 0..side {
-                    let alpha = |column: usize| u16::from(foreground[(y * side + column) * 4 + 3]);
+        if outline {
+            let mut horizontal = vec![0u8; width * height];
+            for y in 0..height {
+                for x in 0..width {
+                    let alpha = |column: usize| u16::from(foreground[(y * width + column) * 4 + 3]);
                     let sum = alpha(x)
                         + if x > 0 { alpha(x - 1) } else { 0 }
-                        + if x + 1 < side { alpha(x + 1) } else { 0 };
-                    horizontal[y * side + x] = sum.min(255) as u8;
+                        + if x + 1 < width { alpha(x + 1) } else { 0 };
+                    horizontal[y * width + x] = sum.min(255) as u8;
                 }
             }
-            for y in 0..side {
-                for x in 0..side {
-                    let alpha = |row: usize| u16::from(horizontal[row * side + x]);
+            for y in 0..height {
+                for x in 0..width {
+                    let alpha = |row: usize| u16::from(horizontal[row * width + x]);
                     let sum = alpha(y)
                         + if y > 0 { alpha(y - 1) } else { 0 }
-                        + if y + 1 < side { alpha(y + 1) } else { 0 };
-                    result[(y * side + x) * 4 + 3] = sum.min(255) as u8;
+                        + if y + 1 < height { alpha(y + 1) } else { 0 };
+                    result[(y * width + x) * 4 + 3] = sum.min(255) as u8;
                 }
             }
         }
-        if effects.shadow {
-            let offset = effects.shadow_offset.map(|value| {
-                if font_size < 20 {
-                    value.wrapping_add(1) >> 1
-                } else {
-                    value
-                }
-            });
-            if offset.iter().any(|&value| value < 0) {
-                return Err(invalid(
-                    "message shadow offset would access before its glyph surface",
-                ));
-            }
-            let [dx, dy] = [offset[0] as usize, offset[1] as usize];
-            if dx < side && dy < side {
-                for y in (0..side - dy).rev() {
-                    for x in 0..side - dx {
-                        let from = (y * side + x) * 4 + 3;
-                        let to = ((y + dy) * side + x + dx) * 4 + 3;
+        if let Some([dx, dy]) = shadow {
+            if dx < width && dy < height {
+                for y in (0..height - dy).rev() {
+                    for x in 0..width - dx {
+                        let from = (y * width + x) * 4 + 3;
+                        let to = ((y + dy) * width + x + dx) * 4 + 3;
                         // Reads result[from] at this instant: horizontal
                         // overlap intentionally observes earlier writes.
                         result[to] = (u16::from(result[to])
@@ -2558,38 +2908,28 @@ fn paint_glyph_pixels(
                 }
             }
         }
-        let foreground = RgbaFrame::from_rgba8(side as u32, side as u32, foreground)
+        let foreground = RgbaFrame::from_rgba8(width as u32, height as u32, foreground)
             .map_err(|_| invalid("message foreground surface construction failed"))?;
-        let mut effects_canvas = Canvas::from_rgba8(side as u32, side as u32, result)
+        let mut effects_canvas = Canvas::from_rgba8(width as u32, height as u32, result)
             .map_err(|_| invalid("message effect surface construction failed"))?;
         effects_canvas
             .draw_frame(&foreground, &ImageDrawOptions::new(Point::default()))
             .map_err(|_| invalid("message foreground/effect composition failed"))?;
-        result = effects_canvas.pixels().to_vec();
+        Ok(effects_canvas.into_frame())
     } else {
-        result = foreground;
+        RgbaFrame::from_rgba8(width as u32, height as u32, foreground)
+            .map_err(|_| invalid("message composited glyph frame construction failed"))
     }
-    // The original paint bounds use RAW shadow offsets even when disabled or
-    // when small-font shadow processing used the halved effective offsets.
-    let right = extent[0]
-        .wrapping_add(extent[2])
-        .wrapping_add(effects.shadow_offset[0])
-        .wrapping_add(2);
-    let bottom = extent[1]
-        .wrapping_add(extent[3])
-        .wrapping_add(effects.shadow_offset[1])
-        .wrapping_add(2);
-    let bounds = [0, 0, right, bottom];
-    let frame = RgbaFrame::from_rgba8(side as u32, side as u32, result)
-        .map_err(|_| invalid("message composited glyph frame construction failed"))?;
-    let mut options = ImageDrawOptions::new(Point::new(position[0], position[1]));
-    options.clip = clipped_bounds(target, position, bounds);
-    if options.clip.is_some() {
-        target
-            .draw_frame(&frame, &options)
-            .map_err(|_| invalid("message composited glyph pixel submission failed"))?;
+}
+
+fn tint_message_rgba(pixels: &mut [u8], tint: u32) {
+    let [alpha, red, green, blue] = tint.to_be_bytes();
+    let channels = [red, green, blue, alpha].map(u16::from);
+    for pixel in pixels.chunks_exact_mut(4) {
+        for (value, channel) in pixel.iter_mut().zip(channels) {
+            *value = ((u16::from(*value) * channel + 127) / 255) as u8;
+        }
     }
-    Ok(bounds)
 }
 
 /// Shared by old and new text planes. ARGB plane color modulates sampled RGBA;
@@ -2601,6 +2941,21 @@ pub(super) fn draw_message_plane(
     node: &super::SceneNode,
     offset: [i32; 2],
     registered_size: [u32; 2],
+) -> Result<()> {
+    draw_message_plane_with_tint(target, frame, node, offset, registered_size, message_plane_tint(node))
+}
+
+pub(super) fn message_plane_tint(node: &super::SceneNode) -> u32 {
+    if node.overlay_color != 0 { node.overlay_color } else { node.color }
+}
+
+pub(super) fn draw_message_plane_with_tint(
+    target: &mut Canvas,
+    frame: RgbaFrame,
+    node: &super::SceneNode,
+    offset: [i32; 2],
+    registered_size: [u32; 2],
+    color: u32,
 ) -> Result<()> {
     if !node.visible {
         return Ok(());
@@ -2628,29 +2983,6 @@ pub(super) fn draw_message_plane(
     if geometry[0] == 0.0 || geometry[1] == 0.0 {
         return Ok(());
     }
-    let color = if node.overlay_color != 0 {
-        node.overlay_color
-    } else {
-        node.color
-    };
-    let channels = [
-        (color >> 16) as u8,
-        (color >> 8) as u8,
-        color as u8,
-        (color >> 24) as u8,
-    ];
-    let mut pixels = frame.pixels().to_vec();
-    if color != u32::MAX {
-        for pixel in pixels.chunks_exact_mut(4) {
-            for component in 0..4 {
-                pixel[component] = ((u16::from(pixel[component]) * u16::from(channels[component])
-                    + 127)
-                    / 255) as u8;
-            }
-        }
-    }
-    let tinted = RgbaFrame::from_rgba8(frame.width(), frame.height(), pixels)
-        .map_err(|_| invalid("message plane tinted frame allocation failed"))?;
     let scale = [
         node.scale[0] * geometry[0] / frame.width() as f32,
         node.scale[1] * geometry[1] / frame.height() as f32,
@@ -2661,6 +2993,18 @@ pub(super) fn draw_message_plane(
     ));
     options.scale_x = scale[0];
     options.scale_y = scale[1];
+    let tinted = if color == u32::MAX {
+        frame
+    } else {
+        let mut pixels = frame.pixels().to_vec();
+        tint_message_rgba(&mut pixels, color);
+        RgbaFrame::from_rgba8(frame.width(), frame.height(), pixels)
+            .map_err(|_| invalid("message plane tinted frame allocation failed"))?
+    };
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if super::gpu_raster::draw_image(target, &tinted, &options) {
+        return Ok(());
+    }
     // Canvas already supports signed/mirrored scales and clips to the viewport.
     // An unscaled registration rectangle would incorrectly cut enlarged text.
     target

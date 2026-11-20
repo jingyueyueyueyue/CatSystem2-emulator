@@ -18,7 +18,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SIMULATOR = ROOT / "simulator"
-DEFAULT_SDK = Path.home() / "AppData/Local/Android/Sdk"
+ANDROID_LOCAL_FILES = (
+    "build", ".gradle", ".idea", ".cxx", ".externalNativeBuild", ".kotlin",
+    "local.properties", "gradle-daemon-jvm.properties",
+)
+
+
+def default_sdk() -> Path:
+    configured = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    return Path(configured).expanduser() if configured else Path.home() / "AppData/Local/Android/Sdk"
 
 
 def source_snapshot() -> dict:
@@ -28,7 +36,7 @@ def source_snapshot() -> dict:
     revert during compilation must not turn a mixed build into a valid one.
     """
     digest = hashlib.sha256()
-    ignored = {"build", ".gradle", "target", ".git", ".cxx", ".externalNativeBuild", "__pycache__"}
+    ignored = {*ANDROID_LOCAL_FILES, "target", ".git", "__pycache__"}
     paths = {
         path for folder in [SIMULATOR / "crates", SIMULATOR / "android", SIMULATOR / "vendor"]
         for path in folder.rglob("*")
@@ -156,12 +164,46 @@ def build_report_path(integration: bool) -> Path:
     return ROOT / "reports" / ("android_integration_build.json" if integration else "android_build.json")
 
 
+def msys2_root() -> Path:
+    def contains_tools(root: Path) -> bool:
+        tools = root / "usr/bin"
+        return all((tools / name).is_file() for name in ("bash.exe", "make.exe"))
+
+    if configured := os.environ.get("CS2_MSYS2_ROOT"):
+        root = Path(configured).expanduser()
+        if not root.is_absolute() or not contains_tools(root):
+            raise RuntimeError("CS2_MSYS2_ROOT must be an absolute MSYS2 directory with usr/bin/bash.exe and make.exe")
+        return ascii_path(root)
+
+    for name in ("bash.exe", "make.exe"):
+        if located := shutil.which(name):
+            binary_dir = Path(located).resolve().parent
+            if binary_dir.name.lower() == "bin" and binary_dir.parent.name.lower() == "usr":
+                root = binary_dir.parent.parent
+                if contains_tools(root):
+                    return ascii_path(root)
+
+    root = Path("C:/msys64")
+    if contains_tools(root):
+        return ascii_path(root)
+    raise RuntimeError("MSYS2 bash and make are required; set CS2_MSYS2_ROOT or put its usr/bin on PATH")
+
+
 def host_c_compiler() -> Path:
-    located = shutil.which("gcc") or shutil.which("cc")
-    compiler = Path(located) if located else Path("C:/msys64/mingw64/bin/gcc.exe")
-    if not compiler.is_file():
-        raise RuntimeError("A native host C compiler is required for FFmpeg build tools and Cargo host dependencies")
-    return ascii_path(compiler)
+    if configured := os.environ.get("CS2_HOST_CC"):
+        compiler = Path(configured).expanduser()
+        if not compiler.is_absolute() or not compiler.is_file():
+            raise RuntimeError("CS2_HOST_CC must be the absolute path to a native host C compiler")
+        return ascii_path(compiler)
+    if located := (shutil.which("gcc") or shutil.which("cc")):
+        return ascii_path(Path(located))
+    if os.name == "nt":
+        root = msys2_root()
+        for environment in ("ucrt64", "mingw64"):
+            compiler = root / environment / "bin/gcc.exe"
+            if compiler.is_file():
+                return ascii_path(compiler)
+    raise RuntimeError("A native host C compiler is required; install GCC or set CS2_HOST_CC")
 
 
 class BuildAttempt:
@@ -332,18 +374,29 @@ def require_complete(expected_source: str | None = None) -> dict:
             "source_tree_sha256": report["source_tree_sha256"]}
 
 
-def gradle_executable() -> Path:
-    configured = shutil.which("gradle")
-    if configured:
-        return Path(configured)
-    cache = Path.home() / ".gradle/wrapper/dists/gradle-9.5.1-bin"
-    candidates = sorted(cache.glob("*/gradle-9.5.1/bin/gradle.bat"))
-    if not candidates:
-        raise RuntimeError("Gradle 9.5.1 is unavailable; install the official distribution before the final build.")
-    return candidates[0]
+def gradle_wrapper_command(project: Path) -> list[str]:
+    if java_home := os.environ.get("JAVA_HOME"):
+        binaries = Path(java_home).expanduser() / "bin"
+        missing = [name for name in ("java.exe", "javac.exe", "jlink.exe")
+                   if not (binaries / name).is_file()]
+        if missing:
+            raise RuntimeError(
+                f"JAVA_HOME must point to a complete JDK. Missing {', '.join(missing)} in {binaries}"
+            )
+        java = binaries / "java.exe"
+    elif located := shutil.which("java"):
+        java = Path(located)
+    else:
+        raise RuntimeError("A supported JDK is required; set JAVA_HOME or put java on PATH")
+    wrapper = project / "gradle/wrapper/gradle-wrapper.jar"
+    if not wrapper.is_file():
+        raise RuntimeError(f"The checked-in Gradle wrapper is missing: {wrapper}")
+    # The wrapper JAR has its own Main-Class. Invoke Java directly so paths
+    # are argv values, including paths with spaces and cmd metacharacters.
+    return [str(java), "-jar", str(wrapper)]
 
 def build_media(sdk: Path, output: Path, env: dict, attempt: BuildAttempt,
-                staging: Path) -> tuple[Path, Path]:
+                staging: Path, msys: Path) -> tuple[Path, Path]:
     """Build pinned media in the same explicit stage/source-bound attempt."""
     prepare = ROOT / "scripts/build/prepare_android_ffmpeg.py"
     media = build_cache_directory("android", attempt.integration) / "ffmpeg"
@@ -358,9 +411,7 @@ def build_media(sdk: Path, output: Path, env: dict, attempt: BuildAttempt,
         preparation += ["--source-archive", str(ascii_path(source))]
     attempt.run("prepare-media", preparation, env=env, cwd=ROOT, timeout=300)
     plan = json.loads((media / "build-plan.json").read_text(encoding="utf-8"))
-    bash = Path("C:/msys64/usr/bin/bash.exe")
-    if not bash.is_file():
-        raise RuntimeError("MSYS2 bash/make are required to build the pinned Android media libraries")
+    bash = msys / "usr/bin/bash.exe"
     if plan["build_stage"] != attempt.record["build_stage"]:
         raise RuntimeError("Prepared Android media belongs to another build stage")
     script = ascii_path(Path(plan["build_script"])).as_posix()
@@ -409,6 +460,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     if not linker.is_file() or not ar.is_file():
         raise RuntimeError("Required Android NDK clang/llvm-ar are unavailable")
     env = attempt.environment(os.environ)
+    msys = msys2_root()
     host_cc = host_c_compiler()
     env["CC_x86_64_pc_windows_gnu"] = str(host_cc)
     env["CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER"] = str(host_cc)
@@ -421,8 +473,8 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     # Gradle/CMake canonicalize project and imported-library paths too. Build
     # from a small source copy on physical ASCII storage, not the inward link.
     project = staging / "project"
-    shutil.copytree(SIMULATOR / "android", project, ignore=shutil.ignore_patterns(
-        "build", ".gradle", ".cxx", ".externalNativeBuild", "local.properties"))
+    shutil.copytree(SIMULATOR / "android", project, ignore=shutil.ignore_patterns(*ANDROID_LOCAL_FILES))
+    gradle = gradle_wrapper_command(project)
     attempt.record["android_paths"] = {
         "physical_cache": str(cache), "staging": str(staging), "project": str(project),
         "archive_output": str(output),
@@ -439,13 +491,17 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     env["CS2_ANDROID_BUILD_ROOT"] = (staging / "app").as_posix()
     env["PATH"] = os.pathsep.join([str(host_cc.parent), str(Path.home() / ".cargo/bin"),
                                   str(ndk / "bin"), env.get("PATH", "")])
-    media_libraries, media_notices = build_media(sdk, output, env, attempt, staging)
+    media_libraries, media_notices = build_media(sdk, output, env, attempt, staging, msys)
     general_notices = media_notices / "third-party"
     shutil.copy2(SIMULATOR / "crates/runtime/src/javascript_LICENSE-MIT.txt",
                  general_notices / "Boa-LICENSE-MIT.txt")
     shutil.copy2(SIMULATOR / "THIRD_PARTY.md", general_notices / "CS2-THIRD-PARTY.md")
     shutil.copy2(SIMULATOR / "vendor/ttf-parser-0.21.1/LICENSE-MIT",
                  general_notices / "ttf-parser-LICENSE-MIT.txt")
+    shutil.copy2(SIMULATOR / "vendor/fontdue-0.9.3/LICENSE-MIT",
+                 general_notices / "fontdue-LICENSE-MIT.txt")
+    shutil.copy2(SIMULATOR / "vendor/lewton-0.10.2/LICENSE",
+                 general_notices / "lewton-LICENSE.txt")
     env["CS2_ANDROID_MEDIA_LIBS"] = ascii_path(media_libraries).as_posix()
     env["CS2_ANDROID_MEDIA_NOTICES"] = ascii_path(media_notices).as_posix()
     profile = "android-integration" if attempt.integration else "release"
@@ -453,7 +509,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     commands = [
         [str(Path.home() / ".cargo/bin/cargo.exe"), "build", "--locked", "--profile", profile,
          "--target", "aarch64-linux-android", "-p", "cs2-android"],
-        [str(gradle_executable()), "--no-daemon", "--project-cache-dir",
+        [*gradle, "--no-daemon", "--project-cache-dir",
          str(cache / "gradle-cache"), "-p", str(project), ":app:assembleDebug"],
     ]
     for index, command in enumerate(commands):
@@ -520,7 +576,7 @@ def install(sdk: Path, serial: str | None, integration: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=["inventory", "build", "install"])
-    parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
+    parser.add_argument("--sdk", type=Path, default=default_sdk())
     parser.add_argument("--serial")
     parser.add_argument("--integration", action="store_true",
                         help="Build/install unfinished integration artifacts; does not assert implementation completion.")

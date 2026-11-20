@@ -9,7 +9,7 @@ use super::{HeadlessPlayer, PlayerFramePhase};
 #[derive(Default)]
 #[repr(C)]
 pub struct HostFrameTiming {
-    pub phase_ns: [u64; HostPhase::ScriptButton as usize + 1],
+    pub phase_ns: [u64; HostPhase::ComposeResourceRedraw as usize + 1],
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +27,18 @@ pub(super) enum HostPhase {
     ScriptListRaster,
     ScriptMotionRaster,
     ScriptButton,
+    ScriptRead,
+    ScriptParse,
+    OpenScan,
+    OpenInitialize,
+    OpenStartup,
+    ComposeLayers,
+    ComposeText,
+    ComposeEmote,
+    ComposeTransition,
+    ComposePlane,
+    ComposeKx,
+    ComposeResourceRedraw,
 }
 
 #[derive(Default)]
@@ -89,7 +101,8 @@ fn measure_phase(phase: HostPhase, script_only: bool) -> HostPhaseTimer {
         let mut state = state.borrow_mut();
         let timing = state.as_mut()?;
         if script_only && !timing.active.is_some_and(|(parent, _)| {
-            matches!(parent, HostPhase::Script) || parent as usize >= HostPhase::ScriptInput as usize
+            matches!(parent, HostPhase::Script)
+                || (HostPhase::ScriptInput as usize..=HostPhase::ScriptButton as usize).contains(&(parent as usize))
         }) {
             return None;
         }
@@ -101,11 +114,78 @@ pub(super) fn measure_host_phase(phase: HostPhase) -> HostPhaseTimer {
     measure_phase(phase, false)
 }
 
+pub(super) fn measure_host_operation<T>(phase: HostPhase, operation: impl FnOnce() -> T) -> T {
+    let _timing = measure_host_phase(phase);
+    operation()
+}
+
 pub(super) fn measure_script_detail(phase: HostPhase) -> HostPhaseTimer {
     measure_phase(phase, true)
 }
 
 impl HeadlessPlayer {
+    /// Enable the hardware raster backend on this interactive host thread.
+    pub fn enable_host_gpu_raster() {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        super::gpu_raster::enable();
+    }
+
+    /// Latest completed hardware raster batch on this host thread.
+    pub fn latest_host_gpu_timing() -> Option<(u64, u64)> {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        return super::gpu_raster::latest_gpu_timing();
+        #[cfg(not(all(feature = "gpu-raster", any(windows, target_os = "android"))))]
+        None
+    }
+
+    pub fn host_device_frame_revision(&self) -> Option<u64> {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        return super::gpu_raster::frame_revision(&self.canvas);
+        #[cfg(not(all(feature = "gpu-raster", any(windows, target_os = "android"))))]
+        None
+    }
+
+    /// The caller keeps a native window reference for this call.
+    #[cfg(target_os = "android")]
+    pub fn android_surface_candidate(window: std::ptr::NonNull<std::ffi::c_void>) -> bool {
+        #[cfg(feature = "gpu-raster")]
+        return super::gpu_raster::surface_candidate(window);
+        #[cfg(not(feature = "gpu-raster"))]
+        { let _ = window; false }
+    }
+
+    /// The caller must hold a live ANativeWindow. The presenter acquires its own
+    /// reference before retaining a surface.
+    #[cfg(target_os = "android")]
+    pub unsafe fn present_android_surface(&self, window: std::ptr::NonNull<std::ffi::c_void>) -> i32 {
+        #[cfg(feature = "gpu-raster")]
+        return super::gpu_raster::present_canvas(window, &self.canvas);
+        #[cfg(not(feature = "gpu-raster"))]
+        { let _ = window; 1 }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn detach_android_surface() {
+        #[cfg(feature = "gpu-raster")]
+        super::gpu_raster::detach();
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn set_android_vulkan_display_stats(enabled: bool) {
+        #[cfg(feature = "gpu-raster")]
+        super::gpu_raster::set_display_stats_enabled(enabled);
+        #[cfg(not(feature = "gpu-raster"))]
+        let _ = enabled;
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_vulkan_display_stats() -> Option<[u64; 7]> {
+        #[cfg(feature = "gpu-raster")]
+        return super::gpu_raster::display_stats();
+        #[cfg(not(feature = "gpu-raster"))]
+        None
+    }
+
     pub fn disable_script_evidence_capture(&mut self) {
         self.capture_script_evidence = false;
     }

@@ -1,4 +1,4 @@
-//! Ordinary two-dimensional plane wrappers and their CPU presentation.
+//! Ordinary two-dimensional plane wrappers and presentation.
 //!
 //! Install `PlaneServices` as `DataServices.planes`. The optional native guard
 //! follows movie_plane_native. Geometry wrappers share PLANE_GEOMETRY_ABI and
@@ -2151,6 +2151,57 @@ pub(super) fn draw_plane_with_view(
     if node.kind != 2 {
         return Ok(false);
     }
+    let Some(plane) = prepare_plane_geometry(node, services, canvas_source, cameras, projection)? else {
+        return Ok(true);
+    };
+    let PlaneGeometry { vertices, source, argb: color, clip, blend } = plane;
+    if let Some(source) = source
+        && matches!(blend, BlendMode::SourceOver | BlendMode::Multiply)
+        && color & 0x00ff_ffff == 0x00ff_ffff
+        && draw_unit_canvas_plane(
+            canvas, source, services.vram_overflow.as_ref(), vertices, clip, (color >> 24) as u8,
+            blend,
+        )
+    {
+        return Ok(true);
+    }
+    let polygons = plane_polygons(vertices);
+    let triangles = || plane_triangles(&polygons);
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if draw_gpu_triangles(canvas, source, services.vram_overflow.as_ref(), triangles(),
+        color, clip, blend)
+    {
+        return Ok(true);
+    }
+    for triangle in triangles() {
+        raster_triangle(
+            canvas,
+            triangle,
+            color,
+            source,
+            services.vram_overflow.as_ref(),
+            clip,
+            blend,
+        )?;
+    }
+    Ok(true)
+}
+
+struct PlaneGeometry<'a> {
+    vertices: [[f64; 6]; 4],
+    source: Option<&'a RgbaFrame>,
+    argb: u32,
+    clip: Option<Rect>,
+    blend: BlendMode,
+}
+
+fn prepare_plane_geometry<'a>(
+    node: &SceneNode,
+    services: &PlaneServices,
+    canvas_source: Option<&'a RgbaFrame>,
+    cameras: &BTreeMap<u32, PlaneCamera>,
+    projection: &MoviePlaneProjection,
+) -> HostResult<Option<PlaneGeometry<'a>>> {
     let fallback;
     let state = match services.planes.get(&node.id) {
         Some(state) => state,
@@ -2161,7 +2212,7 @@ pub(super) fn draw_plane_with_view(
     };
     if !node.initialized || state.display == 0 || !node.visible || state.shape == PlaneShape::Empty
     {
-        return Ok(true);
+        return Ok(None);
     }
     let source = if state.shape == PlaneShape::Canvas {
         Some(canvas_source.context("canvas-textured plane requires a pre-pass canvas snapshot")?)
@@ -2250,32 +2301,61 @@ pub(super) fn draw_plane_with_view(
     } else {
         node.color
     };
-    if let Some(source) = source
-        && matches!(state.blend, BlendMode::SourceOver | BlendMode::Multiply)
-        && color & 0x00ff_ffff == 0x00ff_ffff
-        && draw_unit_canvas_plane(
-            canvas, source, services.vram_overflow.as_ref(), vertices, state.clip, (color >> 24) as u8,
-            state.blend,
-        )
-    {
-        return Ok(true);
-    }
-    for indices in [[0, 1, 2], [2, 1, 3]] {
+    Ok(Some(PlaneGeometry { vertices, source, argb: color, clip: state.clip, blend: state.blend }))
+}
+
+fn plane_polygons(vertices: [[f64; 6]; 4]) -> [Vec<[f64; 6]>; 2] {
+    [[0, 1, 2], [2, 1, 3]].map(|indices| {
         let polygon = indices.map(|index| vertices[index]).to_vec();
-        let polygon = clip_plane_depth(&clip_plane_depth(&polygon, 0., true), 1., false);
-        for index in 1..polygon.len().saturating_sub(1) {
-            raster_triangle(
-                canvas,
-                [polygon[0], polygon[index], polygon[index + 1]],
-                color,
-                source,
-                services.vram_overflow.as_ref(),
-                state.clip,
-                state.blend,
-            )?;
+        clip_plane_depth(&clip_plane_depth(&polygon, 0., true), 1., false)
+    })
+}
+
+fn plane_triangles(polygons: &[Vec<[f64; 6]>; 2]) -> impl Iterator<Item = [[f64; 6]; 3]> {
+    polygons.iter().flat_map(|polygon| {
+        (1..polygon.len().saturating_sub(1)).map(move |i| [polygon[0], polygon[i], polygon[i + 1]])
+    })
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn draw_plane_group<'a>(
+    canvas: &mut Canvas,
+    nodes: impl Iterator<Item = &'a SceneNode>,
+    services: &PlaneServices,
+    canvas_source: Option<&RgbaFrame>,
+    cameras: &BTreeMap<u32, PlaneCamera>,
+    projection: &MoviePlaneProjection,
+) -> HostResult<bool> {
+    use super::gpu_raster;
+    let mut prepared = Vec::new();
+    for node in nodes {
+        let Some(plane) = prepare_plane_geometry(node, services, canvas_source, cameras, projection)? else {
+            continue;
+        };
+        if let Some(source) = plane.source
+            && matches!(plane.blend, BlendMode::SourceOver | BlendMode::Multiply)
+            && plane.argb & 0x00ff_ffff == 0x00ff_ffff
+            && let Some(span) = unit_plane_span([canvas.width(), canvas.height()], source,
+                services.vram_overflow.is_some(), plane.vertices, plane.clip, (plane.argb >> 24) as u8)
+        {
+            if let Some(span) = span {
+                let Some(job) = GpuPlane::from_span(source, services.vram_overflow.as_ref(), &span,
+                    (plane.argb >> 24) as u8, plane.blend) else { return Ok(false); };
+                prepared.push(job);
+            }
+            continue;
+        }
+        let polygons = plane_polygons(plane.vertices);
+        match prepare_gpu_triangles([canvas.width(), canvas.height()], plane.source, services.vram_overflow.as_ref(), true,
+            plane_triangles(&polygons), plane.argb, plane.clip, plane.blend) {
+            Some(Some(job)) => prepared.push(job),
+            Some(None) => {},
+            None => return Ok(false),
         }
     }
-    Ok(true)
+    if prepared.is_empty() { return Ok(true); }
+    let jobs: Vec<_> = prepared.iter().map(GpuPlane::job).collect();
+    Ok(gpu_raster::draw_plane_group(canvas, &jobs))
 }
 
 /// Supply this depth to the common scene sort; translation.z is not the plane
@@ -2403,21 +2483,23 @@ fn clip_plane_depth(input: &[[f64; 6]], edge: f64, lower: bool) -> Vec<[f64; 6]>
     output
 }
 
-fn draw_unit_canvas_plane(
-    canvas: &mut Canvas,
-    source: &RgbaFrame,
-    overflow: Option<&VramOverflow>,
-    vertices: [[f64; 6]; 4],
-    clip: Option<Rect>,
-    opacity: u8,
-    blend: BlendMode,
-) -> bool {
+struct UnitPlaneSpan {
+    start: [u32; 2],
+    size: [u32; 2],
+    sample: [u32; 2],
+    in_frame: bool,
+}
+
+fn unit_plane_span(
+    dimensions: [u32; 2], source: &RgbaFrame, has_overflow: bool,
+    vertices: [[f64; 6]; 4], clip: Option<Rect>, opacity: u8,
+) -> Option<Option<UnitPlaneSpan>> {
     let [origin, right, bottom, opposite] = vertices;
     let reciprocal_w = origin[3];
     if !matches!(reciprocal_w, 1. | 2. | 4.)
         || vertices.iter().any(|point| point[3] != reciprocal_w || !(0. ..=1.).contains(&point[2]))
     {
-        return false;
+        return None;
     }
     let left = origin[0];
     let top = origin[1];
@@ -2429,7 +2511,7 @@ fn draw_unit_canvas_plane(
         .iter().any(|value| value.abs() > 32768. || value.fract() != 0.)
         || left >= end_x || top >= end_y
     {
-        return false;
+        return None;
     }
     for (point, [x, y]) in [right, bottom, opposite]
         .into_iter().zip([[end_x, top], [left, end_y], [end_x, end_y]])
@@ -2438,13 +2520,13 @@ fn draw_unit_canvas_plane(
             || point[4] != (source_x + x - left) * reciprocal_w
             || point[5] != (source_y + y - top) * reciprocal_w
         {
-            return false;
+            return None;
         }
     }
     let mut x0 = (left as i64).max(0);
     let mut y0 = (top as i64).max(0);
-    let mut x1 = (end_x as i64).min(i64::from(canvas.width()));
-    let mut y1 = (end_y as i64).min(i64::from(canvas.height()));
+    let mut x1 = (end_x as i64).min(i64::from(dimensions[0]));
+    let mut y1 = (end_y as i64).min(i64::from(dimensions[1]));
     if let Some(clip) = clip {
         x0 = x0.max(i64::from(clip.x));
         y0 = y0.max(i64::from(clip.y));
@@ -2452,29 +2534,59 @@ fn draw_unit_canvas_plane(
         y1 = y1.min(i64::from(clip.y) + i64::from(clip.height));
     }
     if x0 >= x1 || y0 >= y1 || opacity == 0 {
-        return true;
+        return Some(None);
     }
     let source_x = source_x as i64 + x0 - left as i64;
     let source_y = source_y as i64 + y0 - top as i64;
+    let in_frame = source_x + x1 - x0 <= i64::from(source.width())
+        && source_y + y1 - y0 <= i64::from(source.height());
     if source_x < 0 || source_y < 0
-        || (overflow.is_none() && (source_x + x1 - x0 > i64::from(source.width())
-            || source_y + y1 - y0 > i64::from(source.height())))
+        || (!has_overflow && !in_frame)
     {
-        return false;
+        return None;
+    }
+
+    Some(Some(UnitPlaneSpan {
+        start: [x0 as u32, y0 as u32], size: [(x1 - x0) as u32, (y1 - y0) as u32],
+        sample: [source_x as u32, source_y as u32], in_frame,
+    }))
+}
+
+fn draw_unit_canvas_plane(
+    canvas: &mut Canvas,
+    source: &RgbaFrame,
+    overflow: Option<&VramOverflow>,
+    vertices: [[f64; 6]; 4],
+    clip: Option<Rect>,
+    opacity: u8,
+    blend: BlendMode,
+) -> bool {
+    let span = match unit_plane_span([canvas.width(), canvas.height()], source, overflow.is_some(), vertices, clip, opacity) {
+        Some(Some(span)) => span,
+        Some(None) => return true,
+        None => return false,
+    };
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if super::gpu_raster::available()
+        && u64::from(span.size[0]) * u64::from(span.size[1]) >= 128 * 1024
+        && let Some(plane) = GpuPlane::from_span(source, overflow, &span, opacity, blend)
+    {
+        let job = plane.job();
+        if super::gpu_raster::draw_job(canvas, job) { return true; }
     }
 
     let source_stride = source.width() as usize * 4;
     let canvas_stride = canvas.width() as usize * 4;
-    let width = (x1 - x0) as u32;
+    let width = span.size[0];
     let row_bytes = width as usize * 4;
     let pixels = canvas.pixels_mut();
-    for row in 0..(y1 - y0) as u32 {
-        let sample_y = source_y as u32 + row;
-        let to = (y0 as usize + row as usize) * canvas_stride + x0 as usize * 4;
+    for row in 0..span.size[1] {
+        let sample_y = span.sample[1] + row;
+        let to = (span.start[1] as usize + row as usize) * canvas_stride + span.start[0] as usize * 4;
         let output = &mut pixels[to..to + row_bytes];
         let mut consumed = 0;
         while consumed < width {
-            let sample_x = source_x as u32 + consumed;
+            let sample_x = span.sample[0] + consumed;
             let remaining = width - consumed;
             let (count, input) = if sample_y < source.height() && sample_x < source.width() {
                 let count = remaining.min(source.width() - sample_x);
@@ -2522,6 +2634,165 @@ fn multiply_unit_plane_span(input: &[u8], output: &mut [u8], opacity: u8) {
             }
         }
     }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+struct GpuPlane<'a> {
+    rect: super::gpu_raster::RasterRect,
+    source: Option<RgbaFrame>,
+    atlas: Option<Option<&'a VramOverflow>>,
+    kind: GpuPlaneKind,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+enum GpuPlaneKind {
+    Span { source_origin: [u32; 2], opacity: u8, multiply: bool },
+    Triangles { vertices: Vec<[[f32; 6]; 3]>, source_origin: [u32; 2], argb: u32, blend: BlendMode },
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+impl<'a> GpuPlane<'a> {
+    fn from_span(source: &RgbaFrame, overflow: Option<&'a VramOverflow>, span: &UnitPlaneSpan,
+        opacity: u8, blend: BlendMode,
+    ) -> Option<Self> {
+        use super::gpu_raster::RasterRect;
+        let atlas = super::gpu_raster::can_use_atlas(source, overflow).then_some(overflow);
+        let (frame, source_origin) = if span.in_frame || atlas.is_some() {
+            (source.clone(), span.sample)
+        } else {
+            (overflow?.pack_region(source, span.sample, span.size).ok()?, [0; 2])
+        };
+        Some(Self {
+            rect: RasterRect { origin: span.start, size: span.size },
+            source: Some(frame),
+            atlas,
+            kind: GpuPlaneKind::Span { source_origin, opacity, multiply: blend == BlendMode::Multiply },
+        })
+    }
+
+    fn job(&self) -> super::gpu_raster::RasterJob<'_> {
+        use super::gpu_raster::{Draw, RasterJob};
+        RasterJob {
+            rect: self.rect,
+            source: self.source.as_ref(),
+            atlas: self.atlas,
+            operation: match &self.kind {
+                &GpuPlaneKind::Span { source_origin, opacity, multiply } => Draw::PlaneSpan { source_origin, opacity, multiply },
+                GpuPlaneKind::Triangles { vertices, source_origin, argb, blend } => Draw::PlaneTriangles {
+                    vertices, source_origin: *source_origin, argb: *argb, blend: *blend,
+                },
+            },
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+fn draw_gpu_triangles(
+    canvas: &mut Canvas,
+    source: Option<&RgbaFrame>,
+    overflow: Option<&VramOverflow>,
+    triangles: impl Iterator<Item = [[f64; 6]; 3]>,
+    argb: u32,
+    clip: Option<Rect>,
+    blend: BlendMode,
+) -> bool {
+    use super::gpu_raster;
+    if !gpu_raster::available() { return false; }
+    match prepare_gpu_triangles([canvas.width(), canvas.height()], source, overflow, overflow.is_some(),
+        triangles, argb, clip, blend)
+    {
+        Some(Some(plane)) => {
+            let job = plane.job();
+            gpu_raster::draw_job(canvas, job)
+        }
+        Some(None) => true,
+        None => false,
+    }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+fn prepare_gpu_triangles<'a>(
+    dimensions: [u32; 2],
+    source: Option<&RgbaFrame>,
+    overflow: Option<&'a VramOverflow>,
+    canvas_texture: bool,
+    triangles: impl Iterator<Item = [[f64; 6]; 3]>,
+    argb: u32,
+    clip: Option<Rect>,
+    blend: BlendMode,
+) -> Option<Option<GpuPlane<'a>>> {
+    use super::gpu_raster::RasterRect;
+    let mut vertices = Vec::new();
+    let mut lower = [f64::INFINITY; 2];
+    let mut upper = [f64::NEG_INFINITY; 2];
+    let mut uv_lower = [f64::INFINITY; 2];
+    let mut uv_upper = [f64::NEG_INFINITY; 2];
+    for mut triangle in triangles {
+        let [a, b, c] = triangle;
+        let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if area == 0. { continue; }
+        if area < 0. { triangle.swap(1, 2); }
+        for point in triangle {
+            if point[3] <= 0. || point.iter().any(|value| !value.is_finite() || value.abs() > 1e8) {
+                return None;
+            }
+            for axis in 0..2 {
+                lower[axis] = lower[axis].min(point[axis]);
+                upper[axis] = upper[axis].max(point[axis]);
+                let uv = point[axis + 4] / point[3];
+                uv_lower[axis] = uv_lower[axis].min(uv);
+                uv_upper[axis] = uv_upper[axis].max(uv);
+            }
+        }
+        vertices.push(triangle);
+    }
+    if vertices.is_empty() { return Some(None); }
+    let bounds = dimensions.map(i64::from);
+    let clip_min = clip.map_or([0; 2], |rect| [i64::from(rect.x), i64::from(rect.y)]);
+    let clip_max = clip.map_or(bounds, |rect| [
+        i64::from(rect.x) + i64::from(rect.width),
+        i64::from(rect.y) + i64::from(rect.height),
+    ]);
+    let start: [i64; 2] = std::array::from_fn(|i| (lower[i].floor() as i64).max(0).max(clip_min[i]));
+    let end: [i64; 2] = std::array::from_fn(|i| (upper[i].ceil() as i64).min(bounds[i]).min(clip_max[i]));
+    if (0..2).any(|i| start[i] >= end[i]) { return Some(None); }
+    let mut sampled = source.cloned();
+    let mut source_origin = [0; 2];
+    let resident_atlas = (canvas_texture
+        && source.is_some_and(|frame| super::gpu_raster::can_use_atlas(frame, overflow)))
+        .then_some(overflow);
+    if let (Some(source), Some(atlas)) = (source, overflow) {
+        let viewport = [source.width(), source.height()];
+        if (0..2).any(|axis| uv_upper[axis] >= f64::from(viewport[axis])) {
+            let extent = atlas.dimensions();
+            if (0..2).any(|axis| extent[axis] < viewport[axis]) { return None; }
+            let first = uv_lower.map(|value| value.floor().max(0.) as u32);
+            let last: [u32; 2] = std::array::from_fn(|axis| {
+                (uv_upper[axis].floor() + 1.).clamp(0., f64::from(extent[axis])) as u32
+            });
+            if (0..2).any(|axis| first[axis] >= last[axis]) { return Some(None); }
+            let size = std::array::from_fn(|axis| last[axis] - first[axis]);
+            if resident_atlas.is_some() {
+                source_origin = first;
+            } else {
+                if u64::from(size[0]) * u64::from(size[1]) > 4 * 1024 * 1024 { return None; }
+                sampled = Some(atlas.pack_region(source, first, size).ok()?);
+            }
+            for point in vertices.iter_mut().flatten() {
+                for axis in 0..2 { point[axis + 4] -= f64::from(first[axis]) * point[3]; }
+            }
+        }
+    }
+    Some(Some(GpuPlane {
+        rect: RasterRect { origin: start.map(|value| value as u32),
+            size: std::array::from_fn(|i| (end[i] - start[i]) as u32) },
+        source: sampled,
+        atlas: resident_atlas,
+        kind: GpuPlaneKind::Triangles {
+            vertices: vertices.into_iter().map(|triangle| triangle.map(|point| point.map(|value| value as f32))).collect(),
+            source_origin, argb, blend,
+        },
+    }))
 }
 
 fn raster_triangle(
@@ -2938,10 +3209,16 @@ pub(super) fn draw_fes_motion_frame(
         bail!("FES plane motion matrix produced non-finite vertices");
     }
     let color = (u32::from(options.opacity) << 24) | rgb;
-    for index in 1..polygon.len().saturating_sub(1) {
+    let triangles = || (1..polygon.len().saturating_sub(1))
+        .map(|index| [polygon[0], polygon[index], polygon[index + 1]]);
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if draw_gpu_triangles(canvas, Some(frame), None, triangles(), color, None, options.blend_mode) {
+        return Ok(());
+    }
+    for triangle in triangles() {
         raster_triangle(
             canvas,
-            [polygon[0], polygon[index], polygon[index + 1]],
+            triangle,
             color,
             Some(frame),
             None,

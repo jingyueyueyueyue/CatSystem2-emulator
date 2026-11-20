@@ -43,6 +43,7 @@ impl SceneImage {
 #[derive(Default)]
 pub(super) struct SceneCompositor {
     prefix: Option<ImagePrefix>,
+    pub(super) graphics_frame: Option<RgbaFrame>,
     pub(super) revision: Option<u64>,
     revision_counter: u64,
 }

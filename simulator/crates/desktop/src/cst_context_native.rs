@@ -15,6 +15,7 @@ use super::{LogicEvent, LoggingHost, ScriptTextEncoding, native_state_error, nat
     expand_kcs_format, signed_cst_index, write_kcs_terminated};
 use super::resource_preload::SourcedResource;
 use super::particle_plugin_digest::sha256;
+use super::{HostPhase, measure_host_operation, measure_host_phase};
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
@@ -255,7 +256,7 @@ fn capture_sscript_speaker_copy(source: u32, vm: &Vm) -> Option<CstRawCopy> {
     }
     let suffix = vm.read_string(source).ok()?;
     if suffix.is_ascii() || std::str::from_utf8(&suffix).is_err()
-        || sha256(&vm.program()?.code) != SSCRIPT_CODE_SHA256
+        || vm.program_code_sha256()? != SSCRIPT_CODE_SHA256
     {
         return None;
     }
@@ -548,7 +549,7 @@ impl LoggingHost<'_> {
         // rejected outer length clears only its scene, not its history/position.
         let mut encoding = self.text_encoding;
         let loaded = if signature && valid_length {
-            let document = CstDocument::parse(bytes)?;
+            let document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(bytes))?;
             if let Some(source_encoding) = self.cst_scene_encoding_override(&resource) {
                 require_gbk_records(&document)?;
                 encoding = source_encoding;
@@ -581,7 +582,7 @@ impl LoggingHost<'_> {
         adjacent.push_str(".cstl");
         if let Some(SourcedResource { bytes, source }) = self.cst_read_resource(&adjacent)? {
             if !bytes.is_empty() {
-                let (table, _) = CstlTable::parse_prefix(&bytes)
+                let (table, _) = measure_host_operation(HostPhase::ScriptParse, || CstlTable::parse_prefix(&bytes))
                     .map_err(|_| native_state_error("CST adjacent localization table is malformed"))?;
                 if success && self.trace_neko_cstl() {
                     let origin = match &source.location {
@@ -885,6 +886,7 @@ impl LoggingHost<'_> {
     }
 
     fn cst_read_resource(&self, name: &str) -> Result<Option<SourcedResource>> {
+        let _timing = measure_host_phase(HostPhase::ScriptRead);
         if let Some(resource) = self.data_services.ordinary.cached_resource_with_source(name) {
             if resource.bytes.len() > MAX_BYTES { return Err(native_state_error("CST cached resource exceeds 64 MiB")); }
             return Ok(Some(resource.clone()));

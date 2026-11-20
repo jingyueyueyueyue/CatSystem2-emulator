@@ -74,7 +74,7 @@ final class AndroidTweetHost {
         }
     }
 
-    private final PlayerActivity owner;
+    private final PlayerEngineActivity owner;
     private final Handler engine, ui;
     private final long session;
     private final Consumer<Exception> failure;
@@ -85,7 +85,7 @@ final class AndroidTweetHost {
     private boolean foreground, browserReturnRequired, browserPaused;
     private volatile boolean closed;
 
-    AndroidTweetHost(PlayerActivity owner, Handler engine, Handler ui, long session,
+    AndroidTweetHost(PlayerEngineActivity owner, Handler engine, Handler ui, long session,
                      Consumer<Exception> failure) {
         this.owner = owner; this.engine = engine; this.ui = ui;
         this.session = session; this.failure = failure;

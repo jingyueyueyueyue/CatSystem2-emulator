@@ -3,7 +3,7 @@ use blowfish::{
     BlowfishLE,
     cipher::{BlockDecrypt, KeyInit},
 };
-use cs2_formats::{Archive, ArchiveEntry};
+use cs2_formats::{Archive, ArchiveEntry, ConfigXml};
 use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -421,6 +421,8 @@ pub struct ResourceIndex {
     #[serde(default)]
     routing_startup: Option<Vec<u8>>,
     #[serde(skip)]
+    routing_document: OnceLock<Result<Arc<ConfigXml>, String>>,
+    #[serde(skip)]
     directory_lookups: OnceLock<Vec<OnceLock<ArchiveDirectoryLookup>>>,
     #[serde(skip)]
     file_lookup: OnceLock<BTreeMap<String, usize>>,
@@ -580,6 +582,7 @@ impl ResourceIndex {
             routing: None,
             routing_base: PathBuf::new(),
             routing_startup: None,
+            routing_document: OnceLock::new(),
             routing_error: None,
             directory_lookups: OnceLock::new(),
             file_lookup: OnceLock::new(),
@@ -901,6 +904,7 @@ impl ResourceIndex {
 
     pub fn initialize_resource_router(&mut self) -> RuntimeResult<()> {
         self.routing_startup = None;
+        self.routing_document.take();
         let mut startup = None;
         for prefix in CONFIG_BOOTSTRAP_PREFIXES {
             if let Some(candidate) = self.candidates(format!("{prefix}startup.xml")).first() {
@@ -910,8 +914,9 @@ impl ResourceIndex {
         }
         let (config, base) = if let Some(candidate) = startup {
             let bytes = self.read_candidate(&candidate)?;
-            let config = cs2_formats::ConfigXml::parse_runtime(&bytes)
-                .map_err(|cause| RuntimeError::Host(format!("startup runtime XML: {cause}")))?;
+            let config = Arc::new(ConfigXml::parse_runtime(&bytes)
+                .map_err(|cause| RuntimeError::Host(format!("startup runtime XML: {cause}")))?);
+            self.routing_document.get_or_init(|| Ok(Arc::clone(&config)));
             self.routing_startup = Some(bytes);
             let parent = match &candidate.location {
                 ResourceLocation::File { path } => {
@@ -924,17 +929,26 @@ impl ResourceIndex {
             };
             (Some(config), parent.strip_prefix(&self.root).unwrap_or(Path::new("")).to_path_buf())
         } else { (None, PathBuf::new()) };
-        let router = ResourceRouter::from_index(self, config.as_ref(), &base)?;
+        let router = ResourceRouter::from_index(self, config.as_deref(), &base)?;
         self.routing_base = base;
         self.set_resource_router(router)
     }
 
-    pub fn startup_configuration(&self) -> RuntimeResult<Option<cs2_formats::ConfigXml>> {
+    pub fn startup_configuration(&self) -> RuntimeResult<Option<ConfigXml>> {
+        Ok(self.startup_configuration_ref()?.cloned())
+    }
+
+    fn startup_configuration_ref(&self) -> RuntimeResult<Option<&ConfigXml>> {
         if let Some(cause) = &self.routing_error { return Err(RuntimeError::Host(cause.clone())); }
-        self.routing_startup.as_deref().map(|bytes| {
-            cs2_formats::ConfigXml::parse_runtime(bytes)
-                .map_err(|cause| RuntimeError::Host(format!("startup runtime XML: {cause}")))
-        }).transpose()
+        let Some(bytes) = self.routing_startup.as_deref() else { return Ok(None); };
+        // Deserialize preserves the startup bytes. Its first lookup rebuilds
+        // the same parsed snapshot that fresh indexes seed during routing.
+        match self.routing_document.get_or_init(|| {
+            ConfigXml::parse_runtime(bytes).map(Arc::new).map_err(|cause| format!("startup runtime XML: {cause}"))
+        }) {
+            Ok(config) => Ok(Some(config)),
+            Err(cause) => Err(RuntimeError::Host(cause.clone())),
+        }
     }
 
     /// Load a named configuration through its declared category, with file
@@ -982,14 +996,14 @@ impl ResourceIndex {
         if crate::resource_router::has_category_directory(&source)? {
             return Ok(Some(vec![source]));
         }
-        if let Some(config) = self.startup_configuration()? {
+        if let Some(config) = self.startup_configuration_ref()? {
             for slot in 0..128 {
                 let key = format!("int{slot:02}");
                 let path = [b"document".as_slice(), b"INT", key.as_bytes(), b"name"];
                 let name = config.text(&path).unwrap_or_default();
                 if name.len() >= 32 { return Err(RuntimeError::Host("INT name exceeds original capacity".into())); }
                 if !name.eq_ignore_ascii_case(category) { continue; }
-                return crate::resource_router::complete_category(&config, slot, &source)
+                return crate::resource_router::complete_category(config, slot, &source)
                     .map(|name| Some(vec![name]));
             }
         }
@@ -1010,8 +1024,8 @@ impl ResourceIndex {
         if slot >= 128 { return Err(RuntimeError::InvalidResourceName("INT category slot is outside 0..127".into())); }
         let source = source.split('\0').next().unwrap_or_default();
         if crate::resource_router::has_category_directory(source)? { return Ok(source.to_owned()); }
-        if let Some(config) = self.startup_configuration()? {
-            return crate::resource_router::complete_category(&config, slot, source);
+        if let Some(config) = self.startup_configuration_ref()? {
+            return crate::resource_router::complete_category(config, slot, source);
         }
         Err(RuntimeError::ResourceNotFound("startup.xml".into()))
     }
@@ -2215,10 +2229,41 @@ fn decrypt_payload_with_key(bytes: &mut [u8], key: Option<u32>) -> RuntimeResult
     };
     let cipher = BlowfishLE::new_from_slice(&key.to_le_bytes())
         .map_err(|_| RuntimeError::Archive("invalid KIF payload key".to_string()))?;
-    for block in bytes.chunks_exact_mut(8) {
-        cipher.decrypt_block(block.into());
-    }
+    let workers = if bytes.len() >= 512 * 1024 {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(3))
+    } else {
+        1
+    };
+    decrypt_kif_blocks(bytes, &cipher, workers);
     Ok(())
+}
+
+fn decrypt_kif_blocks(bytes: &mut [u8], cipher: &BlowfishLE, workers: usize) {
+    let decrypt = |bytes: &mut [u8]| {
+        for block in bytes.chunks_exact_mut(8) {
+            cipher.decrypt_block(block.into());
+        }
+    };
+    if workers == 1 {
+        decrypt(bytes);
+        return;
+    }
+    // Blocks are independent. Give each worker complete blocks and leave
+    // the final partial block intact. The caller drains unclaimed chunks if
+    // the OS cannot start extra threads.
+    let chunk_size = (bytes.len() / 8).div_ceil(workers * 4) * 8;
+    let chunks = Mutex::new(bytes.chunks_mut(chunk_size));
+    let decrypt_next = || loop {
+        let chunk = chunks.lock().unwrap_or_else(|poison| poison.into_inner()).next();
+        let Some(chunk) = chunk else { break };
+        decrypt(chunk);
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            let _ = std::thread::Builder::new().spawn_scoped(scope, &decrypt_next);
+        }
+        decrypt_next();
+    });
 }
 
 fn names_equal(left: &[u8], right: &[u8]) -> bool {

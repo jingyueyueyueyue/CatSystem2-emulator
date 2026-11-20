@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result, bail};
-use cs2_renderer::{ImageDrawOptions, Point, Rect, RgbaFrame};
+use cs2_renderer::{Canvas, ImageDrawOptions, Point, Rect, RgbaFrame};
 use cs2_runtime::message_object::{
     MessageCopy, MessageDefaults, MessageEncoding, MessageObject,
     MessagePlaneDisplay,
@@ -18,6 +18,7 @@ use super::fes_driver::{
     FesDriverCommand, FesDriverEffect, FesDriverWait, FesScriptDriver,
 };
 use super::fes_tasks::FesTaskView;
+use super::perf_detail::{SlowTask, TextStage, TextTimer, TextWork};
 use super::{FesRuntime, LoggingHost, LogicEvent, ScriptTextEncoding, message_backend::DesktopMessageDevice};
 
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
@@ -188,6 +189,14 @@ pub(super) struct FesTextProjection {
 }
 
 impl FesTextProjection {
+    pub(super) fn draw(&self, canvas: &mut Canvas) -> cs2_renderer::Result<()> {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if super::gpu_raster::draw_image(canvas, &self.frame, &self.options) {
+            return Ok(());
+        }
+        canvas.draw_frame(&self.frame, &self.options)
+    }
+
     /// Lossless image-list identity; CP932 names must not be collapsed by
     /// String::from_utf8_lossy when combined with ordinary image layers.
     pub(super) fn layer_key(&self) -> String {
@@ -1402,12 +1411,16 @@ pub(super) fn update_owner(
             data.fes_motion.synchronize_text(&data.fes_text, view.id, &key.1, key.2, b"POS2")?;
         }
     }
-    host.data_services.message_device.load_fonts(host.resources);
+    {
+        let _detail = SlowTask::new(view.id, || 34, "fes_text_load_fonts");
+        host.data_services.message_device.load_fonts(host.resources);
+    }
     let data = &mut *host.data_services;
     let next_surface = &mut data.fes_text.next_surface;
     for ((owner, name, index), bank) in &mut data.fes_text.banks {
         if *owner != view.id { continue; }
         if bank.log.is_some() {
+            let _detail = SlowTask::new(view.id, || 34, "fes_text_log").named(name, None).code(*index);
             log::update(bank, next_surface, &mut data.message_device, view, runtime, name, *index,
                 host.backlogs, data.newton_legacy_gbk)?;
         } else {
@@ -1429,6 +1442,7 @@ pub(super) fn update_owner(
             .filter_map(|(key, bank)| Some((key.clone(), bank.projection.clone()?)))
             .collect();
         for (key, projection) in novel {
+            let _detail = SlowTask::new(view.id, || 34, "fes_text_novel_projection").named(&key.1, None).code(key.2);
             let mut projection = prepare_motion_projection(host, view, runtime, projection)?;
             let layer = projection.layer_key();
             super::fes_controls::apply_layer_clip(host.data_services, view.id, &layer, &mut projection.options);
@@ -1461,6 +1475,8 @@ fn render_bank_with_surface(
     device: &mut DesktopMessageDevice, view: &FesTaskView, runtime: &FesRuntime,
     bank: &mut TextBank, (name, index): (&[u8], i32), allocate_surface: bool,
 ) -> Result<()> {
+    let _text = TextWork::new(view.id, index, name);
+    let layout = SlowTask::new(view.id, || 34, "fes_text_layout").named(name, None).code(index);
     let scale = device.time_scale;
     let parent = bank.parent_plane.as_ref().map(|name|
         runtime.planes.get(name).context("STRING parent PLANE does not exist")).transpose()?;
@@ -1482,18 +1498,23 @@ fn render_bank_with_surface(
     // A new message needs its first configuration before user glyphs.
     // Existing messages receive source/mapping changes before reconfigure.
     if !bank.configured {
+        let _stage = TextTimer::new(TextStage::Configure);
         bank.message.reconfigure(&bank.configuration, scale, device)?;
         bank.configured = true; bank.dirty = false;
     }
-    if bank.user_source_dirty {
-        bank.message.set_user_glyph_source(bank.user_glyph_source.clone())?;
-        bank.user_source_dirty = false;
-    }
-    while let Some(&(character, frame)) = bank.user_mappings.get(bank.user_mapping_cursor) {
-        bank.message.map_user_glyph(u32::from(character), u32::from(frame), device)?;
-        bank.user_mapping_cursor += 1;
+    if bank.user_source_dirty || bank.user_mapping_cursor < bank.user_mappings.len() {
+        let _stage = TextTimer::new(TextStage::UserMaps);
+        if bank.user_source_dirty {
+            bank.message.set_user_glyph_source(bank.user_glyph_source.clone())?;
+            bank.user_source_dirty = false;
+        }
+        while let Some(&(character, frame)) = bank.user_mappings.get(bank.user_mapping_cursor) {
+            bank.message.map_user_glyph(u32::from(character), u32::from(frame), device)?;
+            bank.user_mapping_cursor += 1;
+        }
     }
     if bank.dirty {
+        let _stage = TextTimer::new(TextStage::Configure);
         bank.message.reconfigure(&bank.configuration, scale, device)?;
         bank.dirty = false;
     }
@@ -1518,6 +1539,7 @@ fn render_bank_with_surface(
     while let Some(request) = bank.pending.front().cloned() {
         match request {
             TextRequest::Clear => {
+                let _stage = TextTimer::new(TextStage::Clear);
                 bank.message.clear();
                 // Submit the genuinely empty page before any new suffix
                 // is appended; str alone must not reveal its first glyph.
@@ -1532,10 +1554,13 @@ fn render_bank_with_surface(
         bank.pending.pop_front();
     }
     if bank.needs_prepare {
+        let _stage = TextTimer::new(TextStage::Prepare);
         bank.message.prepare(scale, device)?;
         bank.line_count = bank.message.layout().map_or(0, |layout| layout.line_count);
         bank.needs_prepare = false;
     }
+    drop(layout);
+    let raster = SlowTask::new(view.id, || 34, "fes_text_raster").named(name, None).code(index);
     let visible = bank.visible && display_parent.is_none_or(|plane| plane.visible);
     let display = if view.list.is_none() { MessagePlaneDisplay::Unreachable }
         else if visible { MessagePlaneDisplay::Visible } else { MessagePlaneDisplay::Hidden };
@@ -1564,23 +1589,17 @@ fn render_bank_with_surface(
     if let Some(layout) = bank.message.layout() {
         bank.cursor = layout.cursor; bank.draw_area = layout.cursor;
     }
-    let Some(surface) = device.surface(bank.message.id()) else {
+    drop(raster);
+    let _detail = SlowTask::new(view.id, || 34, "fes_text_projection").named(name, None).code(index);
+    let Some(frame) = device.projection_frame(bank.message.id(), bank.tint)? else {
         bank.projection = None; return Ok(());
     };
-    let texture_size = [surface.submitted.width(), surface.submitted.height()];
+    let texture_size = [frame.width(), frame.height()];
     let (registered_size, _) = bank.message.registered_geometry()
         .context("configured STRING has no registered geometry")?;
     // The backend surface is local to this text plane. FES samples that
     // plane at its VRAM origin; the cache coordinates must not also move
     // the resulting screen projection (history uses an offscreen atlas).
-    let mut pixels = surface.submitted.pixels().to_vec();
-    if bank.tint != u32::MAX {
-        let channels = [(bank.tint >> 16) as u8, (bank.tint >> 8) as u8, bank.tint as u8, (bank.tint >> 24) as u8];
-        for pixel in pixels.chunks_exact_mut(4) {
-            for index in 0..4 { pixel[index] = ((u16::from(pixel[index]) * u16::from(channels[index]) + 127) / 255) as u8; }
-        }
-    }
-    let frame = RgbaFrame::from_rgba8(surface.submitted.width(), surface.submitted.height(), pixels)?;
     let mut options = ImageDrawOptions::new(Point::new(
         bank.position[0].wrapping_sub(bank.origin[0]).wrapping_add(parent_position.x),
         bank.position[1].wrapping_sub(bank.origin[1]).wrapping_add(parent_position.y),

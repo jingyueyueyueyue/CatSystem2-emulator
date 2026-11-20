@@ -147,7 +147,7 @@ pub(super) fn validate(s: &Surface, layers: &[ResourceLayer], geometry: &PlanGeo
 }
 
 pub(super) fn redraw(layers: &[ResourceLayer], s: &Surface, current: &RgbaFrame) -> Result<RgbaFrame> {
-    let _timing = crate::measure_host_phase(crate::HostPhase::Compose);
+    let _timing = crate::measure_host_phase(crate::HostPhase::ComposeResourceRedraw);
     let mut target = LayerComposition {
         width: current.width(), height: current.height(), pixels: current.pixels().to_vec(),
         metadata: current.metadata(), attributes: current.hg_attributes().as_map().clone(),

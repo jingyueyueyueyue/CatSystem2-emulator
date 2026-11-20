@@ -17,10 +17,12 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import tarfile
+import tempfile
 import urllib.request
 
-from android_workspace import ascii_path, build_cache_directory, host_c_compiler
+from android_workspace import ascii_path, build_cache_directory, default_sdk, host_c_compiler
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = "8.0.2"
@@ -47,6 +49,33 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def prepare_source_archive(archive: Path, source_archive: Path | None) -> None:
+    if source_archive is not None:
+        if digest(source_archive) != SOURCE_SHA256:
+            raise ValueError("Provided source archive does not match the pinned official SHA256")
+        if source_archive.resolve() == archive.resolve():
+            return
+    elif archive.is_file() and digest(archive) == SOURCE_SHA256:
+        return
+
+    # Verify the complete download before publishing it into the shared cache.
+    temporary = tempfile.NamedTemporaryFile(dir=archive.parent, prefix=".ffmpeg-", delete=False)
+    candidate = Path(temporary.name)
+    try:
+        with temporary:
+            if source_archive is not None:
+                with source_archive.open("rb") as source:
+                    shutil.copyfileobj(source, temporary)
+            else:
+                with urllib.request.urlopen(SOURCE_URL, timeout=45) as source:
+                    shutil.copyfileobj(source, temporary, length=1024 * 1024)
+        if digest(candidate) != SOURCE_SHA256:
+            raise ValueError("Official source archive SHA256 mismatch; refuse to extract")
+        candidate.replace(archive)
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
 def shell(path: Path) -> str:
     # MSYS bash accepts a native Windows path in /drive/... form; Linux/macOS
     # plans use their actual NDK paths without crossing a Windows shell.
@@ -65,6 +94,11 @@ def plan(ndk: Path, output: Path, api: int, host: str, jobs: int, integration: b
     suffix = ".exe" if host.startswith("windows") else ""
     executable = lambda name: shell(tools / (name + suffix))
     host_cc = host_c_compiler()
+    host_command = shell(host_cc)
+    if any(character.isspace() for character in host_command):
+        # FFmpeg expands this command as shell words. The generated recipe
+        # puts this exact compiler's directory first on PATH.
+        host_command = host_cc.name
     source = output / f"ffmpeg-{VERSION}"
     prefix = output / "install/arm64-v8a"
     build = output / "build/arm64-v8a"
@@ -77,7 +111,7 @@ def plan(ndk: Path, output: Path, api: int, host: str, jobs: int, integration: b
         "--cpu=armv8-a", "--enable-cross-compile", "--enable-pic",
         f"--sysroot={shell(tools.parent / 'sysroot')}", f"--cc={executable('clang')}",
         f"--cxx={executable('clang++')}",
-        f"--host-cc={shell(host_cc)}", f"--host-ld={shell(host_cc)}",
+        f"--host-cc={host_command}", f"--host-ld={host_command}",
         f"--ld={executable('clang')}", f"--ar={executable('llvm-ar')}",
         f"--nm={executable('llvm-nm')}",
         f"--ranlib={executable('llvm-ranlib')}", f"--strip={executable('llvm-strip')}",
@@ -174,18 +208,7 @@ def prepare(report: dict, output: Path, source_archive: Path | None) -> None:
         # attempt separately marks concurrent source edits diagnostic-only.
         report[key] = hashlib.sha256(content).hexdigest()
     archive = output / f"ffmpeg-{VERSION}.tar.xz"
-    if source_archive:
-        if digest(source_archive) != SOURCE_SHA256:
-            raise ValueError("Provided source archive does not match the pinned official SHA256")
-        if source_archive.resolve() != archive.resolve():
-            import shutil
-            shutil.copyfile(source_archive, archive)
-    elif not archive.is_file():
-        with urllib.request.urlopen(SOURCE_URL, timeout=45) as response, archive.open("wb") as target:
-            while chunk := response.read(1024 * 1024):
-                target.write(chunk)
-    if digest(archive) != SOURCE_SHA256:
-        raise ValueError("Official source archive SHA256 mismatch; refuse to extract")
+    prepare_source_archive(archive, source_archive)
     source = output / f"ffmpeg-{VERSION}"
     if not source.exists():
         with tarfile.open(archive) as package:
@@ -249,7 +272,7 @@ def prepare(report: dict, output: Path, source_archive: Path | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ndk", type=Path, default=Path.home() / "AppData/Local/Android/Sdk/ndk/28.2.13676358")
+    parser.add_argument("--ndk", type=Path, default=default_sdk() / "ndk/28.2.13676358")
     parser.add_argument("--host", choices=["windows-x86_64", "linux-x86_64", "darwin-x86_64"],
                         default="windows-x86_64" if os.name == "nt" else "linux-x86_64")
     parser.add_argument("--api", type=int, default=26)

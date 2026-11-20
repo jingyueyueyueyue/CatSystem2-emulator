@@ -150,7 +150,7 @@ pub(crate) fn prepare_motion_projection(
     crate::plane_native::draw_fes_motion_frame(
         &mut canvas, &projection.frame, &options, None, Some(&words), Some([0.; 2]),
     )?;
-    projection.frame = RgbaFrame::from_rgba8(list.size[0], list.size[1], canvas.pixels().to_vec())?;
+    projection.frame = canvas.into_frame();
     let mut projected = ImageDrawOptions::new(Point::new(0, 0));
     projected.visible = projection.options.visible;
     projected.opacity = projection.options.opacity;

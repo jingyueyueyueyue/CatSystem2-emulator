@@ -1,4 +1,5 @@
 use super::{ScriptTextEncoding, read_entry_with_fallback};
+use super::perf_detail::{TextStage, TextTimer};
 use anyhow::Result;
 use cs2_renderer::{Canvas, Color, FontRasterizer, Point};
 use cs2_runtime::ResourceIndex;
@@ -6,7 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 #[cfg(any(windows, target_os = "android"))]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FontOrigin {
@@ -19,7 +20,34 @@ pub(super) enum FontOrigin {
 pub(super) struct LoadedFont {
     pub origin: Arc<FontOrigin>,
     pub index: u32,
-    pub rasterizer: Arc<FontRasterizer>,
+    pub bytes: Arc<Vec<u8>>,
+    pub rasterizer: Arc<OnceLock<Option<Arc<FontRasterizer>>>>,
+}
+
+impl LoadedFont {
+    pub(super) fn for_character(&self, character: char) -> Option<&FontRasterizer> {
+        if let Some(font) = self.rasterizer.get() {
+            return font.as_deref().filter(|font| font.has_character(character));
+        }
+        if ttf_parser::Face::parse(&self.bytes, self.index).ok()
+                .and_then(|face| face.tables().cmap)
+                .is_some_and(|cmap| !cmap.subtables.into_iter()
+                    .any(|table| table.glyph_index(character as u32).is_some()))
+        {
+            return None;
+        }
+        let name = match self.origin.as_ref() {
+            FontOrigin::Resource(name) => name.as_bytes(),
+            #[cfg(any(windows, target_os = "android"))]
+            FontOrigin::System(path) => path.file_name().map_or(&[][..], std::ffi::OsStr::as_encoded_bytes),
+        };
+        let _load = TextTimer::new(TextStage::FaceLoad).face(name, self.index);
+        self.rasterizer.get_or_init(|| {
+            let _decode = TextTimer::new(TextStage::FaceDecode);
+            FontRasterizer::from_shared_bytes(Arc::clone(&self.bytes), self.index).ok().map(Arc::new)
+        })
+            .as_deref().filter(|font| font.has_character(character))
+    }
 }
 
 pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
@@ -50,7 +78,7 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
             continue;
         }
         if let Ok(bytes) = read_entry_with_fallback(resources, &name) {
-            append_faces(&mut fonts, FontOrigin::Resource(name), &bytes);
+            append_faces(&mut fonts, FontOrigin::Resource(name), bytes);
         }
     }
 
@@ -68,7 +96,7 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
         ] {
             let path = windows.join("Fonts").join(name);
             if let Ok(bytes) = std::fs::read(&path) {
-                append_faces(&mut fonts, FontOrigin::System(path), &bytes);
+                append_faces(&mut fonts, FontOrigin::System(path), bytes);
             }
         }
     }
@@ -85,11 +113,12 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
                 continue;
             }
             if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(font) = FontRasterizer::from_bytes(&bytes, 0) {
+                if ttf_parser::Face::parse(&bytes, 0).is_ok() {
                     fonts.push(LoadedFont {
                         origin: Arc::new(FontOrigin::System(path)),
                         index: 0,
-                        rasterizer: Arc::new(font),
+                        bytes: Arc::new(bytes),
+                        rasterizer: Arc::new(OnceLock::new()),
                     });
                     system_faces += 1;
                     cjk_loaded |= cjk;
@@ -148,7 +177,7 @@ fn android_font_priority(name: &str) -> u8 {
     }
 }
 
-fn append_faces(fonts: &mut Vec<LoadedFont>, origin: FontOrigin, bytes: &[u8]) {
+fn append_faces(fonts: &mut Vec<LoadedFont>, origin: FontOrigin, bytes: Vec<u8>) {
     let origin = Arc::new(origin);
     let count = if bytes.starts_with(b"ttcf") {
         bytes
@@ -159,15 +188,17 @@ fn append_faces(fonts: &mut Vec<LoadedFont>, origin: FontOrigin, bytes: &[u8]) {
     } else {
         1
     };
+    let bytes = Arc::new(bytes);
     for face in 0..count {
         if fonts.len() >= 64 {
             break;
         }
-        if let Ok(font) = FontRasterizer::from_bytes(bytes, face) {
+        if ttf_parser::Face::parse(&bytes, face).is_ok() {
             fonts.push(LoadedFont {
                 origin: Arc::clone(&origin),
                 index: face,
-                rasterizer: Arc::new(font),
+                bytes: Arc::clone(&bytes),
+                rasterizer: Arc::new(OnceLock::new()),
             });
         }
     }
@@ -240,8 +271,7 @@ fn draw_text_block(
             |character, size, bold, italic| {
                 let font = fonts
                     .iter()
-                    .map(|face| &face.rasterizer)
-                    .find(|font| font.has_character(character))
+                    .find_map(|face| face.for_character(character))
                     .ok_or_else(|| cs2_renderer::RendererError::Decode {
                         message: format!(
                             "no available message font contains U+{:04X}",

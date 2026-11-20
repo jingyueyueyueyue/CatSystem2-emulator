@@ -311,7 +311,9 @@ pub(crate) fn navigation_bindings(
     host: &LoggingHost<'_>, owner: u32,
 ) -> Vec<(FesDriverTarget, String, u32)> {
     let platform = &host.data_services.tasks.fes.platform;
-    platform.objects.iter().filter(|((id, _, _), binding)| *id == owner && binding.kind == b"BUTTON")
+    platform.objects.range((owner, Vec::new(), i32::MIN)..)
+        .take_while(|((id, _, _), _)| *id == owner)
+        .filter(|(_, binding)| binding.kind == b"BUTTON")
         .map(|((_, name, bank), binding)| (FesDriverTarget {
             name: name.clone(), bank: *bank, default_group: None,
             value: binding.child.map_or(-1, |child| child as i32),
@@ -1792,10 +1794,20 @@ pub(super) fn finish_task_media(
     runtime: &mut FesRuntime,
     driver: &mut FesScriptDriver,
 ) -> Result<bool> {
-    super::fes_driver::main_flow::update_geometry(host, view, runtime)?;
-    super::fes_media::update_image_sources(host, view, runtime)?;
-    if !runtime.prepare_driver_animations(host, view)? {
-        return Ok(false);
+    {
+        let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_prepare_images");
+        {
+            let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_image_geometry");
+            super::fes_driver::main_flow::update_geometry(host, view, runtime)?;
+        }
+        {
+            let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_image_sources");
+            super::fes_media::update_image_sources(host, view, runtime)?;
+        }
+        let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_image_animation");
+        if !runtime.prepare_driver_animations(host, view)? {
+            return Ok(false);
+        }
     }
     let color_planes: Vec<_> = host
         .data_services
@@ -1830,6 +1842,7 @@ pub(super) fn finish_task_media(
         // completed stage so retry cannot play a sample or DRAW action twice.
         host.data_services.tasks.fes.platform.finished_extensions.insert(view.id);
     }
+    let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_project_layers");
     let drawable_planes: Vec<_>=host.data_services.tasks.fes.platform.objects.iter()
         .filter(|((owner,_,_),binding)|*owner==view.id && matches!(binding.kind.as_slice(),b"PLANE"|b"CPLANE"))
         .filter_map(|(_,binding)|binding.child.map(|child|(child,binding.key.clone(),binding.kind==b"PLANE"))).collect();

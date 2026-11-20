@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{Context, Result, bail};
-use cs2_renderer::{Canvas, ImageDrawOptions, Point, RgbaFrame};
+use cs2_renderer::{Canvas, FramePixelIdentity, ImageDrawOptions, Point, RgbaFrame};
 use cs2_script::{NativeReturn, Vm};
 
 use super::{LoggingHost, native_state_error, read_u32};
@@ -31,6 +31,26 @@ struct Transition {
     local: [u32; 2],
     submitted: bool,
     rendered: Option<(Point, RgbaFrame)>,
+    rendered_sample: Option<TransitionSample>,
+}
+
+struct TransitionSample {
+    inputs: [Option<FramePixelIdentity>; 3],
+    region: [u32; 4],
+    progress: u32,
+    ended: bool,
+    full: bool,
+}
+
+impl TransitionSample {
+    fn matches(&self, inputs: [Option<&RgbaFrame>; 3], region: [u32; 4], progress: u32, ended: bool, full: bool) -> bool {
+        self.region == region && self.progress == progress && self.ended == ended && self.full == full
+            && self.inputs.iter().zip(inputs).all(|(old, current)| match (old, current) {
+                (Some(old), Some(current)) => old.matches(current),
+                (None, None) => true,
+                _ => false,
+            })
+    }
 }
 
 impl LoggingHost<'_> {
@@ -150,7 +170,7 @@ impl LoggingHost<'_> {
             let mut task = Transition {
                 kind, duration: (words[0] as i32).max(1) as u32, words,
                 started: 0, speed: 1., active: false, size, pixels,
-                output: Point::default(), local: [0; 2], submitted: false, rendered: None,
+                output: Point::default(), local: [0; 2], submitted: false, rendered: None, rendered_sample: None,
             };
             task.output = match kind {
                 26 => Point::new(task.words[8] as i32, task.words[9] as i32),
@@ -209,20 +229,21 @@ impl LoggingHost<'_> {
         let first_handle = task.words[1];
         let first = self.image_handles.get(&first_handle).context("transition first image missing")?.clone();
         validate_region(&first, [task.words[2], task.words[3]], task.size)?;
-        let mut first_pixels = first.pixels().to_vec();
         if task.kind == 28 {
             let mask = self.image_handles.get(&task.words[4]).context("alpha wipe mask missing")?;
             validate_local(task, mask)?;
+            let row_bytes = task.size[0] as usize * 4;
             for row in 0..task.size[1] {
-                for column in 0..task.size[0] {
-                    let source = offset(&first, task.words[2] + column, task.words[3] + row);
-                    let target = (row as usize * task.size[0] as usize + column as usize) * 4;
-                    task.pixels[target..target + 4].copy_from_slice(&first_pixels[source..source + 4]);
-                    if task.words[9] != 0 { task.pixels[target + 3] = 0; }
-                }
+                let source = offset(&first, task.words[2], task.words[3] + row);
+                let target = row as usize * row_bytes;
+                task.pixels[target..target + row_bytes].copy_from_slice(&first.pixels()[source..source + row_bytes]);
+            }
+            if task.words[9] != 0 {
+                for pixel in task.pixels.chunks_exact_mut(4) { pixel[3] = 0; }
             }
             return Ok(());
         }
+        let mut first_pixels = first.pixels().to_vec();
         let second_handle = task.words[4];
         let second = self.image_handles.get(&second_handle).context("transition second image missing")?.clone();
         validate_region(&second, [task.words[5], task.words[6]], task.size)?;
@@ -294,6 +315,20 @@ impl LoggingHost<'_> {
             } else { [0, 0, task.size[0], task.size[1]] };
         let progress = if ended { 256 }
             else { elapsed.wrapping_shl(if task.kind == 27 { 8 } else { 9 }) / task.duration };
+        let full = ended && (task.kind != 28 || natural);
+        let inputs = [Some(first), second, mask];
+        if let Some((at, frame)) = &task.rendered
+            && task.rendered_sample.as_ref().is_some_and(|sample| sample.matches(inputs, region, progress, ended, full))
+        {
+            if ended { task.active = false; }
+            if full { task.local = [0; 2]; }
+            if let Some(canvas) = self.canvas.as_mut() {
+                canvas.copy_frame(frame, &ImageDrawOptions::new(*at))?;
+            }
+            task.submitted = true;
+            return Ok(());
+        }
+        task.rendered_sample = None;
         for row in 0..region[3] {
             for column in 0..region[2] {
                 let x = region[0] + column;
@@ -320,7 +355,6 @@ impl LoggingHost<'_> {
                 }
             }
         }
-        let full = ended && (task.kind != 28 || natural);
         if ended { task.active = false; }
         if full { task.local = [0; 2]; }
         let (at, frame) = if full || task.kind == 27 {
@@ -338,6 +372,9 @@ impl LoggingHost<'_> {
             canvas.copy_frame(&frame, &ImageDrawOptions::new(at))?;
         }
         task.rendered = Some((at, frame));
+        task.rendered_sample = Some(TransitionSample {
+            inputs: inputs.map(|frame| frame.map(RgbaFrame::pixel_identity)), region, progress, ended, full,
+        });
         task.submitted = true;
         Ok(())
     }
@@ -407,7 +444,7 @@ mod tests {
                 kind: 26, words: vec![100, 1, 0, 0, 2, 0, 0, 3, 4, 8, 0, 0, 1, 1],
                 duration: 100, started: 0, speed: 1., active: true,
                 size: [3, 2], pixels: first, output: Point::new(4, 8),
-                local: [1, 1], submitted: false, rendered: None,
+                local: [1, 1], submitted: false, rendered: None, rendered_sample: None,
             };
 
             host.sample_transition(&mut task, 50, false, true)?;

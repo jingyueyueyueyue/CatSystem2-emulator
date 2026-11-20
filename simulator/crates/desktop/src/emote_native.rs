@@ -868,6 +868,7 @@ impl EmoteNativeServices {
         if state.successful_resource_imports == 0 {
             return Ok(true);
         }
+        let _timing = super::measure_host_phase(super::HostPhase::ComposeEmote);
         if self.target_size != Some([canvas.width(), canvas.height()]) {
             return Err(EmoteError::Backend(
                 "type54 final display quad requires a resolved host offset/scale mapping".into(),

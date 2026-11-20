@@ -7,6 +7,6 @@ license = "LGPL-2.1-only"
 [dependencies]
 cs2-formats = { path = "../formats" }
 flate2 = "1"
-fontdue = "=0.9.3"
+fontdue = { version = "=0.9.3", features = ["lazy"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 ttf-parser = { version = "=0.21.1", default-features = false, features = ["variable-fonts"] }

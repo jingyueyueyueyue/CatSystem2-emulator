@@ -44,6 +44,7 @@ impl TransitionStore {
             kind: 27, words: t.words, duration: t.duration, started: t.started,
             speed: f32::from_bits(t.speed), active: t.active, size: t.size, pixels: t.pixels,
             output: Point::new(t.output[0], t.output[1]), local: t.local, submitted: t.submitted,
+            rendered_sample: None,
             rendered: t.rendered.map(|(at, frame)| Ok::<_, anyhow::Error>((
                 Point::new(at[0], at[1]), restore_frame(&frame)?))).transpose()?,
         }))).collect::<Result<_>>()?, queued: saved.queued };

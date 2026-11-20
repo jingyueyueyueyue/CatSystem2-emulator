@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
-gpu = ["dep:pollster", "dep:wgpu"]
+default = ["gpu-raster"]
+gpu = ["gpu-raster"]
+gpu-raster = ["dep:ash", "dep:pollster", "dep:wgpu"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,7 +19,9 @@ encoding_rs.workspace = true
 fontdue.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 thiserror.workspace = true
+ttf-parser = { version = "=0.21.1", default-features = false }
 lewton = "=0.10.2"
+ogg = "=0.8.0"
 
 [dev-dependencies]
 serde.workspace = true
@@ -32,3 +35,8 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "27", default-features = false, features = ["std", "dx12", "wgsl"], optional = true }
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ash = { version = "0.38", default-features = false, optional = true }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "27", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }

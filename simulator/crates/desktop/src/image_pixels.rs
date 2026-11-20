@@ -85,10 +85,12 @@ impl LoggingHost<'_> {
                 let top = y.max(0).min(frame.height() as i32);
                 let right = right.max(0).min(frame.width() as i32);
                 let bottom = bottom.max(0).min(frame.height() as i32);
-                for row in top..bottom {
-                    for column in left..right {
-                        let index = ((frame.height() as usize - 1 - row as usize) * frame.width() as usize + column as usize) * 4;
-                        pixels[index..index + 4].copy_from_slice(&[color.r, color.g, color.b, color.a]);
+                if left < right {
+                    let stride = frame.width() as usize * 4;
+                    for row in top..bottom {
+                        let start = (frame.height() as usize - 1 - row as usize) * stride;
+                        pixels[start + left as usize * 4..start + right as usize * 4]
+                            .as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
                     }
                 }
                 self.replace_image_wrapper_pixels(handle, rebuild(&frame, pixels)?)?;

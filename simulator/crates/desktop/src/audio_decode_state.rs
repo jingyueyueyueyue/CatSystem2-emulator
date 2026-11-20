@@ -8,8 +8,8 @@ use cs2_runtime::graph_serde::{Deserialize, Serialize};
 pub(crate) struct PcmState { probe: AudioProbe, samples: Vec<i16> }
 impl PcmState {
     pub(crate) fn matches(&self, other: &Self) -> bool { self.probe == other.probe && self.samples == other.samples }
-    pub(crate) fn capture(value: &DecodedAudio) -> RuntimeResult<Self> {
-        let result = Self { probe: value.probe, samples: value.samples.to_vec() };
+    pub(crate) fn capture(value: &PreparedAudio) -> RuntimeResult<Self> {
+        let result = Self { probe: value.probe, samples: value.materialize()?.to_vec() };
         result.validate()?;
         Ok(result)
     }
@@ -23,22 +23,25 @@ impl PcmState {
         }
         Ok(())
     }
-    pub(crate) fn restore(self) -> RuntimeResult<Arc<DecodedAudio>> {
+    pub(crate) fn restore(self) -> RuntimeResult<Arc<PreparedAudio>> {
         self.validate()?;
-        Ok(Arc::new(DecodedAudio { probe: self.probe, samples: self.samples.into() }))
+        Ok(Arc::new(PreparedAudio::from_pcm(DecodedAudio {
+            probe: self.probe,
+            samples: self.samples.into(),
+        })))
     }
 }
 pub(crate) mod optional {
     use super::*;
     pub(crate) fn serialize<S: cs2_runtime::graph_serde::Serializer>(
-        value: &Option<Arc<DecodedAudio>>, s: S,
+        value: &Option<Arc<PreparedAudio>>, s: S,
     ) -> Result<S::Ok, S::Error> {
         value.as_ref().map(|v| PcmState::capture(v)).transpose()
             .map_err(cs2_runtime::graph_serde::ser::Error::custom)?.serialize(s)
     }
     pub(crate) fn deserialize<'de, D: cs2_runtime::graph_serde::Deserializer<'de>>(
         d: D,
-    ) -> Result<Option<Arc<DecodedAudio>>, D::Error> {
+    ) -> Result<Option<Arc<PreparedAudio>>, D::Error> {
         Option::<PcmState>::deserialize(d)?.map(PcmState::restore).transpose()
             .map_err(cs2_runtime::graph_serde::de::Error::custom)
     }

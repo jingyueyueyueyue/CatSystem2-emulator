@@ -9,6 +9,8 @@ pub mod message;
 pub mod scene;
 mod vm_snapshot;
 mod vm_identity;
+mod sha256;
+pub use sha256::sha256;
 pub use vm_snapshot::{VmExecutionSnapshot, VmSnapshotGroup};
 
 // Container validation and VM decoding must use one instruction-length table.
@@ -37,7 +39,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
-    sync::{Arc, RwLock, RwLockReadGuard},
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard},
 };
 use thiserror::Error;
 
@@ -740,6 +742,7 @@ pub struct Vm {
     pub stack: Vec<Value>,
     pub instruction_pointer: usize,
     program: Option<KcsProgram>,
+    program_code_sha256: OnceLock<String>,
     memory: Vec<u8>,
     external: SharedExternalStorage,
     regions: BTreeMap<u32, Vec<u8>>,
@@ -801,6 +804,7 @@ impl Vm {
         self.regions.clear();
         self.region_bytes = 0;
         self.program = Some(program);
+        self.program_code_sha256 = OnceLock::new();
         self.stack_start = stack_start;
         self.sp = stack_start;
         self.frame_top = stack_start;

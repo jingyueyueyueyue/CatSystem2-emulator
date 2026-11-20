@@ -1475,8 +1475,8 @@ fn bytes_for_registration(
 impl LoggingHost<'_> {
     /// Ordinary 703 owns its producer through a VM record, independently of
     /// any task list. Registration can later retain this same entry object.
-    pub(super) fn create_unowned_list_entry_source(&mut self, bytes: &[u8]) -> Result<u32> {
-        self.create_retained_image_source(bytes, false)
+    pub(super) fn create_unowned_list_entry_source(&mut self, bytes: &[u8], path: Option<&str>) -> Result<u32> {
+        self.create_retained_image_source(bytes, false, path)
     }
 
     /// Produces the retained entry object used by the image-name/ANM loader.
@@ -1484,26 +1484,38 @@ impl LoggingHost<'_> {
     /// deliberately has no image-wrapper or pixel-table binding.
     pub(super) fn create_list_entry_source(&mut self, bytes: &[u8]) -> Result<u32> {
         if !bytes.starts_with(b"HG-3") { bail!("list raw entry producer requires HG-3"); }
-        self.create_retained_image_source(bytes, true)
+        self.create_retained_image_source(bytes, true, None)
     }
 
-    fn create_retained_image_source(&mut self, bytes: &[u8], owned: bool) -> Result<u32> {
+    fn create_retained_image_source(&mut self, bytes: &[u8], owned: bool, path: Option<&str>) -> Result<u32> {
         if self.data_services.list_native.objects.len() >= 65_536 {
             bail!("retained list entry-object table exceeds 65536 handles");
         }
         // 5e1d50 enumerates HG-3 IDs; all other image dispatchers provide
         // the single ID zero. Decode through the common dispatcher so every
         // cached frame retains attributes, pixel depth and native geometry.
-        let ids = if bytes.starts_with(b"HG-3") {
-            cs2_formats::HgFile::parse(bytes)?.frames.into_iter().map(|frame| frame.id).collect::<Vec<_>>()
-        } else { vec![0] };
+        use crate::perf_detail::{ImageSourceStage, ImageSourceStep};
+        let ids = {
+            let _stage = ImageSourceStep::new(ImageSourceStage::RawDirectory);
+            if bytes.starts_with(b"HG-3") {
+                cs2_formats::HgFile::parse(bytes)?.frames.into_iter().map(|frame| frame.id).collect::<Vec<_>>()
+            } else { vec![0] }
+        };
         let mut entry = Entry::empty(Source::Frame);
         let result = (|| {
             for id in ids {
                 if entry.frames.contains_key(&id) {
                     continue;
                 }
-                let Some(image) = self.decode_managed_image_frame(bytes, id)? else { continue; };
+                let image = {
+                    let _stage = ImageSourceStep::new(ImageSourceStage::RawDecode);
+                    match path {
+                        Some(path) => self.decode_named_image_frame(bytes, id, path)?,
+                        None => self.decode_managed_image_frame(bytes, id)?,
+                    }
+                };
+                let Some(image) = image else { continue; };
+                let _stage = ImageSourceStep::new(ImageSourceStage::RawRegister);
                 // The source frame keeps its original geometry. The wrapper
                 // holds an independent copy that callers may mutate.
                 let bytes = image.pixels().len().checked_mul(2)
@@ -2616,33 +2628,12 @@ pub(super) fn draw_layer(
         return draw_affine_placement(canvas, frame, [frame.width(), frame.height()], placement,
             u32::from(options.opacity), options.clip, options.blend_mode);
     }
-    let entry = if key.0 == u32::MAX {
-        key.1
-            .strip_prefix("\0list-native:")
-            .and_then(|value| u32::from_str_radix(value, 16).ok())
-            .and_then(|key| {
-                host.data_services.list_native.entries.iter().find_map(
-                    |((target, candidate), entry)| {
-                        (*target == list_id && *candidate == key).then_some(entry)
-                    },
-                )
-            })
-    } else {
-        None
-    };
+    let entry = native_layer_entry(host, list_id, key);
     let Some(entry) = entry else {
         // FES IMAGE/CIMAGE/BUTTON, text and control projections are entries in
         // this same CPU list. Keep opacity outside the sampled alpha: the list
         // lookup uses opacity * (source_alpha + 1) >> 8, not a rounded /255.
-        if options.scale_x == 1.
-            && options.scale_y == 1.
-            && options.rotation_radians == 0.
-            && options.pivot == [0.; 2]
-            && !options.flip_x
-            && !options.flip_y
-            && options.mask.is_none()
-            && options.blend_mode == cs2_renderer::BlendMode::SourceOver
-        {
+        if plain_list_options(options) {
             return draw_plain_frame(
                 canvas,
                 frame,
@@ -2651,17 +2642,45 @@ pub(super) fn draw_layer(
                 opaque,
             );
         }
+        use super::perf_detail::{GpuDecision, list_gpu_decision};
+        let reason = if options.mask.is_some() {
+            GpuDecision::DrawMask
+        } else if options.blend_mode != cs2_renderer::BlendMode::SourceOver {
+            GpuDecision::DrawBlend
+        } else {
+            GpuDecision::DrawTransform
+        };
+        let area = options.clip.map_or(u64::from(canvas.width()) * u64::from(canvas.height()),
+            |clip| u64::from(clip.width) * u64::from(clip.height));
+        list_gpu_decision(reason, area);
         canvas.draw_frame(frame, options)?;
         return Ok(());
     };
-    let mut opacity = entry.raw_opacity;
-    if entry.animation.timeline().is_some() {
-        let product = opacity.wrapping_mul(entry.animation.display().blend as u32);
-        opacity = if product < 0xff00 { product / 255 } else { 255 };
-    }
+    let opacity = native_layer_opacity(&entry);
     if opacity == 0 {
         return Ok(());
     }
+    verify_distinct_layer_source(host, list_id, &entry)?;
+    if entry.transform != 0 {
+        return draw_affine(canvas, frame, source_geometry(host, &entry, frame)?,
+            &entry, opacity, options.clip);
+    }
+    draw_plain_frame(canvas, frame, options, opacity, opaque)
+}
+
+fn native_layer_entry<'a>(host: &'a LoggingHost<'_>, list_id: u32, key: &(u32, String)) -> Option<std::cell::Ref<'a, Entry>> {
+    if key.0 != u32::MAX { return None; }
+    let number = u32::from_str_radix(key.1.strip_prefix("\0list-native:")?, 16).ok()?;
+    host.data_services.list_native.entries.get(&(list_id, number))
+}
+
+fn native_layer_opacity(entry: &Entry) -> u32 {
+    if entry.animation.timeline().is_none() { return entry.raw_opacity; }
+    let product = entry.raw_opacity.wrapping_mul(entry.animation.display().blend as u32);
+    if product < 0xff00 { product / 255 } else { 255 }
+}
+
+fn verify_distinct_layer_source(host: &LoggingHost<'_>, list_id: u32, entry: &Entry) -> Result<()> {
     let output = host
         .data_services
         .tasks
@@ -2676,15 +2695,87 @@ pub(super) fn draw_layer(
         .image_wrapper_pixels
         .get(&output)
         .copied()
-        == Some(current_pixels(host, &entry)?)
+        == Some(current_pixels(host, entry)?)
     {
         bail!("an image list cannot draw its own output pixels as a source");
     }
-    if entry.transform != 0 {
-        return draw_affine(canvas, frame, source_geometry(host, &entry, frame)?,
-            &entry, opacity, options.clip);
+    Ok(())
+}
+
+fn plain_list_options(options: &ImageDrawOptions) -> bool {
+    options.scale_x == 1.
+        && options.scale_y == 1.
+        && options.rotation_radians == 0.
+        && options.pivot == [0.; 2]
+        && !options.flip_x
+        && !options.flip_y
+        && options.mask.is_none()
+        && options.blend_mode == cs2_renderer::BlendMode::SourceOver
+}
+
+fn opaque_list_source(source: &RgbaFrame) -> bool {
+    match source.metadata().container {
+        cs2_renderer::HgContainer::Hg3V300 => source.metadata().alpha_flag == 0,
+        _ => !source.has_alpha(),
     }
-    draw_plain_frame(canvas, frame, options, opacity, opaque)
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn append_layer_jobs<'a>(
+    host: &LoggingHost<'_>, list_id: u32, key: &(u32, String), layer: &'a Layer, clips: &[Rect],
+    draws: &mut Vec<super::gpu_raster::RasterJob<'a>>,
+) -> bool {
+    if clips.is_empty() || !layer.options.visible || layer.frame.is_empty() { return true; }
+    let opacity = if let Some(entry) = native_layer_entry(host, list_id, key) {
+        let opacity = native_layer_opacity(&entry);
+        if opacity != 0 && (entry.transform != 0 || verify_distinct_layer_source(host, list_id, &entry).is_err()) {
+            return false;
+        }
+        opacity
+    } else {
+        u32::from(layer.options.opacity)
+    };
+    append_plain_jobs(layer, clips, opacity, draws)
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+fn append_plain_jobs<'a>(layer: &'a Layer, clips: &[Rect], opacity: u32,
+    draws: &mut Vec<super::gpu_raster::RasterJob<'a>>,
+) -> bool {
+    use super::gpu_raster::{Draw, RasterJob, RasterRect};
+    let options = &layer.options;
+    let source = &layer.frame;
+    if !options.visible || opacity == 0 || source.is_empty() { return true; }
+    if !plain_list_options(options) || layer.affine.is_some() { return false; }
+    let copy = opacity == 255 && opaque_list_source(source);
+    let left = i64::from(options.position.x);
+    let top = i64::from(options.position.y);
+    let right = left + i64::from(source.width());
+    let bottom = top + i64::from(source.height());
+    for clip in clips {
+        let clip_left = i64::from(clip.x);
+        let clip_right = clip_left + i64::from(clip.width);
+        let draw_left = left.max(clip_left);
+        let draw_right = right.min(clip_right);
+        let draw_top = top.max(i64::from(clip.y));
+        let draw_bottom = bottom.min(i64::from(clip.y) + i64::from(clip.height));
+        if draw_left >= draw_right || draw_top >= draw_bottom {
+            continue;
+        }
+        let left_halo = !copy && draw_left > clip_left;
+        let right_halo = !copy && draw_right < clip_right;
+        let width = (draw_right - draw_left) as u32;
+        let rect = RasterRect {
+            origin: [(draw_left - i64::from(left_halo)) as u32, draw_top as u32],
+            size: [width + u32::from(left_halo) + u32::from(right_halo), (draw_bottom - draw_top) as u32],
+        };
+        let source_origin = [(draw_left - left) as u32, (draw_top - top) as u32];
+        let operation = if copy { Draw::Copy { source_origin } }
+            else { Draw::ListSpan { source_origin, width, left_halo, opacity } };
+        draws.push(RasterJob { rect, source: Some(source), atlas: None, operation });
+        if draws.len() > 1024 { return false; }
+    }
+    true
 }
 
 fn draw_plain_frame(
@@ -2697,7 +2788,11 @@ fn draw_plain_frame(
     if !options.visible || opacity == 0 {
         return Ok(());
     }
+    use super::perf_detail::{GpuDecision, list_gpu_decision};
     if options.blend_mode.is_list_alpha_mask() {
+        let area = options.clip.map_or(u64::from(canvas.width()) * u64::from(canvas.height()),
+            |clip| u64::from(clip.width) * u64::from(clip.height));
+        list_gpu_decision(GpuDecision::AlphaMask, area);
         canvas.draw_frame(source, options)?;
         return Ok(());
     }
@@ -2719,10 +2814,28 @@ fn draw_plain_frame(
         return Ok(());
     }
 
-    let copy = opacity == 255 && *opaque.get_or_insert_with(|| match source.metadata().container {
-        cs2_renderer::HgContainer::Hg3V300 => source.metadata().alpha_flag == 0,
-        _ => !source.has_alpha(),
-    });
+    let copy = opacity == 255 && *opaque.get_or_insert_with(|| opaque_list_source(source));
+    if copy {
+        list_gpu_decision(GpuDecision::OpaqueCopy, ((draw_right - draw_left) * (draw_bottom - draw_top)) as u64);
+    }
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if !copy {
+        use super::gpu_raster::{Draw, RasterRect, draw};
+        let left_halo = draw_left > clip_left;
+        let right_halo = draw_right < clip_right;
+        if draw(canvas, Some(source), RasterRect {
+            origin: [(draw_left - i64::from(left_halo)) as u32, draw_top as u32],
+            size: [(draw_right - draw_left) as u32 + u32::from(left_halo) + u32::from(right_halo),
+                (draw_bottom - draw_top) as u32],
+        }, Draw::ListSpan {
+            source_origin: [(draw_left - left) as u32, (draw_top - top) as u32],
+            width: (draw_right - draw_left) as u32,
+            left_halo,
+            opacity,
+        }) {
+            return Ok(());
+        }
+    }
     let source_stride = source.width() as usize * 4;
     let target_stride = canvas.width() as usize * 4;
     let target_x = draw_left as usize * 4;
@@ -3052,6 +3165,22 @@ fn draw_affine_placement(
         .transform(base.map(fixed15))
         .map(|value| value >> 15);
     let integer_base = base.map(truncate);
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if lower[0] < upper[0] && lower[1] < upper[1] {
+        use super::gpu_raster::{Draw, RasterRect, draw};
+        if draw(canvas, Some(source), RasterRect {
+            origin: lower.map(|value| value as u32),
+            size: std::array::from_fn(|axis| (upper[axis] - lower[axis]) as u32),
+        }, Draw::ListAffine {
+            inverse: [inverse.xx, inverse.xy, inverse.yx, inverse.yy],
+            offset: std::array::from_fn(|axis| pivot[axis].wrapping_sub(origin[axis])),
+            base: integer_base,
+            opacity,
+            blend,
+        }) {
+            return Ok(());
+        }
+    }
     for y in lower[1]..upper[1] {
         for x in lower[0]..upper[0] {
             let relative = [

@@ -31,7 +31,7 @@ pub(crate) struct WorkerState {
     pub(crate) queue: QueueState,
 }
 impl WorkerState {
-    fn validate(&self, source: &DecodedAudio, parameters: &AudioParameters) -> cs2_runtime::RuntimeResult<()> {
+    fn validate(&self, source: &PreparedAudio, parameters: &AudioParameters) -> cs2_runtime::RuntimeResult<()> {
         self.cursor.validate_checkpoint(source.probe.frames as usize, self.loop_spec)?;
         self.cursor.end(parameters)?;
         self.repeats.validate_checkpoint(parameters)?;
@@ -75,7 +75,14 @@ pub(crate) struct TrackedOutput {
 #[cfg(any(windows, target_os = "android"))]
 impl TrackedOutput {
     pub(crate) fn open(rate: u32, channels: u8, saved: Option<&QueueState>) -> cs2_runtime::RuntimeResult<Self> {
-        let mut output = crate::movie_audio::open_pcm(rate, channels)?;
+        Self::from_output(rate, channels, saved, crate::movie_audio::open_pcm(rate, channels)?)
+    }
+    pub(crate) fn from_output(
+        rate: u32,
+        channels: u8,
+        saved: Option<&QueueState>,
+        mut output: Box<dyn crate::movie_audio::MovieAudioOutput>,
+    ) -> cs2_runtime::RuntimeResult<Self> {
         output.pause(true)?;
         let queue = if let Some(saved) = saved {
             saved.validate(channels)?;
@@ -137,7 +144,10 @@ impl crate::movie_audio::MovieAudioOutput for TrackedOutput {
     }
     fn checkpoint_position_frames(&mut self) -> cs2_runtime::RuntimeResult<u64> { Ok(self.capture()?.consumed) }
     fn drained(&mut self) -> cs2_runtime::RuntimeResult<bool> { self.output.drained() }
-    fn pause(&mut self, value: bool) -> cs2_runtime::RuntimeResult<()> { self.output.pause(value) }
+    fn pause(&mut self, value: bool) -> cs2_runtime::RuntimeResult<()> {
+        let _timing = crate::perf_detail::audio::Stage::Activate.begin();
+        self.output.pause(value)
+    }
     fn stop(&mut self) -> cs2_runtime::RuntimeResult<()> { self.output.stop() }
 }
 
@@ -163,7 +173,7 @@ impl CapturedAudioState {
         self.snapshot.playbacks.get(&handle).is_some_and(|p| p.resource == resource && p.worker.paused == paused && p.channel == channel)
     }
     pub(crate) fn encode(&self) -> cs2_runtime::RuntimeResult<Vec<u8>> { wire::encode_component(&self.snapshot) }
-    pub(crate) fn matches(&self, handle: u64, resource: &str, source: &DecodedAudio, signal: &Arc<audio_control::AudioSignal>, paused: bool) -> bool {
+    pub(crate) fn matches(&self, handle: u64, resource: &str, source: &PreparedAudio, signal: &Arc<audio_control::AudioSignal>, paused: bool) -> bool {
         self.snapshot.playbacks.get(&handle).is_some_and(|saved|
             saved.resource == resource && saved.source_matches(source)
                 && saved.worker.parameters_signal_matches(signal) && saved.worker.paused == paused)
@@ -171,7 +181,7 @@ impl CapturedAudioState {
     pub(crate) fn handles(&self) -> impl Iterator<Item = &u64> { self.snapshot.playbacks.keys() }
 }
 impl Playback {
-    fn source_matches(&self, source: &DecodedAudio) -> bool {
+    fn source_matches(&self, source: &PreparedAudio) -> bool {
         PcmState::capture(source).is_ok_and(|saved| saved.matches(&self.source))
     }
 }
@@ -185,9 +195,11 @@ impl PreparedAudioState {
     pub(crate) fn signal(&self, handle: u64) -> Option<Arc<audio_control::AudioSignal>> {
         self.host.parameters(handle).map(|p| p.signal_arc())
     }
-    pub(crate) fn matches(&self, handle: u64, resource: &str, source: &DecodedAudio, signal: &audio_control::AudioSignal, paused: bool) -> bool {
-        self.host.playback(handle).is_some_and(|p| p.resource == resource && *p.prepared == *source
-            && p.paused == paused && p._parameters.signal_arc().checkpoint() == signal.checkpoint())
+    pub(crate) fn matches(&self, handle: u64, resource: &str, source: &PreparedAudio, signal: &audio_control::AudioSignal, paused: bool) -> cs2_runtime::RuntimeResult<bool> {
+        let Some(playback) = self.host.playback(handle) else { return Ok(false); };
+        Ok(playback.resource == resource && playback.paused == paused
+            && playback._parameters.signal_arc().checkpoint() == signal.checkpoint()
+            && playback.prepared.matches_pcm(source)?)
     }
     pub(crate) fn handles(&self) -> impl Iterator<Item = &u64> { self.host.handles.keys() }
 }
@@ -229,7 +241,7 @@ impl DesktopAudioHost {
     }
     pub(crate) fn prepare_checkpoint(&self, bytes: &[u8],
         retained_handles: &std::collections::BTreeSet<u64>,
-        loaded_source: impl Fn(u64, &str) -> Option<Arc<DecodedAudio>>,
+        loaded_source: impl Fn(u64, &str) -> Option<Arc<PreparedAudio>>,
     ) -> cs2_runtime::RuntimeResult<PreparedAudioState> {
         let saved: Snapshot = wire::decode_component(bytes)?;
         if saved.version != 1 || saved.playbacks.len() > 64 { return Err(error("unsupported physical audio checkpoint")); }
@@ -249,7 +261,7 @@ impl DesktopAudioHost {
                 Some(source) => source,
                 None => prepare_audio((self.resolve)(&playback.resource)?)?,
             };
-            if *source != *actual || playback.ogg != (source.probe.codec == AudioCodec::OggVorbis) {
+            if !source.matches_pcm(&actual)? || playback.ogg != (source.probe.codec == AudioCodec::OggVorbis) {
                 return Err(error("saved SOUND PCM differs from its actual resource/decoder"));
             }
             let parameters = playback.worker.parameters.restore()?;
@@ -279,7 +291,7 @@ impl DesktopAudioHost {
 
 impl WavAudioHost {
     fn restore_playback(&mut self, id: u64, channel: AudioChannel, resource: String,
-        prepared: Arc<DecodedAudio>, parameters: Arc<AudioParameters>, saved: WorkerState,
+        prepared: Arc<PreparedAudio>, parameters: Arc<AudioParameters>, saved: WorkerState,
     ) -> cs2_runtime::RuntimeResult<()> {
         #[cfg(not(any(windows, target_os = "android")))]
         { let _ = (id, channel, resource, prepared, parameters, saved); return Err(error("physical SOUND restore requires Windows/Android PCM output")); }
@@ -291,8 +303,11 @@ impl WavAudioHost {
             let source = prepared.clone(); let controls = parameters.clone(); let suspended = self.suspended;
             let worker = thread::Builder::new().name(format!("cs2-pcm-restore-{id}")).spawn(move || {
                 let startup_error = started.clone();
-                let result = super::pcm_worker::run_playback(source.probe.sample_rate, source.probe.channels,
-                    source.samples.clone(), source, controls, 0, saved.loop_spec, suspended, rx, started, Some(saved));
+                let result = super::pcm_worker::run_playback(
+                    source, controls, 0, saved.loop_spec, suspended, rx, started, Some(saved),
+                    #[cfg(target_os = "android")]
+                    None,
+                );
                 if let Err(cause) = &result { let _ = startup_error.try_send(Err(error(cause))); }
                 let _ = done.send(result);
             }).map_err(|cause| error(format!("prepare SOUND worker: {cause}")))?;

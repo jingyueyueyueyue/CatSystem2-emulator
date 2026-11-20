@@ -86,9 +86,16 @@ struct RenderTask {
     captured: Option<RgbaFrame>,
     mask: Option<RgbaFrame>,
     work: Option<RgbaFrame>,
+    pending_wipe: Option<WipeStep>,
     opacity: u8,
     rendered_once: bool,
     warmup_frames: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WipeStep {
+    Hard(u32),
+    Soft(i32),
 }
 
 impl RenderTaskStore {
@@ -222,6 +229,7 @@ impl RenderTaskStore {
                 captured: initial,
                 mask: None,
                 work: None,
+                pending_wipe: None,
                 opacity: 255,
                 rendered_once: false,
                 warmup_frames: (kind == 38 && profile.is_some_and(|p| p.pe_sha256 == YUKIKOI))
@@ -689,6 +697,7 @@ impl LoggingHost<'_> {
                     }
                     task.mask = mask;
                     task.work = None;
+                    task.pending_wipe = None;
                     // The independent converted mask is prepared here, while
                     // the captured source remains a separate retained image.
                     prepare_mask(&mut task)?;
@@ -945,17 +954,22 @@ fn render_chain(
                 task.work = task.captured.clone();
             }
             if task.active != 0 {
-                wipe_pixels(&mut task)?;
+                task.pending_wipe = Some(wipe_step(&task)?);
             }
-            pixels::composite(
-                &mut live,
-                task.work.as_ref().context("Wipe work surface is absent")?,
-                255,
-                false,
-            )?;
+            if !draw_wipe_on_gpu(&task, &mut live)? {
+                if let Some(step) = task.pending_wipe.take() {
+                    apply_wipe_step(&mut task, step)?;
+                }
+                pixels::composite(
+                    &mut live,
+                    task.work.as_ref().context("Wipe work surface is absent")?,
+                    255,
+                    false,
+                )?;
+            }
         }
         // Commit the low-depth result before repainting the live foreground.
-        destination.copy_frame(&snapshot(&live)?, &ImageDrawOptions::new(Point::new(0, 0)))?;
+        *destination = live;
         render_chain(
             tasks,
             surfaces,
@@ -1087,34 +1101,67 @@ fn prepare_mask(task: &mut RenderTask) -> Result<()> {
     Ok(())
 }
 
-fn wipe_pixels(task: &mut RenderTask) -> Result<()> {
+fn wipe_step(task: &RenderTask) -> Result<WipeStep> {
     let elapsed = task
         .now
         .wrapping_sub(task.started)
         .min(task.end)
         .min(task.duration);
-    let hard = task.raw_configuration[4] != 0;
-    apply_wipe_pixels(task, elapsed, hard)
+    if task.duration == 0 { bail!("render Wipe duration is zero"); }
+    Ok(if task.raw_configuration[4] != 0 {
+        let threshold = 256u32.wrapping_sub(elapsed.wrapping_shl(8) / task.duration);
+        let previous = match task.pending_wipe { Some(WipeStep::Hard(value)) => value, _ => 256 };
+        WipeStep::Hard(threshold.min(previous))
+    } else {
+        WipeStep::Soft((elapsed.wrapping_shl(9) / task.duration) as i32)
+    })
+}
+
+fn draw_wipe_on_gpu(task: &RenderTask, live: &mut Canvas) -> Result<bool> {
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if let Some(step) = task.pending_wipe {
+        let source = task.work.as_ref().context("Wipe work surface is absent")?;
+        let mask = task.mask.as_ref().context("render Wipe mask disappeared")?;
+        if source.dimensions() == live.dimensions() && mask.dimensions() == live.dimensions()
+            && task.size.into_iter().all(|axis| (1..=4096).contains(&axis))
+            && task.size[0] * task.size[1] <= 1 << 23
+        {
+            if matches!(step, WipeStep::Hard(0) | WipeStep::Soft(511..)) {
+                return Ok(true);
+            }
+            use crate::gpu_raster::{Draw, RasterRect, draw};
+            return Ok(draw(live, Some(source), RasterRect { origin: [0; 2], size: task.size },
+                Draw::Wipe { mask, step }));
+        }
+    }
+    let _ = (task, live);
+    Ok(false)
 }
 
 fn apply_wipe_pixels(task: &mut RenderTask, elapsed: u32, hard: bool) -> Result<()> {
+    let duration = task.duration;
+    if duration == 0 { bail!("render Wipe duration is zero"); }
+    let step = if hard {
+        WipeStep::Hard(256u32.wrapping_sub(elapsed.wrapping_shl(8) / duration))
+    } else {
+        WipeStep::Soft((elapsed.wrapping_shl(9) / duration) as i32)
+    };
+    apply_wipe_step(task, step)
+}
+
+fn apply_wipe_step(task: &mut RenderTask, step: WipeStep) -> Result<()> {
     let mask = task.mask.as_ref().context("render Wipe mask disappeared")?;
     let source = task
         .captured
         .as_ref()
         .context("render Wipe capture disappeared")?;
-    let duration = task.duration;
-    if duration == 0 {
-        bail!("render Wipe duration is zero");
-    }
     let mut pixels = task.work.as_ref().unwrap_or(source).pixels().to_vec();
     if pixels.len() != mask.pixels().len() {
         bail!("render Wipe mask/work sizes differ");
     }
-    if hard {
+    if let WipeStep::Hard(threshold) = step {
         // 004d4830..004d492b clears alpha monotonically when the original
         // BGRA first byte reaches the unsigned 256-step threshold.
-        let threshold = 256u32.wrapping_sub(elapsed.wrapping_shl(8) / duration);
         for (pixel, mask) in pixels
             .chunks_exact_mut(4)
             .zip(mask.pixels().chunks_exact(4))
@@ -1123,8 +1170,7 @@ fn apply_wipe_pixels(task: &mut RenderTask, elapsed: u32, hard: bool) -> Result<
                 pixel[3] = 0;
             }
         }
-    } else {
-        let progress = (elapsed.wrapping_shl(9) / duration) as i32;
+    } else if let WipeStep::Soft(progress) = step {
         for (pixel, mask) in pixels
             .chunks_exact_mut(4)
             .zip(mask.pixels().chunks_exact(4))

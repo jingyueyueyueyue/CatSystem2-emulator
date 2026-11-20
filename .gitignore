@@ -6,6 +6,8 @@
 target/
 /simulator/**/build/
 .gradle/
+.idea/
+.kotlin/
 .cxx/
 __pycache__/
 local.properties

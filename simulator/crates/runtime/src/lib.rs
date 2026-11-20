@@ -99,6 +99,8 @@ pub enum RuntimeError {
     InvalidSaveSlot(u32),
     #[error("host operation failed: {0}")]
     Host(String),
+    #[error("audio playback start timed out: {0}")]
+    AudioStartTimeout(String),
     #[error("runtime is not initialized")]
     NotInitialized,
     #[error("save data is corrupt or unsupported: {0}")]

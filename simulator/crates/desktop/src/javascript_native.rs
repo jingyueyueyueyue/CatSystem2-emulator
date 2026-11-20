@@ -193,6 +193,11 @@ impl JavaScriptStore {
         canvas.draw_frame(surface, &options)?;
         Ok(true)
     }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn owns_plane(&self, id: u32) -> bool {
+        self.surfaces.contains_key(&id)
+    }
 }
 
 impl LoggingHost<'_> {

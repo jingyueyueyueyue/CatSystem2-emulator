@@ -479,6 +479,8 @@ impl LoggingHost<'_> {
             let record = &self.data_services.tasks.records[&id];
             (record.kind, record.deletion)
         };
+        let _detail = crate::perf_detail::SlowTask::new(id, || kind as i32, "task_command")
+            .code(command.code);
         // A root handler may delete its sender/itself before completing a
         // synchronous packet. Consume that exact retained acknowledgement
         // before busy/deletion guards; never replay or abandon the handler.

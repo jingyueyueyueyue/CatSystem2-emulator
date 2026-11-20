@@ -96,7 +96,8 @@ impl LoggingHost<'_> {
             .filter(|&at| at > 0).map_or(0, |at| at + 1);
         let stem = decode_name(self.text_encoding, without_extension(&encoded[start..]))?;
         let mut result = SoundSidecars::default();
-        if let Some(bytes) = self.read_sound_sidecar(b"tag", &stem, None)? {
+        let tags = self.media_category_candidates(b"tag", &stem)?.unwrap_or_default();
+        if let Some(bytes) = self.read_sound_sidecar(&tags, None)? {
             if bytes.len() % 24 != 0 {
                 return Err(audio_script_error(
                     "sound tag table is not a sequence of 24-byte records",
@@ -117,7 +118,8 @@ impl LoggingHost<'_> {
                 result.tags.entry(name.to_vec()).or_insert(value);
             }
         }
-        if let Some(bytes) = self.read_sound_sidecar(b"sound", &stem, Some("plv"))? {
+        let sound = self.media_category_candidates(b"sound", &stem)?.unwrap_or_default();
+        if let Some(bytes) = self.read_sound_sidecar(&sound, Some("plv"))? {
             result.encoded_bytes += bytes.len();
             if bytes.len() < 16 || &bytes[..4] != b"PVL\0" {
                 return Err(audio_script_error(
@@ -143,10 +145,10 @@ impl LoggingHost<'_> {
             });
         }
         // The original .lpb success suppresses the independent .lv fallback.
-        if let Some(bytes) = self.read_sound_sidecar(b"sound", &stem, Some("lpb"))? {
+        if let Some(bytes) = self.read_sound_sidecar(&sound, Some("lpb"))? {
             result.encoded_bytes += bytes.len();
             result.lip = Some(bytes.into());
-        } else if let Some(bytes) = self.read_sound_sidecar(b"sound", &stem, Some("lv"))? {
+        } else if let Some(bytes) = self.read_sound_sidecar(&sound, Some("lv"))? {
             result.encoded_bytes += bytes.len();
             result.legacy_lip = Some(bytes.into());
         }
@@ -166,19 +168,17 @@ impl LoggingHost<'_> {
 
     fn read_sound_sidecar(
         &mut self,
-        category: &[u8],
-        stem: &str,
+        names: &[String],
         extension: Option<&str>,
     ) -> Result<Option<Vec<u8>>> {
-        let mut names = match self.media_category_candidates(category, stem)? {
-            Some(names) => names,
-            None => return Ok(None),
+        let replaced;
+        let names = if let Some(extension) = extension {
+            replaced = names.iter().map(|name| replace_extension(self.text_encoding, name, extension))
+                .collect::<Result<Vec<_>>>()?;
+            &replaced
+        } else {
+            names
         };
-        if let Some(extension) = extension {
-            for name in &mut names {
-                *name = replace_extension(self.text_encoding, name, extension)?;
-            }
-        }
         let resources = self.resources;
         for name in names {
             let Some(resource) = resources

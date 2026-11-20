@@ -1,6 +1,7 @@
 //! Image-list history and ordered dirty tiles. Tile rectangles deliberately
 //! use the horizontal extent for their height, retaining overlapping rows.
 use super::{Layer, LoggingHost};
+use crate::fes_task_platform::ImageList;
 use anyhow::{Context, Result, bail};
 use cs2_renderer::{Canvas, FrameMetadata, ImageDrawOptions, Point, Rect, RgbaFrame};
 use std::collections::{BTreeMap, BTreeSet};
@@ -414,59 +415,95 @@ fn compose_inner(
         list.force || force,
     );
     let same_size = [old.width(), old.height()] == surface.size;
+    let canonical = same_size && old.metadata() == FrameMetadata::raster(surface.size)
+        && old.hg_attributes() == &Default::default();
+    let unaliased = host.data_services.image_wrapper_pixels.get(&handle).is_none_or(|pixel| {
+        !host.data_services.image_wrapper_pixels.iter().any(|(&wrapper, candidate)| {
+            wrapper != handle && candidate == pixel && host.image_handles.contains_key(&wrapper)
+        })
+    });
     if dirty.is_empty()
         && !(submit && forced)
         && (!submit || host.canvas.is_some())
-        && same_size
-        && old.metadata() == FrameMetadata::raster(surface.size)
-        && old.hg_attributes() == &Default::default()
-        && host.data_services.image_wrapper_pixels.get(&handle).is_none_or(|pixel| {
-            !host.data_services.image_wrapper_pixels.iter().any(|(&wrapper, candidate)| {
-                wrapper != handle && candidate == pixel && host.image_handles.contains_key(&wrapper)
-            })
-        })
+        && canonical && unaliased
     {
         if clip.is_none() {
             host.data_services.list_native.invalidated.retain(|(list, _)| *list != id);
         }
         return Ok(());
     }
-    let mut canvas = if same_size {
-        Canvas::from_rgba8(surface.size[0], surface.size[1], old.pixels().to_vec())?
+    let list_detail = crate::perf_detail::ListRaster::begin(id, surface.size, areas.len());
+    if areas.is_empty() && canonical {
+        // A forced submit may need existing pixels even when there is nothing to draw.
+        if !unaliased {
+            host.replace_image_wrapper_pixels(handle, old.clone())?;
+        }
+        list_detail.end_stage(0);
+        list_detail.end_stage(1);
+        list_detail.end_stage(2);
     } else {
-        let mut canvas = Canvas::new(surface.size[0], surface.size[1])?;
-        canvas.copy_frame(old, &ImageDrawOptions::new(Point::new(0, 0)))?;
-        canvas
-    };
-    for area in &areas {
-        for y in area.y..area.y + area.height as i32 {
-            let start = (y as usize * canvas.width() as usize + area.x as usize) * 4;
-            canvas.pixels_mut()[start..start + area.width as usize * 4].fill(0);
+        // Keep the authoritative list allocation in place for partial redraws
+        // when no other wrapper or retained projection can observe it.
+        let dirty_pixels: u64 = areas.iter().map(|r| u64::from(r.width) * u64::from(r.height)).sum();
+        let pixels = u64::from(surface.size[0]) * u64::from(surface.size[1]);
+        let cleared = covers_surface(&areas, surface.size);
+        let reused = if !cleared && canonical && unaliased && dirty_pixels <= pixels / 4 {
+            match host.image_handles.remove(&handle).context("image-list output disappeared")?.try_into_canvas() {
+                Ok(canvas) => Some(canvas),
+                Err(frame) => {
+                    host.image_handles.insert(handle, frame);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let reused_storage = reused.is_some();
+        let mut canvas = match reused {
+            Some(canvas) => canvas,
+            None if cleared => Canvas::new(surface.size[0], surface.size[1])?,
+            None => {
+                let old = &host.image_handles[&handle];
+                if same_size {
+                    Canvas::from_rgba8(surface.size[0], surface.size[1], old.pixels().to_vec())?
+                } else {
+                    let mut canvas = Canvas::new(surface.size[0], surface.size[1])?;
+                    canvas.copy_frame(old, &ImageDrawOptions::new(Point::new(0, 0)))?;
+                    canvas
+                }
+            }
+        };
+        let previous = reused_storage.then(|| save_dirty_pixels(&canvas, &areas));
+        if !cleared {
+            for area in &areas {
+                for range in pixel_rows(canvas.width(), *area) {
+                    canvas.pixels_mut()[range].fill(0);
+                }
+            }
         }
-    }
-    let mut layers: Vec<_> = list.layers.iter().collect();
-    layers.sort_by(|(ak, a), (bk, b)| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| super::compare_keys(ak, bk))
-    });
-    for (key, layer) in layers {
-        let mut options = layer.options.clone();
-        let mut opaque = None;
-        for area in &areas {
-            let effective = match layer.options.clip {
-                Some(clip) => intersection(*area, clip),
-                None => Some(*area),
-            };
-            let Some(clip) = effective else {
-                continue;
-            };
-            options.clip = Some(clip);
-            super::draw_layer(host, id, &mut canvas, key, &layer.frame, &options, layer.affine, &mut opaque)?;
+        list_detail.end_stage(0);
+        let rendered = draw_list_layers(host, id, list, &areas, &mut canvas);
+        list_detail.end_stage(1);
+        if let Some(previous) = previous {
+            if rendered.is_err() {
+                restore_dirty_pixels(&mut canvas, &areas, &previous);
+            }
+            let frame = canvas.into_frame();
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            if matches!(rendered, Ok(true)) { crate::gpu_raster::retain_rasterized_frame(&frame); }
+            host.image_handles.insert(handle, frame);
+            rendered?;
+        } else {
+            let gpu = rendered?;
+            let frame = canvas.into_frame();
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            if gpu { crate::gpu_raster::retain_rasterized_frame(&frame); }
+            #[cfg(not(all(feature = "gpu-raster", any(windows, target_os = "android"))))]
+            let _ = gpu;
+            host.replace_image_wrapper_pixels(handle, frame)?;
         }
+        list_detail.end_stage(2);
     }
-    let output = RgbaFrame::from_rgba8(canvas.width(), canvas.height(), canvas.pixels().to_vec())?;
-    host.replace_image_wrapper_pixels(handle, output)?;
     if submit {
         let output = &host.image_handles[&handle];
         let canvas = host
@@ -490,6 +527,7 @@ fn compose_inner(
             }
         }
     }
+    list_detail.end_stage(3);
     if clip.is_none() {
         for tile in &mut surface.tiles {
             tile.dirty = None;
@@ -508,6 +546,115 @@ fn compose_inner(
             .get_mut(&id)
             .unwrap()
             .force = false;
+    }
+    Ok(())
+}
+
+/// List tiles are emitted in row order. Only skip reading the old image
+/// when the current clips form a complete and contiguous grid.
+fn covers_surface(areas: &[Rect], size: [u32; 2]) -> bool {
+    let (mut x, mut y, mut row_height) = (0, 0, 0);
+    for area in areas {
+        if x == 0 { row_height = area.height; }
+        if area.x != x as i32 || area.y != y as i32 || area.height != row_height {
+            return false;
+        }
+        x += area.width;
+        if x == size[0] {
+            x = 0;
+            y += row_height;
+        }
+    }
+    x == 0 && y == size[1]
+}
+
+fn pixel_rows(width: u32, rect: Rect) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let stride = width as usize * 4;
+    let offset = rect.x as usize * 4;
+    let bytes = rect.width as usize * 4;
+    (rect.y as usize..rect.y as usize + rect.height as usize).map(move |y| {
+        let start = y * stride + offset;
+        start..start + bytes
+    })
+}
+
+fn save_dirty_pixels(canvas: &Canvas, areas: &[Rect]) -> Vec<u8> {
+    let mut saved = Vec::new();
+    for range in areas.iter().flat_map(|area| pixel_rows(canvas.width(), *area)) {
+        saved.extend_from_slice(&canvas.pixels()[range]);
+    }
+    saved
+}
+
+fn restore_dirty_pixels(canvas: &mut Canvas, areas: &[Rect], mut saved: &[u8]) {
+    let width = canvas.width();
+    for range in areas.iter().flat_map(|area| pixel_rows(width, *area)) {
+        let (row, rest) = saved.split_at(range.len());
+        canvas.pixels_mut()[range].copy_from_slice(row);
+        saved = rest;
+    }
+}
+
+fn draw_list_layers(
+    host: &LoggingHost<'_>, id: u32, list: &ImageList, areas: &[Rect], canvas: &mut Canvas,
+) -> Result<bool> {
+    let mut layers: Vec<_> = list.layers.iter().collect();
+    layers.sort_by(|(ak, a), (bk, b)| {
+        a.priority.cmp(&b.priority).then_with(|| super::compare_keys(ak, bk))
+    });
+    let layers: Vec<_> = layers.into_iter().map(|(key, layer)| {
+        let clips: Vec<_> = areas.iter().filter_map(|area| {
+            match layer.options.clip {
+                Some(clip) => intersection(*area, clip),
+                None => Some(*area),
+            }
+        }).collect();
+        (key, layer, clips)
+    }).collect();
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if crate::gpu_raster::available() {
+        let mut jobs = Vec::new();
+        let mut start = 0;
+        for (index, (key, layer, clips)) in layers.iter().enumerate() {
+            let previous_jobs = jobs.len();
+            if !super::append_layer_jobs(host, id, key, layer, clips, &mut jobs) {
+                jobs.truncate(previous_jobs);
+                if !draw_list_group(canvas, &jobs) {
+                    draw_list_layers_fallback(host, id, &layers[start..index], canvas)?;
+                }
+                draw_list_layers_fallback(host, id, &layers[index..=index], canvas)?;
+                jobs.clear();
+                start = index + 1;
+            }
+        }
+        let gpu = draw_list_group(canvas, &jobs);
+        if !gpu {
+            draw_list_layers_fallback(host, id, &layers[start..], canvas)?;
+        }
+        return Ok(gpu && start == 0);
+    }
+    draw_list_layers_fallback(host, id, &layers, canvas)?;
+    Ok(false)
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+fn draw_list_group(canvas: &mut Canvas, jobs: &[crate::gpu_raster::RasterJob<'_>]) -> bool {
+    // A list of bare copies already has a contiguous CPU read/write path.
+    // Keep copies in a GPU batch only when it also does actual pixel blending.
+    jobs.iter().any(|job| !matches!(job.operation, crate::gpu_raster::Draw::Copy { .. }))
+        && crate::gpu_raster::draw_list_group(canvas, jobs)
+}
+
+fn draw_list_layers_fallback(
+    host: &LoggingHost<'_>, id: u32, layers: &[(&Key, &Layer, Vec<Rect>)], canvas: &mut Canvas,
+) -> Result<()> {
+    for (key, layer, clips) in layers {
+        let mut options = layer.options.clone();
+        let mut opaque = None;
+        for clip in clips {
+            options.clip = Some(*clip);
+            super::draw_layer(host, id, canvas, key, &layer.frame, &options, layer.affine, &mut opaque)?;
+        }
     }
     Ok(())
 }

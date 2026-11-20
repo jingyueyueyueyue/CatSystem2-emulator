@@ -85,6 +85,7 @@ pub(super) struct DataServices {
     pub(super) fes_draw: super::fes_draw::FesDrawStore,
     pub(super) sounds: super::sound_task::SoundTaskStore,
     pub(super) legacy_sound: super::sound_legacy::LegacySoundSettings,
+    pub(super) startup_int_slots: Option<BTreeMap<Vec<u8>, u32>>,
     pub(super) sound_media: super::sound_media::SoundMediaStore,
     pub(super) host_clock: super::media_clock::HostClock,
     pub(super) list_native: super::list_native::ListNativeStore,

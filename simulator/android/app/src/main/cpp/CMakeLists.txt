@@ -12,6 +12,6 @@ set_target_properties(cs2_android PROPERTIES
     IMPORTED_LOCATION "${cs2_android_library}"
     # Rust's cdylib has no SONAME; link by name so DT_NEEDED stays portable.
     IMPORTED_NO_SONAME TRUE)
-add_library(cs2_android_bridge SHARED bridge.c)
+add_library(cs2_android_bridge SHARED bridge.c egl_presenter.c)
 target_compile_options(cs2_android_bridge PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(cs2_android_bridge cs2_android android log)
+target_link_libraries(cs2_android_bridge cs2_android android log EGL GLESv2)

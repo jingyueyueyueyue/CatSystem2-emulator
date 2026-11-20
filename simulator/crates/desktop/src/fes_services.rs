@@ -60,11 +60,28 @@ pub(super) fn finish(
     host: &mut LoggingHost<'_>, view: &FesTaskView, runtime: &mut FesRuntime,
     driver: &mut FesScriptDriver,
 ) -> Result<bool> {
-    if !super::fes_controls::update_owner(host, view, runtime, driver)? { return Ok(false); }
-    super::fes_text::update_owner(host, view, runtime, driver)?;
-    super::fes_save_panel::update_owner(host, view, runtime)?;
-    if !super::fes_particle::update_owner(host, view, runtime, driver)? { return Ok(false); }
-    if !super::fes_sound::update_owner(host, view, runtime, driver)? { return Ok(false); }
+    use super::perf_detail::SlowTask;
+    {
+        let _detail = SlowTask::new(view.id, || 34, "fes_update_controls");
+        if !super::fes_controls::update_owner(host, view, runtime, driver)? { return Ok(false); }
+    }
+    {
+        let _detail = SlowTask::new(view.id, || 34, "fes_update_text");
+        super::fes_text::update_owner(host, view, runtime, driver)?;
+    }
+    {
+        let _detail = SlowTask::new(view.id, || 34, "fes_update_save_panel");
+        super::fes_save_panel::update_owner(host, view, runtime)?;
+    }
+    {
+        let _detail = SlowTask::new(view.id, || 34, "fes_update_particles");
+        if !super::fes_particle::update_owner(host, view, runtime, driver)? { return Ok(false); }
+    }
+    {
+        let _detail = SlowTask::new(view.id, || 34, "fes_update_sound");
+        if !super::fes_sound::update_owner(host, view, runtime, driver)? { return Ok(false); }
+    }
+    let _detail = SlowTask::new(view.id, || 34, "fes_update_draw");
     super::fes_draw::update_owner(host, view, runtime, driver)
 }
 

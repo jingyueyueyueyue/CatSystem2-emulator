@@ -183,7 +183,7 @@ impl HeadlessPlayer {
                     .context("saved SOUND original resource disappeared")?;
                 let raw = self.scan.resources.read_candidate(candidate.value)?;
                 let actual = crate::audio_decode::prepare_audio(raw)?;
-                if **source != *actual { bail!("saved SOUND channel PCM differs from the actual resource"); }
+                if !source.matches_pcm(&actual)? { bail!("saved SOUND channel PCM differs from the actual resource"); }
                 state.prepared_audio = Some(actual);
             }
         }
@@ -202,7 +202,7 @@ impl HeadlessPlayer {
             if let Some(handle) = state.handle.filter(|id| active.contains(id)) {
                 let signal = state.task.signal.as_ref().context("saved active SOUND lost its signal owner")?;
                 if !audio.matches(handle, state.resource.as_deref().context("saved active SOUND lost its resource")?,
-                    state.prepared_audio.as_ref().context("saved active SOUND lost its source PCM")?, signal, state.paused) {
+                    state.prepared_audio.as_ref().context("saved active SOUND lost its source PCM")?, signal, state.paused)? {
                     bail!("saved physical SOUND channel/worker source or signal differs");
                 }
                 state.task.signal = audio.signal(handle);

@@ -1,5 +1,7 @@
 package org.catsystem2.player;
 
+import static org.catsystem2.player.PlayerActivity.*;
+
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -59,6 +61,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import android.webkit.MimeTypeMap;
 
+import androidx.activity.ComponentActivity;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -75,36 +79,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Android shell for the same portable Rust game player. */
-public final class PlayerActivity extends Activity implements SurfaceHolder.Callback {
-    static { System.loadLibrary("cs2_android_bridge"); }
-    private static native long nativeOpen(byte[] game, byte[] saves);
-    private static native int nativeClose(long handle);
-    private static native int nativeStep(long handle, int budget);
-    private static native int nativeSize(long handle, int axis);
-    private static native int nativePointer(long handle, int[] output);
-    private static native int nativeCursorVisibility(long handle);
-    private static native int nativeWindowRequest(long handle);
-    private static native int nativeGeneralWindowPolicy(long handle);
-    private static native byte[] nativeGeneralWindowCaption(long handle);
-    private static native int nativeWindowMode(long handle, int windowed);
-    private static native byte[] nativeWindowUi(long handle);
-    private static native int nativeWindowUiAction(long handle, long request, int action, int a, int b, int c);
-    private static native int nativeSettingsApply(long handle, long request, byte[] record);
-    private static native byte[] nativeSettingsFontPreview(long handle, long request, int face, int bold);
-    private static native char[] nativeClipboard(long handle);
-    private static native byte[] nativeMessageLists(long handle);
-    private static native int nativeMessageListAction(long handle, int task, int operation, int value);
-    private static native byte[] nativeSceneTools(long handle);
-    private static native int nativeSceneToolAction(long handle, int task, int operation, int parameter, int value);
-    private static native byte[] nativeSystemOpen(long handle);
-    private static native int nativeSystemOpenResult(long handle, long request, byte[] failure);
-    private static native byte[] nativeDialog(long handle);
-    private static native int nativeDialogResult(long handle, long request, int shown);
-    private static native int nativeInput(long handle, int kind, int a, int b);
-    private static native int nativeText(long handle, int kind, byte[] text, int start, int end);
-    private static native int nativePresent(long handle, Surface surface);
-    private static native byte[] nativeError();
+/** Game loop and Android platform adapters used by the Kotlin activity. */
+public abstract class PlayerEngineActivity extends ComponentActivity implements SurfaceHolder.Callback {
 
     private static final int SELECT_GAME = 1;
     private static final int EXPORT_DIAGNOSTICS = 2;
@@ -116,7 +92,9 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
     private static final int GAME_MENU_MESSAGE_LIST = 40047;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final AtomicBoolean importing = new AtomicBoolean(false);
+    private final AtomicBoolean hudSamplePending = new AtomicBoolean(false);
     private final Object surfaceLock = new Object();
+    private boolean surfaceNeedsDetach;
     private HandlerThread playerThread;
     private Handler worker;
     private volatile AndroidTweetHost tweetHost;
@@ -188,6 +166,44 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         final Surface surface;
 
         RenderSurface(Surface surface) { this.surface = surface; }
+    }
+
+    protected abstract View createPerformanceAction();
+    protected abstract void onGameViewVisibilityChanged(boolean visible);
+
+    /** These counters are advanced on the engine thread. */
+    protected abstract void onGameTickCompleted();
+    protected abstract void onGameFrameSubmitted();
+
+    protected final void setGameHudCollection(boolean enabled) {
+        if (worker != null) worker.post(() -> nativeSetHudEnabled(enabled));
+    }
+
+    protected final boolean hasGameMonitorSurface() {
+        return renderSurface != null && !paused && !destroyed;
+    }
+
+    protected final void requestGameHudSample(java.util.function.Consumer<long[]> callback) {
+        if (worker == null || destroyed || !hudSamplePending.compareAndSet(false, true)) return;
+        if (!worker.post(() -> {
+            try {
+                long[] output = new long[16];
+                synchronized (surfaceLock) {
+                    if (session == 0 || !running || paused || renderSurface == null || surfaceNeedsDetach
+                        || nativeReadHud(session, output) != 1) return;
+                }
+                callback.accept(output);
+            } finally {
+                hudSamplePending.set(false);
+            }
+        })) hudSamplePending.set(false);
+    }
+
+    protected final FrameLayout getPlayerRoot() { return root; }
+
+    private void setLibraryVisible(boolean visible) {
+        panel.setVisibility(visible ? View.VISIBLE : View.GONE);
+        onGameViewVisibilityChanged(!visible);
     }
 
     @Override public void onCreate(Bundle state) {
@@ -298,6 +314,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         LinearLayout libraryHeading = new LinearLayout(this);
         libraryHeading.setGravity(Gravity.CENTER_VERTICAL);
         libraryHeading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        libraryHeading.addView(createPerformanceAction());
         Button diagnostics = new Button(this);
         diagnostics.setText("导出诊断日志");
         diagnostics.setOnClickListener(view -> chooseDiagnosticsDestination());
@@ -366,7 +383,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
             @Override public boolean isEnabled(int position) { return !unavailable.containsKey(getItem(position).key); }
             @Override public View getView(int position, View recycled, android.view.ViewGroup parent) {
                 GameLibrary.Entry game = getItem(position);
-                LinearLayout card = new LinearLayout(PlayerActivity.this);
+                LinearLayout card = new LinearLayout(PlayerEngineActivity.this);
                 card.setOrientation(LinearLayout.VERTICAL);
                 card.setGravity(Gravity.CENTER_VERTICAL);
                 card.setPadding(dp(16), dp(16), dp(16), dp(16));
@@ -648,7 +665,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         PointerIcon cursor = PointerIcon.getSystemIcon(this, PointerIcon.TYPE_DEFAULT);
         surfaceView.setPointerIcon(cursor);
         gamePointer.setPointerIcon(cursor);
-        panel.setVisibility(View.VISIBLE);
+        setLibraryVisible(true);
         updateLibraryActions();
     }
 
@@ -785,7 +802,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         int result;
         synchronized (surfaceLock) {
             if (renderSurface != target || paused || !isCurrent(sessionGeneration)) return;
-            if (!target.surface.isValid()) {
+            if (!detachSurfaceLocked() || !target.surface.isValid()) {
                 nextFrame = SystemClock.uptimeMillis() + 16;
                 return;
             }
@@ -796,6 +813,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
             }
         }
         if (result != 0) throw new IOException("画面提交失败 (" + result + ")：" + nativeErrorText());
+        onGameFrameSubmitted();
         framePending = false;
         if (presentedSurface == target) return;
         presentedSurface = target;
@@ -806,7 +824,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
             launchingTitle = null;
             gameReady = true;
             updateLibraryActions();
-            panel.setVisibility(View.GONE);
+            setLibraryVisible(false);
             surfaceView.requestFocus();
         });
     }
@@ -824,6 +842,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                     return;
                 }
                 int state = nativeStep(session, 20000);
+                if (state == FRAME_CHANGED || state == FRAME_UNCHANGED) onGameTickCompleted();
                 if (state == 3) android.util.Log.w("CS2Player", "Game tick stalled:\n" + nativeErrorText());
                 if (state < 0) throw new IOException(nativeErrorText());
                 if (state == 2) {
@@ -885,7 +904,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                     final long cursorSession = session;
                     ui.post(() -> {
                         if (!destroyed && messageUiSession == cursorSession) {
-                            PointerIcon icon = PointerIcon.getSystemIcon(PlayerActivity.this,
+                            PointerIcon icon = PointerIcon.getSystemIcon(PlayerEngineActivity.this,
                                 visible ? PointerIcon.TYPE_DEFAULT : PointerIcon.TYPE_NULL);
                             surfaceView.setPointerIcon(icon);
                             gamePointer.setPointerIcon(icon);
@@ -2065,19 +2084,19 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
 
         MessageInspector(long handle, int task, int kind) {
             this.handle = handle; this.task = task; this.kind = kind;
-            LinearLayout content = new LinearLayout(PlayerActivity.this);
+            LinearLayout content = new LinearLayout(PlayerEngineActivity.this);
             content.setOrientation(LinearLayout.VERTICAL);
             int padding = (int)(12 * getResources().getDisplayMetrics().density);
             content.setPadding(padding, padding, padding, padding);
-            nameFilter = new EditText(PlayerActivity.this);
+            nameFilter = new EditText(PlayerEngineActivity.this);
             nameFilter.setSingleLine(true);
             nameFilter.setHint(kind == 47 ? "姓名筛选" : kind == 33 ? "分组筛选" : "类别筛选");
-            textFilter = new EditText(PlayerActivity.this);
+            textFilter = new EditText(PlayerEngineActivity.this);
             textFilter.setSingleLine(true); textFilter.setHint("正文筛选");
-            monologue = new CheckBox(PlayerActivity.this); monologue.setText("仅旁白");
+            monologue = new CheckBox(PlayerEngineActivity.this); monologue.setText("仅旁白");
             if (kind != 47) monologue.setVisibility(View.GONE);
             content.addView(nameFilter); content.addView(textFilter); content.addView(monologue);
-            ListView list = new ListView(PlayerActivity.this);
+            ListView list = new ListView(PlayerEngineActivity.this);
             list.setAdapter(adapter);
             content.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
             list.setOnItemClickListener((parent, view, position, id) -> {
@@ -2094,7 +2113,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
             };
             nameFilter.addTextChangedListener(watcher); textFilter.addTextChangedListener(watcher);
             monologue.setOnCheckedChangeListener((button, checked) -> filter());
-            dialog = new AlertDialog.Builder(PlayerActivity.this)
+            dialog = new AlertDialog.Builder(PlayerEngineActivity.this)
                 .setTitle(kind == 47 ? "消息列表" : kind == 33 ? "场景列表" : "场景调试")
                 .setView(content).setNegativeButton("关闭", (window, which) ->
                     hideInspector()).create();
@@ -2114,11 +2133,11 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         }
         void editVariable(MessageRow row) {
             int index = row.input - 1000000;
-            EditText value = new EditText(PlayerActivity.this);
+            EditText value = new EditText(PlayerEngineActivity.this);
             value.setSingleLine(true);
             int start = row.text.indexOf(": "), end = row.text.indexOf(" (0x");
             value.setText(start >= 0 && end > start ? row.text.substring(start + 2, end) : "");
-            AlertDialog editor = new AlertDialog.Builder(PlayerActivity.this)
+            AlertDialog editor = new AlertDialog.Builder(PlayerEngineActivity.this)
                 .setTitle("变量 " + index).setView(value)
                 .setNegativeButton("取消", null).setPositiveButton("写入", null).create();
             editor.setOnShowListener(window -> editor.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(button -> {
@@ -2151,7 +2170,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
             public long getItemId(int position) { return Integer.toUnsignedLong(filtered.get(position).input); }
             public boolean hasStableIds() { return true; }
             public View getView(int position, View previous, android.view.ViewGroup parent) {
-                TextView label = previous instanceof TextView ? (TextView)previous : new TextView(PlayerActivity.this);
+                TextView label = previous instanceof TextView ? (TextView)previous : new TextView(PlayerEngineActivity.this);
                 MessageRow row = filtered.get(position);
                 label.setPadding(12, 8, 12, 8);
                 label.setText((row.name.isEmpty() ? "" : row.name + "\n") + row.text);
@@ -2237,7 +2256,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         addPlaybackAction(actions, "下一页（Page Down）", () -> tapGameInput(handle, 3, 4, 34));
         addPlaybackAction(actions, "软键盘", this::showGameKeyboard);
         addPlaybackAction(actions, "打开游戏库", () -> {
-            panel.setVisibility(View.VISIBLE);
+            setLibraryVisible(true);
             refreshLibrary(null);
         });
         addPlaybackAction(actions, "退出当前游戏", this::confirmExit);
@@ -2294,7 +2313,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
     }
 
     private void resumeFromLibrary() {
-        panel.setVisibility(View.GONE);
+        setLibraryVisible(false);
         restorePlaybackFocus();
     }
 
@@ -2396,7 +2415,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         private boolean shown;
         private boolean cursorVisible = true;
         GamePointer() {
-            super(PlayerActivity.this);
+            super(PlayerEngineActivity.this);
             setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         }
         void move(int x, int y) { this.x = x; this.y = y; shown = true; invalidate(); }
@@ -2424,7 +2443,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
 
     private final class PlayerSurface extends SurfaceView {
         PlayerSurface() {
-            super(PlayerActivity.this);
+            super(PlayerEngineActivity.this);
             setFocusable(true);
             setFocusableInTouchMode(true);
         }
@@ -2623,7 +2642,18 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         // Wait only for an in-flight buffer submit, not an engine tick or session close.
         synchronized (surfaceLock) {
             renderSurface = null;
+            surfaceNeedsDetach = true;
         }
+        worker.post(() -> {
+            synchronized (surfaceLock) {
+                detachSurfaceLocked();
+            }
+        });
+    }
+
+    private boolean detachSurfaceLocked() {
+        if (surfaceNeedsDetach && nativeDetachSurface() == 0) surfaceNeedsDetach = false;
+        return !surfaceNeedsDetach;
     }
 
     private String nativeErrorText() { return new String(nativeError(), StandardCharsets.UTF_8); }
@@ -2641,7 +2671,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         refreshLibrary(title);
         status.setText(title);
         updateLibraryActions();
-        panel.setVisibility(View.VISIBLE);
+        setLibraryVisible(true);
         new AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton("确定", null).show();
     }
 }

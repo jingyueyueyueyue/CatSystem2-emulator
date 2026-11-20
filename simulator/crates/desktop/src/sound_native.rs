@@ -1,5 +1,7 @@
 //! Ordinary 935/936 and direct FES sound preparation, without synthetic VM pointers.
-use crate::audio_decode::prepare_audio;
+use crate::audio_decode::{MAX_ENCODED, prepare_named_audio};
+use crate::perf_detail::audio::{Profile as AudioProfile, Stage as AudioStage};
+use crate::perf_detail::SlowTask;
 use crate::{
     LoggingHost, ScriptTextEncoding, audio_script_error, expand_kcs_format, read_u32, trim_nul,
 };
@@ -261,13 +263,17 @@ impl LoggingHost<'_> {
             return Err(self.sound_host_error(cause));
         }
         state.release();
-        let mut resource = None;
+        let resources = self.resources;
+        let mut source = None;
         for name in names {
-            match self.resources.resolve_mode_utf16(
+            match resources.resolve_mode_utf16(
                 &name.encode_utf16().collect::<Vec<_>>(),
                 cs2_runtime::resource_router::ResourceMode::LooseFirst,
             ) {
-                Ok(Some(_)) => { resource = Some(name); break; }
+                Ok(Some(candidate)) => {
+                    source = Some((name, candidate.value));
+                    break;
+                }
                 Ok(None) => {}
                 Err(cause) => {
                     self.sound_channels.insert(channel, state);
@@ -275,11 +281,29 @@ impl LoggingHost<'_> {
                 }
             }
         }
-        let Some(resource) = resource else {
+        let Some((resource, candidate)) = source else {
             self.sound_channels.insert(channel, state);
             return Ok(NativeReturn::Value(0));
         };
-        let prepared = match self.prepare_sound_resource(&resource) {
+        let _audio = AudioProfile::new(self.current_task_id, channel, "load", None, &resource);
+        let kind = || self.scene_nodes.get(&self.current_task_id).map_or(-1, |node| node.kind as i32);
+        let encoded = {
+            let _detail = SlowTask::new(self.current_task_id, kind, "sound_load_read")
+                .named(resource.as_bytes(), None);
+            let _timing = AudioStage::Read.begin();
+            resources.read_candidate_bounded(candidate, MAX_ENCODED)
+        };
+        let prepared = match encoded {
+            Ok(Some(encoded)) => {
+                let _detail = SlowTask::new(self.current_task_id, kind, "sound_load_decode")
+                    .named(resource.as_bytes(), None);
+                let _timing = AudioStage::Prepare.begin();
+                prepare_named_audio(encoded, &resource).map_err(|cause| self.sound_host_error(cause))
+            }
+            Ok(None) => Err(self.sound_host_error("encoded sound must contain 1 byte to 64 MiB")),
+            Err(cause) => Err(self.sound_host_error(cause)),
+        };
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(cause) => {
                 self.sound_channels.insert(channel, state);
@@ -301,7 +325,10 @@ impl LoggingHost<'_> {
                 + u64::from(prepared.probe.sample_rate) * u64::from(duration) / 1000
                 <= u64::from(prepared.probe.sample_rate) * 4;
         state.volume_fade = None;
-        let sidecars = self.load_sound_sidecars(&resource);
+        let sidecars = {
+            let _timing = AudioStage::Sidecars.begin();
+            self.load_sound_sidecars(&resource)
+        };
         match sidecars {
             Ok(sidecars) => state.task.sidecars = sidecars,
             Err(cause) => {
@@ -433,25 +460,6 @@ impl LoggingHost<'_> {
             }
         }
         Ok(names)
-    }
-
-    fn prepare_sound_resource(
-        &mut self,
-        name: &str,
-    ) -> cs2_script::Result<std::sync::Arc<crate::audio_decode::DecodedAudio>> {
-        let resources = self.resources;
-        let candidate = resources
-            .resolve_mode_utf16(
-                &name.encode_utf16().collect::<Vec<_>>(),
-                cs2_runtime::resource_router::ResourceMode::LooseFirst,
-            )
-            .map_err(|cause| self.sound_host_error(cause))?
-            .ok_or_else(|| audio_script_error("selected sound resource disappeared"))?;
-        let encoded = self
-            .resources
-            .read_candidate(candidate.value)
-            .map_err(|cause| self.sound_host_error(cause))?;
-        prepare_audio(encoded).map_err(|cause| self.sound_host_error(cause))
     }
 
     pub(super) fn sound_host_error(

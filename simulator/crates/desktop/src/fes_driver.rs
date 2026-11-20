@@ -854,6 +854,8 @@ impl FesScriptDriver {
     }
 
     fn command(&mut self, command: FesDriverCommand, frame: u64) -> Result<Option<FesDriverEffect>> {
+        let _detail = super::perf_detail::SlowTask::new(self.task_id, || 34, "fes_command")
+            .named(command.parameters.first().map_or(&[], Vec::as_slice), Some(command.offset));
         if let Some(effect) = self.main_flow_command(&command)? { return Ok(effect); }
         let arguments = &command.parameters;
         let name = arguments.first().map_or(&[][..], Vec::as_slice);

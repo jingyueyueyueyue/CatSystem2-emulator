@@ -14,7 +14,7 @@ use super::fes_driver::{
 use super::native_tasks::NativeSubtreeContinuation;
 use super::{
     FesRuntime, HeadlessPlayer, LoggingHost, LogicEvent, cp932_to_utf8, expand_kcs_format, native_state_error,
-    native_state_error_owned, read_u32,
+    HostPhase, measure_host_operation, measure_host_phase, native_state_error_owned, read_u32,
 };
 
 #[path = "fes_task_state.rs"]
@@ -1193,6 +1193,7 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn update_fes_task(&mut self, id: u32, now: u32, budget: usize) -> Result<bool> {
+        let _detail = super::perf_detail::SlowTask::new(id, || 34, "fes_update");
         if !self.fes_target(id)? {
             return Ok(true);
         }
@@ -1797,6 +1798,7 @@ impl FesTask {
                 let effect = match self.pending_effect.take() {
                     Some(effect) => effect,
                     None => with_expression(host, |_, shared| {
+                        let _detail = super::perf_detail::SlowTask::new(self.id, || 34, "fes_interpreter");
                         driver.advance_system_notification(
                             now as u64, shared, budget - iteration, bounded_block,
                         )
@@ -1958,9 +1960,7 @@ impl FesTask {
             if candidate.size > MAX_FES_BYTES as u64 {
                 return Err(native_state_error("FES resource exceeds 64 MiB"));
             }
-            let bytes = host
-                .resources
-                .read_candidate(candidate)
+            let bytes = measure_host_operation(HostPhase::ScriptRead, || host.resources.read_candidate(candidate))
                 .map_err(|error| host.fes_task_error(self.id, error))?;
             let mut replacement = self.new_loaded_runtime(host, candidate, &bytes)?;
             let mut previous = self
@@ -2021,9 +2021,7 @@ impl FesTask {
             if candidate.size > MAX_FES_BYTES as u64 {
                 return Err(native_state_error("FES resource exceeds 64 MiB"));
             }
-            let bytes = host
-                .resources
-                .read_candidate(candidate)
+            let bytes = measure_host_operation(HostPhase::ScriptRead, || host.resources.read_candidate(candidate))
                 .map_err(|error| host.fes_task_error(self.id, error))?;
             let mut replacement = self.new_loaded_runtime(host, candidate, &bytes)?;
             if let Some(previous) = self
@@ -2357,12 +2355,16 @@ impl FesTask {
                     }
                     self.refresh_child_status(host, driver);
                     let finish = (|| {
-                        if !super::fes_motion::advance_owner(
-                            host, &self.view(host, now), runtime, driver, budget - iteration,
-                        ).map_err(|error| host.fes_task_error(self.id, error))? {
-                            return Ok(false);
+                        {
+                            let _detail = super::perf_detail::SlowTask::new(self.id, || 34, "fes_motion");
+                            if !super::fes_motion::advance_owner(
+                                host, &self.view(host, now), runtime, driver, budget - iteration,
+                            ).map_err(|error| host.fes_task_error(self.id, error))? {
+                                return Ok(false);
+                            }
                         }
                         if self.media_frame != Some(now) {
+                            let _detail = super::perf_detail::SlowTask::new(self.id, || 34, "fes_media_update");
                             runtime
                                 .update_driver_media(
                                     now as u64,
@@ -2373,6 +2375,7 @@ impl FesTask {
                                 .map_err(|error| host.fes_task_error(self.id, error))?;
                             self.media_frame = Some(now);
                         }
+                        let _detail = super::perf_detail::SlowTask::new(self.id, || 34, "fes_media_finish");
                         super::fes_task_platform::finish_task_media(
                             host,
                             &self.view(host, now),
@@ -2458,6 +2461,22 @@ impl FesTask {
         now: u32,
         budget: usize,
     ) -> Result<EffectResult> {
+        let (scope, name, offset): (&'static str, &[u8], Option<usize>) = match effect {
+            FesDriverEffect::Command(command) => ("fes_effect",
+                command.parameters.first().map_or(&[], Vec::as_slice), Some(command.offset)),
+            FesDriverEffect::ExecKcs { name, .. } => ("fes_exec_kcs", name, None),
+            FesDriverEffect::ExecFes { name, .. } => ("fes_exec_fes", name, None),
+            FesDriverEffect::SystemBlock { name, .. } => ("fes_system", name, None),
+            FesDriverEffect::ObjectEvent { event, .. } => ("fes_object_event", event, None),
+            FesDriverEffect::Initialize { .. } => ("fes_initialize", &[], None),
+            FesDriverEffect::ControlFlow(_) => ("fes_control_flow", &[], None),
+            FesDriverEffect::Send { .. } => ("fes_send", &[], None),
+            _ => ("fes_effect_other", &[], None),
+        };
+        let timer = super::perf_detail::SlowTask::new(self.id, || 34, scope).named(name, offset);
+        let _detail = if let FesDriverEffect::Send { message, .. } = effect {
+            timer.code(message[1])
+        } else { timer };
         let acknowledge_statement = driver.media_statement_effect_pending();
         let result = self.effect_inner(host, runtime, driver, effect, now, budget);
         if acknowledge_statement
@@ -2843,6 +2862,7 @@ fn kanmi_message_notification_rejects_other_shapes() {
 }
 
 fn parse_document(bytes: &[u8]) -> Result<FesDocument> {
+    let _timing = measure_host_phase(HostPhase::ScriptParse);
     if bytes.len() > MAX_FES_BYTES {
         return Err(native_state_error("FES data exceeds 64 MiB"));
     }

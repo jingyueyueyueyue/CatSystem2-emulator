@@ -9,6 +9,7 @@ use cs2_runtime::RuntimeError;
 use cs2_script::{NativeReturn, Result, Vm};
 
 use super::{LoggingHost, cp932_to_utf8, expand_kcs_format, native_state_error, read_u32, trim_nul};
+use super::perf_detail::{ImageSourceStage, ImageSourceStep, SlowTask};
 
 const MAX_FILE: usize = 64 * 1024 * 1024;
 const MAX_PIXELS: usize = 128 * 1024 * 1024;
@@ -111,6 +112,10 @@ impl ImageManager {
 
     fn get(&self, name: &str, id: u32) -> Option<RgbaFrame> {
         self.frames.get(&Self::key(name, id)).map(|(_, frame)| cache_copy(frame))
+    }
+
+    fn shared_frame(&self, name: &str, id: u32) -> Option<RgbaFrame> {
+        self.frames.get(&Self::key(name, id)).map(|(_, frame)| frame.clone())
     }
 
     /// The layer planner uses the borrowed-cache lookup, which never
@@ -291,7 +296,7 @@ impl LoggingHost<'_> {
     }
 
     fn load_resource_animation_layer(&mut self, name: &str, anm_name: &str) -> Result<Option<ResourceLayer>> {
-        let Some(bytes) = self.read_managed_image_bytes(name)? else { return Ok(None); };
+        let Some((path, bytes)) = self.read_managed_image_asset(name, false)? else { return Ok(None); };
         let ids = if bytes.starts_with(b"HG-3") {
             cs2_formats::HgFile::parse(&bytes)
                 .map_err(|_| native_state_error("native 710 animated HG directory is malformed"))?
@@ -300,7 +305,7 @@ impl LoggingHost<'_> {
         let mut frames = BTreeMap::new();
         let mut total = 0usize;
         for id in ids {
-            if let Some(frame) = self.decode_managed_image_frame(&bytes, id)? {
+            if let Some(frame) = self.decode_named_image_frame(&bytes, id, &path)? {
                 total = total.checked_add(frame.pixels().len()).filter(|&n| n <= MAX_CACHE)
                     .ok_or_else(|| native_state_error("native 710 retained frames exceed 256 MiB"))?;
                 frames.insert(id, frame);
@@ -541,16 +546,69 @@ impl LoggingHost<'_> {
     pub(super) fn load_managed_image(
         &mut self, name: &str, id: u32, request_cache: bool,
     ) -> Result<Option<RgbaFrame>> {
-        self.ensure_image_manager()?;
+        self.load_managed_frame(name, id, request_cache, false)
+    }
+
+    /// FES projections only replace whole frames. Sharing decoded bytes
+    /// preserves their texture identity without exposing native wrappers.
+    pub(super) fn load_managed_image_projection(&mut self, name: &str, id: u32) -> Result<Option<RgbaFrame>> {
+        self.load_managed_frame(name, id, false, true)
+    }
+
+    fn load_managed_frame(
+        &mut self, name: &str, id: u32, request_cache: bool, share_pixels: bool,
+    ) -> Result<Option<RgbaFrame>> {
+        let task = self.current_task_id;
+        let kind = self.scene_nodes.get(&task).map_or(-1, |node| node.kind as i32);
+        let scope = |operation| SlowTask::new(task, || kind, operation).named(name.as_bytes(), None).code(id);
+        if !self.data_services.image_manager.initialized {
+            let _detail = scope("image_manager_init");
+            self.ensure_image_manager()?;
+        }
         let cache = request_cache || self.data_services.image_manager.force_cache != 0;
-        if let Some(frame) = self.data_services.image_manager.get(name, id) {
-            if cache { self.data_services.image_manager.remember(name, id, &frame)?; }
+        let cached = {
+            let _detail = scope("image_frame_cache_lookup");
+            let _stage = ImageSourceStep::new(ImageSourceStage::CacheLookup);
+            if share_pixels { self.data_services.image_manager.shared_frame(name, id) }
+            else { self.data_services.image_manager.get(name, id) }
+        };
+        if let Some(frame) = cached {
+            ImageSourceStep::cache_hit();
+            if cache {
+                let _detail = scope("image_frame_cache_touch");
+                let _stage = ImageSourceStep::new(ImageSourceStage::CacheTouch);
+                self.data_services.image_manager.remember(name, id, &frame)?;
+            }
             return Ok(Some(frame));
         }
-        let Some(bytes) = self.read_managed_image_bytes(name)? else { return Ok(None); };
-        let Some(frame) = self.decode_managed_image_frame(&bytes, id)? else { return Ok(None); };
-        if cache { self.data_services.image_manager.remember(name, id, &frame)?; }
+        let asset = {
+            let _detail = scope("image_encoded_ingress");
+            let _stage = ImageSourceStep::new(ImageSourceStage::Ingress);
+            self.read_managed_image_asset(name, false)?
+        };
+        let Some((path, bytes)) = asset else { return Ok(None); };
+        let frame = {
+            let _detail = scope("image_frame_decode");
+            let _stage = ImageSourceStep::new(ImageSourceStage::Decode);
+            self.decode_named_image_frame(&bytes, id, &path)?
+        };
+        let Some(frame) = frame else { return Ok(None); };
+        if cache {
+            let _detail = scope("image_frame_cache_insert");
+            self.data_services.image_manager.remember(name, id, &frame)?;
+            if share_pixels && let Some(shared) = self.data_services.image_manager.shared_frame(name, id) {
+                return Ok(Some(shared));
+            }
+        }
         Ok(Some(frame))
+    }
+
+    pub(super) fn decode_named_image_frame(&mut self, bytes: &[u8], id: u32, path: &str)
+        -> Result<Option<RgbaFrame>> {
+        Ok(self.decode_managed_image_frame(bytes, id)?.map(|frame| {
+            let path = path.replace('\\', "/").to_ascii_lowercase();
+            frame.with_asset_source(path.trim_start_matches("./").trim_start_matches('/').into(), id)
+        }))
     }
 
     /// The original translation hook runs inside native HG-3 decoding, before
@@ -712,22 +770,22 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn read_managed_image_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.read_managed_image_source(name, false)
+        Ok(self.read_managed_image_asset(name, false)?.map(|(_, bytes)| bytes))
     }
 
     /// A raw-data object retains successfully opened empty files. Its later
     /// consumer, rather than the resource router, diagnoses the empty format.
     pub(crate) fn read_managed_raw_image_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.read_managed_image_source(name, true)
+        Ok(self.read_managed_image_asset(name, true)?.map(|(_, bytes)| bytes))
     }
 
-    fn read_managed_image_source(&self, name: &str, raw: bool) -> Result<Option<Vec<u8>>> {
+    pub(super) fn read_managed_image_asset(&self, name: &str, raw: bool) -> Result<Option<(String, Vec<u8>)>> {
         let _timing = super::measure_host_phase(super::HostPhase::Read);
         if name.encode_utf16().count() >= 260 {
             return Err(native_state_error("image manager name exceeds 259 UTF-16 units"));
         }
         if let Some(bytes) = self.data_services.ordinary.cached_resource(name) {
-            return Ok((raw || !bytes.is_empty()).then(|| bytes.to_vec()));
+            return Ok((raw || !bytes.is_empty()).then(|| (name.to_owned(), bytes.to_vec())));
         }
         let Some(candidate) = self.resources.resolve_mode_utf16(
             &name.encode_utf16().collect::<Vec<_>>(), cs2_runtime::resource_router::ResourceMode::LooseFirst,
@@ -739,7 +797,7 @@ impl LoggingHost<'_> {
         }
         match self.resources.read_candidate(candidate) {
             Ok(bytes) if !raw && bytes.is_empty() => Ok(None),
-            Ok(bytes) if bytes.len() <= MAX_FILE => Ok(Some(bytes)),
+            Ok(bytes) if bytes.len() <= MAX_FILE => Ok(Some((candidate.name.clone(), bytes))),
             Ok(_) => Err(native_state_error("image manager resource exceeds 64 MiB")),
             Err(RuntimeError::ResourceNotFound(_)) => Ok(None),
             Err(RuntimeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
@@ -1080,7 +1138,7 @@ pub(super) fn decode_image_frame(bytes: &[u8], id: u32) -> Result<Option<RgbaFra
         if !file.frames.iter().any(|frame| frame.id == id) { return Ok(None); }
         AnimationFrameSelection::Id(id)
     };
-    let frame = RgbaFrame::decode_hg(bytes, selection)
+    let frame = RgbaFrame::decode_parsed_hg(bytes, &file, selection)
         .map_err(|_| native_state_error("image manager HG frame decode failed"))?;
     if frame.pixels().len() > MAX_PIXELS {
         return Err(native_state_error("image manager decoded pixels exceed 128 MiB"));

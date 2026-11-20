@@ -96,7 +96,11 @@ mod string_native;
 mod file_native;
 mod portable_host;
 pub use portable_host::HostFrameTiming;
-use portable_host::{HostPhase, measure_host_phase, measure_script_detail};
+mod perf_detail;
+pub use perf_detail::HostPerfDetails;
+use portable_host::{HostPhase, measure_host_operation, measure_host_phase, measure_script_detail};
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+mod gpu_raster;
 mod vm_context_native;
 mod achievement_native;
 pub use achievement_native::LocalAchievement;
@@ -309,7 +313,7 @@ struct SoundChannelState {
     pan_fade: Option<audio_control::AudioFade>,
     fade_clock: u32,
     #[serde(with = "audio_decode::checkpoint::optional")]
-    prepared_audio: Option<Arc<audio_decode::DecodedAudio>>,
+    prepared_audio: Option<Arc<audio_decode::PreparedAudio>>,
     task: sound_task::SoundTaskChannel,
 }
 
@@ -1469,7 +1473,7 @@ impl CstRuntime {
             if let Some(target) = self.pending_scene.take() {
                 let target = self.resolve_scene_target(&target, resources)?;
                 let bytes = read_entry_with_fallback(resources, &target)?;
-                self.document = CstDocument::parse(&bytes)?;
+                self.document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(&bytes))?;
                 self.scene_name = target.clone();
                 self.input = 0;
                 self.record = self.document.inputs.first().map_or(0, |range| range.start);
@@ -1790,7 +1794,7 @@ impl CstRuntime {
                 let target = self.resolve_scene_target(target, resources)?;
                 let bytes = read_entry_with_fallback(resources, &target)
                     .with_context(|| format!("read CST scene target {target}"))?;
-                let document = CstDocument::parse(&bytes)
+                let document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(&bytes))
                     .with_context(|| format!("parse CST scene target {target}"))?;
                 if head.eq_ignore_ascii_case("call") {
                     if self.call_stack.len() >= 128 {
@@ -3824,19 +3828,24 @@ impl Host for LoggingHost<'_> {
         arguments: &[u8],
         vm: &mut Vm,
     ) -> cs2_script::Result<NativeReturn> {
-        let argument_hex = arguments
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<Vec<_>>()
-            .join("");
+        let mut detail_timer = perf_detail::SlowTask::kcs_native(self.current_task_id,
+            || self.scene_nodes.get(&self.current_task_id).map_or(-1, |node| node.kind as i32),
+            index, vm.instruction_pointer);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut detail = format!("index={index} arguments={} bytes [", arguments.len());
+        detail.reserve(arguments.len() * 2 + 1);
+        for &byte in arguments {
+            detail.push(char::from(HEX[usize::from(byte >> 4)]));
+            detail.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        detail.push(']');
         self.events.push(LogicEvent {
             frame: self.frame,
             kind: "native-call".to_string(),
-            detail: format!(
-                "index={index} arguments={} bytes [{argument_hex}]",
-                arguments.len()
-            ),
+            detail,
         });
+        // Keep native event construction visible as a separate profiling cost.
+        detail_timer.native_log_finished();
         let word = |offset: usize| -> Option<u32> {
             arguments
                 .get(offset..offset + 4)
@@ -7030,8 +7039,12 @@ impl HeadlessPlayer {
     }
 
     fn open_internal(path: &Path, save_root: Option<PathBuf>) -> Result<Self> {
-        let root = GameRoot::open(path).context("open game directory")?;
-        let scan = root.scan().context("scan game directory")?;
+        let (root, scan) = measure_host_operation(HostPhase::OpenScan, || -> Result<_> {
+            let root = GameRoot::open(path).context("open game directory")?;
+            let scan = root.scan().context("scan game directory")?;
+            Ok((root, scan))
+        })?;
+        let _timing = measure_host_phase(HostPhase::OpenInitialize);
         let (sound_groups, discovered_sound_config_enabled) =
             discover_sound_groups(&scan.resources);
         let sound_config = discover_sound_config(&scan.resources);
@@ -7128,7 +7141,7 @@ impl HeadlessPlayer {
         player.log.push(format!(
             "message font: {}",
             if !player.font.is_empty() {
-                "loaded"
+                "faces located"
             } else {
                 "unavailable"
             }
@@ -7339,6 +7352,7 @@ impl HeadlessPlayer {
     /// Enter the configured game program. Opening a directory only indexes
     /// resources; it must not manufacture a title screen or a successful run.
     pub fn load_startup(&mut self) -> Result<&LoadedEntry> {
+        let _timing = measure_host_phase(HostPhase::OpenStartup);
         let entry = self.default_entry.clone().context(
             "no startup program: expected SCRIPT/start in startup.xml or a main/start KCS resource",
         )?;
@@ -7379,7 +7393,8 @@ impl HeadlessPlayer {
         let bytes = read_entry_with_fallback(&self.scan.resources, name)
             .with_context(|| format!("read script/resource entry {name}"))?;
         let loaded = if bytes.starts_with(b"KCS\0") {
-            let program = KcsProgram::parse(&bytes).context("parse KCS entry")?;
+            let program = measure_host_operation(HostPhase::ScriptParse, || KcsProgram::parse(&bytes))
+                .context("parse KCS entry")?;
             self.retire_direct_fes_for_entry()?;
             let mut vm = Vm::new();
             vm.load_program(program.clone(), vec![0; self.external_size])
@@ -7409,7 +7424,8 @@ impl HeadlessPlayer {
                 ),
             }
         } else if bytes.starts_with(b"CatScene") {
-            let document = CstDocument::parse(&bytes).context("parse CST entry")?;
+            let document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(&bytes))
+                .context("parse CST entry")?;
             self.retire_direct_fes_for_entry()?;
             self.vm = None;
             self.fes = None;
@@ -7440,7 +7456,8 @@ impl HeadlessPlayer {
                 ),
             }
         } else if bytes.starts_with(b"FES\0") {
-            let document = FesDocument::parse(&bytes).context("parse FES entry")?;
+            let document = measure_host_operation(HostPhase::ScriptParse, || FesDocument::parse(&bytes))
+                .context("parse FES entry")?;
             let sections = document.sections.len();
             let lines = document.sections.iter().map(|section| section.lines.len()).sum::<usize>();
             if self.frame_phase != PlayerFramePhase::Start {
@@ -8006,7 +8023,10 @@ impl HeadlessPlayer {
     fn render_scene(&mut self) -> Result<()> {
         let _timing = measure_host_phase(HostPhase::Compose);
         let previous_revision = self.scene_compositor.revision.take();
-        let mut graphics_snapshot = None;
+        let mut graphics_snapshot = self.scene_compositor.graphics_frame.take().filter(|buffer| {
+            buffer.dimensions() == self.graphics_canvas.dimensions()
+                && buffer.pixels() == self.graphics_canvas.pixels()
+        });
         let stale_movies = self
             .movie_host
             .begin_movie_plane_frame(&self.scene_nodes)
@@ -8016,6 +8036,7 @@ impl HeadlessPlayer {
             self.movie_resources.remove(&handle);
         }
         if self.data_services.tasks.render.has_composition() {
+            let _timing = measure_host_phase(HostPhase::ComposeTransition);
             self.scene_compositor.clear_prefix();
             if self.image_frame.is_some() || self.fes.is_some() || self.cst.is_some() || !self.cst_images.is_empty() {
                 bail!("render effect needs the legacy scene's actual drawable depth bindings");
@@ -8039,6 +8060,7 @@ impl HeadlessPlayer {
                 && (self.cst.is_none() || self.font.is_empty())
                 && fes_text::novel_projections(&self.data_services, f32::NEG_INFINITY, f32::INFINITY).is_empty();
             let unchanged = if prefix_cached {
+                let _timing = measure_host_phase(HostPhase::ComposeLayers);
                 let layers = self.scene_image_prefix();
                 self.scene_compositor.compose_prefix(&mut self.canvas, layers, static_prefix)?
             } else {
@@ -8058,6 +8080,7 @@ impl HeadlessPlayer {
         }
         self.movie_host.draw_exclusive_movie(&mut self.canvas)
             .context("compose exclusive movie surface")?;
+        self.scene_compositor.graphics_frame = graphics_snapshot;
         Ok(())
     }
 
@@ -8081,11 +8104,13 @@ impl HeadlessPlayer {
         graphics_snapshot: &mut Option<RgbaFrame>,
     ) -> Result<()> {
         if !prefix_cached && let Some(frame) = &self.image_frame {
+            let _timing = measure_host_phase(HostPhase::ComposeLayers);
             self.canvas
                 .draw_frame(frame, &ImageDrawOptions::new(Point::new(0, 0)))
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
         if let Some(fes) = &self.fes {
+            let _timing = measure_host_phase(HostPhase::ComposeLayers);
             let mut fes_queue = RenderQueue::new();
             for layer in fes.media.values() {
                 let animation_visible = layer
@@ -8149,6 +8174,7 @@ impl HeadlessPlayer {
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
         if !prefix_cached {
+            let _timing = measure_host_phase(HostPhase::ComposeLayers);
             let mut image_queue = RenderQueue::new();
             for ((kind, bank), layers) in &self.cst_images {
                 for image in layers {
@@ -8170,6 +8196,7 @@ impl HeadlessPlayer {
         if let Some(cst) = &self.cst
             && !self.font.is_empty()
         {
+            let _timing = measure_host_phase(HostPhase::ComposeText);
             let (speaker, text) = cst.display_text();
             draw_message_text(&mut self.canvas, &self.font, &speaker, &text, cst.display_encoding())?;
         }
@@ -8200,8 +8227,11 @@ impl HeadlessPlayer {
             .data_services
             .planes
             .draw_order_with_depths(&self.scene_nodes, &movie_depths);
-        let mut novel = fes_text::novel_projections(&self.data_services, lower, upper)
-            .into_iter().peekable();
+        let mut novel = measure_host_operation(HostPhase::ComposeText, || {
+            fes_text::novel_projections(&self.data_services, lower, upper)
+        }).into_iter().peekable();
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        let (gpu_planes, mut pending_planes) = (gpu_raster::available(), Vec::new());
         for id in nodes {
             let Some(node) = self.scene_nodes.get(&id) else {
                 continue;
@@ -8216,8 +8246,32 @@ impl HeadlessPlayer {
             });
             if !(lower <= depth && depth < upper) { continue; }
             while novel.peek().is_some_and(|layer| (layer.priority as f32) < depth) {
+                #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
+                let _timing = measure_host_phase(HostPhase::ComposeText);
                 let layer = novel.next().unwrap();
-                self.canvas.draw_frame(&layer.frame, &layer.options)?;
+                layer.draw(&mut self.canvas)?;
+            }
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            if gpu_planes {
+                let node = &self.scene_nodes[&id];
+                let independent = !movie_depths.contains_key(&id)
+                    && !self.particles.contains_key(&id)
+                    && !self.data_services.css_models.owners.contains_key(&id)
+                    && !self.data_services.css_models.utate_models.contains_key(&id)
+                    && !self.data_services.particle_external.canvases.contains_key(&id)
+                    && !self.data_services.tasks.javascript.owns_plane(id)
+                    && self.kx_geometry(id).is_none();
+                if independent {
+                    if node.kind == 2 {
+                        pending_planes.push(id);
+                        continue;
+                    }
+                    if matches!(node.kind, 0 | 1 | 6 | 8 | 11..=13 | 15 | 16 | 32..=34 | 40..=49 | 55 | 62 | 63) {
+                        continue;
+                    }
+                }
+                self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
             }
             if particle_native::draw_ordinary_task(
                 id, &mut self.canvas, &self.particles,
@@ -8227,6 +8281,7 @@ impl HeadlessPlayer {
             if self.data_services.css_models.draw(id, &mut self.canvas, &self.scan.resources, self.script_encoding)? { continue; }
             if self.data_services.particle_external.draw(id, &mut self.canvas, &self.particles)? { continue; }
             if self.kx_geometry(id).is_some() {
+                let _timing = measure_host_phase(HostPhase::ComposeKx);
                 let source = scene_compositor::graphics_source(&self.graphics_canvas, graphics_snapshot)?;
                 if self.draw_kx_geometry(id, source).context("compose live KX plane mesh")? {
                     continue;
@@ -8255,19 +8310,23 @@ impl HeadlessPlayer {
             {
                 continue;
             }
-            let canvas_source = if node.kind == 2 && self.data_services.planes.state(id)
-                .is_some_and(|state| state.shape == plane_native::PlaneShape::Canvas)
-            {
-                Some(scene_compositor::graphics_source(&self.graphics_canvas, graphics_snapshot)?)
-            } else { None };
-            if plane_native::draw_plane_with_view(
-                &mut self.canvas,
-                node,
-                &self.data_services.planes,
-                canvas_source,
-                &self.movie_host.planes.cameras,
-                &self.movie_host.planes.projection,
-            )? {
+            let phase = if node.kind == 2 { HostPhase::ComposePlane } else { HostPhase::ComposeLayers };
+            let drew_plane = measure_host_operation(phase, || {
+                let canvas_source = if node.kind == 2 && self.data_services.planes.state(id)
+                    .is_some_and(|state| state.shape == plane_native::PlaneShape::Canvas)
+                {
+                    Some(scene_compositor::graphics_source(&self.graphics_canvas, graphics_snapshot)?)
+                } else { None };
+                plane_native::draw_plane_with_view(
+                    &mut self.canvas,
+                    node,
+                    &self.data_services.planes,
+                    canvas_source,
+                    &self.movie_host.planes.cameras,
+                    &self.movie_host.planes.projection,
+                )
+            })?;
+            if drew_plane {
                 continue;
             }
             if matches!(node.kind,
@@ -8279,10 +8338,37 @@ impl HeadlessPlayer {
             }
             bail!("task {} type {} has no concrete drawable renderer", node.id, node.kind);
         }
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
+        let _timing = measure_host_phase(HostPhase::ComposeText);
         for layer in novel {
-            self.canvas.draw_frame(&layer.frame, &layer.options)?;
+            layer.draw(&mut self.canvas)?;
         }
         self.render_message_objects_range(lower, upper).context("compose message object depth range")?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    fn flush_plane_group(&mut self, pending: &mut Vec<u32>, graphics_snapshot: &mut Option<RgbaFrame>) -> Result<()> {
+        if pending.is_empty() { return Ok(()); }
+        let _timing = measure_host_phase(HostPhase::ComposePlane);
+        let planes = &self.data_services.planes;
+        let source = if pending.iter().any(|&id| planes.state(id)
+            .is_some_and(|state| state.shape == plane_native::PlaneShape::Canvas))
+        {
+            Some(scene_compositor::graphics_source(&self.graphics_canvas, graphics_snapshot)?)
+        } else { None };
+        let cameras = &self.movie_host.planes.cameras;
+        let projection = &self.movie_host.planes.projection;
+        if !plane_native::draw_plane_group(&mut self.canvas,
+            pending.iter().map(|id| &self.scene_nodes[id]), planes, source, cameras, projection)?
+        {
+            for id in pending.iter() {
+                plane_native::draw_plane_with_view(&mut self.canvas, &self.scene_nodes[id], planes,
+                    source, cameras, projection)?;
+            }
+        }
+        pending.clear();
         Ok(())
     }
 
@@ -8410,6 +8496,7 @@ pub fn run() -> Result<()> {
 
 #[cfg(windows)]
 fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
+    HeadlessPlayer::enable_host_gpu_raster();
     let mut player = HeadlessPlayer::open(path)
         .with_context(|| format!("open game directory `{}`", path.display()))?;
     player.capture_script_evidence = false;
@@ -9740,6 +9827,7 @@ fn format_diagnostic(diagnostic: &cs2_runtime::ScanDiagnostic) -> String {
 }
 
 fn read_entry_with_fallback(resources: &ResourceIndex, name: &str) -> Result<Vec<u8>> {
+    let _timing = measure_host_phase(HostPhase::ScriptRead);
     // A mounted virtual prefix already describes all permitted fallbacks.
     // Stripping it could load an unrelated same-named script or image.
     if let Some((prefix, _)) = name.split_once('/')
@@ -9787,7 +9875,7 @@ fn load_cstl(resources: &ResourceIndex, scene_name: &str) -> Option<CstlTable> {
         .to_string_lossy()
         .replace('\\', "/");
     let bytes = read_entry_with_fallback(resources, &candidate).ok()?;
-    CstlTable::parse(&bytes).ok()
+    measure_host_operation(HostPhase::ScriptParse, || CstlTable::parse(&bytes)).ok()
 }
 
 fn parse_hg_frame_id(value: &str) -> Option<usize> {

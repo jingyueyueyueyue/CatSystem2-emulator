@@ -49,6 +49,23 @@ The local change closes the final CFF2 contour once a glyph's charstring
 finishes. The original license texts are in `vendor/ttf-parser-0.21.1/`.
 Android packages carry the MIT notice.
 
+## Font rasterizer
+
+The renderer uses fontdue 0.9.3 under the MIT license. The local vendor
+directory retains the published crate source from commit
+`1f1f6ddbe3c9f918952df707763e60d0bb2ce197` with registry checksum
+`2e57e16b3fe8ff4364c0661fdaac543fb38b29ea9bc9c2f45612d90adf931d2b`.
+The local change adds opt-in delayed outline compilation using the existing
+glyph geometry and rasterization. The original notices are in
+`vendor/fontdue-0.9.3/`. Android packages carry the MIT notice.
+
+## Lewton
+
+The Vorbis decoder uses Lewton 0.10.2 under the MIT or Apache-2.0 license.
+The local copy checks the packet mode index in the sample-count estimator.
+The original license is in `vendor/lewton-0.10.2/LICENSE` and is included
+in Android packages.
+
 ## Other fixed research references
 
 The commit, origin and hash of retained license files for all eight snapshots

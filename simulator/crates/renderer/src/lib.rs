@@ -1162,8 +1162,79 @@ impl Transform2D {
 pub struct Canvas {
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pixels: CanvasPixels,
 }
+
+/// Optional device output for a canvas. The platform implementation and its
+/// resource stay alive while the game still owns this logical frame.
+pub trait CanvasReadback: std::any::Any + std::fmt::Debug + Send + Sync {
+    fn read_rgba(&self, output: &mut [u8]) -> bool;
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+#[derive(Debug)]
+enum CanvasPixels {
+    Cpu(Vec<u8>),
+    Device {
+        previous: Vec<u8>,
+        source: Arc<dyn CanvasReadback>,
+        readback: OnceLock<Vec<u8>>,
+    },
+}
+
+impl CanvasPixels {
+    fn discard_device(&mut self) -> &mut Vec<u8> {
+        if let Self::Device { previous, readback, .. } = self {
+            *self = Self::Cpu(readback.take().unwrap_or_else(|| std::mem::take(previous)));
+        }
+        let Self::Cpu(pixels) = self else { unreachable!() };
+        pixels
+    }
+
+    fn into_vec(mut self) -> Vec<u8> {
+        let _ = &mut *self;
+        match self {
+            Self::Cpu(pixels) => pixels,
+            Self::Device { .. } => unreachable!(),
+        }
+    }
+}
+
+impl Deref for CanvasPixels {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Cpu(pixels) => pixels,
+            Self::Device { previous, source, readback } => readback.get_or_init(|| {
+                let mut pixels = vec![0; previous.len()];
+                if !source.read_rgba(&mut pixels) { pixels.copy_from_slice(previous); }
+                pixels
+            }),
+        }
+    }
+}
+
+impl std::ops::DerefMut for CanvasPixels {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if let Self::Device { previous, source, readback } = self
+            && readback.get().is_none() {
+            let mut output = vec![0; previous.len()];
+            if source.read_rgba(&mut output) { let _ = readback.set(output); }
+        }
+        self.discard_device()
+    }
+}
+
+impl Clone for CanvasPixels {
+    fn clone(&self) -> Self { Self::Cpu(self.to_vec()) }
+}
+
+impl PartialEq for CanvasPixels {
+    fn eq(&self, other: &Self) -> bool { self[..] == other[..] }
+}
+
+impl Eq for CanvasPixels {}
 
 impl Canvas {
     pub fn new(width: u32, height: u32) -> Result<Self> {
@@ -1176,7 +1247,7 @@ impl Canvas {
         Ok(Self {
             width,
             height,
-            pixels,
+            pixels: CanvasPixels::Cpu(pixels),
         })
     }
 
@@ -1191,7 +1262,7 @@ impl Canvas {
         Ok(Self {
             width,
             height,
-            pixels,
+            pixels: CanvasPixels::Cpu(pixels),
         })
     }
 
@@ -1215,10 +1286,31 @@ impl Canvas {
         &mut self.pixels
     }
 
-    pub fn clear(&mut self, color: Color) {
-        for pixel in self.pixels.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[color.r, color.g, color.b, color.a]);
+    pub fn set_device_pixels(&mut self, source: Arc<dyn CanvasReadback>) {
+        let previous = std::mem::take(self.pixels.discard_device());
+        self.pixels = CanvasPixels::Device { previous, source, readback: OnceLock::new() };
+    }
+
+    pub fn device_pixels(&self) -> Option<&dyn CanvasReadback> {
+        match &self.pixels {
+            CanvasPixels::Device { source, .. } => Some(&**source),
+            CanvasPixels::Cpu(_) => None,
         }
+    }
+
+    /// Publish the rendered pixels without copying the backing allocation.
+    pub fn into_frame(self) -> RgbaFrame {
+        RgbaFrame {
+            width: self.width,
+            height: self.height,
+            pixels: Arc::new(FramePixels::new(self.pixels.into_vec())),
+            metadata: FrameMetadata::raster([self.width, self.height]),
+            attributes: HgFrameAttributes::default(),
+        }
+    }
+
+    pub fn clear(&mut self, color: Color) {
+        self.pixels.discard_device().as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> Result<Color> {
@@ -1607,7 +1699,7 @@ impl Canvas {
         canvas.draw_window_tiles(frames, Rect::new(0, 0, size[0], size[1]), 255)?;
         let mut metadata = FrameMetadata::composed(size);
         metadata.alpha_flag = u32::from(canvas.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255));
-        RgbaFrame::from_rgba8_with_metadata(size[0], size[1], canvas.pixels, metadata)
+        RgbaFrame::from_rgba8_with_metadata(size[0], size[1], canvas.pixels.into_vec(), metadata)
     }
 
     /// Composes an IMGWND raster and applies its window opacity to both the
@@ -2016,7 +2108,7 @@ impl Canvas {
         FrameSnapshot {
             width: self.width,
             height: self.height,
-            rgba: self.pixels.clone(),
+            rgba: self.pixels.to_vec(),
             hash: frame_hash(self.width, self.height, &self.pixels),
         }
     }
@@ -2111,6 +2203,31 @@ pub struct RgbaFrame {
 struct FramePixels {
     bytes: Vec<u8>,
     opaque: OnceLock<bool>,
+    patch: Option<(FramePixelIdentity, Rect)>,
+    asset: OnceLock<FrameAsset>,
+    asset_revision: OnceLock<u64>,
+}
+
+/// Provenance of pixels decoded from an immutable resource frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameAsset {
+    pub path: Arc<str>,
+    pub frame: u32,
+}
+
+/// Weak identity for an immutable pixel allocation. Device caches use it
+/// without retaining the CPU image or preventing the owner from taking its pixels.
+#[derive(Debug)]
+pub struct FramePixelIdentity(std::sync::Weak<FramePixels>);
+
+impl FramePixelIdentity {
+    pub fn matches(&self, frame: &RgbaFrame) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&frame.pixels))
+    }
+
+    pub fn same_allocation(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
 }
 
 impl FramePixels {
@@ -2118,6 +2235,9 @@ impl FramePixels {
         Self {
             bytes,
             opaque: OnceLock::new(),
+            patch: None,
+            asset: OnceLock::new(),
+            asset_revision: OnceLock::new(),
         }
     }
 
@@ -2145,6 +2265,74 @@ impl Deref for FramePixels {
 }
 
 impl RgbaFrame {
+    /// Pixel copies and metadata changes retain this identity. Operations
+    /// producing different RGBA allocate new pixels and discard it.
+    pub fn with_asset_source(self, path: Arc<str>, frame: u32) -> Self {
+        let _ = self.pixels.asset.set(FrameAsset { path, frame });
+        self
+    }
+
+    pub fn asset_source(&self) -> Option<&FrameAsset> {
+        self.pixels.asset.get()
+    }
+
+    /// Lazily verify a reload at the same resource path before binding the
+    /// previous device texture. Include the committed, potentially patched RGBA.
+    pub fn asset_revision(&self) -> u64 {
+        *self.pixels.asset_revision.get_or_init(|| {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            self.pixels.bytes.hash(&mut hasher);
+            hasher.finish()
+        })
+    }
+
+    pub fn pixel_identity(&self) -> FramePixelIdentity {
+        FramePixelIdentity(Arc::downgrade(&self.pixels))
+    }
+
+    /// Replace tightly packed RGBA rows, retaining the prior identity and
+    /// bounds as an upload hint. Existing readers keep their original frame.
+    pub fn replace_region_rgba(&self, rect: Rect, rgba: &[u8]) -> Result<Self> {
+        if rect.x < 0 || rect.y < 0
+            || u64::from(rect.x as u32) + u64::from(rect.width) > u64::from(self.width)
+            || u64::from(rect.y as u32) + u64::from(rect.height) > u64::from(self.height)
+        {
+            return Err(RendererError::RegionOutOfBounds { rect, width: self.width, height: self.height });
+        }
+        let stride = self.width as usize * 4;
+        let row_bytes = rect.width as usize * 4;
+        let expected = row_bytes * rect.height as usize;
+        if expected != rgba.len() {
+            return Err(RendererError::BufferLength { expected, actual: rgba.len() });
+        }
+        if expected == 0 { return Ok(self.clone()); }
+        let first = rect.y as usize * stride + rect.x as usize * 4;
+        let rows = || rgba.chunks_exact(row_bytes).enumerate().map(|(y, bytes)| (first + y * stride, bytes));
+        if rows().all(|(at, row)| self.pixels[at..at + row_bytes] == *row) {
+            return Ok(self.clone());
+        }
+        let mut bytes = self.pixels.to_vec();
+        for (at, row) in rows() { bytes[at..at + row_bytes].copy_from_slice(row); }
+        let mut pixels = FramePixels::new(bytes);
+        pixels.patch = Some((self.pixel_identity(), rect));
+        Ok(Self { pixels: Arc::new(pixels), ..self.clone() })
+    }
+
+    pub fn pixel_patch(&self) -> Option<(&FramePixelIdentity, Rect)> {
+        self.pixels.patch.as_ref().map(|(previous, region)| (previous, *region))
+    }
+
+    /// Recover the allocation only when nobody else can still observe the frame.
+    /// The canvas has no image metadata. Empty images remain frames.
+    pub fn try_into_canvas(self) -> std::result::Result<Canvas, Self> {
+        if self.is_empty() { return Err(self); }
+        match Arc::try_unwrap(self.pixels) {
+            Ok(pixels) => Ok(Canvas { width: self.width, height: self.height, pixels: CanvasPixels::Cpu(pixels.bytes) }),
+            Err(pixels) => Err(Self { pixels, ..self }),
+        }
+    }
+
     pub fn from_rgba8(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self> {
         Self::from_rgba8_with_metadata(
             width,
@@ -2366,6 +2554,11 @@ impl RgbaFrame {
         let file = HgFile::parse(encoded).map_err(|error| RendererError::Decode {
             message: error.to_string(),
         })?;
+        Self::decode_parsed_hg(encoded, &file, selection)
+    }
+
+    /// Decodes a frame from the same encoded bytes used to parse `file`.
+    pub fn decode_parsed_hg(encoded: &[u8], file: &HgFile, selection: AnimationFrameSelection) -> Result<Self> {
         let frame_index = match selection {
             AnimationFrameSelection::Index(index) => index,
             AnimationFrameSelection::Id(id) => file
@@ -2392,7 +2585,10 @@ impl RgbaFrame {
             .map_err(|error| RendererError::Decode {
                 message: error.to_string(),
             })?;
-        Self::from_hg_rgba8_with_frame_info(&pixels, inspection.container, info)
+        let metadata = FrameMetadata::from_hg_frame(inspection.container, info);
+        let mut frame = Self::from_rgba8_with_metadata(info.width, info.height, pixels, metadata)?;
+        frame.attributes = info.attributes_view();
+        Ok(frame)
     }
 
     pub fn width(&self) -> u32 {
@@ -2564,7 +2760,7 @@ impl RgbaFrame {
                     || layer.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255)
             })),
         };
-        Self::from_rgba8_with_metadata(width, height, canvas.pixels, metadata)
+        Self::from_rgba8_with_metadata(width, height, canvas.pixels.into_vec(), metadata)
             .map(|frame| Some(frame.with_hg_attributes(attributes)))
     }
 
@@ -4561,20 +4757,39 @@ pub struct FontRasterizer {
 
 impl FontRasterizer {
     pub fn from_bytes(bytes: &[u8], collection_index: u32) -> Result<Self> {
-        if bytes.len() > 64 * 1024 * 1024 {
-            return Err(RendererError::Decode {
-                message: "font data exceeds the 64 MiB limit".into(),
-            });
-        }
-        let font = fontdue::Font::from_bytes(
+        Self::validate_font_size(bytes.len())?;
+        Self::from_font(fontdue::Font::from_bytes(
             bytes,
             fontdue::FontSettings {
                 collection_index,
                 load_substitutions: false,
                 ..Default::default()
             },
-        )
-        .map_err(|message| RendererError::Decode {
+        ))
+    }
+
+    /// Opens an immutable shared font and compiles outlines on first glyph use.
+    pub fn from_shared_bytes(bytes: Arc<Vec<u8>>, collection_index: u32) -> Result<Self> {
+        Self::validate_font_size(bytes.len())?;
+        Self::from_font(fontdue::Font::from_shared_bytes_lazy(
+            bytes,
+            fontdue::FontSettings {
+                collection_index,
+                load_substitutions: false,
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn validate_font_size(length: usize) -> Result<()> {
+        if length > 64 * 1024 * 1024 {
+            return Err(RendererError::Decode { message: "font data exceeds the 64 MiB limit".into() });
+        }
+        Ok(())
+    }
+
+    fn from_font(font: fontdue::FontResult<fontdue::Font>) -> Result<Self> {
+        let font = font.map_err(|message| RendererError::Decode {
             message: format!("font decode failed: {message}"),
         })?;
         Ok(Self {
@@ -4591,6 +4806,11 @@ impl FontRasterizer {
     pub fn measure(&self, character: char, size: u32) -> Result<i32> {
         let metrics = self.metrics(character, size)?;
         Ok(metrics.advance_width.round() as i32)
+    }
+
+    /// The selected face's glyph-zero advance for a missing character.
+    pub fn missing_glyph_advance(&self, size: u32) -> f32 {
+        self.font.metrics_indexed(0, size as f32).advance_width
     }
 
     pub fn baseline(&self, size: u32) -> i32 {
