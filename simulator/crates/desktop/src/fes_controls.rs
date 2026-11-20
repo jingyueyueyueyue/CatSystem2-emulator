@@ -1758,6 +1758,7 @@ fn submit_control_projection(
                     frame: projection.frame,
                     options: projection.options,
                     priority: projection.priority,
+                    affine: None,
                 },
             );
         changed.insert(target);
@@ -2611,7 +2612,8 @@ pub(super) fn read_metadata(
     reference: &MetadataReference,
 ) -> RuntimeResult<Option<([i32; 2], [i32; 2])>> {
     let result = (|| -> Result<_> {
-        let bytes = optional_image(host, &reference.name)?;
+        let name = expand_resource_name(host, &reference.name)?;
+        let bytes = optional_image(host, &name)?;
         let Some(bytes) = bytes else { return Ok(None) };
         let image = HgFile::parse(&bytes)?;
         Ok(image

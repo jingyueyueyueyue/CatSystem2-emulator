@@ -226,7 +226,7 @@ pub(super) fn geometry(host: &mut LoggingHost<'_>, key: &Key) -> Result<()> {
 pub(super) fn update(
     bank: &mut TextBank, next_surface: &mut i32, device: &mut DesktopMessageDevice,
     view: &FesTaskView, runtime: &FesRuntime, name: &[u8], index: i32,
-    backlogs: &BTreeMap<u32, Backlog>,
+    backlogs: &BTreeMap<u32, Backlog>, legacy_gbk: bool,
 ) -> Result<()> {
     let mut state = bank.log.take().unwrap();
     let result = (|| -> Result<()> {
@@ -286,7 +286,7 @@ pub(super) fn update(
                 for (offset, color) in [0x10, 0x14, 0x18].into_iter().zip(colors) { set(&mut row.configuration, offset, color); }
                 row.restore_colors = colors; row.dirty = true;
                 let text = log.and_then(|log| log.lines().get(line_index as usize)).map_or(&[][..], |line| line.text.as_slice());
-                row.replace(text)?;
+                row.replace_with_codec(text, legacy_gbk)?;
                 row.draw = Some(u32::MAX);
             }
         }

@@ -311,6 +311,13 @@ fn find_live_string(vm: &Vm, source: u32, needle: u32) -> Result<Option<usize>> 
 pub(super) fn expand_shared_strings(
     input: &[u8], strings: &BTreeMap<u32, Vec<u8>>,
 ) -> Result<Vec<u8>> {
+    expand_shared_strings_observed(input, strings, |_, _| {})
+}
+
+fn expand_shared_strings_observed(
+    input: &[u8], strings: &BTreeMap<u32, Vec<u8>>,
+    mut observe: impl FnMut(u32, &[u8]),
+) -> Result<Vec<u8>> {
     let input = trim_nul(input);
     let mut output = Vec::new();
     let mut cursor = 0;
@@ -319,6 +326,7 @@ pub(super) fn expand_shared_strings(
             if let Some((length, id)) = super::cst_context_native::integer_prefix(&input[cursor + 4..]) {
                 if let Some(value) = strings.get(&id) {
                     let value = trim_nul(value);
+                    observe(id, value);
                     if output.len().checked_add(value.len())
                         .is_none_or(|length| length > MAX_EXPANDED_BYTES)
                     {
@@ -836,9 +844,21 @@ impl LoggingHost<'_> {
     ) -> Result<NativeReturn> {
         let target = read_u32(args, 0)?;
         let input = vm.read_string(target)?;
-        let mut output = expand_shared_strings(&input, self.string_values)?;
+        let origins = &mut self.data_services.cst_text_origins;
+        let mut codec = origins.returned(self.current_task_id, target, &input);
+        let mut output = expand_shared_strings_observed(&input, self.string_values, |id, bytes| {
+            if !bytes.is_ascii() && origins.shared(id, bytes) != codec {
+                codec = None;
+            }
+        })?;
+        let text_len = output.len();
         output.extend_from_slice(&[0, 0]);
         vm.write(target, &output)?;
+        if let Some(codec) = codec {
+            origins.record(self.current_task_id, target, &output[..text_len], codec);
+        } else {
+            origins.invalidate_returned(self.current_task_id, target);
+        }
         Ok(NativeReturn::Continue)
     }
 

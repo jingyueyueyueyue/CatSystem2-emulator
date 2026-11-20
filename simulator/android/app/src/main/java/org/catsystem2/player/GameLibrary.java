@@ -1,9 +1,11 @@
 package org.catsystem2.player;
 
+import android.Manifest;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.UriPermission;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
@@ -11,6 +13,9 @@ import android.os.Environment;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.provider.DocumentsContract;
+import android.system.ErrnoException;
+import android.system.Os;
+import android.system.OsConstants;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -43,8 +48,10 @@ final class GameLibrary {
     private final SharedPreferences settings;
     private final File files;
     private final StorageManager storage;
+    private final Context context;
 
     GameLibrary(Context context) {
+        this.context = context.getApplicationContext();
         resolver = context.getContentResolver();
         settings = context.getSharedPreferences("game-library", Context.MODE_PRIVATE);
         files = context.getFilesDir();
@@ -73,6 +80,26 @@ final class GameLibrary {
             this.systemMirror = systemMirror;
         }
 
+    }
+
+    enum DirectoryStatus {
+        MISSING("目录不存在"),
+        DENIED("无权读取目录"),
+        UNAVAILABLE("目录不可用");
+
+        final String label;
+
+        DirectoryStatus(String label) { this.label = label; }
+    }
+
+    static final class DirectoryFailure extends IOException {
+        final DirectoryStatus status;
+
+        DirectoryFailure(DirectoryStatus status, String stage, File path, Throwable cause) {
+            super("state=" + status + " stage=" + stage + " path=" + path
+                + (cause == null ? "" : " cause=" + cause.getMessage()), cause);
+            this.status = status;
+        }
     }
 
     private static final class Contents {
@@ -383,23 +410,29 @@ final class GameLibrary {
         return new File(files, "games/" + identity + "/" + name);
     }
 
-    File gameDirectory(Entry entry) throws IOException {
-        if (entry.tree != null) return localDirectory(entry.tree, entry.document);
-        if (entry.game.isDirectory()) return entry.game;
-        throw new IOException("游戏目录不存在，请重新选择游戏文件夹");
+    boolean hasStorageAccess() {
+        return Build.VERSION.SDK_INT >= 30 ? Environment.isExternalStorageManager()
+            : context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
     }
 
-    private File localDirectory(Uri tree, String document) throws IOException {
+    File gameDirectory(Entry entry) throws DirectoryFailure {
+        if (entry.tree != null) return localDirectory(entry.tree, entry.document);
+        return checkedDirectory(entry.game, null);
+    }
+
+    private File localDirectory(Uri tree, String document) throws DirectoryFailure {
         if (!LOCAL_STORAGE.equals(tree.getAuthority())) {
-            throw new IOException("请选择内部存储或 SD 卡上的游戏目录");
+            throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "unsupported-provider", null, null);
         }
         int separator = document.indexOf(':');
-        if (separator <= 0) throw new IOException("无法识别游戏存储卷");
+        if (separator <= 0) {
+            throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "invalid-document-id", null, null);
+        }
         String volumeId = document.substring(0, separator);
         File volume = null;
         if (volumeId.equalsIgnoreCase("primary")) {
             volume = Environment.getExternalStorageDirectory();
-        } else if (Build.VERSION.SDK_INT >= 30) {
+        } else if (Build.VERSION.SDK_INT >= 30 && storage != null) {
             for (StorageVolume candidate : storage.getStorageVolumes()) {
                 if (volumeId.equalsIgnoreCase(candidate.getUuid())) {
                     volume = candidate.getDirectory();
@@ -407,13 +440,78 @@ final class GameLibrary {
                 }
             }
         }
-        if (volume == null) throw new IOException("游戏所在存储卷不可用");
-        File root = volume.getCanonicalFile();
-        File directory = new File(root, document.substring(separator + 1)).getCanonicalFile();
-        if (!directory.toPath().startsWith(root.toPath()) || !directory.isDirectory() || !directory.canRead()) {
-            throw new IOException("无法读取游戏目录，请检查文件权限或重新选择游戏文件夹");
+        if (volume == null) {
+            throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "volume-not-found", null, null);
         }
-        return directory;
+        File path = new File(volume, document.substring(separator + 1));
+        try {
+            if (!hasStorageAccess()) {
+                throw new DirectoryFailure(DirectoryStatus.DENIED, "storage-permission", path, null);
+            }
+            String state = Environment.getExternalStorageState(volume);
+            if (!Environment.MEDIA_MOUNTED.equals(state) && !Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
+                throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "volume-state:" + state, path, null);
+            }
+            File root = volume.getCanonicalFile();
+            File directory = path.getCanonicalFile();
+            if (!directory.toPath().startsWith(root.toPath())) {
+                throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "outside-volume", directory, null);
+            }
+            return checkedDirectory(directory, root);
+        } catch (DirectoryFailure error) {
+            throw error;
+        } catch (SecurityException error) {
+            throw new DirectoryFailure(DirectoryStatus.DENIED, "resolve-directory", path, error);
+        } catch (IOException error) {
+            throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "resolve-directory", path, error);
+        }
+    }
+
+    private File checkedDirectory(File directory, File volume) throws DirectoryFailure {
+        String path = directory.getAbsolutePath();
+        String stage = "stat-directory";
+        try {
+            if (!OsConstants.S_ISDIR(Os.stat(path).st_mode)) {
+                throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "not-a-directory", directory, null);
+            }
+            stage = "read-directory";
+            if (!Os.access(path, OsConstants.R_OK | OsConstants.X_OK)) {
+                throw new DirectoryFailure(DirectoryStatus.DENIED, stage, directory, null);
+            }
+            return directory;
+        } catch (ErrnoException error) {
+            DirectoryStatus status = DirectoryStatus.UNAVAILABLE;
+            if (error.errno == OsConstants.EACCES || error.errno == OsConstants.EPERM) {
+                status = DirectoryStatus.DENIED;
+            } else if (error.errno == OsConstants.ENOENT) {
+                status = absenceStatus(directory, volume);
+            }
+            throw new DirectoryFailure(status, stage, directory, error);
+        } catch (SecurityException error) {
+            throw new DirectoryFailure(DirectoryStatus.DENIED, stage, directory, error);
+        }
+    }
+
+    private DirectoryStatus absenceStatus(File directory, File volume) {
+        if (volume == null) return DirectoryStatus.MISSING;
+        try {
+            if (!Os.access(volume.getAbsolutePath(), OsConstants.R_OK | OsConstants.X_OK)) {
+                return DirectoryStatus.UNAVAILABLE;
+            }
+        } catch (ErrnoException | SecurityException error) {
+            return DirectoryStatus.UNAVAILABLE;
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            String relative = volume.toPath().relativize(directory.toPath()).toString().toLowerCase(Locale.ROOT);
+            for (String restricted : new String[] {"android/data", "android/obb"}) {
+                if (relative.equals(restricted)) return DirectoryStatus.DENIED;
+                if (relative.startsWith(restricted + "/")) {
+                    String own = restricted + "/" + context.getPackageName().toLowerCase(Locale.ROOT);
+                    if (!relative.equals(own) && !relative.startsWith(own + "/")) return DirectoryStatus.DENIED;
+                }
+            }
+        }
+        return DirectoryStatus.MISSING;
     }
 
     Uri lastFolder() {

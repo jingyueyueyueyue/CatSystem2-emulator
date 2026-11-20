@@ -911,7 +911,12 @@ fn parse_hg3(data: &[u8]) -> Result<HgFile, HgError> {
 
             if next == 0 {
                 let padding = data.get(tag_end..frame_end).ok_or(HgError::InvalidFrame)?;
-                if padding.len() > 7 || padding.iter().any(|&byte| byte != 0) {
+                let padded_control_tag = padding.len() == 9
+                    && offset_next != 0
+                    && tag_name == b"cptype"
+                    && frame_end.is_multiple_of(8);
+                if (padding.len() > 7 && !padded_control_tag) || padding.iter().any(|&byte| byte != 0)
+                {
                     return Err(HgError::InvalidFrame);
                 }
                 break;

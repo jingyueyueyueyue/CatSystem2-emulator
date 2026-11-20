@@ -367,6 +367,10 @@ impl OrdinaryNativeServices {
         self.preloads.cached(name)
     }
 
+    pub(super) fn cached_resource_with_source(&self, name: &str) -> Option<&super::resource_preload::SourcedResource> {
+        self.preloads.cached_with_source(name)
+    }
+
     fn allocate(&self, next_handle: &mut u32) -> Result<u32> {
         if self.sequences.len().saturating_add(self.image_data.len())
             .saturating_add(self.pair_tables.len()) >= 1_000_000 {

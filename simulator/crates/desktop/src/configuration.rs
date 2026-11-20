@@ -6,8 +6,125 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use cs2_formats::ConfigXml;
 use cs2_runtime::configuration::ConfigurationDocument;
-use cs2_script::NativeReturn;
+use cs2_script::{NativeReturn, Vm};
+use super::particle_external::CAMPANELLA_SHA;
 use super::{DesktopSoundConfig, DesktopSoundPart, HeadlessPlayer, LoggingHost, LogicEvent, native_state_error, xml_integer};
+
+pub(super) const CAMPANELLA_BOOT_PATH: &[&[u8]] = &[b"document", b"sysstr", b"boot"];
+const CAMPANELLA_ADV_SHA256: &str = "5e55b26f8c9637054486a3fe303e25f863a29ae5deda96554e2dc9517e320b22";
+const CAMPANELLA_CONFIG_LENGTHS: [usize; 4] = [0xb28, 0x20, 0x1c, 0x0c];
+
+fn campanella_sound_block(modern: &[u8]) -> cs2_script::Result<[u8; 0xb28]> {
+    let raw_volumes = modern.get(0x15d4..0x15e8)
+        .ok_or_else(|| native_state_error("Campanella sound configuration source is truncated"))?;
+    let mut legacy = [0; 0xb28];
+    legacy[..20].copy_from_slice(&modern[..20]);
+    for channel in 0..32 {
+        let source = 20 + 116 * channel;
+        let target = 20 + 0x58 * channel;
+        legacy[target..target + 40].copy_from_slice(&modern[source..source + 40]);
+        let head = &modern[source + 40..source + 80];
+        let mut length = 0;
+        while length < 15 && head[length] != 0 {
+            let width = if matches!(head[length], 0x81..=0x9f | 0xe0..=0xfc) { 2 } else { 1 };
+            if length + width > 15 { break; }
+            length += width;
+        }
+        legacy[target + 40..target + 40 + length].copy_from_slice(&head[..length]);
+        legacy[target + 56..target + 0x58].copy_from_slice(&modern[source + 84..source + 116]);
+    }
+    legacy[0xb14..].copy_from_slice(raw_volumes);
+    Ok(legacy)
+}
+
+fn write_campanella_configuration(
+    blocks: &[Vec<u8>; 4], addresses: [u32; 4], vm: &mut Vm,
+) -> cs2_script::Result<()> {
+    let sound = campanella_sound_block(&blocks[0])?;
+    for (index, address) in addresses.into_iter().enumerate() {
+        let block = if index == 0 { sound.as_slice() } else { &blocks[index] };
+        if vm.read(address, 1).is_ok() {
+            let bytes = block.get(..CAMPANELLA_CONFIG_LENGTHS[index])
+                .ok_or_else(|| native_state_error("Campanella configuration source is truncated"))?;
+            vm.write(address, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn campanella_native359_preserves_motion_slots_and_copy_order() {
+    let blocks = [vec![0x11; 5628], vec![0x22; 72], vec![0x33; 32], vec![0x44; 12]];
+    let mut vm = Vm::new();
+    vm.bind_external(vec![0xa5; 0x16a0]).unwrap();
+    vm.write(0x8000_0e44, &0x15c_u32.to_le_bytes()).unwrap();
+    vm.write(0x8000_1168, &0x15f_u32.to_le_bytes()).unwrap();
+    let untouched = vm.read(0x8000_0bc8, 0x16a0 - 0xbc8).unwrap();
+
+    write_campanella_configuration(&blocks, [0x8000_0098, 0x8000_0b80, 0x8000_0ba0, 0x8000_0bbc], &mut vm).unwrap();
+
+    assert_eq!(vm.read(0x8000_0097, 2).unwrap(), [0xa5, 0x11]);
+    assert_eq!(vm.read(0x8000_0b80, 0x20).unwrap(), [0x22; 0x20]);
+    assert_eq!(vm.read(0x8000_0ba0, 0x1c).unwrap(), [0x33; 0x1c]);
+    assert_eq!(vm.read(0x8000_0bbc, 0x0c).unwrap(), [0x44; 0x0c]);
+    assert_eq!(vm.read(0x8000_0bc8, untouched.len()).unwrap(), untouched);
+}
+
+#[cfg(test)]
+#[test]
+fn campanella_native359_maps_sound_fields_to_legacy_offsets() {
+    let mut modern = vec![0; 5628];
+    modern[..20].fill(0x12);
+    let channel = 20 + 116 * 31;
+    modern[channel..channel + 40].fill(0x34);
+    modern[channel + 40..channel + 54].fill(b'a');
+    modern[channel + 54..channel + 56].copy_from_slice(&[0x82, 0xa0]);
+    modern[channel + 80..channel + 84].fill(0x56);
+    modern[channel + 84..channel + 116].fill(0x78);
+    modern[0x15d4..0x15e8].fill(0x9a);
+    modern[0x15e8..].fill(0xbc);
+
+    let legacy = campanella_sound_block(&modern).unwrap();
+    let channel = 20 + 0x58 * 31;
+    assert_eq!(&legacy[..20], &[0x12; 20]);
+    assert_eq!(&legacy[channel..channel + 40], &[0x34; 40]);
+    assert_eq!(&legacy[channel + 40..channel + 54], &[b'a'; 14]);
+    assert_eq!(&legacy[channel + 54..channel + 56], &[0; 2]);
+    assert_eq!(&legacy[channel + 56..channel + 0x58], &[0x78; 32]);
+    assert_eq!(&legacy[0xb14..], &[0x9a; 20]);
+}
+
+pub(super) fn campanella_boot_first_path(
+    pe_sha: Option<&str>,
+    name: &str,
+    member_sha256: impl FnOnce() -> String,
+) -> Option<&'static [&'static [u8]]> {
+    (pe_sha == Some(CAMPANELLA_SHA)
+        && name.eq_ignore_ascii_case("config.int/adv.xml")
+        && member_sha256() == CAMPANELLA_ADV_SHA256)
+        .then_some(CAMPANELLA_BOOT_PATH)
+}
+
+#[cfg(test)]
+#[test]
+fn campanella_boot_first_path_checks_game_and_member_identity() {
+    let adv = "config.int/adv.xml";
+    let verified = || CAMPANELLA_ADV_SHA256.to_owned();
+    assert_eq!(
+        campanella_boot_first_path(Some(CAMPANELLA_SHA), adv, verified),
+        Some(CAMPANELLA_BOOT_PATH)
+    );
+    assert_eq!(campanella_boot_first_path(None, adv, || panic!("unexpected hash")), None);
+    assert_eq!(
+        campanella_boot_first_path(Some(CAMPANELLA_SHA), "adv.xml", || panic!("unexpected hash")),
+        None
+    );
+    assert_eq!(
+        campanella_boot_first_path(Some(CAMPANELLA_SHA), adv, || "changed".to_owned()),
+        None
+    );
+}
 
 // Public serialized field identities and initial values, not renderer feature
 // claims. Actual device application stays with the corresponding host.
@@ -91,6 +208,23 @@ impl ConfigurationState {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn campanella_configuration_export(
+        &mut self, arguments: &[u8], vm: &mut Vm,
+    ) -> cs2_script::Result<NativeReturn> {
+        self.ensure_legacy_sound_settings()?;
+        let mut addresses = [0; 4];
+        for (index, address) in addresses.iter_mut().enumerate() {
+            *address = super::read_u32(arguments, index * 4)?;
+        }
+        write_campanella_configuration(self.system_config_blocks, addresses, vm)?;
+        self.events.push(LogicEvent {
+            frame: self.frame,
+            kind: "campanella-config-export".into(),
+            detail: format!("native=359 addresses={addresses:#x?} lengths={CAMPANELLA_CONFIG_LENGTHS:#x?}"),
+        });
+        Ok(NativeReturn::Continue)
+    }
+
     pub(super) fn write_general_information(&mut self, bytes: &[u8]) {
         self.write_configuration_file(Path::new("info.txt"), bytes);
     }

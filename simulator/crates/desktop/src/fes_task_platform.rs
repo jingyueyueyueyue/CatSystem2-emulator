@@ -156,6 +156,7 @@ pub(super) struct Layer {
     pub(super) frame: RgbaFrame,
     pub(super) options: ImageDrawOptions,
     pub(super) priority: i32,
+    pub(super) affine: Option<super::list_native::AffinePlacement>,
 }
 
 #[derive(Clone, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -1470,14 +1471,7 @@ fn create_objects(
         object.definition.name == definition.name
             && object.definition.kind_name == definition.kind)
         .context("FES creation has no original declaration record")?;
-    let count = if definition.kind == b"BUTTON" {
-        driver.adapter.objects[declaration].definition.bank_count
-    } else { driver
-        .adapter
-        .object(&definition.name)
-        .context("FES definition lacks adapter metadata")?
-        .definition
-        .bank_count };
+    let count = driver.adapter.objects[declaration].definition.bank_count;
     let name = host.text_encoding.decode(&definition.name);
     for bank in 0..count {
         let identity = (view.id, definition.name.clone(), bank as i32);
@@ -1570,20 +1564,17 @@ fn initialize_objects(
     shared: &mut ExpressionState,
 ) -> Result<()> {
     let (raw_name, bank) = target(&init.target)?;
-    let count = driver
-        .adapter
-        .object(raw_name)
-        .context("FES initializer target has no definition")?
-        .definition
-        .bank_count;
     let banks: Vec<_> = if let Some(bank) = bank {
         let bank = driver.evaluate_parameter(bank, 0, shared)?;
-        if bank < 0 || bank as usize >= count {
+        if bank < 0 || driver.adapter.object_bank(raw_name, bank as usize).is_none() {
             return Ok(());
         }
         vec![bank]
     } else {
-        (0..count as i32).collect()
+        let Some(object) = driver.adapter.object(raw_name) else {
+            return Ok(());
+        };
+        (0..object.definition.bank_count as i32).collect()
     };
     let fields = init.columns.len().min(init.values.len());
     let identity = (view.id, init.offset);
@@ -1683,6 +1674,15 @@ fn initialize_objects(
                     1..=4 => { masks.insert((view.id, key.clone()), channel as u8); }
                     _ => bail!("FES MASK channel {channel} is outside 0..=4"),
                 }
+            }
+            b"BTYPE" if matches!(kind.as_slice(), b"IMAGE" | b"BUTTON" | b"CIMAGE") => {
+                let mode = driver.evaluate_parameter(value, 0, shared)?;
+                let layer = runtime.media.get_mut(&key)
+                    .context("BTYPE used on an absent image bank")?;
+                layer.source.btype = mode;
+            }
+            b"TYPE" if kind == b"IMAGE" => {
+                driver.evaluate_parameter(value, 0, shared)?;
             }
             b"IDN" if matches!(kind.as_slice(), b"IMAGE" | b"BUTTON") => {
                 let id = driver.evaluate_parameter(value, 0, shared)?;
@@ -1882,22 +1882,35 @@ pub(super) fn finish_task_media(
         } else { super::fes_media::source_image(host, layer)? };
         if view.paused == 0 && let Some(image) = image.as_ref() {
             if let Some(mut options) = runtime.driver_media_draw_options(name)? {
-                super::fes_media::source_draw_options(layer, image, &mut options);
                 if let Some(&channel) = host.data_services.tasks.fes.platform.image_masks
                     .get(&(view.id, name.clone())) {
                     options.blend_mode = cs2_renderer::BlendMode::list_alpha_mask(u32::from(channel))
                         .context("FES projection has an invalid MASK channel")?;
                 }
-                let (image, projected_options) = super::fes_motion::prepare_projection(
-                    host, view, runtime, name, image, options,
-                )?;
-                options = projected_options;
+                let (image, mut options, affine) = if layer.kind == "IMAGE" {
+                    let placement = super::fes_motion::image_list_placement(host, view, runtime, name, image)?;
+                    let [left, top] = super::list_native::entry_top_left(
+                        placement.position, placement.base, placement.offset,
+                    );
+                    options.position = Point::new(left, top);
+                    options.pivot = [0.; 2];
+                    options.scale_x = 1.;
+                    options.scale_y = 1.;
+                    options.rotation_radians = 0.;
+                    (image.clone(), options, (layer.source.coordmode != 0).then_some(placement))
+                } else {
+                    super::fes_media::source_draw_options(layer, image, &mut options);
+                    let (image, options) = super::fes_motion::prepare_projection(
+                        host, view, runtime, name, image, options,
+                    )?;
+                    (image, options, None)
+                };
                 super::fes_controls::apply_layer_clip(host.data_services, view.id, name, &mut options);
                 if let Some(plane) = &layer.plane {
                     super::fes_controls::apply_layer_clip(host.data_services, view.id, plane, &mut options);
                 }
                 replacement.push(((view.id, name.clone()), Layer {
-                    frame: image, options, priority: layer.priority,
+                    frame: image, options, priority: layer.priority, affine,
                 }));
             }
         }
@@ -1910,7 +1923,7 @@ pub(super) fn finish_task_media(
         replacement.push((
             (view.id, key),
             Layer { frame: projection.frame, options,
-                    priority: projection.priority },
+                    priority: projection.priority, affine: None },
         ));
     }
     let mut by_list: BTreeMap<u32, Vec<_>> = BTreeMap::new();
@@ -1922,6 +1935,7 @@ pub(super) fn finish_task_media(
             let key = projection.layer_key();
             by_list.entry(list).or_default().push(((view.id, key), Layer {
                 frame: projection.frame, options: projection.options, priority: projection.priority,
+                affine: None,
             }));
         }
     }
@@ -2157,6 +2171,7 @@ mod media_lifecycle_tests {
                 let view = FesTaskView { id, parent: 0, context: Vec::new(), list: None, now: 1, paused: 0 };
                 while let Some(effect) = driver.advance_initialization(&mut shared)? {
                     if !matches!(effect, FesDriverEffect::Yield) {
+                        super::super::fes_motion::observe(host, &view, &driver, &effect)?;
                         assert!(apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?);
                     }
                 }
@@ -2174,6 +2189,207 @@ mod media_lifecycle_tests {
         assert!(matches!(effect, FesDriverEffect::Command(_)), "{effect:?}");
         assert!(apply_effect(host, view, runtime, driver, &effect, shared)?);
         Ok(())
+    }
+
+    #[test]
+    fn fes_button_draw_does_not_evaluate_duration_or_change_layer() -> Result<()> {
+        with_script(b"BUTTON nameimg", &[
+            b"nameimg disp 1",
+            b"nameimg draw ($7+=1)",
+            b"nameimg disp 0",
+        ], |host, view, runtime, driver, shared| {
+            command(host, view, runtime, driver, shared)?;
+            let layer = runtime.media.get_mut("nameimg").context("button media missing")?;
+            layer.selected_id = 2;
+            let image = cs2_renderer::RgbaFrame::from_rgba8(1, 1, vec![10, 20, 30, 255])?;
+            super::super::fes_media::install_ordinary_frame(layer, image.clone());
+
+            command(host, view, runtime, driver, shared)?;
+            let layer = &runtime.media["nameimg"];
+            assert_eq!(shared.shared[7], 0);
+            assert!(layer.visible);
+            assert_eq!(layer.selected_id, 2);
+            assert_eq!(layer.image.as_ref(), Some(&image));
+            assert!(!super::super::fes_draw::has_owner(&host.data_services.fes_draw, view.id));
+            assert!(host.events.iter().any(|event| event.kind == "fes-media"
+                && event.detail.contains("command=draw action=ignored-by-button")));
+
+            command(host, view, runtime, driver, shared)?;
+            assert!(!runtime.media["nameimg"].visible);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_type_initializer_distinguishes_visual_image_and_button() -> Result<()> {
+        let initializer = |target: &[u8]| cs2_script::FesObjectInitialization {
+            offset: 100,
+            target: target.to_vec(),
+            columns: vec![b"TYPE".to_vec(), b"PL".to_vec()],
+            values: vec![b"7".to_vec(), b"pl[5]".to_vec()],
+        };
+        with_script(b"IMAGE btn_1i", &[], |host, view, runtime, driver, shared| {
+            initialize_objects(host, view, runtime, driver, &initializer(b"btn_1i"), shared)?;
+            let layer = &runtime.media["btn_1i"];
+            assert_eq!(layer.plane.as_deref(), Some("pl[5]"));
+            assert_eq!(layer.source.btype, 0);
+            let platform = &host.data_services.tasks.fes.platform;
+            let identity = (view.id, b"btn_1i".to_vec(), 0);
+            assert!(platform.objects[&identity].child.is_none());
+            assert!(!platform.button_properties.contains_key(&identity));
+            Ok(())
+        })?;
+        with_script(b"BUTTON btn1", &[], |host, view, runtime, driver, shared| {
+            initialize_objects(host, view, runtime, driver, &initializer(b"btn1"), shared)?;
+            let platform = &host.data_services.tasks.fes.platform;
+            let identity = (view.id, b"btn1".to_vec(), 0);
+            assert!(platform.objects[&identity].child.is_some());
+            assert_eq!(platform.button_properties[&identity].raw_type, 7);
+            assert_eq!(runtime.media["btn1"].plane.as_deref(), Some("pl[5]"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_btype_initializer_is_bank_local_and_projects_crop_once() -> Result<()> {
+        with_script(b"IMAGE logo[2]", &[], |host, view, runtime, driver, shared| {
+            let list = host.create_task_object(15, view.parent, b"BTYPE list", b"")?;
+            host.initialize_fes_image_list(list, 12, 8)?;
+            let mut view = view.clone();
+            view.list = Some(query_list(host, list)?);
+
+            let initializer = |offset, mode: &[u8]| cs2_script::FesObjectInitialization {
+                offset,
+                target: b"logo[1]".to_vec(),
+                columns: vec![b"BTYPE".to_vec()],
+                values: vec![mode.to_vec()],
+            };
+            initialize_objects(host, &view, runtime, driver, &initializer(100, b"1"), shared)?;
+            assert_eq!(runtime.media["logo[0]"].source.btype, 0);
+            assert_eq!(runtime.media["logo[1]"].source.btype, 1);
+
+            let frame = RgbaFrame::from_rgba8(1, 1, vec![10, 20, 30, 255])?;
+            let mut metadata = frame.metadata();
+            metadata.offset = [3, 2];
+            metadata.base = [2, 1];
+            metadata.canvas_size = [12, 8];
+            let frame = frame.with_raw_metadata(metadata);
+            let layer = runtime.media.get_mut("logo[1]").unwrap();
+            layer.visible = true;
+            layer.position = Point::new(4, 3);
+            super::super::fes_media::install_ordinary_frame(layer, frame.clone());
+
+            let pixel = |host: &LoggingHost<'_>, x, y| {
+                let output = host.data_services.tasks.fes.platform.lists[&list].output;
+                host.image_handles[&output].pixel(x, y)
+            };
+            let color = Color::rgba(10, 20, 30, 255);
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 5, 4)?, color);
+            assert_eq!(pixel(host, 7, 5)?, Color::TRANSPARENT);
+            assert_eq!(pixel(host, 8, 6)?, Color::TRANSPARENT);
+
+            initialize_objects(host, &view, runtime, driver, &initializer(110, b"0"), shared)?;
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 5, 4)?, color);
+            assert_eq!(runtime.media["logo[1]"].image.as_ref().unwrap().metadata(), metadata);
+
+            let layer = runtime.media.get_mut("logo[1]").unwrap();
+            super::super::fes_media::install_ordinary_frame(layer, frame);
+            assert_eq!((layer.image_offset, layer.image_base), ([2, 1], [-1, -1]));
+            let installed = layer.image.as_ref().unwrap().metadata();
+            assert_eq!((installed.offset, installed.canvas_size), ([0, 0], [1, 1]));
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 5, 4)?, Color::TRANSPARENT);
+            assert_eq!(pixel(host, 7, 5)?, color);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_image_coordmode_changes_clipped_list_pixels() -> Result<()> {
+        use cs2_runtime::object_graph::{decode_component, encode_component};
+
+        with_script(b"IMAGE help[12]", &[
+            b"help disp 0",
+            b"help coordmode 1",
+            b"help[-1] coordmode ($7+=1)",
+            b"help[3] coordmode",
+            b"help[3] disp 1",
+            b"help[3] coordmode 1",
+            b"help[3] coordmode -2",
+            b"help[3] coordmode",
+            b"help[3] disp 0",
+        ], |host, view, runtime, driver, shared| {
+            let list = host.create_task_object(15, view.parent, b"coordmode list", b"")?;
+            host.initialize_fes_image_list(list, 8, 6)?;
+            let mut view = view.clone();
+            view.list = Some(query_list(host, list)?);
+            let modes = |runtime: &FesRuntime| {
+                (0..12).map(|bank| runtime.media[&format!("help[{bank}]")].source.coordmode)
+                    .collect::<Vec<_>>()
+            };
+            let pixel = |host: &LoggingHost<'_>, x, y| {
+                let output = host.data_services.tasks.fes.platform.lists[&list].output;
+                host.image_handles[&output].pixel(x, y)
+            };
+
+            let first = Color::rgba(10, 20, 30, 255);
+            let second = Color::rgba(110, 20, 30, 255);
+            let frame = RgbaFrame::from_rgba8(3, 1, vec![10, 20, 30, 255, 110, 20, 30, 255, 210, 20, 30, 255])?;
+            let mut metadata = frame.metadata();
+            metadata.base = [2, 1];
+            metadata.offset = [1, 0];
+            let layer = runtime.media.get_mut("help[3]").unwrap();
+            layer.position = Point::new(3, 2);
+            layer.clip = Some(Rect::new(4, 2, 2, 1));
+            let mut words = [0; 36];
+            words[6..8].copy_from_slice(&[3.5f32.to_bits(), 2f32.to_bits()]);
+            words[25..27].fill(1f32.to_bits());
+            layer.motion = Some(words);
+            super::super::fes_media::install_ordinary_frame(layer, frame.with_raw_metadata(metadata));
+
+            assert_eq!(modes(runtime), [0; 12]);
+            command(host, &view, runtime, driver, shared)?;
+            command(host, &view, runtime, driver, shared)?;
+            assert_eq!(modes(runtime), [1; 12]);
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 5, 2)?, Color::TRANSPARENT);
+
+            shared.shared[7] = -3;
+            command(host, &view, runtime, driver, shared)?;
+            assert_eq!(shared.shared[7], -2);
+            assert_eq!(modes(runtime), [-2; 12]);
+            let restored: super::super::fes_media::ImageSourceState =
+                decode_component(&encode_component(&runtime.media["help[3]"].source)?)?;
+            assert_eq!(restored.coordmode, -2);
+            command(host, &view, runtime, driver, shared)?;
+            let mut expected = [-2; 12];
+            expected[3] = 0;
+            assert_eq!(modes(runtime), expected);
+
+            command(host, &view, runtime, driver, shared)?;
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 4, 2)?, first);
+            assert_eq!(pixel(host, 5, 2)?, second);
+            assert_eq!(pixel(host, 6, 2)?, Color::TRANSPARENT);
+
+            for _ in 0..2 {
+                command(host, &view, runtime, driver, shared)?;
+                assert!(finish_task_media(host, &view, runtime, driver)?);
+                assert_eq!(pixel(host, 4, 2)?, Color::TRANSPARENT);
+                assert_eq!(pixel(host, 5, 2)?, Color::rgba(59, 20, 30, 255));
+                assert_eq!(pixel(host, 6, 2)?, Color::TRANSPARENT);
+            }
+            command(host, &view, runtime, driver, shared)?;
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 4, 2)?, first);
+            assert_eq!(pixel(host, 5, 2)?, second);
+            command(host, &view, runtime, driver, shared)?;
+            assert!(finish_task_media(host, &view, runtime, driver)?);
+            assert_eq!(pixel(host, 5, 2)?, Color::TRANSPARENT);
+            Ok(())
+        })
     }
 
     #[test]
@@ -2240,6 +2456,73 @@ mod media_lifecycle_tests {
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn fes_initializer_skips_undefined_objects_and_keeps_valid_rows() -> Result<()> {
+        with_script(b"IMAGE logo", &[], |host, view, runtime, driver, shared| {
+            assert!(!runtime.media["logo"].visible);
+            for (offset, name) in [
+                (100, b"trial".as_slice()),
+                (110, b"trial[0]".as_slice()),
+                (120, b"logo".as_slice()),
+            ] {
+                let initializer = cs2_script::FesObjectInitialization {
+                    offset,
+                    target: name.to_vec(),
+                    columns: vec![b"DISP".to_vec()],
+                    values: vec![b"1".to_vec()],
+                };
+                initialize_objects(host, view, runtime, driver, &initializer, shared)?;
+            }
+            assert_eq!(runtime.media.len(), 1);
+            assert!(runtime.media["logo"].visible);
+            assert!(driver.adapter.object(b"trial").is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_redeclaration_initializes_new_plane_banks() -> Result<()> {
+        with_script(b"PLANE pl[4]", &[b"pl[5] disp 1"], |host, view, runtime, driver, shared| {
+            let original_children: Vec<_> = (0..4).map(|bank| {
+                host.data_services.tasks.fes.platform.objects[&(view.id, b"pl".to_vec(), bank)].child
+            }).collect();
+            let event = FesEvent::CreateObject(cs2_script::FesObjectDefinition {
+                offset: 100,
+                kind: b"PLANE".to_vec(),
+                name: b"pl".to_vec(),
+                bank_expression: Some(b"6".to_vec()),
+                banks: 6,
+            });
+            let dispatch = driver.adapter.dispatch(event.clone())?;
+            let effect = FesDriverEffect::Initialize { event, dispatch };
+            super::super::fes_motion::observe(host, view, driver, &effect)?;
+            assert!(apply_effect(host, view, runtime, driver, &effect, shared)?);
+
+            for (bank, original_child) in original_children.into_iter().enumerate() {
+                let identity = (view.id, b"pl".to_vec(), bank as i32);
+                assert_eq!(host.data_services.tasks.fes.platform.objects[&identity].child, original_child);
+            }
+            assert_eq!(runtime.planes.len(), 6);
+
+            let event = FesEvent::InitializeObject(cs2_script::FesObjectInitialization {
+                offset: 110,
+                target: b"pl[5]".to_vec(),
+                columns: vec![b"POS".to_vec(), b"SIZE".to_vec(), b"VRAM".to_vec()],
+                values: vec![b"10,20".to_vec(), b"1024,576".to_vec(), b"1536,1704".to_vec()],
+            });
+            let dispatch = driver.adapter.dispatch(event.clone())?;
+            let effect = FesDriverEffect::Initialize { event, dispatch };
+            assert!(apply_effect(host, view, runtime, driver, &effect, shared)?);
+            command(host, view, runtime, driver, shared)?;
+            let plane = &runtime.planes["pl[5]"];
+            assert_eq!(plane.position, Point::new(10, 20));
+            assert_eq!(plane.size, [1024, 576]);
+            assert_eq!(plane.vram, [1536, 1704]);
+            assert!(plane.visible);
+            Ok(())
+        })
     }
 
     #[test]

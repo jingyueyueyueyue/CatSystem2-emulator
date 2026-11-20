@@ -30,8 +30,16 @@ use cs2_runtime::message_object::{
 use cs2_script::{Result, ScriptError};
 
 use super::message_native::{decode_inline_image, decode_user_glyph, scale_user_glyph};
+use super::text::{FontOrigin, LoadedFont};
 
 const MAX_SURFACE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(any(windows, target_os = "android"))]
+fn is_east_asian_message_character(character: char) -> bool {
+    matches!(character as u32,
+        0x2e80..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff | 0xfe30..=0xffef
+            | 0x20000..=0x2ffff | 0x30000..=0x323af)
+}
 const MAX_DEVICE_BYTES: usize = 256 * 1024 * 1024;
 const GLYPH_SIDE: usize = 128;
 
@@ -80,7 +88,7 @@ fn message_surface_error(width: u32, height: u32, error: RendererError) -> Scrip
 
 #[derive(Debug)]
 pub(super) struct DesktopMessageDevice {
-    fonts: Vec<FontRasterizer>,
+    fonts: Arc<[LoadedFont]>,
     /// SFNT aliases share one lazy face. System font paths are retained instead
     /// of eagerly decoding/copying every installed font into every alias.
     named_fonts: BTreeMap<String, Vec<Arc<NamedFace>>>,
@@ -89,6 +97,7 @@ pub(super) struct DesktopMessageDevice {
     platform_substitutions: RefCell<BTreeSet<MessageFontSubstitution>>,
     fonts_loaded: bool,
     surfaces: BTreeMap<i32, MessageSurface>,
+    pixel_less_message: Option<i32>,
     pub(super) time_scale: Option<u32>,
     pub(super) drawing_enabled: bool,
     pub(super) settings_loaded: bool,
@@ -150,21 +159,24 @@ struct NamedFace {
     cjk: bool,
     serif: bool,
     monospace: bool,
-    font: OnceLock<Option<FontRasterizer>>,
+    font: OnceLock<Option<Arc<FontRasterizer>>>,
     control_font: OnceLock<Option<fontdue::Font>>,
 }
 
 impl NamedFace {
     fn get(&self) -> Option<&FontRasterizer> {
         self.font
-            .get_or_init(|| match self.source.as_ref() {
-                FontSource::Bytes(bytes) => FontRasterizer::from_bytes(bytes, self.index).ok(),
-                FontSource::File(path) => {
-                    let bytes = std::fs::read(path).ok()?;
-                    FontRasterizer::from_bytes(&bytes, self.index).ok()
-                }
+            .get_or_init(|| {
+                let font = match self.source.as_ref() {
+                    FontSource::Bytes(bytes) => FontRasterizer::from_bytes(bytes, self.index).ok()?,
+                    FontSource::File(path) => {
+                        let bytes = std::fs::read(path).ok()?;
+                        FontRasterizer::from_bytes(&bytes, self.index).ok()?
+                    }
+                };
+                Some(Arc::new(font))
             })
-            .as_ref()
+            .as_deref()
     }
 
     fn control_font(&self) -> Option<&fontdue::Font> {
@@ -191,13 +203,14 @@ impl NamedFace {
 impl Default for DesktopMessageDevice {
     fn default() -> Self {
         Self {
-            fonts: Vec::new(),
+            fonts: Arc::default(),
             named_fonts: BTreeMap::new(),
             resource_font_files: BTreeMap::new(),
             fallback_faces: Vec::new(),
             platform_substitutions: RefCell::new(BTreeSet::new()),
             fonts_loaded: false,
             surfaces: BTreeMap::new(),
+            pixel_less_message: None,
             time_scale: None,
             drawing_enabled: true,
             settings_loaded: false,
@@ -277,7 +290,13 @@ impl DesktopMessageDevice {
 
     pub(super) fn load_fonts(&mut self, resources: &ResourceIndex) {
         if !self.fonts_loaded {
-            self.fonts = super::load_font(resources);
+            self.initialize_fonts(resources, super::load_font(resources).into());
+        }
+    }
+
+    pub(super) fn initialize_fonts(&mut self, resources: &ResourceIndex, fonts: Arc<[LoadedFont]>) {
+        if !self.fonts_loaded {
+            self.fonts = fonts;
             self.load_font_names(resources);
             self.load_game_font_files(resources);
             self.fonts_loaded = true;
@@ -290,7 +309,7 @@ impl DesktopMessageDevice {
         let font = FontRasterizer::from_bytes(bytes, face)
             .map_err(|_| invalid("message named font could not be decoded"))?;
         let cached = OnceLock::new();
-        let _ = cached.set(Some(font));
+        let _ = cached.set(Some(Arc::new(font)));
         let offset = if bytes.starts_with(b"ttcf") {
             be32(bytes, 12 + face as usize * 4).unwrap_or(0) as usize
         } else {
@@ -433,8 +452,9 @@ impl DesktopMessageDevice {
             .collect();
         for name in names {
             if let Ok(bytes) = super::read_entry_with_fallback(resources, &name) {
-                let source = Arc::new(FontSource::Bytes(Arc::new(bytes.clone())));
-                self.register_sfnt(&bytes, source);
+                let bytes = Arc::new(bytes);
+                let source = Arc::new(FontSource::Bytes(Arc::clone(&bytes)));
+                self.register_sfnt(&bytes, source, &FontOrigin::Resource(name));
             }
         }
         #[cfg(windows)]
@@ -466,7 +486,7 @@ impl DesktopMessageDevice {
                             })
                         {
                             if let Ok(bytes) = std::fs::read(&path) {
-                                self.register_sfnt(&bytes, Arc::new(FontSource::File(path)));
+                                self.register_system_sfnt(&bytes, path);
                             }
                         }
                     }
@@ -479,13 +499,19 @@ impl DesktopMessageDevice {
             // but register every SFNT collection member and style lazily.
             for path in super::text::android_font_paths() {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    self.register_sfnt(&bytes, Arc::new(FontSource::File(path)));
+                    self.register_system_sfnt(&bytes, path);
                 }
             }
         }
     }
 
-    fn register_sfnt(&mut self, bytes: &[u8], source: Arc<FontSource>) {
+    #[cfg(any(windows, target_os = "android"))]
+    fn register_system_sfnt(&mut self, bytes: &[u8], path: PathBuf) {
+        let origin = FontOrigin::System(path.clone());
+        self.register_sfnt(bytes, Arc::new(FontSource::File(path)), &origin);
+    }
+
+    fn register_sfnt(&mut self, bytes: &[u8], source: Arc<FontSource>, origin: &FontOrigin) {
         if bytes.len() > MAX_SURFACE_BYTES {
             return;
         }
@@ -523,6 +549,9 @@ impl DesktopMessageDevice {
                     || name.contains("serifsc")
                     || name.contains("sanstc")
                     || name.contains("seriftc")
+                    || name.contains("microsoft yahei")
+                    || name.contains("simsun")
+                    || name.contains("simhei")
                     || name.contains("droidsansfallback")
             });
             let serif = sfnt_serif(bytes, offset)
@@ -532,6 +561,12 @@ impl DesktopMessageDevice {
                         || name.contains("明朝")
                         || name.contains("serif") && !name.contains("sans")
                 });
+            let cached = OnceLock::new();
+            if let Some(loaded) = self.fonts.iter().find(|loaded| {
+                loaded.origin.as_ref() == origin && loaded.index == face
+            }) {
+                let _ = cached.set(Some(Arc::clone(&loaded.rasterizer)));
+            }
             let font = Arc::new(NamedFace {
                 source: source.clone(),
                 index: face,
@@ -543,7 +578,7 @@ impl DesktopMessageDevice {
                 cjk,
                 serif,
                 monospace: sfnt_monospace(bytes, offset),
-                font: OnceLock::new(),
+                font: cached,
                 control_font: OnceLock::new(),
             });
             self.fallback_faces.push(font.clone());
@@ -677,6 +712,18 @@ impl DesktopMessageDevice {
         self.surfaces.remove(&id);
     }
 
+    pub(super) fn without_message_pixels<T>(
+        &mut self,
+        id: i32,
+        update: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = self.pixel_less_message.replace(id);
+        self.release(id);
+        let result = update(self);
+        self.pixel_less_message = previous;
+        result
+    }
+
     /// Clear/recreate also affect inactive objects, so frame/render integration
     /// must synchronize every retained object, not only active playback.
     pub(super) fn sync_object(&mut self, object: &MessageObject) -> Result<()> {
@@ -684,7 +731,15 @@ impl DesktopMessageDevice {
             self.release(object.id());
             return Ok(());
         };
-        self.ensure_surface(object, configuration)
+        self.ensure_surface(object, configuration)?;
+        #[cfg(not(target_os = "android"))]
+        if object.active() && object.reveal_trace_enabled() && !object.source().is_empty() {
+            eprintln!(
+                "message-reveal sync id={} gen={} playback={}",
+                object.id(), object.surface_generation(), object.playback_time(),
+            );
+        }
+        Ok(())
     }
 
     fn ensure_surface(
@@ -856,10 +911,11 @@ impl DesktopMessageDevice {
                 .fonts
                 .iter()
                 .filter(|_| self.fallback_faces.is_empty())
+                .map(|face| face.rasterizer.as_ref())
                 .find(|font| font.has_character(character))
                 .map(|font| (font, false, false))
-                .ok_or_else(|| {
-                    invalid("no available message font contains the requested character")
+                .ok_or_else(|| ScriptError::HostCallFailed {
+                    message: format!("no available message font covers U+{:04X} for the default family", character as u32),
                 });
         }
         let name = String::from_utf16(&units)
@@ -882,18 +938,18 @@ impl DesktopMessageDevice {
                 return Ok((font, face.weight == 700, face.italic));
             }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(windows, target_os = "android"))]
         {
-            return self.android_substitute(&units, configuration, character, bold, italic);
+            return self.platform_substitute(&units, configuration, character, bold, italic);
         }
-        #[cfg(not(target_os = "android"))]
-        Err(invalid(
-            "no configured message font contains the requested character",
-        ))
+        #[cfg(not(any(windows, target_os = "android")))]
+        Err(ScriptError::HostCallFailed {
+            message: format!("no configured message font covers U+{:04X} for {name:?}", character as u32),
+        })
     }
 
-    #[cfg(target_os = "android")]
-    fn android_substitute(
+    #[cfg(any(windows, target_os = "android"))]
+    fn platform_substitute(
         &self,
         requested: &[u16],
         configuration: &MessageConfiguration,
@@ -908,8 +964,7 @@ impl DesktopMessageDevice {
         let mono = requested_name.contains("mono")
             || requested_name.contains("ＭＳ ゴシック".to_lowercase().as_str())
             || requested_name == "ms gothic";
-        let cjk = matches!(character as u32,
-            0x2e80..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff | 0xfe30..=0xffef);
+        let cjk = is_east_asian_message_character(character);
         let japanese = configuration.glyph_parameter() as u8 == 128
             || requested_name.contains("gothic")
             || requested_name.contains("mincho")
@@ -961,9 +1016,9 @@ impl DesktopMessageDevice {
             }
             return Ok((font, face.weight == 700, face.italic));
         }
-        Err(invalid(
-            "Android has no real font face covering the requested message character",
-        ))
+        Err(ScriptError::HostCallFailed {
+            message: format!("no real message font covers U+{:04X} for {requested_name:?}", character as u32),
+        })
     }
 
     fn measure(
@@ -1018,7 +1073,7 @@ impl DesktopMessageDevice {
                 .find(|face| {
                     face.font
                         .get()
-                        .and_then(Option::as_ref)
+                        .and_then(Option::as_deref)
                         .is_some_and(|loaded| std::ptr::eq(loaded, font))
                 })
                 .ok_or_else(|| invalid("inline image selected font has no retained SFNT source"))?;
@@ -1294,6 +1349,16 @@ impl MessageBackend for DesktopMessageDevice {
     }
 
     fn paint(&mut self, request: MessageRenderRequest<'_>) -> Result<MessagePaintResult> {
+        if self.pixel_less_message == Some(request.object.id())
+            && request.configuration.size() == [0, 0]
+            && request.reveal_phase.is_none()
+        {
+            return Ok(MessagePaintResult {
+                prepared: request.prepare.to_vec(),
+                completed: request.process.to_vec(),
+                ..MessagePaintResult::default()
+            });
+        }
         self.ensure_surface(request.object, request.configuration)?;
         let id = request.object.id();
         // Taking the surface out avoids self-referential mutable/immutable
@@ -1406,6 +1471,13 @@ impl DesktopMessageDevice {
                 }
             }
         }
+        #[cfg(not(target_os = "android"))]
+        let trace = request.object.reveal_trace_enabled()
+            && (!request.process.is_empty() || surface.dirty.is_some());
+        #[cfg(not(target_os = "android"))]
+        let trace_dirty = trace.then_some(surface.dirty).flatten();
+        #[cfg(not(target_os = "android"))]
+        let changed = trace_dirty.map(|rect| differing_message_pixels(surface, rect));
         match request.copy {
             MessageCopy::None => {}
             MessageCopy::Full => {
@@ -1422,8 +1494,32 @@ impl DesktopMessageDevice {
                 }
             }
         }
+        #[cfg(not(target_os = "android"))]
+        if trace {
+            eprintln!(
+                "message-reveal paint id={} gen={} copy={:?} prepared={} completed={} dirty={:?} changed={:?} copied_dirty={} failure={:?}",
+                request.object.id(), request.surface_generation, request.copy, result.prepared.len(),
+                result.completed.len(), trace_dirty, changed, result.copied_dirty, result.failure,
+            );
+        }
         Ok(result)
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn differing_message_pixels(surface: &MessageSurface, rect: Rect) -> usize {
+    let width = surface.visible.width() as usize;
+    (rect.y as usize..rect.y as usize + rect.height as usize)
+        .map(|row| {
+            let start = (row * width + rect.x as usize) * 4;
+            let end = start + rect.width as usize * 4;
+            surface.visible.pixels()[start..end]
+                .chunks_exact(4)
+                .zip(surface.submitted.pixels()[start..end].chunks_exact(4))
+                .filter(|(visible, submitted)| visible != submitted)
+                .count()
+        })
+        .sum()
 }
 
 fn paint_failure(error: ScriptError) -> MessagePaintFailure {
@@ -2179,6 +2275,92 @@ mod game_font_tests {
         let mut bytes = defaults.configuration(encoding).unwrap().bytes().to_vec();
         bytes[0x118..0x11c].copy_from_slice(&backend.to_le_bytes());
         MessageConfiguration::from_bytes(&bytes, encoding).unwrap()
+    }
+
+    #[test]
+    fn message_reveal_submits_new_pixels_only_when_enabled() {
+        use cs2_runtime::message_object::MessagePlaneDisplay;
+
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let font = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        let mut device = DesktopMessageDevice::default();
+        device.bind_font("Arial", &font, 0).unwrap();
+
+        let scale = Some(5);
+        let mut bytes = configuration("Arial", 0).bytes().to_vec();
+        bytes[8..12].copy_from_slice(&128u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&64u32.to_le_bytes());
+        bytes[0x74..0x78].copy_from_slice(&7u32.to_le_bytes());
+        let mut skipped_pixels = Vec::new();
+        for (id, submit, force) in [(-1, true, true), (-2, true, false), (-3, false, false)] {
+            bytes[0x128..0x12c].copy_from_slice(&u32::from(submit).to_le_bytes());
+            let mut message = MessageObject::new(id, MessageEncoding::Unicode);
+            message.recreate(&bytes, scale, &mut device).unwrap();
+            message.append(b"ABC").unwrap();
+            message.start(0, MessagePlaneDisplay::Visible, 100, scale, &mut device).unwrap();
+            let start = device.snapshot_pixels(id).unwrap().submitted_rgba;
+            assert!(start.chunks_exact(4).any(|pixel| pixel[3] != 0));
+            if force {
+                message.force_complete(MessagePlaneDisplay::Visible, scale, &mut device).unwrap();
+                skipped_pixels = device.snapshot_pixels(id).unwrap().submitted_rgba;
+                assert_ne!(skipped_pixels, start);
+                continue;
+            }
+            message.frame_update(103, scale, &mut device).unwrap();
+            assert_eq!(device.surface(id).unwrap().submitted.pixels(), start);
+            message.frame_update(104, scale, &mut device).unwrap();
+            if submit {
+                assert_ne!(device.surface(id).unwrap().submitted.pixels(), start);
+                assert_ne!(device.surface(id).unwrap().submitted.pixels(), skipped_pixels);
+            }
+            message.frame_update(107, scale, &mut device).unwrap();
+            message.frame_update(108, scale, &mut device).unwrap();
+            assert_eq!(message.remaining_all().unwrap(), 0);
+            let surface = device.surface(id).unwrap();
+            assert_eq!(surface.visible.pixels(), skipped_pixels);
+            if submit {
+                assert_eq!(surface.submitted.pixels(), skipped_pixels);
+                assert!(surface.dirty.is_none());
+            } else {
+                assert_eq!(surface.submitted.pixels(), start);
+                assert!(surface.dirty.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn registered_face_reuses_only_the_matching_preloaded_rasterizer() {
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let bytes = Arc::new(fs::read(windows.join("Fonts/arial.ttf")).unwrap());
+        let rasterizer = Arc::new(FontRasterizer::from_bytes(&bytes, 0).unwrap());
+        let origin = Arc::new(FontOrigin::Resource("font/face.ttf".into()));
+        let mut device = DesktopMessageDevice::default();
+        device.fonts = vec![LoadedFont {
+            origin: Arc::clone(&origin),
+            index: 0,
+            rasterizer: Arc::clone(&rasterizer),
+        }].into();
+
+        let source = Arc::new(FontSource::Bytes(Arc::clone(&bytes)));
+        device.register_sfnt(&bytes, Arc::clone(&source), &origin);
+        device.register_sfnt(&bytes, source, &FontOrigin::Resource("other/face.ttf".into()));
+        let selected = device.font(&configuration("Arial", 0), 'A', false, false, None).unwrap().0;
+        assert!(std::ptr::eq(selected, rasterizer.as_ref()));
+        assert!(device.fallback_faces[1].font.get().is_none());
+    }
+
+    #[test]
+    fn message_family_substitutes_a_real_face_for_punctuation_outside_cjk_blocks() {
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let font = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        let mut device = DesktopMessageDevice::default();
+        device.bind_font("Fixture fallback", &font, 0).unwrap();
+        let requested = configuration("Uninstalled game family", 0);
+        let glyph = device.mask(&requested, '\u{2014}', 24, false, false).unwrap();
+        assert!(glyph.alpha().iter().any(|&alpha| alpha != 0));
+        assert!(device.font_substitutions()[0].selected_name.to_lowercase().contains("arial"));
+        let error = device.mask(&requested, '\u{10ffff}', 24, false, false).unwrap_err().to_string();
+        assert!(error.contains("U+10FFFF") && error.contains("uninstalled game family"));
     }
 
     #[test]

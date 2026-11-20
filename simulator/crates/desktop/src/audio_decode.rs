@@ -171,8 +171,13 @@ mod tests {
     #[test]
     #[ignore = "requires the local sample 05 archives"]
     fn decodes_sample_05_title_music_and_voice_from_original_archives() -> anyhow::Result<()> {
-        let root = std::env::var_os("CS2_SAMPLE_ROOT").map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
+        let root = match std::env::var_os("CS2_SAMPLE_ROOT").map(PathBuf::from) {
+            Some(root) => {
+                let catalog = root.join("games");
+                if catalog.is_dir() { catalog } else { root }
+            }
+            None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../games"),
+        };
         let sample = root.join("\u{3046}\u{305f}\u{3066}\u{3081}\u{3050}\u{308a}");
         let scan = GameRoot::open(sample)?.scan()?;
         let music = scan.resources.read("bgm.int/BGM50.ogg")?;

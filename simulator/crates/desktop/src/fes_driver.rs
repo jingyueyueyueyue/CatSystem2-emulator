@@ -176,6 +176,12 @@ struct SystemBlockRequest {
 pub(crate) struct FesScriptDriver {
     pub(crate) interpreter: FesInterpreter,
     pub(crate) adapter: FesRuntimeAdapter,
+    #[serde(skip)]
+    island_gbk_fes_source: bool,
+    #[serde(skip)]
+    rebellions_message_fes_source: bool,
+    #[serde(skip)]
+    pub(super) kanmi_message_fes_source: Option<bool>,
     expression: ExpressionState,
     #[serde(skip)]
     external: SharedExternalStorage,
@@ -230,6 +236,9 @@ impl FesScriptDriver {
         Ok(Self {
             interpreter: FesInterpreter::new(program)?,
             adapter: FesRuntimeAdapter::new(),
+            island_gbk_fes_source: false,
+            rebellions_message_fes_source: false,
+            kanmi_message_fes_source: None,
             expression: ExpressionState::default(),
             external: SharedExternalStorage::default(),
             inputs: VecDeque::new(),
@@ -255,6 +264,22 @@ impl FesScriptDriver {
             media_statement_result: None,
             notification_only: false,
         })
+    }
+
+    pub(crate) fn is_island_gbk_fes_source(&self) -> bool {
+        self.island_gbk_fes_source
+    }
+
+    pub(super) fn set_island_gbk_fes_source(&mut self, enabled: bool) {
+        self.island_gbk_fes_source = enabled;
+    }
+
+    pub(super) fn is_rebellions_message_fes_source(&self) -> bool {
+        self.rebellions_message_fes_source
+    }
+
+    pub(super) fn set_rebellions_message_fes_source(&mut self, enabled: bool) {
+        self.rebellions_message_fes_source = enabled;
     }
 
     pub(crate) fn set_task_id(&mut self, task_id: u32) {
@@ -486,10 +511,17 @@ impl FesScriptDriver {
     pub(crate) fn advance_notification(
         &mut self, frame: u64, shared: &mut ExpressionState, budget: usize,
     ) -> Result<FesDriverEffect> {
+        self.advance_system_notification(frame, shared, budget, None)
+    }
+
+    pub(super) fn advance_system_notification(
+        &mut self, frame: u64, shared: &mut ExpressionState, budget: usize,
+        bounded_block: Option<&[u8]>,
+    ) -> Result<FesDriverEffect> {
         let main_last_frame = self.last_frame.replace(frame);
         let main_budget_frame = self.budget_frame.take();
         let notification_only = std::mem::replace(&mut self.notification_only, true);
-        let result = self.advance(frame, shared, budget);
+        let result = self.advance_with_notification(frame, shared, budget, bounded_block);
         self.notification_only = notification_only;
         self.last_frame = main_last_frame;
         self.budget_frame = main_budget_frame;
@@ -504,6 +536,16 @@ impl FesScriptDriver {
         frame: u64,
         shared: &mut ExpressionState,
         budget: usize,
+    ) -> Result<FesDriverEffect> {
+        self.advance_with_notification(frame, shared, budget, None)
+    }
+
+    fn advance_with_notification(
+        &mut self,
+        frame: u64,
+        shared: &mut ExpressionState,
+        budget: usize,
+        bounded_block: Option<&[u8]>,
     ) -> Result<FesDriverEffect> {
         if self.media_statement.is_some() {
             return match self.advance_media_statement(frame, shared, budget)? {
@@ -530,7 +572,7 @@ impl FesScriptDriver {
         if self.handler.is_none() {
             self.expression.current = shared.current;
         }
-        let result = self.advance_inner(frame, budget);
+        let result = self.advance_inner(frame, budget, bounded_block);
         std::mem::swap(&mut self.expression.strings, &mut shared.strings);
         std::mem::swap(&mut self.expression.shared, &mut shared.shared);
         self.budget_frame = if matches!(&result, Ok(FesDriverEffect::Yield)) {
@@ -582,7 +624,9 @@ impl FesScriptDriver {
         Ok(self.interpreter.evaluate_parameter(source, &mut self.expression)?)
     }
 
-    fn advance_inner(&mut self, frame: u64, budget: usize) -> Result<FesDriverEffect> {
+    fn advance_inner(
+        &mut self, frame: u64, budget: usize, bounded_block: Option<&[u8]>,
+    ) -> Result<FesDriverEffect> {
         if self.last_frame.is_some_and(|previous| frame < previous) {
             bail!("FES frame moved backwards; restore a driver snapshot before rewinding");
         }
@@ -616,7 +660,16 @@ impl FesScriptDriver {
                     continue;
                 }
             }
-            if self.handler.is_some() {
+            if let Some(handler) = self.handler.as_ref() {
+                if handler.phase == HandlerPhase::System
+                    && handler.target.name.is_empty()
+                    && handler.target.bank == 0
+                    && bounded_block == Some(handler.event.as_slice())
+                    && matches!(self.interpreter.current_block(), b"SETBUTTON" | b"_SETBUTTON")
+                    && self.interpreter.return_call_at_block_end(handler.depth)
+                {
+                    continue;
+                }
                 if let Some(effect) = self.check_handler_boundary()? {
                     return Ok(effect);
                 }
@@ -805,7 +858,7 @@ impl FesScriptDriver {
         let arguments = &command.parameters;
         let name = arguments.first().map_or(&[][..], Vec::as_slice);
         match name {
-            b"decode" | b"baseimg" if self.handler.is_some() => {
+            b"decode" | b"baseimg" | b"config_open" if self.handler.is_some() => {
                 self.defer(FesDriverEffect::Command(command))?;
                 self.finish_handler(false).map(Some)
             }
@@ -1054,9 +1107,17 @@ impl FesScriptDriver {
         {
             return Ok(Some(self.finish_handler(true)?));
         }
+        let preserves_nested_returns = handler.phase == HandlerPhase::Object
+            || (handler.phase == HandlerPhase::System
+                && self.rebellions_message_fes_source
+                && handler.target.name.is_empty()
+                && matches!(
+                    (handler.event.as_slice(), self.interpreter.current_block()),
+                    (b"MES_SHOW" | b"MES_WAITINPUT", b"SETBUTTON" | b"_SETBUTTON")
+                        | (b"MES_SHOW", b"PDA_ON")
+                ));
         if self.interpreter.at_block_end()
-            && (handler.phase != HandlerPhase::Object
-                || self.interpreter.call_depth() <= handler.depth)
+            && (!preserves_nested_returns || self.interpreter.call_depth() <= handler.depth)
         {
             return Ok(Some(self.finish_handler(false)?));
         }

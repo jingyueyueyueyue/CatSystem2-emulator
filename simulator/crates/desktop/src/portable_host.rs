@@ -150,6 +150,59 @@ impl HeadlessPlayer {
                 "plane {} {} parent={} visible={} shape={shape:?} position={:?} size={:?} depth={depth} color={:#010x} source={source:?} sample={sample:?}",
                 node.id, node.name, node.parent, node.visible, node.position, node.size, node.color);
         }
+        for (&id, object) in self.data_services.messages.objects() {
+            let Some(node) = self.scene_nodes.get(&id) else { continue };
+            let Some(surface) = self.data_services.message_device.surface(id as i32) else { continue };
+            let task = self.data_services.tasks.message_task_state(id);
+            let geometry = object.registered_geometry();
+            let submitted_alpha = surface.submitted.pixels().chunks_exact(4)
+                .filter(|pixel| pixel[3] != 0).count();
+            let projected = self.project_message_plane(node).ok();
+            let projected_position = projected.as_ref().map(|plane| plane.position);
+            let opaque_final_rgb_probe = (|| {
+                let (registered_size, registered_offset) = geometry?;
+                let node = projected.as_deref()?;
+                let submitted = surface.submitted;
+                let size = if node.initialized { node.size } else { registered_size.map(|val| val as f32) };
+                if !node.visible || node.scale[..2] != [1.0, 1.0] || node.color != u32::MAX
+                    || node.overlay_color != 0 || size != [submitted.width() as f32, submitted.height() as f32]
+                    || node.position.iter().any(|coordinate| !coordinate.is_finite())
+                {
+                    return None;
+                }
+                let current_offset = object.configuration()?.canvas_offset();
+                let draw_origin = [0, 1].map(|axis| (node.position[axis] as i32).wrapping_add(registered_offset[axis]));
+                let mut tested = 0;
+                let mut matched = 0;
+                let mut texture_clipped = 0;
+                let mut viewport_clipped = 0;
+                for (index, pixel) in submitted.pixels().chunks_exact(4).enumerate().filter(|(_, pixel)| pixel[3] == 255) {
+                    let local = [(index % submitted.width() as usize) as i64, (index / submitted.width() as usize) as i64];
+                    let shifted = [0, 1].map(|axis| local[axis] + i64::from(current_offset[axis]) - i64::from(registered_offset[axis]));
+                    if !(0..i64::from(submitted.width())).contains(&shifted[0])
+                        || !(0..i64::from(submitted.height())).contains(&shifted[1])
+                    {
+                        texture_clipped += 1;
+                        continue;
+                    }
+                    let screen = [0, 1].map(|axis| draw_origin[axis].wrapping_add(shifted[axis] as i32));
+                    if let Ok(output) = self.canvas.pixel(screen[0], screen[1]) {
+                        tested += 1;
+                        matched += usize::from([output.r, output.g, output.b] == pixel[..3]);
+                    } else {
+                        viewport_clipped += 1;
+                    }
+                }
+                Some(((matched, tested), draw_origin, (texture_clipped, viewport_clipped)))
+            })();
+            let opaque_final_rgb_matches = opaque_final_rgb_probe.map(|probe| probe.0);
+            let draw_origin = opaque_final_rgb_probe.map(|probe| probe.1);
+            let opaque_texture_viewport_clipped = opaque_final_rgb_probe.map(|probe| probe.2);
+            let _ = writeln!(out,
+                "message plane {id} {} kind={} parent={} visible={} position={:?} size={:?} scale={:?} color={:#010x} overlay={:#010x} task={task:?} geometry={geometry:?} generation={} submitted_alpha={submitted_alpha} opaque_final_rgb_matches={opaque_final_rgb_matches:?} projected_position={projected_position:?} draw_origin={draw_origin:?} opaque_texture_viewport_clipped={opaque_texture_viewport_clipped:?}",
+                node.name, node.kind, node.parent, node.visible, node.position, node.size,
+                node.scale, node.color, node.overlay_color, surface.generation);
+        }
         for (id, list) in &self.data_services.tasks.fes.platform.lists {
             let output = self.image_handles.get(&list.output);
             let _ = writeln!(out, "list {id} size={:?} offset={:?} enabled={} submit={} force={} nonzero_alpha={:?}",

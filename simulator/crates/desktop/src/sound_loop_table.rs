@@ -129,7 +129,19 @@ impl LoggingHost<'_> {
         )) {
             return Ok(true);
         }
-        Ok(self.verified_utate_sound_loop_source()? || self.verified_sudden_sound_loop_source()?)
+        Ok(self.verified_utate_sound_loop_source()?
+            || self.rebellions_sound_loop_query()?.is_some()
+            || self.verified_sudden_sound_loop_source()?)
+    }
+
+    pub(super) fn rebellions_sound_loop_query(&self) -> Result<Option<u32>> {
+        const RUNTIME: &str =
+            "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3";
+        const PRODUCER: &str =
+            "a25b9e9c8d4c7d8091b30d457fec070211fb86013e5d58dc6fdbec7ac0236ec1";
+        Ok((self.verified_sound_loop_executable("REBELLIONS.exe", 4_350_976, RUNTIME)?
+            && self.verified_sound_loop_producer(PRODUCER)?)
+            .then_some(33))
     }
 
     pub(super) fn verified_kanmi_sound_loop_source(&self) -> Result<bool> {

@@ -12,9 +12,11 @@ use std::{
 };
 
 fn workspace_root() -> PathBuf {
-    std::env::var_os("CS2_SAMPLE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
+    if let Some(root) = std::env::var_os("CS2_SAMPLE_ROOT").map(PathBuf::from) {
+        let catalog = root.join("games");
+        return if catalog.is_dir() { catalog } else { root };
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../games")
 }
 
 fn sample_file(parts: &[&str]) -> Option<Vec<u8>> {
@@ -156,9 +158,6 @@ fn parses_real_update05_cst_with_inner_declared_script_length() {
 #[test]
 fn restores_every_real_grisaia_update01_cst_including_overwritten_keys() {
     let Some(bytes) = sample_file(&[
-        "games",
-        "catsystem2",
-        "grisaia-series",
         "灰色的果实",
         "UPDATE01.INT",
     ]) else {
@@ -264,6 +263,86 @@ fn accepts_zero_padding_after_hg3_tags_and_rejects_nonzero_padding() {
         HgFile::parse(&padded),
         Err(cs2_formats::HgError::InvalidFrame)
     ));
+}
+
+#[test]
+fn restricts_nine_byte_hg3_padding_to_aligned_cptype_followed_by_a_frame() {
+    let make_frame = |tag, padding_len: usize, alignment_shift| {
+        let mut bytes = synthetic_hg3_with_tags(&[
+            (*b"stdinfo\0", synthetic_stdinfo(1, 1)),
+            (*b"custom\0\0", vec![0; 16 - padding_len + alignment_shift]),
+            (tag, vec![0; 4]),
+        ]);
+        bytes.resize(bytes.len() + padding_len, 0);
+        assert_eq!(bytes.len() % 8, alignment_shift);
+        bytes
+    };
+    let append_frame = |bytes: &mut Vec<u8>| {
+        let next_frame = u32::try_from(bytes.len() - 12).unwrap();
+        bytes[12..16].copy_from_slice(&next_frame.to_le_bytes());
+        let next = synthetic_hg3_with_tags(&[(*b"stdinfo\0", synthetic_stdinfo(1, 1))]);
+        bytes.extend_from_slice(&next[12..]);
+    };
+
+    let cptype = *b"cptype\0\0";
+    let mut bytes = make_frame(cptype, 9, 0);
+    let next_frame_offset = bytes.len();
+    append_frame(&mut bytes);
+    let file = HgFile::parse(&bytes).unwrap();
+    assert_eq!(file.frames.len(), 2);
+    assert_eq!(file.frames[1].frame_offset, next_frame_offset as u64);
+
+    for (case, tag, padding_len, alignment_shift, followed_by_frame, nonzero) in [
+        ("eight bytes", cptype, 8, 0, true, false),
+        ("ten bytes", cptype, 10, 0, true, false),
+        ("different tag", *b"unknown\0", 9, 0, true, false),
+        ("unaligned next frame", cptype, 9, 1, true, false),
+        ("last frame", cptype, 9, 0, false, false),
+        ("nonzero padding", cptype, 9, 0, true, true),
+    ] {
+        let mut bytes = make_frame(tag, padding_len, alignment_shift);
+        if nonzero {
+            *bytes.last_mut().unwrap() = 1;
+        }
+        if followed_by_frame {
+            append_frame(&mut bytes);
+        }
+        assert!(
+            matches!(HgFile::parse(&bytes), Err(HgError::InvalidFrame)),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn decodes_kanmi_hg3_message_window_frame_after_cptype_padding() {
+    let Some(bytes) = sample_file(&[
+        "\u{5c1a}\u{6709}\u{4f73}\u{871c}\u{4f34}\u{604b}\u{5fc3}",
+        "image",
+        "sys_meswnd.hg3",
+    ]) else {
+        assert!(
+            std::env::var_os("CS2_SAMPLE_ROOT").is_none(),
+            "Kanmi HG3 fixture is absent"
+        );
+        return;
+    };
+    let file = HgFile::parse(&bytes).unwrap();
+    assert_eq!(file.frames[0].id, 1406);
+    assert_eq!(file.frames[1].frame_offset, 2072);
+    let (index, frame) = file
+        .frames
+        .iter()
+        .enumerate()
+        .find(|(_, frame)| frame.id == 30)
+        .unwrap();
+    assert_eq!(
+        (frame.frame_offset, frame.width, frame.height),
+        (104920, 312, 260)
+    );
+    let pixels = file.decode_frame_rgba8(&bytes, index).unwrap();
+    assert_eq!(pixels.len(), 312 * 260 * 4);
+    assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
 }
 
 #[test]

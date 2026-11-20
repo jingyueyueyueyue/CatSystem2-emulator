@@ -17,10 +17,9 @@ typedef struct {
     uint64_t phase_ns[PERF_PHASES];
 } HostFrameTiming;
 
-extern uint64_t cs2_android_open(const char *, const char *);
+extern uint64_t cs2_android_open(const char *, const char *, int32_t);
 extern int32_t cs2_android_close(uint64_t);
-extern int32_t cs2_android_step(uint64_t, uint32_t);
-extern int32_t cs2_android_step_timed(uint64_t, uint32_t, HostFrameTiming *);
+extern int32_t cs2_android_step(uint64_t, uint32_t, HostFrameTiming *, const char **);
 extern int32_t cs2_android_size(uint64_t, uint32_t);
 extern int32_t cs2_android_take_pointer(uint64_t, int32_t *);
 extern int32_t cs2_android_take_cursor_visibility(uint64_t);
@@ -168,10 +167,12 @@ static char *path_bytes(JNIEnv *env, jbyteArray bytes) {
 JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray game, jbyteArray saves) {
     UNUSED_TYPES;
     const uint64_t start = perf_enabled() ? perf_now_ns() : 0;
+    char story_value[PROP_VALUE_MAX];
+    const int story = __system_property_get("log.tag." STORY_TAG, story_value) == 1 && story_value[0] == 'D';
     char *game_path = path_bytes(env, game);
     char *save_path = path_bytes(env, saves);
     uint64_t handle = 0;
-    if (game_path != NULL && save_path != NULL) handle = cs2_android_open(game_path, save_path);
+    if (game_path != NULL && save_path != NULL) handle = cs2_android_open(game_path, save_path, story);
     free(game_path);
     free(save_path);
     if (start && handle) {
@@ -197,21 +198,24 @@ JNIEXPORT jint JNICALL JNI(nativeClose)(JNIEnv *env, jclass type, jlong handle) 
 }
 JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, jint budget) {
     (void)env; UNUSED_TYPES;
-    if (!perf.handle || perf.handle != (uint64_t)handle) {
-        return cs2_android_step((uint64_t)handle, (uint32_t)budget);
-    }
+    const int timed = perf.handle && perf.handle == (uint64_t)handle;
     HostFrameTiming sample = {0};
-    const uint64_t start = perf_now_ns();
-    const int32_t result = cs2_android_step_timed((uint64_t)handle, (uint32_t)budget, &sample);
-    perf.tick.step_ns += perf_now_ns() - start;
-    if (perf.tick.step_calls++ == 0) perf.tick.first_step_ns = start;
-    for (size_t phase = 0; phase < PERF_PHASES; phase++) {
-        perf.tick.timing.phase_ns[phase] += sample.phase_ns[phase];
+    const uint64_t start = timed ? perf_now_ns() : 0;
+    const char *story_row = NULL;
+    const int32_t result = cs2_android_step((uint64_t)handle, (uint32_t)budget,
+                                           timed ? &sample : NULL, &story_row);
+    if (timed) {
+        perf.tick.step_ns += perf_now_ns() - start;
+        if (perf.tick.step_calls++ == 0) perf.tick.first_step_ns = start;
+        for (size_t phase = 0; phase < PERF_PHASES; phase++) {
+            perf.tick.timing.phase_ns[phase] += sample.phase_ns[phase];
+        }
+        if (result == FRAME_CHANGED || result == FRAME_UNCHANGED) {
+            perf.tick.frame = ++perf.frame_sequence;
+            if (result == FRAME_UNCHANGED) perf_record_unchanged();
+        }
     }
-    if (result == FRAME_CHANGED || result == FRAME_UNCHANGED) {
-        perf.tick.frame = ++perf.frame_sequence;
-        if (result == FRAME_UNCHANGED) perf_record_unchanged();
-    }
+    if (story_row != NULL) __android_log_write(ANDROID_LOG_DEBUG, STORY_TAG, story_row);
     return result;
 }
 JNIEXPORT jint JNICALL JNI(nativeSize)(JNIEnv *env, jclass type, jlong handle, jint axis) {

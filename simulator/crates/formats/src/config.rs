@@ -33,6 +33,14 @@ impl ConfigXml {
     /// `document` is an implicit root for script-facing path queries.
     /// `parse` remains the independent raw/legacy format inspector.
     pub fn parse_runtime(data: &[u8]) -> Result<Self, ConfigError> {
+        Self::parse_runtime_with_first_path(data, None)
+    }
+
+    /// Opt in to retaining the first element's text at one fully rooted path.
+    pub fn parse_runtime_with_first_path(
+        data: &[u8],
+        first_path: Option<&[&[u8]]>,
+    ) -> Result<Self, ConfigError> {
         use std::collections::BTreeMap;
         let end = data.iter().position(|&byte| byte == 0).unwrap_or(data.len());
         let limited = end > MAX_XML_SIZE;
@@ -64,10 +72,10 @@ impl ConfigXml {
                 .ok_or(ConfigError::Malformed(position))?;
             let mut normalized = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_vec();
             normalized.extend_from_slice(text.as_bytes());
-            return Self::parse_runtime(&normalized);
+            return Self::parse_runtime_with_first_path(&normalized, first_path);
         }
         if !encoding.eq_ignore_ascii_case(b"UTF-8") { return Err(ConfigError::Malformed(0)); }
-        let mut stack: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut stack: Vec<(Vec<u8>, Option<usize>)> = Vec::new();
         let mut root = Vec::new();
         let mut fields: Vec<XmlField> = Vec::new();
         let mut indices: BTreeMap<Vec<Vec<u8>>, usize> = BTreeMap::new();
@@ -77,8 +85,10 @@ impl ConfigXml {
                 let next = data[position..].iter().position(|&byte| byte == b'<')
                     .map_or(data.len(), |offset| position + offset);
                 let text = &data[position..next];
-                if let Some(&(_, field)) = stack.last() {
-                    append_runtime_text(&mut fields[field].text, text);
+                if let Some((_, field)) = stack.last() {
+                    if let Some(field) = *field {
+                        append_runtime_text(&mut fields[field].text, text);
+                    }
                 } else if !text_is_whitespace(text) {
                     return Err(ConfigError::Malformed(position));
                 }
@@ -120,9 +130,13 @@ impl ConfigXml {
             let mut path: Vec<_> = stack.iter().map(|(name, _)| name.clone()).collect();
             path.push(name.clone());
             let field = if let Some(&field) = indices.get(&path) {
-                // Descendant fields are separate map entries and survive.
-                fields[field].text.clear();
-                field
+                if first_path.is_some_and(|first| path.iter().map(Vec::as_slice).eq(first.iter().copied())) {
+                    None
+                } else {
+                    // Descendant fields are separate map entries and survive.
+                    fields[field].text.clear();
+                    Some(field)
+                }
             } else {
                 if fields.len() == MAX_XML_FIELDS { return Err(ConfigError::TooLarge); }
                 let size = path.iter().map(Vec::len).sum::<usize>();
@@ -131,7 +145,7 @@ impl ConfigXml {
                 let field = fields.len();
                 indices.insert(path.clone(), field);
                 fields.push(XmlField { path, text: Vec::new() });
-                field
+                Some(field)
             };
             position = close + 1;
             if self_closing {
@@ -484,4 +498,45 @@ pub fn parse_integer_prefix(bytes: &[u8]) -> i32 {
     } else {
         value
     }) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, ConfigXml};
+
+    const BOOT: &[&[u8]] = &[b"document", b"sysstr", b"boot"];
+
+    #[test]
+    fn runtime_first_path_preserves_only_the_selected_duplicate() {
+        let bytes = b"<?xml version='1.0' encoding='Shift_JIS'?>\
+            <document><sysstr><boot>200</boot><boot>500<child>ok</child></boot>\
+            <other>1</other><other>2</other></sysstr><boot>3</boot><boot>4</boot></document>";
+        let default = ConfigXml::parse_runtime(bytes).unwrap();
+        let mut selected = ConfigXml::parse_runtime_with_first_path(bytes, Some(BOOT)).unwrap();
+        assert_eq!(default.integer(BOOT, -1), 500);
+        assert_eq!(selected.integer(BOOT, -1), 200);
+        assert_eq!(selected.text(&[b"document", b"sysstr", b"boot", b"child"]), Some(b"ok".as_slice()));
+        assert_eq!(selected.integer(&[b"document", b"sysstr", b"movie"], -1), -1);
+        let boot = selected.fields.iter_mut().find(|field| {
+            field.path.iter().map(Vec::as_slice).eq(BOOT.iter().copied())
+        }).unwrap();
+        boot.text = b"500".to_vec();
+        assert_eq!(selected, default);
+    }
+
+    #[test]
+    fn runtime_first_path_keeps_empty_first_element_and_validates_later_elements() {
+        let bytes = b"<?xml version='1.0' encoding='UTF-8'?>\
+            <document><sysstr><boot></boot><boot>500</boot></sysstr></document>";
+        let selected = ConfigXml::parse_runtime_with_first_path(bytes, Some(BOOT)).unwrap();
+        assert_eq!(selected.text(BOOT), Some(b"".as_slice()));
+        assert_eq!(selected.integer(BOOT, -1), 0);
+
+        let malformed = b"<?xml version='1.0' encoding='UTF-8'?>\
+            <document><sysstr><boot>200</boot><boot>500</bad></sysstr></document>";
+        assert!(matches!(
+            ConfigXml::parse_runtime_with_first_path(malformed, Some(BOOT)),
+            Err(ConfigError::Malformed(_))
+        ));
+    }
 }

@@ -25,6 +25,7 @@ pub(super) const SUPPORTED_SLOTS: [u32; 13] = [
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OBJECTS: usize = 65_536;
 pub(super) const UTATE_STRING_KIND: u32 = 47;
+pub(super) const CAMPANELLA_STRING_KIND: u32 = 45;
 const UTATE_CONFIG_SIZE: usize = 0xbc;
 
 const BODY_NATIVES: &[(u32, usize, MessageEncoding)] = &[
@@ -95,6 +96,9 @@ pub(super) trait MessageNativeContext: MessageBackend {
     fn utate_string_receiver(&self) -> bool {
         false
     }
+    fn campanella_string_receiver(&self) -> bool {
+        false
+    }
     fn raw_message_image(&mut self, handle: u32) -> Result<Vec<u8>>;
     /// Old command117 takes the current pixels of an image wrapper, unlike
     /// new command464's retained, multi-frame raw image resource.
@@ -118,7 +122,7 @@ pub(super) struct MessageNativeServices {
     /// Resource/startup font defaults, captured before private user overrides.
     pub(super) font_panel_defaults: Option<MessageDefaults>,
     pub(super) legacy: super::legacy_text_native::LegacyTextNativeServices,
-    utate_visibility: BTreeMap<u32, bool>,
+    legacy_string_visibility: BTreeMap<u32, (u32, bool)>,
     pub(super) text_input: MessageTextInputState,
     pub(super) device_keys: DeviceKeys,
     pub(super) device_keys_loaded: bool,
@@ -210,7 +214,10 @@ impl MessageNativeServices {
         self.objects.contains_key(&id) || self.legacy.object(id).is_some()
     }
     pub(super) fn owns_utate_string(&self, id: u32) -> bool {
-        self.utate_visibility.contains_key(&id)
+        self.legacy_string_kind(id) == Some(UTATE_STRING_KIND)
+    }
+    pub(super) fn legacy_string_kind(&self, id: u32) -> Option<u32> {
+        self.legacy_string_visibility.get(&id).map(|&(kind, _)| kind)
     }
 
     pub(super) fn update_utate_display(
@@ -221,7 +228,7 @@ impl MessageNativeServices {
         scale: Option<u32>,
         backend: &mut impl MessageBackend,
     ) -> Result<Option<MessageRevealUpdate>> {
-        let Some(previous) = self.utate_visibility.get_mut(&id) else {
+        let Some((_, previous)) = self.legacy_string_visibility.get_mut(&id) else {
             return Ok(None);
         };
         *previous = display == MessagePlaneDisplay::Visible;
@@ -311,7 +318,7 @@ impl MessageNativeServices {
         self.fes_button_controllers.remove(&id);
         self.fes_button_owners.remove(&id);
         self.legacy.release(id);
-        self.utate_visibility.remove(&id);
+        self.legacy_string_visibility.remove(&id);
         self.plane_show.remove(&id);
         self.pending_display.retain(|(target, _)| *target != id);
         self.objects.remove(&id)
@@ -370,15 +377,15 @@ impl MessageNativeServices {
         deletion: u32,
         context: &mut impl MessageNativeContext,
     ) -> Result<Option<MessageRevealUpdate>> {
-        if let Some(previous) = self.utate_visibility.get_mut(&id) {
+        if let Some(&(kind, previous)) = self.legacy_string_visibility.get(&id) {
             if deletion != 0 {
                 return Ok(None);
             }
-            let Some(node) = nodes.get(&id).filter(|node| node.kind == UTATE_STRING_KIND) else {
+            let Some(node) = nodes.get(&id).filter(|node| node.kind == kind) else {
                 return Ok(None);
             };
             let scale = context.message_time_scale();
-            if node.visible != *previous {
+            if node.visible != previous {
                 let display = if node.visible {
                     MessagePlaneDisplay::Visible
                 } else {
@@ -452,15 +459,25 @@ impl MessageNativeServices {
         if index == 620 && word(1) == 0 {
             return Ok(NativeReturn::Continue);
         }
-        if matches!(index, 611..=621) && context.utate_string_receiver() {
+        let legacy_kind = if matches!(index, 611..=619) && context.campanella_string_receiver() {
+            Some(CAMPANELLA_STRING_KIND)
+        } else if matches!(index, 611..=621) && context.utate_string_receiver() {
+            Some(UTATE_STRING_KIND)
+        } else {
+            None
+        };
+        if let Some(kind) = legacy_kind {
             let route = context.route_message(word(0))?.filter(|route| {
                 route.deletion == 0
                     && nodes
                         .get(&route.id)
-                        .is_some_and(|node| node.kind == UTATE_STRING_KIND)
+                        .is_some_and(|node| node.kind == kind)
             });
             return match route {
-                Some(route) => self.call_utate_string(index, arguments, vm, route, context),
+                Some(route) => self.call_legacy_string(index, arguments, vm, route, kind, context),
+                None if index == 616 && kind == CAMPANELLA_STRING_KIND => Err(invalid(
+                    "Campanella layout query has no reachable live kind-45 handler",
+                )),
                 None if index == 616 => Err(invalid(
                     "Utate layout query has no reachable live kind-47 handler",
                 )),
@@ -576,12 +593,13 @@ impl MessageNativeServices {
         result
     }
 
-    fn call_utate_string(
+    fn call_legacy_string(
         &mut self,
         index: u32,
         arguments: &[u8],
         vm: &mut Vm,
         route: MessageRoute,
+        kind: u32,
         context: &mut impl MessageNativeContext,
     ) -> Result<NativeReturn> {
         let word = |index: usize| {
@@ -599,16 +617,17 @@ impl MessageNativeServices {
         }
         if index == 612 {
             self.register(route.id)?;
-            self.utate_visibility.entry(route.id).or_insert(false);
+            self.legacy_string_visibility.entry(route.id).or_insert((kind, false));
         }
+        let owned = self.legacy_string_kind(route.id) == Some(kind);
         let object = self
             .objects
             .get_mut(&route.id)
-            .filter(|_| self.utate_visibility.contains_key(&route.id));
+            .filter(|_| owned);
         let Some(object) = object else {
             return if index == 616 {
                 Err(invalid(
-                    "Utate layout query requires native612 initialization",
+                    "legacy layout query requires native612 initialization",
                 ))
             } else {
                 Ok(NativeReturn::Continue)
@@ -618,7 +637,10 @@ impl MessageNativeServices {
             612 | 613 => {
                 let address = word(1);
                 if vm.read(address, 4)? == (UTATE_CONFIG_SIZE as u32).to_le_bytes() {
-                    let bytes = translate_utate_config(&vm.read(address, UTATE_CONFIG_SIZE)?)?;
+                    let legacy = vm.read(address, UTATE_CONFIG_SIZE)?;
+                    let mode_start = if kind == CAMPANELLA_STRING_KIND { 0x70 } else { 0x6c };
+                    let gradual = legacy[mode_start..mode_start + 4] != [0; 4];
+                    let bytes = translate_legacy_string_config(&legacy, gradual)?;
                     if index == 612 {
                         object.recreate(&bytes, scale, context)?;
                     } else if object.configured() {
@@ -736,10 +758,9 @@ fn utate_config_defaults(defaults: &MessageDefaults) -> Result<[u8; UTATE_CONFIG
     Ok(bytes)
 }
 
-fn translate_utate_config(legacy: &[u8]) -> Result<[u8; MESSAGE_CONFIGURATION_SIZE]> {
+fn translate_legacy_string_config(legacy: &[u8], gradual: bool) -> Result<[u8; MESSAGE_CONFIGURATION_SIZE]> {
     let mut bytes = [0; MESSAGE_CONFIGURATION_SIZE];
     bytes[..4].copy_from_slice(&(MESSAGE_CONFIGURATION_SIZE as u32).to_le_bytes());
-    let gradual = legacy[0x6c..0x70] != [0; 4];
     bytes[4..8].copy_from_slice(&u32::from(gradual).to_le_bytes());
     bytes[8..0x84].copy_from_slice(&legacy[4..0x80]);
     let name = legacy[0x80..0xa0]
@@ -776,6 +797,7 @@ mod utate_tests {
 
     struct Backend {
         legacy: bool,
+        campanella: bool,
         deletion: u32,
         display: MessagePlaneDisplay,
         completed_glyphs: usize,
@@ -837,6 +859,9 @@ mod utate_tests {
         fn utate_string_receiver(&self) -> bool {
             self.legacy
         }
+        fn campanella_string_receiver(&self) -> bool {
+            self.campanella
+        }
         fn raw_message_image(&mut self, _handle: u32) -> Result<Vec<u8>> {
             unreachable!()
         }
@@ -875,6 +900,7 @@ mod utate_tests {
         )]);
         let mut backend = Backend {
             legacy: false,
+            campanella: false,
             deletion: 0,
             display: MessagePlaneDisplay::Hidden,
             completed_glyphs: 0,
@@ -955,6 +981,57 @@ mod utate_tests {
         call(611, &[modern]);
         call(612, &[modern]);
         assert_eq!(call(616, &[]), NativeReturn::Value(0));
+    }
+
+    #[test]
+    fn campanella_kind45_native616_queries_the_real_message_queue() -> Result<()> {
+        let mut services = MessageNativeServices::default();
+        let program = cs2_script::KcsProgram::from_code(&[0x3b], Vec::new(), 0)?;
+        let mut vm = Vm::from_program(program)?;
+        let config = utate_config_defaults(&MessageDefaults {
+            font_name: "Gothic".encode_utf16().collect(),
+            bold: false,
+            shadow: 0,
+            outline: 0,
+            glyph_parameter: None,
+            gradual: false,
+        })?;
+        let config = vm.allocate_region(&config)?;
+        let text = vm.allocate_region(b"AB\0")?;
+        let id = 39u32;
+        let mut nodes = BTreeMap::from([(
+            id,
+            SceneNode::new(id, CAMPANELLA_STRING_KIND, 37, "string".into()),
+        )]);
+        let mut backend = Backend {
+            legacy: false,
+            campanella: false,
+            deletion: 0,
+            display: MessagePlaneDisplay::Hidden,
+            completed_glyphs: 0,
+        };
+        let mut call = |index, extra: &[u32], nodes: &BTreeMap<_, _>, backend: &mut Backend| {
+            let args: Vec<_> = std::iter::once(id)
+                .chain(extra.iter().copied())
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            services.call(index, &args, &mut vm, nodes, backend)
+        };
+        assert!(call(616, &[], &nodes, &mut backend).is_err());
+        backend.campanella = true;
+        call(612, &[config], &nodes, &mut backend)?;
+        assert_eq!(call(616, &[], &nodes, &mut backend)?, NativeReturn::Value(1));
+        call(614, &[text], &nodes, &mut backend)?;
+        assert_eq!(call(616, &[], &nodes, &mut backend)?, NativeReturn::Value(0));
+        call(615, &[], &nodes, &mut backend)?;
+        assert_eq!(call(616, &[], &nodes, &mut backend)?, NativeReturn::Value(1));
+        backend.deletion = 1;
+        assert!(call(616, &[], &nodes, &mut backend).is_err());
+        backend.deletion = 0;
+        nodes.get_mut(&id).unwrap().kind = UTATE_STRING_KIND;
+        assert!(call(616, &[], &nodes, &mut backend).is_err());
+        assert_eq!(services.legacy_string_kind(id), Some(CAMPANELLA_STRING_KIND));
+        Ok(())
     }
 }
 

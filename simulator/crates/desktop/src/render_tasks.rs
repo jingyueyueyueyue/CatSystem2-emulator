@@ -21,8 +21,21 @@ use surface_pass::SurfacePass;
 
 const MAX_WORK_BYTES: usize = 128 * 1024 * 1024;
 const V401: &str = "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f";
+const AUGUST: &str = "4ccb48ad4bb6bfb5a15a45b8e1f2c2e62072cfad9f1487f869561a473770ed94";
+const GRISAIA_FRUIT: &str = "9f3a5ad0ed22074420685f1e2a3bc92436d68289c7bac854d5f7d7331dc3ef67";
 const GRISAIA_LABYRINTH: &str = "ac226c8455eff72114d6b1b9929fae01ac49ba90b8ba579f049f179c4c6dd8d5";
+const GRISAIA_EDEN: &str = "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c";
+const HAKUCHUUMU: &str = "1f3288d5fd5408bee4d395faab708aca78c9eeaa6c172dc06dcce09c844ba9d5";
+const HAPPINESS2_COMPANION_PE: &str =
+    "5869b7d03a636c200f5042f0c3fc37878a362615bf724f58d47aec5eb8b2d44c";
+const ISLAND: &str = "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1";
+const KANMI: &str = "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26";
 const KOKONATSU: &str = "c47c9d883126f641ce07d92eb57b6ac9833fe7495996001c12c68c55b99974d3";
+const NEKOPARA: &str = "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc";
+const NEWTON: &str = "3b359fc2d737d5ceed454d6b65e6e5b5e6dfb4a24cf88ee361df86e454203f18";
+const REBELLIONS_DRAW_PE: &str = "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3";
+const REBELLIONS_DRAW_SCRIPT: &str = "533ecc0aec6ae5c0b6b2e21f56ee1d3e4637f5eb655ac0b746a133c06f323407";
+const SUDDEN_DRAW_SCRIPT: &str = "1153e10b75c189b7908858d0165c6b2020a09d859aa2005704a4e710ea293a95";
 const YUKIKOI: &str = "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +58,7 @@ pub(crate) enum RenderTaskOperation {
 pub(crate) struct RenderTaskStore {
     tasks: BTreeMap<u32, RenderTask>,
     effects: frame_effects::FrameEffects,
+    unprofiled_duration_first_draw: Option<bool>,
     callback_owner: Option<u32>,
     auxiliary: Option<RgbaFrame>,
     auxiliary_second: Option<RgbaFrame>,
@@ -458,27 +472,13 @@ impl LoggingHost<'_> {
                 record.extend_from_slice(&args[8..32]);
                 record
             }
-            527 => draw_configuration(
+            527 => self.native_draw_configuration(args)?.to_vec(),
+            523 | 525 => args[4..].to_vec(),
+            530 => wipe_configuration(
                 args,
                 self.data_services.native_profile.map(|profile| profile.pe_sha256),
-            ).to_vec(),
-            523 | 525 => args[4..].to_vec(),
-            530 => {
-                let mut record = Vec::with_capacity(20);
-                if self
-                    .data_services
-                    .native_profile
-                    .is_some_and(|profile| profile.pe_sha256 == KOKONATSU)
-                {
-                    record.extend_from_slice(&args[8..16]);
-                    record.extend_from_slice(&args[4..8]);
-                    record.extend_from_slice(&args[16..20]);
-                } else {
-                    record.extend_from_slice(&args[4..20]);
-                }
-                record.extend_from_slice(&0u32.to_le_bytes());
-                record
-            }
+            )
+            .to_vec(),
             _ => Vec::new(),
         };
         let scalar = if matches!(index, 522 | 524 | 526 | 528 | 531) {
@@ -499,6 +499,50 @@ impl LoggingHost<'_> {
         } else {
             NativeReturn::Continue
         })
+    }
+
+    fn native_draw_configuration(&mut self, args: &[u8]) -> cs2_script::Result<[u8; 12]> {
+        let duration_first = if let Some(profile) = self.data_services.native_profile {
+            duration_first_draw_profile(profile.pe_sha256)
+        } else if self.data_services.particle_message_pe_sha256 == Some(HAPPINESS2_COMPANION_PE) {
+            true
+        } else {
+            match self.data_services.tasks.render.unprofiled_duration_first_draw {
+                Some(verified) => verified,
+                None => {
+                    let verified = self.css_task_sha() == Some(GRISAIA_FRUIT)
+                        || self.verified_kanmi_sound_loop_source()?
+                        || self.verified_sudden_draw_source()
+                        || self.verified_rebellions_draw_source();
+                    self.data_services.tasks.render.unprofiled_duration_first_draw = Some(verified);
+                    verified
+                }
+            }
+        };
+        Ok(draw_configuration(args, duration_first))
+    }
+
+    fn verified_rebellions_draw_source(&self) -> bool {
+        const PE_SIZE: usize = 4_350_976;
+        let Some(runtime) = self.resources.resolve_plain_file("REBELLIONS.exe").ok().flatten()
+            .filter(|runtime| runtime.size == PE_SIZE as u64)
+            .and_then(|runtime| self.resources.read_candidate_bounded(runtime, PE_SIZE).ok().flatten())
+        else { return false; };
+        rebellions_draw_source_matches(&crate::particle_plugin_digest::sha256(&runtime), || {
+            let names = self.resources.category_names(b"kcs", "sscript").ok()?;
+            let script = names.iter().find_map(|name| self.resources.find(name))?;
+            Some(crate::particle_plugin_digest::sha256(&self.resources.read_candidate(script).ok()?))
+        })
+    }
+
+    fn verified_sudden_draw_source(&self) -> bool {
+        if !self.verified_sudden_sound_loop_source().unwrap_or(false) {
+            return false;
+        }
+        self.resources.category_names(b"kcs", "sscript.kcs").ok()
+            .and_then(|names| names.iter().find_map(|name| self.resources.find(name)))
+            .and_then(|candidate| self.resources.read_candidate(candidate).ok())
+            .is_some_and(|bytes| crate::particle_plugin_digest::sha256(&bytes) == SUDDEN_DRAW_SCRIPT)
     }
 
     /// Semantic producer API for FES/platform code, with owned record bytes.
@@ -1128,9 +1172,24 @@ fn dword(bytes: &[u8], offset: usize) -> Result<u32> {
     ))
 }
 
-fn draw_configuration(args: &[u8], pe_sha256: Option<&str>) -> [u8; 12] {
+fn duration_first_draw_profile(pe_sha256: &str) -> bool {
+    matches!(
+        pe_sha256,
+        V401 | AUGUST | GRISAIA_FRUIT | GRISAIA_LABYRINTH | GRISAIA_EDEN | HAKUCHUUMU | ISLAND | KANMI | NEWTON | YUKIKOI
+    )
+}
+
+fn rebellions_draw_source_matches(
+    runtime_sha256: &str,
+    script_sha256: impl FnOnce() -> Option<String>,
+) -> bool {
+    runtime_sha256 == REBELLIONS_DRAW_PE
+        && script_sha256().as_deref() == Some(REBELLIONS_DRAW_SCRIPT)
+}
+
+fn draw_configuration(args: &[u8], duration_first: bool) -> [u8; 12] {
     let mut record = [0; 12];
-    if matches!(pe_sha256, Some(V401 | GRISAIA_LABYRINTH)) {
+    if duration_first {
         record[..8].copy_from_slice(&args[8..16]);
         record[8..].copy_from_slice(&args[4..8]);
     } else {
@@ -1139,18 +1198,467 @@ fn draw_configuration(args: &[u8], pe_sha256: Option<&str>) -> [u8; 12] {
     record
 }
 
+fn wipe_configuration(args: &[u8], pe_sha256: Option<&str>) -> [u8; 20] {
+    let mut record = [0; 20];
+    let duration_first = matches!(pe_sha256, Some(AUGUST | HAKUCHUUMU | ISLAND | KOKONATSU | NEKOPARA | YUKIKOI));
+    record[..12].copy_from_slice(&draw_configuration(args, duration_first));
+    record[12..16].copy_from_slice(&args[16..20]);
+    record
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn august_cinema_wipe_uses_recorded_530_abi() {
+        let mode = 1.0f32.to_bits();
+        let split_depth = 45_000f32.to_bits();
+        let args = [13u32, 38, mode, split_depth, 345].map(u32::to_le_bytes).concat();
+        let expected = [mode, split_depth, 38, 345, 0].map(u32::to_le_bytes).concat();
+        let unchanged = [38, mode, split_depth, 345, 0].map(u32::to_le_bytes).concat();
+        assert_eq!(wipe_configuration(&args, Some(AUGUST)).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+    }
+
+    #[test]
+    fn august_and_grisaia_fruit_draw_use_recorded_527_abi() {
+        let split_depth = 45_000f32.to_bits();
+        for (runtime, task, duration) in [(AUGUST, 30u32, 18u32), (GRISAIA_FRUIT, 29, 58)] {
+            let args = [task, duration, 0, split_depth].map(u32::to_le_bytes).concat();
+            let expected = [0, split_depth, duration].map(u32::to_le_bytes).concat();
+            assert_eq!(draw_configuration(&args, duration_first_draw_profile(runtime)).as_slice(), expected);
+            assert_eq!(draw_configuration(&args, duration_first_draw_profile(KOKONATSU)), args[4..]);
+        }
+    }
+
+    #[test]
+    fn rebellions_draw_requires_both_527_fingerprints() {
+        let split_depth = 45_000f32.to_bits();
+        let args = [12u32, 58, 0, split_depth].map(u32::to_le_bytes).concat();
+        let expected = [0, split_depth, 58].map(u32::to_le_bytes).concat();
+        let verified = rebellions_draw_source_matches(REBELLIONS_DRAW_PE, || Some(REBELLIONS_DRAW_SCRIPT.into()));
+        assert_eq!(draw_configuration(&args, verified).as_slice(), expected);
+        for verified in [
+            duration_first_draw_profile(REBELLIONS_DRAW_PE),
+            rebellions_draw_source_matches(REBELLIONS_DRAW_PE, || Some(SUDDEN_DRAW_SCRIPT.into())),
+            rebellions_draw_source_matches(REBELLIONS_DRAW_PE, || None),
+            rebellions_draw_source_matches(YUKIKOI, || Some(REBELLIONS_DRAW_SCRIPT.into())),
+        ] {
+            assert_eq!(draw_configuration(&args, verified), args[4..]);
+        }
+    }
+
+    #[test]
+    fn hakuchuumu_cinema_wipe_uses_recorded_530_abi() {
+        let mode = 1.0f32.to_bits();
+        let split_depth = 45_000f32.to_bits();
+        let args = [65u32, 38, mode, split_depth, 259].map(u32::to_le_bytes).concat();
+        let expected = [mode, split_depth, 38, 259, 0].map(u32::to_le_bytes).concat();
+        let unchanged = [38, mode, split_depth, 259, 0].map(u32::to_le_bytes).concat();
+        assert_eq!(wipe_configuration(&args, Some(HAKUCHUUMU)).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+    }
+
+    #[test]
+    fn hakuchuumu_cinema_draw_uses_recorded_527_abi() {
+        let split_depth = 45_000f32.to_bits();
+        let args = [13u32, 298, 0, split_depth].map(u32::to_le_bytes).concat();
+        let expected = [0, split_depth, 298].map(u32::to_le_bytes).concat();
+        assert_eq!(
+            draw_configuration(&args, duration_first_draw_profile(HAKUCHUUMU)).as_slice(),
+            expected
+        );
+        for other in [NEKOPARA, KOKONATSU] {
+            assert_eq!(draw_configuration(&args, duration_first_draw_profile(other)), args[4..]);
+        }
+    }
+
+    #[test]
+    fn nekopara_scene01_wipe_uses_script_duration_and_depth() {
+        let depth = 45_000f32.to_bits();
+        let args = [12u32, 58, 0, depth, 1332].map(u32::to_le_bytes).concat();
+        let expected = [0, depth, 58, 1332, 0].map(u32::to_le_bytes).concat();
+        let unchanged = [58, 0, depth, 1332, 0].map(u32::to_le_bytes).concat();
+        assert_eq!(wipe_configuration(&args, Some(NEKOPARA)).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, Some(KOKONATSU)).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+    }
+
+    #[test]
+    fn yukikoi_wipe04_uses_recorded_530_abi() {
+        let args = [39u32, 28, 0, 0x472f_c800, 265].map(u32::to_le_bytes).concat();
+        let expected = [0u32, 0x472f_c800, 28, 265, 0].map(u32::to_le_bytes).concat();
+        let unchanged = [28u32, 0, 0x472f_c800, 265, 0].map(u32::to_le_bytes).concat();
+        assert_eq!(wipe_configuration(&args, Some(YUKIKOI)).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+    }
+
+    #[test]
     fn labyrinth_draw_uses_duration_before_mode_and_depth() {
         let args = [30u32, 58, 0, 45_000f32.to_bits()].map(u32::to_le_bytes).concat();
-        let record = draw_configuration(&args, Some(GRISAIA_LABYRINTH));
+        let record = draw_configuration(&args, duration_first_draw_profile(GRISAIA_LABYRINTH));
         assert_eq!(dword(&record, 0).unwrap(), 0);
         assert_eq!(f32::from_bits(dword(&record, 4).unwrap()), 45_000.);
         assert_eq!(dword(&record, 8).unwrap(), 58);
-        assert_eq!(draw_configuration(&args, Some(V401)), record);
-        assert_eq!(draw_configuration(&args, None), args[4..]);
+        assert_eq!(draw_configuration(&args, duration_first_draw_profile(V401)), record);
+        assert_eq!(draw_configuration(&args, false), args[4..]);
+    }
+
+    #[test]
+    fn island_rdraw60_composes_through_script_duration() -> Result<()> {
+        let duration = 58u32;
+        let split_depth = 45_000f32;
+        let recorded_args = [12, duration, 0, split_depth.to_bits()]
+            .map(u32::to_le_bytes)
+            .concat();
+        let expected = [0, split_depth.to_bits(), duration]
+            .map(u32::to_le_bytes)
+            .concat();
+        assert_eq!(
+            draw_configuration(&recorded_args, duration_first_draw_profile(ISLAND)).as_slice(),
+            expected
+        );
+        let other_island = "7bd9f6dcc7d62868d4ad9cc68d5580452e71bd907540ec4f993d960d051d2c45";
+        assert!(!duration_first_draw_profile(other_island));
+
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/ISLAND");
+        if !game.is_dir() {
+            return Ok(());
+        }
+        let profile = std::env::temp_dir().join(format!("cs2-island-rdraw60-{}", std::process::id()));
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&game, profile)?;
+        player.with_host(|host| {
+            assert_eq!(host.data_services.native_profile.map(|profile| profile.pe_sha256), Some(ISLAND));
+            let id = host.create_task_object(38, 0, b"rdraw", b"")?;
+            let mut args = recorded_args;
+            args[..4].copy_from_slice(&id.to_le_bytes());
+            let mut vm = Vm::new();
+            assert_eq!(host.render_tasks_native(527, &args, &mut vm)?, NativeReturn::Continue);
+            let origin = host.data_services.tasks.task_clock(id).unwrap().origin;
+            let activation = origin.wrapping_add(41);
+            host.data_services.tasks.set_task_clock(id, activation)?;
+            let enable = [id, 1].map(u32::to_le_bytes).concat();
+            assert_eq!(host.render_tasks_native(528, &enable, &mut vm)?, NativeReturn::Continue);
+            let task = &host.data_services.tasks.render.tasks[&id];
+            assert_eq!((task.duration, task.depth, task.started, task.end), (duration, split_depth, 41, 99));
+            let [width, height] = task.size;
+            let mut frame = Canvas::new(width, height)?;
+            let foreground = Color::rgba(0, 128, 255, 255);
+            let query = id.to_le_bytes();
+            for elapsed in [0, duration / 2, duration - 1, duration] {
+                host.data_services.tasks.set_task_clock(id, activation.wrapping_add(elapsed))?;
+                host.data_services.tasks.render.update(id, 41 + elapsed)?;
+                assert_eq!(host.render_tasks_native(520, &query, &mut vm)?, NativeReturn::Value(1));
+                let mut ranges = Vec::new();
+                host.data_services.tasks.render.compose(&mut frame, &mut |canvas, lower, upper| {
+                    ranges.push((lower, upper));
+                    if (lower..upper).contains(&10.) {
+                        canvas.clear(Color::rgba(255, 255, 255, 255));
+                    }
+                    if (lower..upper).contains(&50_000.) {
+                        canvas.fill_rect(cs2_renderer::Rect::new(1, 0, 1, 1), foreground)?;
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(ranges, [(0., split_depth), (split_depth, 1_000_000.)]);
+                assert_eq!(frame.pixel(1, 0)?, foreground);
+                assert_eq!(frame.pixel(0, 0)?.r, (elapsed * 255 / duration) as u8);
+                assert_eq!(
+                    host.render_tasks_native(520, &query, &mut vm)?,
+                    NativeReturn::Value(u32::from(elapsed < duration))
+                );
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn island_wipe05b_uses_recorded_530_abi() {
+        let depth = 45_000f32.to_bits();
+        let args = [12u32, 28, 0, depth, 1181].map(u32::to_le_bytes).concat();
+        let expected = [0u32, depth, 28, 1181, 0].map(u32::to_le_bytes).concat();
+        let unchanged = [28u32, 0, depth, 1181, 0].map(u32::to_le_bytes).concat();
+        assert_eq!(wipe_configuration(&args, Some(ISLAND)).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+    }
+
+    #[test]
+    fn yukikoi_rdraw60_keeps_warmup_and_composes_to_completion() -> Result<()> {
+        let split_depth = 45_000f32;
+        let recorded = [119u32, 58, 0, 0x472f_c800].map(u32::to_le_bytes).concat();
+        let expected = [0, split_depth.to_bits(), 58].map(u32::to_le_bytes).concat();
+        assert_eq!(draw_configuration(&recorded, duration_first_draw_profile(YUKIKOI)).as_slice(), expected);
+        assert_eq!(draw_configuration(&recorded, duration_first_draw_profile(KOKONATSU)), recorded[4..]);
+
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/Yukikoi Melt");
+        if !game.is_dir() {
+            return Ok(());
+        }
+        let profile = std::env::temp_dir().join(format!("cs2-yukikoi-rdraw60-{}", std::process::id()));
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&game, profile)?;
+        player.with_host(|host| {
+            assert_eq!(host.data_services.native_profile.map(|profile| profile.pe_sha256), Some(YUKIKOI));
+            let id = host.create_task_object(38, 0, b"rdraw", b"")?;
+            let mut args = recorded;
+            args[..4].copy_from_slice(&id.to_le_bytes());
+            let mut vm = Vm::new();
+            assert_eq!(host.render_tasks_native(527, &args, &mut vm)?, NativeReturn::Continue);
+
+            let started = 41u32;
+            let activation = host.data_services.tasks.task_clock(id).unwrap().origin.wrapping_add(started);
+            host.data_services.tasks.set_task_clock(id, activation)?;
+            let enable = [id, 1].map(u32::to_le_bytes).concat();
+            assert_eq!(host.render_tasks_native(528, &enable, &mut vm)?, NativeReturn::Continue);
+            let task = &host.data_services.tasks.render.tasks[&id];
+            assert_eq!((task.duration, task.depth, task.warmup_frames), (58, split_depth, Some(0)));
+            let [width, height] = task.size;
+            let mut frame = Canvas::new(width, height)?;
+            let foreground = Color::rgba(0, 128, 255, 255);
+            let query = id.to_le_bytes();
+            for (elapsed, red) in [(0, 0), (1, 0), (2, 0), (31, 127), (59, 250), (60, 255)] {
+                host.data_services.tasks.set_task_clock(id, activation.wrapping_add(elapsed))?;
+                host.data_services.tasks.render.update(id, started + elapsed)?;
+                assert_eq!(host.render_tasks_native(520, &query, &mut vm)?, NativeReturn::Value(1));
+                let mut ranges = Vec::new();
+                host.data_services.tasks.render.compose(&mut frame, &mut |canvas, lower, upper| {
+                    ranges.push((lower, upper));
+                    if (lower..upper).contains(&10.) {
+                        canvas.clear(Color::rgba(255, 255, 255, 255));
+                    }
+                    if (lower..upper).contains(&50_000.) {
+                        canvas.fill_rect(cs2_renderer::Rect::new(1, 0, 1, 1), foreground)?;
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(ranges, [(0., split_depth), (split_depth, 1_000_000.)]);
+                assert_eq!(frame.pixel(0, 0)?.r, red);
+                assert_eq!(frame.pixel(1, 0)?, foreground);
+                assert_eq!(host.render_tasks_native(520, &query, &mut vm)?, NativeReturn::Value(u32::from(elapsed < 60)));
+            }
+            let task = &host.data_services.tasks.render.tasks[&id];
+            assert_eq!((task.started, task.end), (started + 2, started + 60));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn eden_post_op_draw_uses_duration_before_mode_and_depth() {
+        let args = [12u32, 28, 0, 45_000f32.to_bits()].map(u32::to_le_bytes).concat();
+        let record = draw_configuration(&args, duration_first_draw_profile(GRISAIA_EDEN));
+        assert_eq!(dword(&record, 0).unwrap(), 0);
+        assert_eq!(f32::from_bits(dword(&record, 4).unwrap()), 45_000.);
+        assert_eq!(dword(&record, 8).unwrap(), 28);
+    }
+
+    #[test]
+    fn happiness2_verified_companion_draw_composes_until_deadline() -> Result<()> {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games/Happiness\u{ff01}2 \u{6a31}\u{82b1}\u{76db}\u{5178}");
+        if !game.is_dir() {
+            return Ok(());
+        }
+        let profile = std::env::temp_dir().join(format!("cs2-happiness2-draw-{}", std::process::id()));
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&game, profile)?;
+        player.with_host(|host| {
+            assert!(host.data_services.native_profile.is_none());
+            let companion = host.data_services.particle_message_pe_sha256.take();
+            assert_eq!(companion, Some(HAPPINESS2_COMPANION_PE));
+            let id = host.create_task_object(38, 0, b"rdraw", b"")?;
+            let duration = 48u32;
+            let split_depth = 45_000f32;
+            let args = [id, duration, 0, split_depth.to_bits()]
+                .map(u32::to_le_bytes)
+                .concat();
+            assert_eq!(host.native_draw_configuration(&args)?, args[4..]);
+            host.data_services.particle_message_pe_sha256 = companion;
+
+            let mut vm = Vm::new();
+            assert_eq!(
+                host.render_tasks_native(527, &args, &mut vm)?,
+                NativeReturn::Continue
+            );
+            let origin = host.data_services.tasks.task_clock(id).unwrap().origin;
+            let started = 41u32;
+            let activation = origin.wrapping_add(started);
+            host.data_services.tasks.set_task_clock(id, activation)?;
+            let enable = [id, 1].map(u32::to_le_bytes).concat();
+            assert_eq!(
+                host.render_tasks_native(528, &enable, &mut vm)?,
+                NativeReturn::Continue
+            );
+            let task = &host.data_services.tasks.render.tasks[&id];
+            assert_eq!(task.raw_configuration[..3], [0, split_depth.to_bits(), duration]);
+            assert_eq!((task.started, task.end), (started, started + duration));
+
+            let [width, height] = task.size;
+            let mut frame = Canvas::new(width, height)?;
+            let foreground = Color::rgba(0, 128, 255, 255);
+            let query = id.to_le_bytes();
+            for elapsed in [0, duration / 2, duration - 1, duration] {
+                host.data_services.tasks.set_task_clock(id, activation.wrapping_add(elapsed))?;
+                host.data_services.tasks.render.update(id, started + elapsed)?;
+                assert_eq!(host.render_tasks_native(520, &query, &mut vm)?, NativeReturn::Value(1));
+                host.data_services.tasks.render.compose(&mut frame, &mut |canvas, lower, upper| {
+                    if (lower..upper).contains(&10.) {
+                        canvas.clear(Color::rgba(255, 255, 255, 255));
+                    }
+                    if (lower..upper).contains(&50_000.) {
+                        canvas.fill_rect(cs2_renderer::Rect::new(1, 0, 1, 1), foreground)?;
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(frame.pixel(0, 0)?.r, (elapsed * 255 / duration) as u8);
+                assert_eq!(frame.pixel(1, 0)?, foreground);
+                assert_eq!(
+                    host.render_tasks_native(520, &query, &mut vm)?,
+                    NativeReturn::Value(u32::from(elapsed < duration))
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn kanmi_sc01_draw_uses_duration_before_mode_and_depth() {
+        let args = [28u32, 98, 0, 0x472f_c800].map(u32::to_le_bytes).concat();
+        let expected = [0u32, 0x472f_c800, 98].map(u32::to_le_bytes).concat();
+        assert_eq!(draw_configuration(&args, duration_first_draw_profile(KANMI)).as_slice(), expected);
+        assert_eq!(draw_configuration(&args, duration_first_draw_profile(KOKONATSU)), args[4..]);
+    }
+
+    #[test]
+    fn kanmi_sc01_draw_finishes_on_verified_package_without_native_profile() {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games")
+            .join("\u{5c1a}\u{6709}\u{4f73}\u{871c}\u{4f34}\u{604b}\u{5fc3}");
+        if !game.is_dir() {
+            return;
+        }
+        let profile = std::env::temp_dir().join(format!("cs2-kanmi-draw-{}", std::process::id()));
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&game, profile).unwrap();
+        player.with_host(|host| {
+            assert!(host.data_services.native_profile.is_none());
+            let id = host.create_task_object(38, 0, b"rdraw", b"")?;
+            let args = [id, 98, 0, 45_000f32.to_bits()].map(u32::to_le_bytes).concat();
+            let mut vm = Vm::new();
+            assert_eq!(host.render_tasks_native(527, &args, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.data_services.tasks.render.unprofiled_duration_first_draw, Some(true));
+            let enable = [id, 1].map(u32::to_le_bytes).concat();
+            assert_eq!(host.render_tasks_native(528, &enable, &mut vm)?, NativeReturn::Continue);
+            let task = &host.data_services.tasks.render.tasks[&id];
+            assert_eq!(task.depth, 45_000.);
+            assert_eq!(task.duration, 98);
+            let [width, height] = task.size;
+            let deadline = task.end;
+            let mut frame = Canvas::new(width, height)?;
+            let sky = Color::rgba(64, 128, 255, 255);
+            for (now, expected_active) in [(deadline - 1, 1), (deadline, 0)] {
+                let render = &mut host.data_services.tasks.render;
+                render.update(id, now)?;
+                render.compose(&mut frame, &mut |canvas, lower, upper| {
+                    if (lower..upper).contains(&10.) {
+                        canvas.clear(sky);
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(host.render_tasks_native(520, &id.to_le_bytes(), &mut vm)?,
+                    NativeReturn::Value(expected_active));
+            }
+            assert_eq!(frame.pixel(0, 0)?, sky);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn newton_draw_record_uses_verified_pe_order() {
+        let args = [30u32, 238, 0, 45_000f32.to_bits()].map(u32::to_le_bytes).concat();
+        let expected = [0u32, 45_000f32.to_bits(), 238].map(u32::to_le_bytes).concat();
+        assert_eq!(draw_configuration(&args, duration_first_draw_profile(NEWTON)).as_slice(), expected);
+        for unverified in [
+            "35ec21bcfcee0f324206e945eef1c082e35fd8af594ea0e738a46cd941f5b3f3",
+            "d158c8915d4982c82badc631b4f92e1f140b246df5929ff2d9924d242c66765c",
+        ] {
+            assert_eq!(draw_configuration(&args, duration_first_draw_profile(unverified)), args[4..]);
+        }
+    }
+
+    #[test]
+    fn verified_draw_profiles_compose_through_the_recorded_duration() -> Result<()> {
+        let games = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+        for (case_index, (game, expected_profile, duration)) in [
+            ("\u{725b}\u{987f}\u{4e0e}\u{82f9}\u{679c}\u{6811}", Some(NEWTON), 238u32),
+            ("\u{7a81}\u{7136}\u{4e4b}\u{95f4}\u{53d1}\u{73b0}\u{6211}\u{5df2}\u{604b}\u{4e0a}\u{4f60}", None, 238),
+            ("\u{767d}\u{663c}\u{5922}\u{306e}\u{9752}\u{5199}\u{771f}", Some(HAKUCHUUMU), 298),
+            (concat!("\u{672a}\u{6765}\u{30e9}\u{30b8}\u{30aa}\u{3068}\u{4eba}\u{5de5}\u{9ce9}",
+                "\u{ff08}AUGUST\u{ff09}"), Some(AUGUST), 18),
+            ("\u{7070}\u{8272}\u{7684}\u{679c}\u{5b9e}", None, 58),
+            ("\u{79d8}\u{5bc6}\u{6e38}\u{620f} \u{53cd}\u{53db}", None, 58),
+        ].into_iter().enumerate() {
+            let game = games.join(game);
+            if !game.is_dir() {
+                continue;
+            }
+            let profile = std::env::temp_dir().join(format!("cs2-{duration}-draw-{}-{case_index}",
+                std::process::id()));
+            let mut player = crate::HeadlessPlayer::open_with_save_root(&game, profile)?;
+            player.with_host(|host| {
+                assert_eq!(host.data_services.native_profile.map(|profile| profile.pe_sha256), expected_profile);
+                let id = host.create_task_object(38, 0, b"rdraw", b"")?;
+                let args = [id, duration, 0, 45_000f32.to_bits()].map(u32::to_le_bytes).concat();
+                let mut vm = Vm::new();
+                assert_eq!(host.render_tasks_native(527, &args, &mut vm)?, NativeReturn::Continue);
+                if expected_profile.is_none() {
+                    assert_eq!(host.data_services.tasks.render.unprofiled_duration_first_draw, Some(true));
+                }
+                let origin = host.data_services.tasks.task_clock(id).unwrap().origin;
+                let activation_tick = origin.wrapping_add(41);
+                host.data_services.tasks.set_task_clock(id, activation_tick)?;
+                let enable = [id, 1].map(u32::to_le_bytes).concat();
+                assert_eq!(host.render_tasks_native(528, &enable, &mut vm)?, NativeReturn::Continue);
+                let task = &host.data_services.tasks.render.tasks[&id];
+                assert_eq!(task.depth, 45_000.);
+                assert_eq!(task.duration, duration);
+                assert_eq!(task.started, 41);
+                assert_eq!(task.end, 41 + duration);
+                let start = task.started;
+                let [width, height] = task.size;
+                let mut frame = Canvas::new(width, height)?;
+                let background = Color::rgba(255, 255, 255, 255);
+                let foreground = Color::rgba(0, 128, 255, 255);
+                let query = id.to_le_bytes();
+                for elapsed in [0, duration / 2, duration - 1, duration] {
+                    host.data_services.tasks.set_task_clock(id, activation_tick.wrapping_add(elapsed))?;
+                    host.data_services.tasks.render.update(id, start.wrapping_add(elapsed))?;
+                    assert_eq!(host.render_tasks_native(520, &query, &mut vm)?, NativeReturn::Value(1));
+                    let mut ranges = Vec::new();
+                    host.data_services.tasks.render.compose(&mut frame, &mut |canvas, lower, upper| {
+                        ranges.push((lower, upper));
+                        if (lower..upper).contains(&10.) {
+                            canvas.clear(background);
+                        }
+                        if (lower..upper).contains(&50_000.) {
+                            canvas.fill_rect(cs2_renderer::Rect::new(1, 0, 1, 1), foreground)?;
+                        }
+                        Ok(())
+                    })?;
+                    assert_eq!(ranges, [(0., 45_000.), (45_000., 1_000_000.)]);
+                    assert_eq!(frame.pixel(1, 0)?, foreground);
+                    let red = frame.pixel(0, 0)?.r;
+                    assert_eq!(red, (elapsed * 255 / duration) as u8);
+                    assert_eq!(host.render_tasks_native(520, &query, &mut vm)?,
+                        NativeReturn::Value(u32::from(elapsed < duration)));
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 }

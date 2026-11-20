@@ -567,6 +567,10 @@ pub(super) fn apply_effect(
 ) -> Result<Option<bool>> {
     let FesDriverEffect::Command(command) = effect else { return Ok(None); };
     let Some(verb) = command.parameters.first().map(Vec::as_slice) else { return Ok(None); };
+    if verb == b"config_open" {
+        host.post_effect_settings()?;
+        return Ok(Some(true));
+    }
     if !matches!(verb, b"getconf" | b"setconf") { return Ok(None); }
     host.ensure_fes_settings()?;
     let args = &command.parameters[1..];

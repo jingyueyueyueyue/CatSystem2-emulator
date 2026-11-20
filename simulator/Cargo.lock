@@ -496,6 +496,8 @@ dependencies = [
  "lewton",
  "libc",
  "pollster",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "wgpu",
  "windows-sys 0.52.0",

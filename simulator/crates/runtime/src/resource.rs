@@ -2479,7 +2479,7 @@ mod tests {
             .ancestors()
             .nth(3)
             .expect("runtime crate should be inside the workspace")
-            .to_path_buf();
+            .join("games");
         let samples = [
             workspace_root.join("牛顿与苹果树"),
             workspace_root

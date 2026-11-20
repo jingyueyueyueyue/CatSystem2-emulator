@@ -3,8 +3,9 @@ package org.catsystem2.player;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
+import android.content.pm.ApplicationInfo;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentProvider;
@@ -23,7 +24,6 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.os.Build;
-import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -66,6 +66,7 @@ import java.io.IOException;
 import java.io.FileNotFoundException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -126,6 +127,8 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
     private TextView status;
     private GameLibrary library;
     private GridView gameShelf;
+    private long libraryRefreshGeneration;
+    private File isolatedSaveRoot;
     private Button addFolder;
     private Button resumeGame;
     private Button exitGame;
@@ -241,7 +244,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                     }
                 });
             }, ui).build();
-        renderLibrary();
+        status.setText("正在检查游戏目录…");
         List<Uri> folders = library.persistedFolders();
         if (!folders.isEmpty()) scanFolders(folders, null);
     }
@@ -310,18 +313,57 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         gameShelf.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
         gameShelf.setHorizontalSpacing(dp(12));
         gameShelf.setVerticalSpacing(dp(12));
-        gameShelf.setOnItemClickListener((parent, view, position, id) ->
-            launch((GameLibrary.Entry)parent.getItemAtPosition(position)));
+        gameShelf.setOnItemClickListener((parent, view, position, id) -> {
+            if (gameShelf.getAdapter().isEnabled(position)) {
+                launch((GameLibrary.Entry)parent.getItemAtPosition(position), false);
+            }
+        });
+        if (isDebuggable(this)) gameShelf.setOnItemLongClickListener((parent, view, position, id) -> {
+            if (gameShelf.getAdapter().isEnabled(position) && !importing.get()
+                    && launchingTitle == null && !endingGame) {
+                confirmIsolatedLaunch((GameLibrary.Entry)parent.getItemAtPosition(position));
+            }
+            return true;
+        });
         panel.addView(gameShelf, new LinearLayout.LayoutParams(-1, 0, 1));
         updateLibraryActions();
     }
 
-    private void renderLibrary() {
-        ArrayList<GameLibrary.Entry> games = library.entries();
+    private void refreshLibrary(String notice) {
+        if (destroyed || importing.get()) return;
+        long refresh = ++libraryRefreshGeneration;
+        new Thread(() -> {
+            ArrayList<GameLibrary.Entry> games = library.entries();
+            HashMap<String, GameLibrary.DirectoryStatus> unavailable = new HashMap<>();
+            for (GameLibrary.Entry game : games) {
+                if (destroyed) return;
+                try {
+                    library.gameDirectory(game);
+                } catch (GameLibrary.DirectoryFailure error) {
+                    unavailable.put(game.key, error.status);
+                    logLibraryIssue("refresh", "check-directory", game, error);
+                }
+            }
+            ui.post(() -> {
+                if (destroyed || importing.get() || refresh != libraryRefreshGeneration) return;
+                renderLibrary(games, unavailable);
+                if (launchingTitle == null) {
+                    String summary = games.isEmpty() ? "暂无游戏" : games.size() + " 个游戏";
+                    if (!unavailable.isEmpty()) summary += " · " + unavailable.size() + " 个不可启动";
+                    status.setText(notice == null ? summary : notice + " · " + summary);
+                }
+            });
+        }, "CS2 library check").start();
+    }
+
+    private void renderLibrary(ArrayList<GameLibrary.Entry> games,
+                               HashMap<String, GameLibrary.DirectoryStatus> unavailable) {
         gameShelf.setAdapter(new BaseAdapter() {
             @Override public int getCount() { return games.size(); }
             @Override public GameLibrary.Entry getItem(int position) { return games.get(position); }
             @Override public long getItemId(int position) { return position; }
+            @Override public boolean areAllItemsEnabled() { return unavailable.isEmpty(); }
+            @Override public boolean isEnabled(int position) { return !unavailable.containsKey(getItem(position).key); }
             @Override public View getView(int position, View recycled, android.view.ViewGroup parent) {
                 GameLibrary.Entry game = getItem(position);
                 LinearLayout card = new LinearLayout(PlayerActivity.this);
@@ -339,11 +381,15 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                 name.setMaxLines(2);
                 name.setEllipsize(android.text.TextUtils.TruncateAt.END);
                 card.addView(name);
-                card.addView(libraryText(game.tree == null ? "旧版副本" : "从原目录打开", 12, 0xffb2c4bb));
+                GameLibrary.DirectoryStatus issue = unavailable.get(game.key);
+                if (issue == null) {
+                    card.addView(libraryText(game.tree == null ? "旧版副本" : "从原目录打开", 12, 0xffb2c4bb));
+                } else {
+                    card.addView(libraryText(issue.label + " · 不可启动", 12, 0xfff3bb99));
+                }
                 return card;
             }
         });
-        status.setText(games.isEmpty() ? "暂无游戏" : games.size() + " 个游戏");
         updateLibraryActions();
     }
 
@@ -365,9 +411,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
     }
 
     private boolean ensureStorageAccess() {
-        boolean allowed = Build.VERSION.SDK_INT >= 30 ? Environment.isExternalStorageManager()
-            : checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
-        if (allowed) return true;
+        if (library.hasStorageAccess()) return true;
         new AlertDialog.Builder(this)
             .setTitle("开启文件访问")
             .setMessage("允许文件访问后，播放器会直接读取所选目录里的游戏资源。")
@@ -406,6 +450,21 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
 
     private File diagnosticsLog() {
         return new File(getFilesDir(), "player-error.log");
+    }
+
+    private void appendDiagnostic(String message) {
+        try (FileOutputStream output = new FileOutputStream(diagnosticsLog(), true)) {
+            output.write((message + "\n").getBytes(StandardCharsets.UTF_8));
+        } catch (IOException ignored) {}
+    }
+
+    private void logLibraryIssue(String phase, String stage, GameLibrary.Entry entry, Exception error) {
+        String source = entry.tree == null ? "legacyPath=" + entry.game.getAbsolutePath()
+            : "tree=" + entry.tree + " document=" + entry.document;
+        String message = "library phase=" + phase + " stage=" + stage + " key=" + entry.key
+            + " title=" + entry.title + " " + source + " error=" + error;
+        android.util.Log.w("CS2Player", message);
+        appendDiagnostic(message);
     }
 
     private void chooseDiagnosticsDestination() {
@@ -472,14 +531,13 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                 ui.post(() -> {
                     if (destroyed) return;
                     importing.set(false);
-                    renderLibrary();
-                    if (selected != null && scanned.found == 0) {
-                        status.setText("文件夹内未找到 CatSystem2 游戏");
-                    }
-                    if (scanned.unreadable != 0) {
-                        status.append(" · " + scanned.unreadable + " 个目录无法扫描");
-                    }
-                    scanPendingFolder();
+                    if (scanPendingFolder()) return;
+                    updateLibraryActions();
+                    String notice = selected != null && scanned.found == 0
+                        ? "文件夹内未找到 CatSystem2 游戏" : null;
+                    if (scanned.unreadable != 0) notice = (notice == null ? "" : notice + " · ")
+                        + scanned.unreadable + " 个目录无法扫描";
+                    refreshLibrary(notice);
                 });
             } catch (Exception error) {
                 ui.post(() -> {
@@ -499,24 +557,73 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         return true;
     }
 
-    private void launch(GameLibrary.Entry entry) {
+    private static boolean isDebuggable(Context context) {
+        return (context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+    }
+
+    private static File isolatedProfiles(Context context) throws IOException {
+        File cache = context.getCacheDir();
+        if (cache == null) throw new IOException("缓存目录不可用");
+        return GameFilesProvider.checkedFile(cache, new File(cache, "isolated-profiles"));
+    }
+
+    private void confirmIsolatedLaunch(GameLibrary.Entry entry) {
+        new AlertDialog.Builder(this)
+            .setTitle("隔离验收：" + entry.title)
+            .setMessage("本次使用全新的临时存档，不读取或覆盖正式存档。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("隔离启动", (dialog, which) -> launch(entry, true))
+            .show();
+    }
+
+    private void launch(GameLibrary.Entry entry, boolean isolated) {
         if (importing.get() || launchingTitle != null || endingGame) return;
-        if (entry.tree != null && !ensureStorageAccess()) return;
-        long generation = ++playGeneration;
-        resetGameUi();
-        launchingTitle = entry.title;
+        if (isolated && !isDebuggable(this)) return;
+        long generation = playGeneration;
+        String title = isolated ? entry.title + "（隔离验收）" : entry.title;
+        String phase = isolated ? "launch-isolated" : "launch";
+        launchingTitle = title;
         updateLibraryActions();
-        status.setText("正在准备 " + entry.title + "…");
-        worker.post(this::closeSession);
+        status.setText("正在准备 " + title + "…");
         new Thread(() -> {
+            String stage = "check-directory";
             try {
                 File game = library.gameDirectory(entry);
-                if (!entry.saves.isDirectory() && !entry.saves.mkdirs() && !entry.saves.isDirectory()) {
-                    throw new IOException("无法创建存档目录");
+                if (!isCurrent(generation)) return;
+                stage = "prepare-saves";
+                File saves;
+                if (isolated) {
+                    File root = isolatedProfiles(this);
+                    Files.createDirectories(root.toPath());
+                    saves = GameFilesProvider.checkedFile(root, Files.createTempDirectory(root.toPath(), "run-").toFile());
+                } else {
+                    saves = entry.saves;
+                    if (!saves.isDirectory() && !saves.mkdirs() && !saves.isDirectory()) {
+                        throw new IOException("无法创建存档目录: " + saves.getAbsolutePath());
+                    }
                 }
-                if (isCurrent(generation)) open(game.getAbsolutePath(), entry.saves.getAbsolutePath(), generation);
+                ui.post(() -> {
+                    if (!isCurrent(generation)) return;
+                    long opening = ++playGeneration;
+                    resetGameUi();
+                    launchingTitle = title;
+                    status.setText("正在启动 " + title + "…");
+                    updateLibraryActions();
+                    worker.post(this::closeSession);
+                    open(entry, game, saves, isolated, opening);
+                });
             } catch (Exception error) {
-                reportGameError(generation, "准备游戏失败", error);
+                logLibraryIssue(phase, stage, entry, error);
+                ui.post(() -> {
+                    if (!isCurrent(generation)) return;
+                    launchingTitle = null;
+                    if (error instanceof GameLibrary.DirectoryFailure) {
+                        GameLibrary.DirectoryFailure failure = (GameLibrary.DirectoryFailure)error;
+                        showFailure("准备游戏失败", failure.status.label);
+                    } else {
+                        showFailure("准备游戏失败", error.getMessage());
+                    }
+                });
             }
         }, "CS2 game open").start();
     }
@@ -531,6 +638,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         clearMessageInspectors();
         if (gameFullscreen) setGameFullscreen(false);
         launchingTitle = null;
+        isolatedSaveRoot = null;
         gameReady = false;
         hidePlaybackControls();
         logicalWidth = logicalHeight = 0;
@@ -558,7 +666,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                     ui.post(() -> {
                         if (!isCurrent(generation)) return;
                         endingGame = false;
-                        renderLibrary();
+                        refreshLibrary("游戏已退出");
                         status.setText("游戏已退出");
                     });
                 });
@@ -604,14 +712,27 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         });
     }
 
-    private void open(String game, String saves, long generation) {
+    private void open(GameLibrary.Entry entry, File game, File saves, boolean isolated, long generation) {
         worker.post(() -> {
             if (!isCurrent(generation)) return;
             sessionGeneration = generation;
             try {
-                session = nativeOpen(game.getBytes(StandardCharsets.UTF_8), saves.getBytes(StandardCharsets.UTF_8));
-                if (session == 0) throw new IOException(nativeErrorText());
+                String mode = isolated ? "isolated" : "standard";
+                String details = " mode=" + mode + " key=" + entry.key + " game=" + game.getAbsolutePath()
+                    + " saves=" + saves.getAbsolutePath();
+                session = nativeOpen(game.getAbsolutePath().getBytes(StandardCharsets.UTF_8),
+                    saves.getAbsolutePath().getBytes(StandardCharsets.UTF_8));
+                if (session == 0) {
+                    IOException error = new IOException(nativeErrorText());
+                    logLibraryIssue(isolated ? "launch-isolated" : "launch", "native-open" + details, entry, error);
+                    throw error;
+                }
                 android.util.Log.i("CS2Player", "Opened " + game);
+                if (isolated) {
+                    String record = "library phase=launch stage=native-open result=opened" + details;
+                    android.util.Log.i("CS2Player", record);
+                    appendDiagnostic(record);
+                }
                 if (!isCurrent(generation)) {
                     closeSession();
                     return;
@@ -630,6 +751,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                     error -> { if (session == openedSession) stopWithError("Tweet host failed", error); });
                 ui.post(() -> {
                     if (!isCurrent(generation)) return;
+                    isolatedSaveRoot = isolated ? saves : null;
                     messageUiSession = openedSession;
                     logicalWidth = width;
                     logicalHeight = height;
@@ -683,7 +805,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
             if (!isCurrent(generation) || messageUiSession != handle || renderSurface != target || gameReady) return;
             launchingTitle = null;
             gameReady = true;
-            renderLibrary();
+            updateLibraryActions();
             panel.setVisibility(View.GONE);
             surfaceView.requestFocus();
         });
@@ -710,7 +832,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                         if (!isCurrent(generation)) return;
                         ++playGeneration;
                         resetGameUi();
-                        renderLibrary();
+                        refreshLibrary("游戏已退出");
                         status.setText("游戏已退出");
                     });
                     return;
@@ -1603,7 +1725,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
                 if (!base.isAbsolute()) base = new File(gameRoot, directory.replace('\\', '/'));
                 File file = uri.getScheme() == null ? new File(normalized) : new File(uri.getPath());
                 if (!file.isAbsolute()) file = new File(base, normalized);
-                file = GameFilesProvider.checkedFile(getFilesDir(), file);
+                file = checkedGameDocument(file);
                 if (file.isDirectory()) {
                     showReadOnlyDirectory(file, file);
                     intent = null;
@@ -1639,10 +1761,17 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         });
     }
 
+    private File checkedGameDocument(File requested) throws IOException {
+        if (isolatedSaveRoot == null) return GameFilesProvider.checkedFile(getFilesDir(), requested);
+        File canonical = requested.getCanonicalFile();
+        return canonical.equals(isolatedSaveRoot) ? canonical
+            : GameFilesProvider.checkedFile(isolatedSaveRoot, canonical);
+    }
+
     /** Real directory receiver for the active private save directory. */
     private void showReadOnlyDirectory(File boundary, File requested) throws IOException {
-        File base = GameFilesProvider.checkedFile(getFilesDir(), boundary);
-        File directory = GameFilesProvider.checkedFile(getFilesDir(), requested);
+        File base = checkedGameDocument(boundary);
+        File directory = checkedGameDocument(requested);
         if (!directory.equals(base) && !directory.getPath().startsWith(base.getPath() + File.separator)) {
             throw new IOException("Directory escapes its opened root");
         }
@@ -1660,7 +1789,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle(directory.getName())
             .setItems(names.toArray(new String[0]), (window, selected) -> {
                 try {
-                    File file = GameFilesProvider.checkedFile(getFilesDir(), paths.get(selected));
+                    File file = checkedGameDocument(paths.get(selected));
                     if (!file.equals(base) && !file.getPath().startsWith(base.getPath() + File.separator)) {
                         throw new IOException("Selected document escapes its opened root");
                     }
@@ -1721,8 +1850,16 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         }
         private File file(Uri uri) throws FileNotFoundException {
             try {
-                if (getContext() == null || uri.getPath() == null) throw new IOException("文档路径为空");
-                return checkedFile(getContext().getFilesDir(), new File(uri.getPath()));
+                Context context = getContext();
+                if (context == null || uri.getPath() == null) throw new IOException("文档路径为空");
+                File requested = new File(uri.getPath());
+                if (isDebuggable(context) && context.getCacheDir() != null) {
+                    File cache = context.getCacheDir().getCanonicalFile();
+                    if (requested.toPath().startsWith(cache.toPath())) {
+                        return checkedFile(isolatedProfiles(context), requested);
+                    }
+                }
+                return checkedFile(context.getFilesDir(), requested);
             } catch (IOException error) { throw new FileNotFoundException(error.getMessage()); }
         }
         static String extension(File file) {
@@ -2099,7 +2236,10 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
         addPlaybackAction(actions, "上一页（Page Up）", () -> tapGameInput(handle, 3, 4, 33));
         addPlaybackAction(actions, "下一页（Page Down）", () -> tapGameInput(handle, 3, 4, 34));
         addPlaybackAction(actions, "软键盘", this::showGameKeyboard);
-        addPlaybackAction(actions, "打开游戏库", () -> panel.setVisibility(View.VISIBLE));
+        addPlaybackAction(actions, "打开游戏库", () -> {
+            panel.setVisibility(View.VISIBLE);
+            refreshLibrary(null);
+        });
         addPlaybackAction(actions, "退出当前游戏", this::confirmExit);
 
         playbackControls = overlay;
@@ -2409,6 +2549,7 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
 
     @Override protected void onResume() {
         super.onResume();
+        if (panel != null && panel.getVisibility() == View.VISIBLE) refreshLibrary(null);
         generalStopped = false;
         applyGeneralCamouflage();
         paused = false;
@@ -2489,16 +2630,18 @@ public final class PlayerActivity extends Activity implements SurfaceHolder.Call
     private void fail(String title, Exception error) {
         String message = error.getMessage() == null ? error.toString() : error.getMessage();
         android.util.Log.e("CS2Player", title, error);
-        try (FileOutputStream output = new FileOutputStream(diagnosticsLog(), true)) {
-            output.write((title + ": " + message + "\n").getBytes(StandardCharsets.UTF_8));
-        } catch (IOException ignored) {}
-        ui.post(() -> {
-            if (destroyed) return;
-            endGameKeyboard(true);
-            renderLibrary();
-            status.setText(title);
-            panel.setVisibility(View.VISIBLE);
-            new AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton("确定", null).show();
-        });
+        appendDiagnostic(title + ": " + message);
+        ui.post(() -> showFailure(title, error instanceof GameLibrary.DirectoryFailure
+            ? ((GameLibrary.DirectoryFailure)error).status.label : message));
+    }
+
+    private void showFailure(String title, String message) {
+        if (destroyed) return;
+        endGameKeyboard(true);
+        refreshLibrary(title);
+        status.setText(title);
+        updateLibraryActions();
+        panel.setVisibility(View.VISIBLE);
+        new AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton("确定", null).show();
     }
 }

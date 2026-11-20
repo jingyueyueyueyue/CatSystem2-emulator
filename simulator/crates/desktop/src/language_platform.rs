@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use cs2_formats::ConfigXml;
 use cs2_runtime::language::{LanguageChangeRequest, LanguageState, LanguageTarget};
 use cs2_runtime::resource_router::ResourceMode;
-use cs2_runtime::{ResourceIndex, RuntimeError};
+use cs2_runtime::{ResourceIndex, ResourceLocation, RuntimeError};
 
 use super::{HeadlessPlayer, load_fes_media_image};
 
@@ -73,6 +73,8 @@ impl HeadlessPlayer {
     /// optional declaration source; startup supplies APP/title. gamedef is
     /// parsed but is not treated as a user-language override without a contract.
     pub(super) fn initialize_languages(&mut self) -> Result<()> {
+        let pe_sha256 = self.data_services.native_profile.map(|profile| profile.pe_sha256);
+        self.data_services.language.configure_prefix_query(pe_sha256);
         let startup = optional_config(&self.scan.resources, "startup.xml")?;
         let language = optional_config(&self.scan.resources, "language.xml")?;
         let _game_defaults = optional_config(&self.scan.resources, "gamedef.xml")?;
@@ -80,18 +82,38 @@ impl HeadlessPlayer {
             .as_ref()
             .filter(|xml| has_language(xml))
             .or_else(|| startup.as_ref().filter(|xml| has_language(xml)));
+        let mut from_setup = false;
         if let Some(declaration) = declaration {
             self.data_services.language.languages =
                 LanguageState::from_config_xml(&declaration.document);
             self.data_services.language.platform.configuration =
                 TableConfiguration::from_xml(declaration, startup.as_ref())?;
+            let path = self.save_root.join("setup.xml");
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let document = ConfigXml::parse_runtime(&bytes).context("parse private setup.xml")?;
+                    self.data_services.language.apply_user_config_xml(&document);
+                    from_setup = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+            }
         } else if let Some(startup) = &startup {
             self.data_services.language.platform.configuration.title =
                 wide_xml(startup, &[b"APP", b"title"])?;
         }
         let languages = self.data_services.language.languages.clone();
         let platform = &mut self.data_services.language.platform;
-        platform.reload_tables(&self.scan.resources, LanguageTarget::Interface, &languages)?;
+        let [interface_table, game_table] =
+            platform.reload_tables(&self.scan.resources, LanguageTarget::Interface, &languages)?;
+        if declaration.is_some() {
+            let ui = languages.prefix(0).map(String::from_utf8_lossy);
+            let main = languages.prefix(1).map(String::from_utf8_lossy);
+            self.log.push(format!(
+                "language-bootstrap from_setup={from_setup} ui_index={} ui={ui:?} main_index={} main={main:?} interface_table={interface_table:?} game_table={game_table:?}",
+                languages.primary_index, languages.message_index,
+            ));
+        }
         self.install_default_language_adapters();
         self.data_services.language.platform.adapters.resolved_title =
             self.language_window_title()?;
@@ -434,7 +456,7 @@ impl LanguagePlatformState {
         resources: &ResourceIndex,
         target: LanguageTarget,
         languages: &LanguageState,
-    ) -> Result<()> {
+    ) -> Result<[Option<String>; 2]> {
         match target {
             LanguageTarget::Interface => {
                 let Some(prefix) = self
@@ -442,7 +464,7 @@ impl LanguagePlatformState {
                     .prefixes
                     .get(languages.primary_index as usize)
                 else {
-                    return Ok(());
+                    return Ok([None, None]);
                 };
                 let mut name: Vec<_> = "language_".encode_utf16().collect();
                 name.extend_from_slice(prefix);
@@ -450,20 +472,21 @@ impl LanguagePlatformState {
                 if name.len() > 1023 {
                     bail!("language interface-table path exceeds 1023 UTF-16 units");
                 }
-                self.reload_table(resources, 0, &name)?;
+                let interface = self.reload_table(resources, 0, &name)?;
                 let name = self.configuration.game_path(languages)?;
-                self.reload_table(resources, 1, &name)?;
+                let game = self.reload_table(resources, 1, &name)?;
+                Ok([interface, game])
             }
             LanguageTarget::MainText => {
                 let name = self.configuration.game_path(languages)?;
-                self.reload_table(resources, 1, &name)?;
+                let mut game = self.reload_table(resources, 1, &name)?;
                 if languages.contains_index(languages.message_index) {
-                    self.reload_table(resources, 1, &name)?;
+                    game = self.reload_table(resources, 1, &name)?;
                 }
+                Ok([None, game])
             }
-            LanguageTarget::Subtitle => {}
+            LanguageTarget::Subtitle => Ok([None, None]),
         }
-        Ok(())
     }
 
     fn reload_table(
@@ -471,14 +494,16 @@ impl LanguagePlatformState {
         resources: &ResourceIndex,
         selector: u32,
         name: &[u16],
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         self.tables.remove(&selector);
         let name = String::from_utf16(name)
             .context("language table filename contains an unsupported isolated UTF-16 surrogate")?;
-        if let Some(bytes) = optional_resource(resources, &name)? {
-            self.tables.insert(selector, parse_string_table(&bytes)?);
+        if let Some((bytes, source)) = optional_resource_mode(resources, &name, ResourceMode::LooseFirst)? {
+            self.tables.insert(selector, parse_string_table(&bytes)
+                .with_context(|| format!("parse language table {name:?} from {source:?}"))?);
+            return Ok(Some(source));
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -502,7 +527,7 @@ fn optional_config(resources: &ResourceIndex, name: &str) -> Result<Option<Encod
         Err(error) => return Err(error.into()),
     };
     for candidate in names {
-        if let Some(bytes) = optional_resource_mode(resources, &candidate, mode)? {
+        if let Some((bytes, _)) = optional_resource_mode(resources, &candidate, mode)? {
             let document = ConfigXml::parse_runtime(&bytes)
                 .with_context(|| format!("parse language configuration resource {candidate:?}"))?;
             return Ok(Some(EncodedConfiguration { document, codec: encoding_rs::UTF_8 }));
@@ -511,11 +536,9 @@ fn optional_config(resources: &ResourceIndex, name: &str) -> Result<Option<Encod
     Ok(None)
 }
 
-fn optional_resource(resources: &ResourceIndex, name: &str) -> Result<Option<Vec<u8>>> {
-    optional_resource_mode(resources, name, ResourceMode::LooseFirst)
-}
-
-fn optional_resource_mode(resources: &ResourceIndex, name: &str, mode: ResourceMode) -> Result<Option<Vec<u8>>> {
+fn optional_resource_mode(
+    resources: &ResourceIndex, name: &str, mode: ResourceMode,
+) -> Result<Option<(Vec<u8>, String)>> {
     if name.is_empty() {
         return Ok(None);
     }
@@ -530,7 +553,13 @@ fn optional_resource_mode(resources: &ResourceIndex, name: &str, mode: ResourceM
     if bytes.len() as u64 > MAX_TABLE_BYTES {
         bail!("language resource exceeds 64 MiB");
     }
-    Ok(Some(bytes))
+    let source = match &candidate.location {
+        ResourceLocation::File { .. } => candidate.name.replace('\\', "/"),
+        ResourceLocation::Archive { path, .. } => format!(
+            "{}::{}", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy(), candidate.name,
+        ),
+    };
+    Ok(Some((bytes, source)))
 }
 
 fn has_language(xml: &EncodedConfiguration) -> bool {
@@ -658,4 +687,63 @@ fn wide_nul(units: &[u16]) -> &[u16] {
         .iter()
         .position(|&unit| unit == 0)
         .unwrap_or(units.len())]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+    #[test]
+    fn cold_open_loads_private_ui_and_main_tables_independently() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-language-{}-{suffix}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let scratch = Scratch(root);
+        let game = scratch.0.join("game");
+        let profile = scratch.0.join("profile");
+        fs::create_dir_all(game.join("config")).unwrap();
+        fs::create_dir(&profile).unwrap();
+        fs::write(game.join("config/startup.xml"), br#"<document>
+          <APP><title>$ui$Default title</title></APP>
+          <language><default>0</default><L00><prefix>en</prefix></L00>
+            <L01><prefix>jp</prefix></L01><L02><prefix>cn</prefix></L02>
+            <OPTTABLE>config.int/gamelangtbl_%LANG_M%.txt</OPTTABLE></language>
+          <INT><int00><name>config</name><int>config.int</int><ext>xml</ext><dir>config</dir></int00></INT>
+        </document>"#).unwrap();
+        for (name, table) in [
+            ("language_en.txt", "$ui$\nEnglish UI\n"),
+            ("language_cn.txt", "$ui$\nChinese UI\n"),
+            ("config/gamelangtbl_en.txt", "$body$\nEnglish text\n"),
+            ("config/gamelangtbl_cn.txt", "$body$\nChinese text\n"),
+        ] {
+            fs::write(game.join(name), table).unwrap();
+        }
+        for (setup, selections, ui, body, source) in [
+            (None, [0, 0, u32::MAX], "English UI", "English text", "config/gamelangtbl_en.txt"),
+            (Some((0, 2)), [0, 2, u32::MAX], "English UI", "Chinese text", "config/gamelangtbl_cn.txt"),
+            (Some((1, 1)), [1, 1, u32::MAX], "Default title", "Original text", ""),
+        ] {
+            if let Some((interface, main)) = setup {
+                fs::write(profile.join("setup.xml"), format!(
+                    "<document><language><id><UI>{interface}</UI><main>{main}</main></id></language></document>"
+                )).unwrap();
+            }
+            let player = HeadlessPlayer::open_with_save_root(&game, &profile).unwrap();
+            assert_eq!(player.data_services.language.languages.selections(), selections);
+            assert_eq!(player.language_window_title().unwrap().as_deref(), Some(ui));
+            assert_eq!(player.data_services.language.platform.adapters.resolved_title.as_deref(), Some(ui));
+            let key: Vec<u16> = "$body$Original text".encode_utf16().collect();
+            assert_eq!(String::from_utf16(&player.resolve_language_text(&key)).unwrap(), body);
+            let receipt = player.log().iter().find(|line| line.starts_with("language-bootstrap ")).unwrap();
+            assert!(receipt.contains(&format!("from_setup={}", setup.is_some())));
+            let game_table = if source.is_empty() { "game_table=None".to_owned() }
+                else { format!("game_table=Some({source:?})") };
+            assert!(receipt.contains(&game_table), "{receipt}");
+        }
+    }
 }

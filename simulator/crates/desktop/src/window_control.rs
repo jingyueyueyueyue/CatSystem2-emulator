@@ -30,6 +30,11 @@ pub(super) struct WindowControlState {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn post_effect_settings(&mut self) -> cs2_script::Result<()> {
+        self.window_control_native(457, &[])?;
+        Ok(())
+    }
+
     pub(super) fn window_control_native(
         &mut self, index: u32, arguments: &[u8],
     ) -> cs2_script::Result<NativeReturn> {

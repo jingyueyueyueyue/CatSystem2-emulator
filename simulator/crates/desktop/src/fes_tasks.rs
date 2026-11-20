@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use cs2_script::{
-    ExpressionState, FesDocument, FesEvent, FesLine, FesSection, NativeReturn, Result,
+    ExpressionState, FesDocument, FesEvent, FesLine, FesProgram, FesSection, NativeReturn, Result,
     SharedExternalStorage, Vm,
 };
 
@@ -23,6 +23,17 @@ pub(crate) mod state;
 const MAX_FES_BYTES: usize = 64 * 1024 * 1024;
 const SYNC_BUDGET: usize = 4096;
 const LEGACY_SHARED_SLOTS: usize = 1024;
+const REBELLIONS_MESSAGE_FES_SIZE: usize = 3943;
+const REBELLIONS_MESSAGE_FES_SHA256: &str =
+    "4ff3b5efdad654cb1d581f1cde55cd46fdfa4a6918471377e69779d1f5535022";
+const REBELLIONS_MESSAGE_PE_SIZE: usize = 4_350_976;
+const REBELLIONS_MESSAGE_PE_SHA256: &str =
+    "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3";
+const KANMI_MESSAGE_FES_SIZE: usize = 2975;
+const KANMI_MESSAGE_FES_SHA256: &str =
+    "98edd179cca0c4bc511a0dd411745d69c7cd681bbefb2370322abad189ac5639";
+const KANMI_PE_SHA256: &str =
+    "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26";
 
 pub(super) fn startup_shared_slots(scan: &cs2_runtime::GameScan, entry: Option<&str>) -> usize {
     super::discover_shared_slots(&scan.resources)
@@ -496,6 +507,14 @@ impl FesTaskStore {
                 .filter(|object| object.started && object.paused == 0)
                 .and_then(|object| object.runtime.as_ref())
                 .map(|runtime| (id, runtime))
+        })
+    }
+
+    pub(super) fn story_runtimes(&self) -> impl Iterator<Item = (u32, &[u8], &FesRuntime, bool)> {
+        self.runtimes().filter_map(|(id, runtime)| {
+            let slot = self.slots.get(&id)?;
+            Some((id, slot.object.as_ref()?.name.as_deref()?, runtime,
+                slot.named_dwords.get(b"WAIT_KEY".as_slice()) == Some(&1)))
         })
     }
 
@@ -1707,7 +1726,11 @@ impl FesTask {
             .driver
             .take()
             .ok_or_else(|| native_state_error("FES system driver is missing"))?;
-        let now = self.system.as_ref().unwrap().now;
+        let system = self.system.as_ref().unwrap();
+        let now = system.now;
+        let bounded_block = (kanmi_message_notification(
+            key, value, block, system.object.is_none() && system.input.is_none(),
+        ) && self.verified_kanmi_message_driver(host, &mut driver)).then_some(block);
         let result = (|| {
             self.apply_data_commands(host, &mut driver);
             if !self.system.as_ref().unwrap().entered {
@@ -1774,7 +1797,9 @@ impl FesTask {
                 let effect = match self.pending_effect.take() {
                     Some(effect) => effect,
                     None => with_expression(host, |_, shared| {
-                        driver.advance_notification(now as u64, shared, budget - iteration)
+                        driver.advance_system_notification(
+                            now as u64, shared, budget - iteration, bounded_block,
+                        )
                     })
                     .map_err(|error| host.fes_task_error(self.id, error))?,
                 };
@@ -1937,8 +1962,7 @@ impl FesTask {
                 .resources
                 .read_candidate(candidate)
                 .map_err(|error| host.fes_task_error(self.id, error))?;
-            let document = parse_document(&bytes)?;
-            let mut replacement = self.new_runtime(document)?;
+            let mut replacement = self.new_loaded_runtime(host, candidate, &bytes)?;
             let mut previous = self
                 .runtime
                 .as_ref()
@@ -2001,8 +2025,7 @@ impl FesTask {
                 .resources
                 .read_candidate(candidate)
                 .map_err(|error| host.fes_task_error(self.id, error))?;
-            let document = parse_document(&bytes)?;
-            let mut replacement = self.new_runtime(document)?;
+            let mut replacement = self.new_loaded_runtime(host, candidate, &bytes)?;
             if let Some(previous) = self
                 .runtime
                 .as_mut()
@@ -2041,6 +2064,9 @@ impl FesTask {
             if let Some(mut previous) = self.previous_driver.take() {
                 let runtime = self.runtime.as_mut().unwrap();
                 let staged = runtime.driver.take().unwrap();
+                previous.set_island_gbk_fes_source(staged.is_island_gbk_fes_source());
+                previous.set_rebellions_message_fes_source(staged.is_rebellions_message_fes_source());
+                previous.kanmi_message_fes_source = staged.kanmi_message_fes_source;
                 previous.interpreter = staged.interpreter;
                 previous.adapter = staged.adapter;
                 previous.set_task_id(self.id);
@@ -2049,6 +2075,40 @@ impl FesTask {
             }
         }
         Ok(done)
+    }
+
+    fn new_loaded_runtime(
+        &self,
+        host: &LoggingHost<'_>,
+        candidate: &cs2_runtime::ResourceCandidate,
+        bytes: &[u8],
+    ) -> Result<FesRuntime> {
+        let mut runtime = self.new_runtime(parse_document(bytes)?)?;
+        let driver = runtime.driver.as_mut().unwrap();
+        driver.set_island_gbk_fes_source(is_island_gbk_fes_source(host.resources, candidate));
+        driver.set_rebellions_message_fes_source(is_rebellions_message_fes_source(host.resources, bytes));
+        driver.kanmi_message_fes_source = Some(is_kanmi_message_fes_source(host, bytes));
+        Ok(runtime)
+    }
+
+    fn verified_kanmi_message_driver(&self, host: &LoggingHost<'_>, driver: &mut FesScriptDriver) -> bool {
+        if host.data_services.particle_message_pe_sha256 != Some(KANMI_PE_SHA256) {
+            return false;
+        }
+        if let Some(verified) = driver.kanmi_message_fes_source {
+            return verified;
+        }
+        let verified = self.name.as_deref()
+            .and_then(|name| host.fes_resource_names(name).ok())
+            .and_then(|names| names.iter().find_map(|name| host.resources.find(name)))
+            .filter(|candidate| candidate.size == KANMI_MESSAGE_FES_SIZE as u64)
+            .and_then(|candidate| host.resources.read_candidate(candidate).ok())
+            .filter(|bytes| is_kanmi_message_fes_source(host, bytes))
+            .and_then(|bytes| parse_document(&bytes).ok())
+            .and_then(|document| FesProgram::from_document(&document).ok())
+            .is_some_and(|program| program == driver.interpreter.program);
+        driver.kanmi_message_fes_source = Some(verified);
+        verified
     }
 
     fn bind_list(&mut self, host: &mut LoggingHost<'_>, list: u32) -> Result<()> {
@@ -2739,6 +2799,47 @@ fn nul(bytes: &[u8]) -> &[u8] {
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(bytes.len())]
+}
+
+fn is_island_gbk_fes_source(resources: &cs2_runtime::ResourceIndex,
+    candidate: &cs2_runtime::ResourceCandidate) -> bool {
+    let cs2_runtime::ResourceLocation::Archive { path, .. } = &candidate.location else {
+        return false;
+    };
+    resources.resource_router().is_some_and(|router| router.is_island_chinese_fes(resources, path))
+}
+
+fn is_rebellions_message_fes_source(resources: &cs2_runtime::ResourceIndex, bytes: &[u8]) -> bool {
+    let sha256 = super::particle_plugin_digest::sha256;
+    bytes.len() == REBELLIONS_MESSAGE_FES_SIZE
+        && sha256(bytes) == REBELLIONS_MESSAGE_FES_SHA256
+        && resources.resolve_plain_file("REBELLIONS.exe").ok().flatten()
+            .filter(|candidate| candidate.size == REBELLIONS_MESSAGE_PE_SIZE as u64)
+            .and_then(|candidate| resources.read_candidate_bounded(candidate, REBELLIONS_MESSAGE_PE_SIZE).ok().flatten())
+            .is_some_and(|bytes| sha256(&bytes) == REBELLIONS_MESSAGE_PE_SHA256)
+}
+
+fn kanmi_message_notification(key: u32, bank: u32, block: &[u8], context_free: bool) -> bool {
+    key == 343 && bank == 0 && context_free && matches!(block, b"MES_SHOW" | b"MES_SETSTATE")
+}
+
+fn is_kanmi_message_fes_source(host: &LoggingHost<'_>, bytes: &[u8]) -> bool {
+    bytes.len() == KANMI_MESSAGE_FES_SIZE
+        && host.data_services.particle_message_pe_sha256 == Some(KANMI_PE_SHA256)
+        && super::particle_plugin_digest::sha256(bytes) == KANMI_MESSAGE_FES_SHA256
+        && super::discover_start_entry(host.resources).as_deref() == Some("kcs.int/main.kcs")
+}
+
+#[test]
+fn kanmi_message_notification_rejects_other_shapes() {
+    assert!(kanmi_message_notification(343, 0, b"MES_SHOW", true));
+    assert!(kanmi_message_notification(343, 0, b"MES_SETSTATE", true));
+    assert!(!kanmi_message_notification(341, 0, b"MES_SHOW", true));
+    assert!(!kanmi_message_notification(343, 1, b"MES_SHOW", true));
+    assert!(!kanmi_message_notification(343, 0, b"MES_SHOW", false));
+    assert!(!kanmi_message_notification(343, 0, b"MES_WAITINPUT", true));
+    assert!(!kanmi_message_notification(343, 0, b"MES_DRAW", true));
+    assert!(!kanmi_message_notification(343, 0, b"MES_ISDRAW", true));
 }
 
 fn parse_document(bytes: &[u8]) -> Result<FesDocument> {

@@ -4,11 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use cs2_renderer::{Canvas, Color, ImageDrawOptions, Point, RgbaFrame};
+use cs2_runtime::ResourceLocation;
 use cs2_runtime::fes_motion::{FesMotionArguments, FesMotionContext, x86_integer};
 use cs2_script::{ExpressionState, FesEvent, FesSubcommand, KcsProgram, NativeReturn};
 
 use super::fes_driver::{FesDriverCommand, FesDriverEffect, FesScriptDriver};
 use super::fes_tasks::FesTaskView;
+use super::motion_vm::{ExternalLayout, MotionProgram, MotionRunner, MotionStart};
 use super::{
     DesktopMotionServices, FesRuntime, LoggingHost, MotionControllerState, MotionTaskState,
     ScriptTextEncoding, advance_motion_controller, create_motion_runner,
@@ -201,7 +203,12 @@ pub(super) fn observe(
     }
     let count = driver
         .adapter
-        .object(&definition.name)
+        .objects
+        .iter()
+        .rfind(|object| {
+            object.definition.name == definition.name
+                && object.definition.kind_name == definition.kind
+        })
         .context("motion declaration has no resolved bank count")?
         .definition
         .bank_count;
@@ -578,10 +585,12 @@ pub(super) fn apply_effect(
     if matches!(verb.as_slice(), b"getpos" | b"getpos2") {
         return query_position(host, view, runtime, driver, command, shared, verb == b"getpos2");
     }
+    let legacy_mcpend = verb == b"mcpend"
+        && host.data_services.css_task_pe_sha256 == Some(super::css_model::SHA);
     let built_in = matches!(
         verb.as_slice(),
         b"pos" | b"blend" | b"color" | b"arc" | b"mcarc" | b"delay" | b"ismot" | b"stop"
-    );
+    ) || legacy_mcpend;
     let binding = (!built_in)
         .then(|| driver.adapter.subcommand(verb).cloned())
         .flatten();
@@ -595,8 +604,12 @@ pub(super) fn apply_effect(
     let Some(definition) = driver.adapter.object(raw_name) else {
         return Ok(None);
     };
-    let node_kind = kind(&definition.definition.kind_name);
-    if node_kind == Kind::Other {
+    let kind_name = &definition.definition.kind_name;
+    if legacy_mcpend && !kind_name.eq_ignore_ascii_case(b"IMAGE") {
+        return Ok(None);
+    }
+    let node_kind = kind(kind_name);
+    if node_kind == Kind::Other && !(verb == b"stop" && kind_name.eq_ignore_ascii_case(b"IMGWND")) {
         return Ok(None);
     }
     if verb == b"color" && !matches!(node_kind, Kind::Image | Kind::Plane) {
@@ -703,6 +716,8 @@ fn run_command(
         3
     } else if matches!(pending.verb.as_slice(), b"arc" | b"mcarc") {
         5
+    } else if pending.verb == b"mcpend" {
+        4
     } else {
         0
     };
@@ -730,7 +745,9 @@ fn run_command(
             255
         } else if pending.verb == b"pos" {
             current
-        } else if matches!(pending.verb.as_slice(), b"arc" | b"mcarc") && index == 0 {
+        } else if matches!(pending.verb.as_slice(), b"arc" | b"mcarc" | b"mcpend")
+            && index == 0
+        {
             30
         } else {
             0
@@ -861,6 +878,9 @@ fn run_command(
                         values[2] = 0;
                     }
                     pending.parameters = Some(values);
+                } else if pending.verb == b"mcpend" {
+                    let values = pending.values.as_slice().try_into()?;
+                    pending.parameters = Some(mcpend_parameters(values).to_vec());
                 } else if matches!(pending.verb.as_slice(), b"arc" | b"mcarc") {
                     let mut values: Vec<_> = pending
                         .values
@@ -968,6 +988,7 @@ fn run_command(
                     b"pos" => b"pPos".to_vec(),
                     b"blend" | b"color" => b"pColor".to_vec(),
                     b"arc" => b"motArc".to_vec(),
+                    b"mcpend" => b"mcPend".to_vec(),
                     _ => b"mcArc".to_vec(),
                 }
             };
@@ -984,19 +1005,17 @@ fn run_command(
                 }
                 pending.baseline_captured = true;
             }
-            if let Some(program) = load_program(host, owner, &resource)? {
+            if let Some((program, layout)) = load_program(host, owner, &resource)? {
                 let node = owner.nodes.get_mut(&key).unwrap();
                 let mut parameters = [0; 256];
                 let mapped = pending.parameters.as_ref().unwrap();
                 parameters[..mapped.len()].copy_from_slice(mapped);
-                let mut runner = create_motion_runner(
+                let mut runner = create_fes_motion_runner(
                     program,
+                    layout,
                     &resource,
-                    &parameters,
-                    &[],
-                    0,
+                    parameters,
                     node.controller.base_properties,
-                    0,
                 )?;
                 runner.set_base_time(node.delay)?;
                 let id = node.controller.next_task_id;
@@ -1006,7 +1025,7 @@ fn run_command(
                     id,
                     MotionTaskState {
                         name: resource,
-                        group: i32::from(pending.verb == b"mcarc"),
+                        group: i32::from(matches!(pending.verb.as_slice(), b"mcarc" | b"mcpend")),
                         parameters,
                         saved_data: Vec::new(),
                         snapshot_flags: 0,
@@ -1027,6 +1046,17 @@ fn run_command(
         pending.baseline_captured = false;
     }
     Ok(true)
+}
+
+fn mcpend_parameters([period, x_degrees, y_degrees, z_degrees]: [i32; 4]) -> [u32; 4] {
+    let radians = |degrees: i32| (f64::from(degrees) * f64::from(std::f32::consts::PI) / 180.0) as f32;
+    [
+        period.max(0) as f32,
+        radians(x_degrees),
+        radians(y_degrees),
+        radians(z_degrees),
+    ]
+    .map(f32::to_bits)
 }
 
 /// Call after SOUND has saved its full signed volume. The captured words are
@@ -1073,7 +1103,7 @@ pub(super) fn queue_sound_blend(
             }
             owner.sound_blends.insert(stamp.clone(), value);
         }
-        if let Some(program) = load_program(host, &mut owner, b"pColor")? {
+        if let Some((program, layout)) = load_program(host, &mut owner, b"pColor")? {
             let node = owner.nodes.get_mut(&id).unwrap();
             let mut parameters = [0; 256];
             parameters[..4].copy_from_slice(&[
@@ -1087,14 +1117,12 @@ pub(super) fn queue_sound_blend(
                 .next_task_id
                 .checked_add(1)
                 .context("SOUND motion number overflow")?;
-            let mut runner = create_motion_runner(
+            let mut runner = create_fes_motion_runner(
                 program,
+                layout,
                 b"pColor",
-                &parameters,
-                &[],
-                0,
+                parameters,
                 node.controller.base_properties,
-                0,
             )?;
             runner.set_base_time(node.delay)?;
             node.controller.tasks.insert(
@@ -1595,11 +1623,69 @@ fn writeback(
     Ok(())
 }
 
+fn create_fes_motion_runner(
+    program: KcsProgram,
+    layout: ExternalLayout,
+    name: &[u8],
+    parameters: [u32; 256],
+    properties: [u32; 36],
+) -> cs2_script::Result<MotionRunner> {
+    MotionRunner::with_external_layout(MotionProgram::from_program(program)?, MotionStart {
+        name, parameters, properties, external_value: 0, base_time: 0,
+        saved_data: &[], snapshot_flags: 0,
+    }, layout)
+}
+
+fn uses_short_fes_motion_layout(pe_sha: Option<&str>) -> bool {
+    matches!(
+        pe_sha,
+        Some(super::particle_external::CAMPANELLA_SHA | super::css_model::SHA)
+    )
+}
+
+fn fes_motion_external_layout(
+    pe_sha: Option<&str>, archive_name: Option<&str>, member: &str, code: &[u8],
+) -> ExternalLayout {
+    if !uses_short_fes_motion_layout(pe_sha)
+        || !archive_name.is_some_and(|name| name.eq_ignore_ascii_case("mot.int"))
+    {
+        return ExternalLayout::Default;
+    }
+    let digest = match member.rsplit(['/', '\\']).next().unwrap_or(member) {
+        "motfade.kcs" => "ac0c5bd4bde966f0749bdefcae54164d1bde8a86225977ffb0e2c2d063b2755c",
+        "motfade2.kcs" => "5e68e41efb92c31ea3b592b91b9c03dc6ca16e15d6123f906aac6d01db1afdf3",
+        "motmove.kcs" => "f0c7cc2432f9fd07da58233610c9a4128fce3c228fca126826bdcdd4a1d4b039",
+        "motrot.kcs" => "f6a23ac5449351fe0abfe6be05c1a20e9f492f06c4a86b2fffebc3e8759ea75e",
+        "motscale.kcs" => "d461e36f2f52481330c66cb517fb62dc7c909bcf0a65733509330f035b53f886",
+        "mcfade.kcs" => "8eebe432198f723e930205237fa80a4d016a1d39cbbe506f148cc1465f395a17",
+        "mcmove.kcs" => "eb626eae7b4de39214dcc13391d7b39547859684f4604dc7f49b3f12702fd63b",
+        "mcpend.kcs" if pe_sha == Some(super::css_model::SHA) => {
+            "5d29c4b32edc46fb15fbcbbe088a430a953a0b0e737c3532ec26f2d45a997b7d"
+        }
+        "mcrot.kcs" => "2550e754e0fac92fcd380c22503e04084f990433303f49d163ffee1dbce2645b",
+        "mcscalecos.kcs" => "d8cd5f1df6cd30dd281710d94103b8bfb16709adff1729359529fe71816683d7",
+        "mcscalesin.kcs" => "ad5fcc72b72d7a85a9c4395143c4071d5148a51757f8daa2800d647f0a733cba",
+        "pbase.kcs" => "171e58f8afd181083a48f3e5ed12982b7568fa7d4b111161d84ab900751c0c7b",
+        "pcolor.kcs" => "0559f4afdf8dbf0b89cc8c292ed75dd64f691ecfed40a62711b7fe092a0aba9a",
+        "pdepth.kcs" => "dafa40f545276cf893411f40f9a893a3048452d0372e55e88adf46f29c2ccb06",
+        "ppos.kcs" => "73a23866f2f5c2d3129a174da3113d3d43f9e0acab68f150c4cebdbd972866e2",
+        "prot.kcs" => "c163f9c82795d91ec177a9703016d3b735ce5c4efbd6025439d5a673767c8efd",
+        "pscale.kcs" => "8eb68956e3ce9a9d7a307ba4e43009a418149c7f28f4486f3e0b8ff10fbbd749",
+        "pvram.kcs" => "6b9531f7ced26052a7b2d73c57e422a5bec7087144e28b0543b51467ec629778",
+        _ => return ExternalLayout::Default,
+    };
+    if super::particle_plugin_digest::sha256(code) == digest {
+        ExternalLayout::Campanella
+    } else {
+        ExternalLayout::Default
+    }
+}
+
 fn load_program(
     host: &LoggingHost<'_>,
     owner: &mut Owner,
     raw_name: &[u8],
-) -> Result<Option<KcsProgram>> {
+) -> Result<Option<(KcsProgram, ExternalLayout)>> {
     if !owner.resources.contains_key(raw_name) {
         owner.resources.insert(
             raw_name.to_vec(),
@@ -1607,18 +1693,34 @@ fn load_program(
                 .category_names(b"mot", &decode(raw_name, host.text_encoding)?)?,
         );
     }
+    let pe_sha = host.data_services.css_task_pe_sha256;
     for name in &owner.resources[raw_name] {
         let key = name.to_lowercase();
+        let layout = |program: &KcsProgram, location: &ResourceLocation| {
+            let archive = match location {
+                ResourceLocation::Archive { path, .. } => path.file_name().and_then(|name| name.to_str()),
+                ResourceLocation::File { .. } => None,
+            };
+            fes_motion_external_layout(pe_sha, archive, &key, &program.code)
+        };
         if let Some(program) = owner.programs.get(&key) {
-            return Ok(Some(program.clone()));
+            let external = if uses_short_fes_motion_layout(pe_sha) {
+                host.resources.resolve(name)?.map_or(ExternalLayout::Default, |resource| {
+                    layout(program, &resource.location)
+                })
+            } else {
+                ExternalLayout::Default
+            };
+            return Ok(Some((program.clone(), external)));
         }
         if let Some(resource) = host.resources.resolve(name)? {
             if resource.size > MAX_BYTES {
                 bail!("FES motion resource exceeds 64 MiB");
             }
             let program = KcsProgram::parse(&host.resources.read_candidate(resource)?)?;
+            let external = layout(&program, &resource.location);
             owner.programs.insert(key, program.clone());
-            return Ok(Some(program));
+            return Ok(Some((program, external)));
         }
     }
     Ok(None)
@@ -1928,6 +2030,46 @@ pub(super) fn plane_render_properties(
 /// Keep integral image translations as real list entries. Other image poses
 /// are projected into the bound list; lower plane matrices are consumed once
 /// by the plane drawable rather than baked into each image.
+pub(super) fn image_list_placement(
+    host: &LoggingHost<'_>,
+    view: &FesTaskView,
+    runtime: &FesRuntime,
+    name: &str,
+    frame: &RgbaFrame,
+) -> Result<super::list_native::AffinePlacement> {
+    let layer = &runtime.media[name];
+    let parent = inherited_image_position(host, view.id, runtime, name)?;
+    let animation = layer.animation_display.map_or([0; 2], |display| [display.x, display.y]);
+    let vram = layer.plane.as_ref().filter(|plane| !runtime.media.contains_key(*plane))
+        .and_then(|plane| runtime.planes.get(plane)).map_or([0; 2], |plane| plane.vram);
+    let mut position = [layer.position.x, layer.position.y].map(|value| value as f32);
+    let mut base = layer.image_base.map(|value| value as f32);
+    let mut offset = layer.image_offset;
+    let mut scale = [1.; 2];
+    let mut rotation = 0.;
+    if let Some(words) = layer.motion.as_ref() {
+        for axis in 0..2 {
+            let motion = f32::from_bits(words[6 + axis]);
+            position[axis] += motion - x86_integer(motion) as f32;
+            base[axis] = f32::from_bits(words[3 + axis]);
+            scale[axis] = f32::from_bits(words[25 + axis]);
+        }
+        rotation = f32::from_bits(words[31]);
+    }
+    let metadata = frame.metadata();
+    let raw_frame = layer.image.is_none() && layer.source.has_raw_source();
+    for axis in 0..2 {
+        position[axis] += parent[axis] + animation[axis] as f32 + vram[axis] as f32;
+        if raw_frame {
+            base[axis] += metadata.base[axis] as f32;
+        }
+        if raw_frame || layer.image.is_some() {
+            offset[axis] = offset[axis].wrapping_add(metadata.offset[axis]);
+        }
+    }
+    Ok(super::list_native::AffinePlacement { position, base, offset, scale, rotation })
+}
+
 pub(super) fn prepare_projection(
     host: &LoggingHost<'_>,
     view: &FesTaskView,
@@ -2154,4 +2296,85 @@ pub(super) fn button_unlocked_coordinates(
             + animation[axis] as f32
             + parent[axis]
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HeadlessPlayer, fes_services};
+    use cs2_script::{FesDocument, FesLine, FesSection};
+
+    #[test]
+    fn tsunaban_mcpend_maps_all_four_motion_words() {
+        assert_eq!(
+            mcpend_parameters([150, 0, 0, 2]),
+            [150.0_f32.to_bits(), 0, 0, 2.0_f32.to_radians().to_bits()],
+        );
+        assert_eq!(
+            mcpend_parameters([-1, 90, -180, 45]),
+            [0, std::f32::consts::FRAC_PI_2.to_bits(), (-std::f32::consts::PI).to_bits(), std::f32::consts::FRAC_PI_4.to_bits()],
+        );
+    }
+
+    #[test]
+    fn imgwnd_stop_reuses_shared_motion_for_indexed_and_all_banks() -> Result<()> {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        let directory = std::env::temp_dir().join(format!(
+            "cs2-fes-imgwnd-stop-{}-{}", std::process::id(), unique.as_nanos(),
+        ));
+        std::fs::create_dir(&directory)?;
+        let result = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile"))
+            .and_then(|mut player| player.with_host(|host| {
+                let mut offset = 0;
+                let mut section = |header: &[u8], lines: &[&[u8]]| FesSection {
+                    header: header.to_vec(),
+                    lines: lines.iter().map(|bytes| {
+                        let line = FesLine { offset, bytes: bytes.to_vec() };
+                        offset += bytes.len() + 1;
+                        line
+                    }).collect(),
+                };
+                let document = FesDocument { sections: vec![
+                    section(b"DEFINE", &[b"IMGWND window[2]", b"VIEWPORT clip"]),
+                    section(b"START", &[b"window[1] stop", b"window stop", b"clip stop"]),
+                ] };
+                let mut driver = FesScriptDriver::new(&document)?;
+                let mut runtime = FesRuntime::new(document);
+                let mut shared = ExpressionState::default();
+                let id = host.create_task_object(34, 0, b"imgwnd stop test", b"")?;
+                let view = FesTaskView { id, parent: 0, context: Vec::new(), list: None, now: 50, paused: 0 };
+                while let Some(effect) = driver.advance_initialization(&mut shared)? {
+                    if matches!(&effect, FesDriverEffect::Initialize { event: FesEvent::CreateObject(_), .. }) {
+                        assert_eq!(fes_services::apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?, Some(true));
+                    }
+                }
+
+                let first = (b"window".to_vec(), 0);
+                let second = (b"window".to_vec(), 1);
+                let child = (b"child".to_vec(), 0);
+                let program = KcsProgram::from_code(&[0x3b], vec![0; 16], 16)?;
+                attach_draw_motion(host, id, &child.0, second.clone(), Some(program))?;
+                let nodes = &mut host.data_services.fes_motion.owners.get_mut(&id).unwrap().nodes;
+                nodes.get_mut(&first).unwrap().delay = 10;
+                nodes.get_mut(&second).unwrap().delay = 20;
+                let child_node = nodes.get_mut(&child).unwrap();
+                child_node.delay = 30;
+                child_node.controller.tasks.get_mut(&1).unwrap().origin = u32::MAX - 1;
+
+                for (expected, first_delay) in [(Some(true), 10), (Some(true), 0), (None, 0)] {
+                    let effect = driver.advance(u64::from(view.now), &mut shared, 64)?;
+                    assert!(matches!(&effect, FesDriverEffect::Command(_)), "{effect:?}");
+                    assert_eq!(fes_services::apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?, expected);
+                    let nodes = &host.data_services.fes_motion.owners[&id].nodes;
+                    assert_eq!(nodes[&first].delay, first_delay);
+                    assert_eq!(nodes[&second].delay, 0);
+                    assert_eq!(nodes[&child].delay, 30);
+                    let task = &nodes[&child].controller.tasks[&1];
+                    assert_eq!((task.finishing, task.elapsed, task.running), (1, 2, 1));
+                }
+                Ok(())
+            }));
+        std::fs::remove_dir(&directory)?;
+        result
+    }
 }

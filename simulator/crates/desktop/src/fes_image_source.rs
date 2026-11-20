@@ -8,7 +8,7 @@ use super::{FesDriverCommand, FesScriptDriver, decode, split_target};
 use crate::{FesMediaLayer, FesRuntime, LoggingHost};
 use crate::fes_tasks::FesTaskView;
 
-#[derive(Clone, Debug, Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
+#[derive(Clone, Debug, Default, cs2_runtime::graph_serde::Serialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub(crate) struct ImageSourceState {
     requested: Option<Vec<u8>>,
@@ -22,6 +22,42 @@ pub(crate) struct ImageSourceState {
     raw_pending: bool,
     #[serde(skip)]
     difimage_resource: Option<u32>,
+    pub(crate) coordmode: i32,
+    pub(crate) btype: i32,
+}
+
+impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ImageSourceState {
+    fn deserialize<D: cs2_runtime::graph_serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use cs2_runtime::graph_serde::de::{Error, SeqAccess, Visitor};
+
+        struct SourceVisitor;
+        impl<'de> Visitor<'de> for SourceVisitor {
+            type Value = ImageSourceState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an IMAGE source record with optional coordmode and BTYPE")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let missing = || A::Error::custom("truncated IMAGE source record");
+                Ok(ImageSourceState {
+                    requested: seq.next_element()?.ok_or_else(missing)?,
+                    expanded: seq.next_element()?.ok_or_else(missing)?,
+                    selected_frame: seq.next_element()?.ok_or_else(missing)?,
+                    dirty: seq.next_element()?.ok_or_else(missing)?,
+                    raw_bytes: seq.next_element()?.ok_or_else(missing)?,
+                    raw_entry: seq.next_element()?.ok_or_else(missing)?,
+                    raw_pending: seq.next_element()?.ok_or_else(missing)?,
+                    difimage_resource: None,
+                    coordmode: seq.next_element()?.unwrap_or_default(),
+                    btype: seq.next_element()?.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_seq(SourceVisitor)
+    }
 }
 
 impl ImageSourceState {
@@ -317,9 +353,11 @@ pub(crate) fn update_image_sources(
             }
         }
         if let Some(image) = image {
-            let size = layer.clip.map(|clip| [clip.width as i32, clip.height as i32])
-                .unwrap_or([image.width() as i32, image.height() as i32]);
-            layer.navigation.set_size(size);
+            if matches!(layer.source.btype, 0 | 1) {
+                let size = layer.clip.map(|clip| [clip.width as i32, clip.height as i32])
+                    .unwrap_or([image.width() as i32, image.height() as i32]);
+                layer.navigation.set_size(size);
+            }
             install_ordinary_frame(layer, image);
         }
         // Publish each completed bank before trying the next resource, so a
@@ -337,15 +375,27 @@ pub(crate) fn update_image_sources(
 
 pub(super) fn install_ordinary_frame(layer: &mut FesMediaLayer, image: RgbaFrame) {
     let mut metadata = image.metadata();
-    layer.image_offset = metadata.base;
-    layer.image_base = std::array::from_fn(|axis| {
-        metadata.base[axis].wrapping_sub(metadata.offset[axis])
-    });
+    match layer.source.btype {
+        0 => {
+            layer.image_offset = metadata.base;
+            layer.image_base = std::array::from_fn(|axis| {
+                metadata.base[axis].wrapping_sub(metadata.offset[axis])
+            });
+            metadata.offset = [0; 2];
+            metadata.canvas_size = [image.width(), image.height()];
+        }
+        1 => {
+            layer.image_offset = [0; 2];
+            layer.image_base = metadata.base;
+        }
+        _ => {
+            layer.image = Some(image);
+            return;
+        }
+    }
     if let Some(words) = &mut layer.motion {
         words[3..5].copy_from_slice(&layer.image_base.map(|base| (base as f32).to_bits()));
     }
-    metadata.offset = [0; 2];
-    metadata.canvas_size = [image.width(), image.height()];
     layer.image = Some(image.with_raw_metadata(metadata));
 }
 
@@ -396,12 +446,20 @@ pub(crate) fn source_image(host: &LoggingHost<'_>, layer: &FesMediaLayer)
     host.retained_image_source_frame(entry, select)
 }
 
-/// Raw list frames retain their own crop and selected-frame base. Ordinary
-/// IMAGE pixels already received their BTYPE geometry on the media layer.
+/// Both sources can retain a crop, but only a raw frame supplies an extra base.
 pub(crate) fn source_draw_options(layer: &FesMediaLayer, image: &cs2_renderer::RgbaFrame,
     options: &mut cs2_renderer::ImageDrawOptions) {
-    if layer.image.is_none() && layer.source.raw_entry.is_some() {
-        let metadata = image.metadata();
+    let metadata = image.metadata();
+    if layer.image.is_some() {
+        if layer.motion.is_some() {
+            for (pivot, crop) in options.pivot.iter_mut().zip(metadata.offset) {
+                *pivot -= crop as f32;
+            }
+        } else {
+            options.position.x = options.position.x.wrapping_add(metadata.offset[0]);
+            options.position.y = options.position.y.wrapping_add(metadata.offset[1]);
+        }
+    } else if layer.source.raw_entry.is_some() {
         options.position.x = options.position.x.wrapping_add(metadata.offset[0])
             .wrapping_sub(metadata.base[0]);
         options.position.y = options.position.y.wrapping_add(metadata.offset[1])
@@ -451,6 +509,69 @@ pub(crate) fn validate_image_source_bindings(host: &LoggingHost<'_>, runtime: &F
             bail!("FES raw IMAGE checkpoint has no matching retained list source");
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn btype_checkpoint_defaults_for_older_image_sources() -> Result<()> {
+    use cs2_runtime::object_graph::{decode_component, encode_component};
+
+    let name = Option::<Vec<u8>>::None;
+    let frame = Option::<u32>::None;
+    let legacy = (name.clone(), name.clone(), frame, false, name.clone(), frame, false);
+    let previous = (name.clone(), name.clone(), frame, false, name, frame, false, -2i32);
+    for (bytes, expected_coordmode) in [(encode_component(&legacy)?, 0), (encode_component(&previous)?, -2)] {
+        let mut restored: ImageSourceState = decode_component(&bytes)?;
+        assert_eq!((restored.coordmode, restored.btype), (expected_coordmode, 0));
+        restored.btype = -3;
+        let roundtrip: ImageSourceState = decode_component(&encode_component(&restored)?)?;
+        assert_eq!((roundtrip.coordmode, roundtrip.btype), (expected_coordmode, -3));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn btype_button_frame_preserves_crop_and_uses_only_one_base() -> Result<()> {
+    use cs2_renderer::{ImageDrawOptions, Point};
+
+    let mut layer = super::internal_layer("BUTTON", "btn");
+    let image = RgbaFrame::from_rgba8(2, 1, vec![255; 8])?;
+    let mut metadata = image.metadata();
+    metadata.canvas_size = [1280, 720];
+    metadata.offset = [7, 4];
+    metadata.base = [3, 2];
+    let image = image.with_raw_metadata(metadata);
+    layer.motion = Some([0; 36]);
+    layer.source.btype = 1;
+    install_ordinary_frame(&mut layer, image.clone());
+    assert_eq!((layer.image_offset, layer.image_base), ([0, 0], [3, 2]));
+    let words = layer.motion.unwrap();
+    assert_eq!([3, 4].map(|index| f32::from_bits(words[index])), [3., 2.]);
+    let installed = layer.image.as_ref().unwrap();
+    assert_eq!(installed.metadata(), metadata);
+
+    let mut options = ImageDrawOptions::new(Point::new(10, 20));
+    options.pivot = [3., 2.];
+    options.scale_x = 2.;
+    source_draw_options(&layer, installed, &mut options);
+    assert_eq!(options.transform().map_source_point([0., 0.]), [18., 22.]);
+
+    layer.source.btype = -3;
+    let mut next = metadata;
+    next.base = [11, 12];
+    install_ordinary_frame(&mut layer, image.with_raw_metadata(next));
+    assert_eq!(layer.source.btype, -3);
+    assert_eq!((layer.image_offset, layer.image_base), ([0, 0], [3, 2]));
+    assert_eq!(layer.motion, Some(words));
+    let raw = layer.image.take().unwrap();
+    assert_eq!(raw.metadata(), next);
+    layer.source.btype = 1;
+    layer.source.raw_entry = Some(1);
+    let mut options = ImageDrawOptions::new(Point::new(10, 20));
+    source_draw_options(&layer, &raw, &mut options);
+    assert_eq!(options.position, Point::new(6, 12));
     Ok(())
 }
 

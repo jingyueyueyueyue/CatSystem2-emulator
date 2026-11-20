@@ -11,22 +11,61 @@ pub(super) struct Rectangle { at: [i32; 2], size: [u32; 2] }
 pub(super) fn rect(r: Rect) -> Rectangle { Rectangle { at: [r.x, r.y], size: [r.width, r.height] } }
 pub(super) fn unrect(r: &Rectangle) -> Rect { Rect::new(r.at[0], r.at[1], r.size[0], r.size[1]) }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub(super) struct Options {
     at: [i32; 2], scale: [u32; 2], opacity: u8, visible: bool,
     clip: Option<Rectangle>, mask: Option<([u32; 2], Vec<u8>)>,
     pivot: [u32; 2], rotation: u32, flip: [bool; 2], blend: u32, linear: bool,
+    pub(super) affine: Option<AffinePlacement>,
 }
-pub(super) fn options(o: &ImageDrawOptions) -> Options {
+
+impl<'de> Deserialize<'de> for Options {
+    fn deserialize<D: cs2_runtime::graph_serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use cs2_runtime::graph_serde::de::{Error, SeqAccess, Visitor};
+
+        struct OptionsVisitor;
+        impl<'de> Visitor<'de> for OptionsVisitor {
+            type Value = Options;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("list draw options with an optional affine placement")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let missing = || A::Error::custom("truncated list draw options");
+                Ok(Options {
+                    at: seq.next_element()?.ok_or_else(missing)?,
+                    scale: seq.next_element()?.ok_or_else(missing)?,
+                    opacity: seq.next_element()?.ok_or_else(missing)?,
+                    visible: seq.next_element()?.ok_or_else(missing)?,
+                    clip: seq.next_element()?.ok_or_else(missing)?,
+                    mask: seq.next_element()?.ok_or_else(missing)?,
+                    pivot: seq.next_element()?.ok_or_else(missing)?,
+                    rotation: seq.next_element()?.ok_or_else(missing)?,
+                    flip: seq.next_element()?.ok_or_else(missing)?,
+                    blend: seq.next_element()?.ok_or_else(missing)?,
+                    linear: seq.next_element()?.ok_or_else(missing)?,
+                    affine: seq.next_element()?.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_seq(OptionsVisitor)
+    }
+}
+
+pub(super) fn options(o: &ImageDrawOptions, affine: Option<AffinePlacement>) -> Options {
     Options { at: [o.position.x, o.position.y], scale: [o.scale_x.to_bits(), o.scale_y.to_bits()],
         opacity: o.opacity, visible: o.visible, clip: o.clip.map(rect),
         mask: o.mask.as_ref().map(|m| ([m.width(), m.height()], m.alpha().to_vec())),
         pivot: o.pivot.map(f32::to_bits), rotation: o.rotation_radians.to_bits(),
         flip: [o.flip_x, o.flip_y], blend: o.blend_mode as u32,
-        linear: o.filter == cs2_renderer::ScaleFilter::Linear }
+        linear: o.filter == cs2_renderer::ScaleFilter::Linear, affine }
 }
 pub(super) fn unoptions(o: &Options) -> Result<ImageDrawOptions> {
+    if let Some(affine) = o.affine { affine.validate()?; }
     let mut result = ImageDrawOptions::new(Point::new(o.at[0], o.at[1]));
     result.scale_x = f32::from_bits(o.scale[0]); result.scale_y = f32::from_bits(o.scale[1]);
     result.opacity = o.opacity; result.visible = o.visible; result.clip = o.clip.as_ref().map(unrect);
@@ -132,7 +171,8 @@ impl crate::HeadlessPlayer {
             let e = entry.try_borrow().context("cannot snapshot an actively borrowed list entry")?;
             shared.push(EntryState {
                 key: e.key, source: match e.source { Source::Resource { handle, wrapper } => [0, handle, wrapper],
-                    Source::Wrapper(wrapper) => [1, wrapper, 0], Source::Frame => [2, 0, 0] },
+                    Source::Wrapper(wrapper) => [1, wrapper, 0], Source::Frame => [2, 0, 0],
+                    Source::Empty => [3, 0, 0] },
                 position: e.position.map(f32::to_bits), base: e.base.map(f32::to_bits),
                 rotation: e.rotation.to_bits(), scale: e.scale.map(f32::to_bits),
                 opacity: e.opacity, raw_opacity: e.raw_opacity, visible: e.visible,
@@ -166,7 +206,7 @@ impl crate::HeadlessPlayer {
             output: l.output, size: l.size, offset: l.offset, base_plane: l.base_plane,
             enabled: l.enabled, submit: l.submit, force: l.force,
             layers: l.layers.iter().map(|(key, l)| (key.clone(), LayerState {
-                frame: capture_frame(&l.frame), options: options(&l.options), priority: l.priority,
+                frame: capture_frame(&l.frame), options: options(&l.options, l.affine), priority: l.priority,
             })).collect(),
         })).collect();
         let snapshot = Snapshot {
@@ -242,6 +282,7 @@ impl crate::HeadlessPlayer {
                 }
                 [1, wrapper, 0] if images.contains_key(&wrapper) => Source::Wrapper(wrapper),
                 [2, 0, 0] => Source::Frame,
+                [3, 0, 0] if e.frames.is_empty() => Source::Empty,
                 _ => bail!("saved list source has no retained resource or wrapper"),
             };
             if e.frames.keys().ne(e.frame_handles.keys())
@@ -286,6 +327,7 @@ impl crate::HeadlessPlayer {
             }
             let layers = l.layers.iter().map(|(key, layer)| Ok((key.clone(), Layer {
                 frame: restore_frame(&layer.frame)?, options: unoptions(&layer.options)?, priority: layer.priority,
+                affine: layer.options.affine,
             }))).collect::<Result<_>>()?;
             lists.insert(id, ImageList { output: l.output, size: l.size, offset: l.offset,
                 base_plane: l.base_plane, enabled: l.enabled, submit: l.submit, force: l.force, layers });

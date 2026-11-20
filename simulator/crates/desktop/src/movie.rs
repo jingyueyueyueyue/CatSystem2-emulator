@@ -285,6 +285,7 @@ struct ActiveMovie {
     decoders: Arc<DecoderGroup>,
     finished: mpsc::Receiver<RuntimeResult<()>>,
     last_time: Arc<AtomicU64>,
+    looped: bool,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -530,6 +531,16 @@ impl MpegMovieHost {
 
     pub fn frame_surface(&self) -> Arc<MovieFrameSurface> {
         self.surface.clone()
+    }
+
+    pub(super) fn replay_playback_sample(&self, handle: u64) -> RuntimeResult<Option<(bool, Option<f64>)>> {
+        let Some(playback) = self.active.get(&handle) else {
+            return Ok(None);
+        };
+        let decoded = self.surface.retained_frame()?
+            .filter(|(owner, _)| *owner == handle)
+            .map(|(_, frame)| frame.presentation_time);
+        Ok(Some((playback.looped, decoded)))
     }
 
     pub fn decoder_path(&self) -> &Path {
@@ -806,6 +817,7 @@ impl MpegMovieHost {
             decoders,
             finished,
             last_time,
+            looped,
             thread: Some(worker),
         };
         match started_receiver.recv_timeout(START_TIMEOUT) {

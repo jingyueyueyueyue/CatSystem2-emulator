@@ -1386,7 +1386,10 @@ impl Vm {
             0x15 => {
                 let target = self.raw(a[0])?;
                 let value = self.value(a[1])?;
-                let width = a[0].flags.width()?;
+                let width = match a[0].flags.bits() {
+                    0x56 => 4,
+                    _ => a[0].flags.width()?,
+                };
                 self.write(target, &value.to_le_bytes()[..width])?;
                 self.push_word(match width {
                     1 => value & 0xff,
@@ -2395,12 +2398,17 @@ mod tests {
     fn sample_root() -> Option<PathBuf> {
         if let Some(root) = std::env::var_os("CS2_SAMPLE_ROOT") {
             let root = PathBuf::from(root);
+            let catalog = root.join("games");
+            if catalog.is_dir() {
+                return Some(catalog);
+            }
             return root.is_dir().then_some(root);
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
-            .join("..");
+            .join("..")
+            .join("games");
         root.is_dir().then_some(root)
     }
 
@@ -2650,6 +2658,23 @@ mod tests {
                 length: 2
             })
         );
+    }
+
+    #[test]
+    fn assignment_to_stack_computed_0x56_target_writes_and_pushes_a_dword() {
+        let mut code = Vec::new();
+        instruction(&mut code, 0x3e, &[Operand::new(0x13, 4), immediate(8)]);
+        instruction(&mut code, 0x15, &[Operand::new(0x56, 0), immediate(0x8877_6655)]);
+        code.push(0x3b);
+
+        let mut vm = Vm::from_program(program(&code)).unwrap();
+        vm.write(4, &16u32.to_le_bytes()).unwrap();
+        vm.write(23, &[0xa5, 0, 0, 0, 0, 0x5a]).unwrap();
+
+        assert_eq!(vm.run(&mut NullHost, 8).unwrap(), Step::Halted);
+        assert_eq!(vm.read(23, 6).unwrap(), [0xa5, 0x55, 0x66, 0x77, 0x88, 0x5a]);
+        assert_eq!(vm.stack_bits().collect::<Vec<_>>(), [0x8877_6655]);
+        assert!(matches!(TypeFlags::new(0x56).width(), Err(ScriptError::InvalidTypeFlags { flags: 0x56 })));
     }
 
     #[test]

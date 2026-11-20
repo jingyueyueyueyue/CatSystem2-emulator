@@ -130,7 +130,9 @@ fn collect_bank<'a>(
         || [bank.remove_characters.as_ref(), bank.add_characters.as_ref()].into_iter()
             .flatten().any(|(index, bytes)| *index > 4 || bytes.len() > MAX_TEXT_BYTES)
         || bank.pending.iter().any(|request| matches!(request,
-            TextRequest::Append(bytes) if bytes.len() > MAX_TEXT_BYTES))
+            TextRequest::Append(bytes) | TextRequest::AppendLegacyGbk(bytes) if bytes.len() > MAX_TEXT_BYTES))
+        || bank.pending.iter().any(|request| matches!(request,
+            TextRequest::AppendDecoded { bytes, text } if bytes.len() > MAX_TEXT_BYTES || text.len() > MAX_TEXT_BYTES))
         || bank.parent_plane.as_ref().is_some_and(|name| name.len() > 259 || name.contains('\0'))
         || bank.configured && !bank.message.configured()
     { bail!("FES text checkpoint message storage or surface identity is invalid"); }

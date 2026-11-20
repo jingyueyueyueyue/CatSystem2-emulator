@@ -928,14 +928,14 @@ impl RenderContext<'_> {
         let mut primitives = Vec::new();
         self.collect_motion(object, name, time, parent, warps, depth, &[], &mut primitives)?;
         //44c13 stores world26c in primitive+24.4810/486a sorts the complete
-        //expanded color list with2dd20: descending f32 depth. Its secondary
+        //expanded color list with2dd20: ascending f32 depth. Its secondary
         //key is the common player priority (35310/42e04), equal within this
         //CpuPlayer. Keep equal-depth primitive insertion order, as the native
         //stable merge does. Groups themselves emit no textured primitive.
         primitives.sort_by(|a, b| {
             let az = a.motion.pending[a.index].as_ref().unwrap().transform.z;
             let bz = b.motion.pending[b.index].as_ref().unwrap().transform.z;
-            bz.partial_cmp(&az).unwrap_or(std::cmp::Ordering::Equal)
+            az.partial_cmp(&bz).unwrap_or(std::cmp::Ordering::Equal)
         });
         //A frame's owner/source samples are immutable. Reuse the actual
         //linked plane for the same complete chain, instead of resampling

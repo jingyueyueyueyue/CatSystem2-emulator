@@ -1047,6 +1047,7 @@ impl LoggingHost<'_> {
                                     .wrapping_sub(metadata.base[1]),
                             )),
                             priority: id as i32,
+                            affine: None,
                         },
                     );
                 }

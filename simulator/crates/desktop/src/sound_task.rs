@@ -172,6 +172,9 @@ impl LoggingHost<'_> {
         if query.is_none() && self.verified_utate_sound_loop_source()? {
             query = Some(32);
         }
+        if query.is_none() {
+            query = self.rebellions_sound_loop_query()?;
+        }
         self.data_services.sounds.root_query_code = query;
         if query.is_none()
             && !self.verified_kanmi_sound_loop_source()?

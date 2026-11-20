@@ -120,6 +120,18 @@ const CONTRACTS: &[Contract] = &[
         returns_priority: false,
     },
     Contract {
+        native: 626,
+        command: 288,
+        bytes: 48,
+        returns_priority: false,
+    },
+    Contract {
+        native: 627,
+        command: 288,
+        bytes: 48,
+        returns_priority: false,
+    },
+    Contract {
         native: 707,
         command: 286,
         bytes: 52,
@@ -198,6 +210,20 @@ const CONTRACTS: &[Contract] = &[
         returns_priority: false,
     },
 ];
+
+const LEGACY_EMPTY_LIST_SOURCE: &[u8; 4] = b"LEMP";
+
+fn is_legacy_list_pe(sha: Option<&str>) -> bool {
+    matches!(sha, Some(super::css_model::UTATE_SHA | super::particle_external::CAMPANELLA_SHA))
+}
+
+fn is_short_registration_pe(sha: Option<&str>) -> bool {
+    is_legacy_list_pe(sha) || sha == Some(super::css_model::SHA)
+}
+
+fn uses_short_registration(sha: Option<&str>, index: u32, bytes: usize) -> bool {
+    matches!(index, 257 | 259) && bytes == 32 && is_short_registration_pe(sha)
+}
 
 #[derive(Default)]
 pub(super) struct ListNativeStore {
@@ -385,7 +411,7 @@ impl Entry {
             .and_then(|id| self.frame_handles.get(&id).copied())
             .or_else(|| match self.source {
                 Source::Resource { wrapper, .. } | Source::Wrapper(wrapper) => Some(wrapper),
-                Source::Frame => None,
+                Source::Frame | Source::Empty => None,
             })
     }
 }
@@ -399,6 +425,7 @@ enum Source {
     /// An independent unowned wrapper keeps the shared pixel binding alive.
     Wrapper(u32),
     Frame,
+    Empty,
 }
 
 struct Background {
@@ -425,6 +452,9 @@ pub(super) fn has_entry(host: &LoggingHost<'_>, command: cs2_runtime::TaskComman
 }
 
 fn current_pixels(host: &LoggingHost<'_>, entry: &Entry) -> Result<u32> {
+    if matches!(entry.source, Source::Empty) {
+        return Ok(0);
+    }
     let wrapper = entry.current_wrapper()
         .context("list source has no current pixel wrapper")?;
     host.data_services
@@ -533,6 +563,9 @@ fn record_geometry(
                 .entries
                 .get(&(list, key))
                 .unwrap();
+            if matches!(entry.source, Source::Empty) {
+                continue;
+            }
             let wrapper = entry.current_wrapper()
                 .context("list history source has no current wrapper")?;
             let frame = host
@@ -974,7 +1007,8 @@ fn receive_inner(
                             _ => 0,
                         }) == command.data[0]
                     }
-                    _ => current_pixels(host, &entry)? == command.data[0],
+                    _ => !matches!(entry.source, Source::Empty)
+                        && current_pixels(host, &entry)? == command.data[0],
                 } {
                     found = Some(entry.key);
                     break;
@@ -1118,7 +1152,11 @@ fn register_owned(
     let raw_opacity = read_u32(bytes, 44)?;
     let visible = read_u32(bytes, 48)? != 0;
     let transform = read_u32(bytes, 52)?;
-    if sources.iter().all(|&source| source == 0) {
+    let no_sources = sources == [0; 4];
+    let legacy_empty = no_sources
+        && bytes.get(60..) == Some(LEGACY_EMPTY_LIST_SOURCE.as_slice())
+        && is_short_registration_pe(host.css_task_sha());
+    if no_sources && !legacy_empty {
         if command.code == 286 && identity != 0 {
             if let Some(mut entry) = host.data_services.list_native.entries.get_mut(&stamp) {
                 entry.identity = identity;
@@ -1157,7 +1195,9 @@ fn register_owned(
         invalidate_entry(host, id, key);
         return Ok(());
     }
-    let (source, mut frames, mut selection, mut frame_handles, mut frame_charges) = if sources[0] != 0 {
+    let (source, mut frames, mut selection, mut frame_handles, mut frame_charges) = if legacy_empty {
+        (Source::Empty, BTreeMap::new(), None, BTreeMap::new(), BTreeMap::new())
+    } else if sources[0] != 0 {
         let original = host
             .data_services
             .image_wrapper_pixels
@@ -1323,7 +1363,7 @@ fn register_owned(
         }
     };
     let previous = host.data_services.list_native.entries.remove(&stamp);
-    if frames.is_empty() {
+    if frames.is_empty() && !legacy_empty {
         if let Some(previous) = previous.as_ref() {
             let mut previous = previous.borrow_mut();
             frames = std::mem::take(&mut previous.frames);
@@ -1599,7 +1639,7 @@ impl LoggingHost<'_> {
                 Source::Wrapper(wrapper) | Source::Resource { wrapper, .. } =>
                     Some(self.image_handles.get(&wrapper)
                         .ok_or_else(|| native_state_error("native 706 current frame wrapper was released"))?),
-                Source::Frame => None,
+                Source::Frame | Source::Empty => None,
             }
         };
         let Some(frame) = frame else { return Ok(NativeReturn::Value(0)); };
@@ -1855,6 +1895,13 @@ impl LoggingHost<'_> {
         } else { NativeReturn::Continue })
     }
 
+    pub(super) fn legacy_list_profile(&mut self) -> cs2_script::Result<bool> {
+        if self.css_task_sha().is_none() {
+            self.bind_utate_plane_input_profile()?;
+        }
+        Ok(is_legacy_list_pe(self.css_task_sha()))
+    }
+
     pub(super) fn list_contract_native(
         &mut self,
         index: u32,
@@ -1864,8 +1911,15 @@ impl LoggingHost<'_> {
             .iter()
             .find(|spec| spec.native == index)
             .ok_or_else(|| native_state_error("native has no image-list batch contract"))?;
-        if args.len() < contract.bytes {
+        if matches!(index, 257 | 259) && args.len() == 32 {
+            self.legacy_list_profile()?;
+        }
+        let short = uses_short_registration(self.css_task_sha(), index, args.len());
+        if !short && args.len() < contract.bytes {
             return Err(native_state_error("image-list arguments are truncated"));
+        }
+        if matches!(index, 626 | 627) && args.len() != contract.bytes {
+            return Err(native_state_error("legacy affine registration requires exactly 48 argument bytes"));
         }
         let id = read_u32(args, 0)?;
         let slot = if contract.bytes >= 8 {
@@ -1876,7 +1930,6 @@ impl LoggingHost<'_> {
         let (data, second) = match contract.command {
             286 | 288 => {
                 let source = read_u32(args, 8)?;
-                let mut record = vec![0u8; 60];
                 let field = match index { 622 | 623 => 4, 707 | 708 => 8, 732 => 12, _ => 0 };
                 let handle = if matches!(index, 622 | 623 | 707 | 708 | 732) || source == 0 {
                     source
@@ -1889,11 +1942,7 @@ impl LoggingHost<'_> {
                             native_state_error("list source wrapper has no pixel identity")
                         })?
                 };
-                record[field..field + 4].copy_from_slice(&handle.to_le_bytes());
-                record[16..56].copy_from_slice(&args[12..52]);
-                if matches!(index, 257 | 259 | 622 | 623 | 707 | 708 | 732) {
-                    record[44..48].copy_from_slice(&read_u32(args, 40)?.min(255).to_le_bytes());
-                }
+                let record = list_registration_record(index, args, field, handle, short)?;
                 ([slot, 1, 0], Some(record))
             }
             295 => {
@@ -1966,7 +2015,7 @@ impl LoggingHost<'_> {
                 self.release_list_resource(handle)
             }
             Source::Wrapper(handle) => Ok(self.release_image_wrapper(handle)?),
-            Source::Frame => Ok(()),
+            Source::Frame | Source::Empty => Ok(()),
         }
     }
 
@@ -1988,6 +2037,142 @@ impl LoggingHost<'_> {
 
     fn update_native_list_region(&mut self, id: u32, clip: Rect) -> Result<()> {
         tiles::compose(self, id, false, Some(clip))
+    }
+}
+
+fn list_registration_record(
+    index: u32,
+    args: &[u8],
+    field: usize,
+    handle: u32,
+    short: bool,
+) -> cs2_script::Result<Vec<u8>> {
+    let mut record = vec![0u8; 60];
+    record[field..field + 4].copy_from_slice(&handle.to_le_bytes());
+    if short {
+        let visibility = read_u32(args, 28)?;
+        if read_u32(args, 24)? != 1 {
+            return Err(native_state_error("unsupported legacy image-list registration field"));
+        }
+        let position_x = read_u32(args, 12)? as i32 as f32;
+        let position_y = read_u32(args, 16)? as i32 as f32;
+        record[16..20].copy_from_slice(&position_x.to_le_bytes());
+        record[20..24].copy_from_slice(&position_y.to_le_bytes());
+        record[36..40].copy_from_slice(&1f32.to_le_bytes());
+        record[40..44].copy_from_slice(&1f32.to_le_bytes());
+        record[44..48].copy_from_slice(&read_u32(args, 20)?.min(255).to_le_bytes());
+        record[48..52].copy_from_slice(&visibility.to_le_bytes());
+    } else if matches!(index, 626 | 627) {
+        record[16..52].copy_from_slice(
+            args.get(12..48).ok_or_else(|| native_state_error("image-list arguments are truncated"))?,
+        );
+        record[44..48].copy_from_slice(&read_u32(args, 40)?.min(255).to_le_bytes());
+        record[52..56].copy_from_slice(&1u32.to_le_bytes());
+    } else {
+        record[16..56].copy_from_slice(
+            args.get(12..52).ok_or_else(|| native_state_error("image-list arguments are truncated"))?,
+        );
+        if matches!(index, 257 | 259 | 622 | 623 | 707 | 708 | 732) {
+            record[44..48].copy_from_slice(&read_u32(args, 40)?.min(255).to_le_bytes());
+        }
+    }
+    if (short || matches!(index, 626 | 627)) && handle == 0 {
+        record.extend_from_slice(LEGACY_EMPTY_LIST_SOURCE);
+    }
+    Ok(record)
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    fn words(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn story_entry_records_are_short_only_for_verified_executables() {
+        for (sha, target, wrapper) in [
+            (crate::css_model::UTATE_SHA, 11, 40),
+            (crate::particle_external::CAMPANELLA_SHA, 33, 33),
+        ] {
+            let args = words(&[target, 1, wrapper, 0, 0, 255, 1, 1]);
+            let expected = words(&[91, 0, 0, 0, 0, 0, 0, 0, 0, 1f32.to_bits(), 1f32.to_bits(), 255, 1, 0, 0]);
+            for native in [257, 259] {
+                assert!(uses_short_registration(Some(sha), native, args.len()));
+                assert_eq!(list_registration_record(native, &args, 0, 91, true).unwrap(), expected);
+                assert!(!uses_short_registration(None, native, args.len()));
+                assert!(!uses_short_registration(Some("other"), native, args.len()));
+                assert!(!uses_short_registration(Some(sha), native, 31));
+                assert!(!uses_short_registration(Some(sha), native, 33));
+                assert!(!uses_short_registration(Some(sha), native, 52));
+            }
+            assert!(!uses_short_registration(Some(sha), 622, args.len()));
+        }
+    }
+
+    #[test]
+    fn tsunaban_meswnd2_uses_integer_registration_without_the_affine_profile() {
+        let sha = Some(super::super::css_model::SHA);
+        let captured = words(&[10, 10, 46, 0, (-374i32) as u32, 255, 1, 1]);
+        let expected = words(&[
+            91, 0, 0, 0, 0, (-374f32).to_bits(), 0, 0, 0, 1f32.to_bits(), 1f32.to_bits(),
+            255, 1, 0, 0,
+        ]);
+        for index in [257, 259] {
+            assert!(uses_short_registration(sha, index, captured.len()));
+            assert_eq!(list_registration_record(index, &captured, 0, 91, true).unwrap(), expected);
+            assert!(!uses_short_registration(sha, index, 31));
+            assert!(!uses_short_registration(sha, index, 33));
+            assert!(!uses_short_registration(sha, index, 52));
+            let empty = list_registration_record(index, &captured, 0, 0, true).unwrap();
+            assert_eq!(&empty[60..], LEGACY_EMPTY_LIST_SOURCE);
+        }
+        assert!(!uses_short_registration(sha, 622, captured.len()));
+        assert!(!uses_short_registration(sha, 627, captured.len()));
+        assert!(!is_legacy_list_pe(sha));
+    }
+
+    #[test]
+    fn legacy_position_opacity_visibility_and_empty_source_follow_the_owned_record() {
+        let args = words(&[33, 1, 0, (-21i32) as u32, 57, 999, 1, 0]);
+        let record = list_registration_record(259, &args, 0, 0, true).unwrap();
+        assert_eq!(float(&record, 16).unwrap(), -21.0);
+        assert_eq!(float(&record, 20).unwrap(), 57.0);
+        assert_eq!(read_u32(&record, 44).unwrap(), 255);
+        assert_eq!(read_u32(&record, 48).unwrap(), 0);
+        assert_eq!(&record[60..], LEGACY_EMPTY_LIST_SOURCE);
+        assert!(list_registration_record(259, &args[..31], 0, 0, true).is_err());
+
+        let unknown_field = words(&[33, 1, 0, 0, 0, 255, 2, 1]);
+        assert!(list_registration_record(259, &unknown_field, 0, 0, true).is_err());
+    }
+
+    #[test]
+    fn legacy_affine_expands_the_record_and_modern_registration_keeps_its_layout() {
+        let args = words(&[11, 300, 86, 1, 2, 3, 4, 5, 6, 7, 999, 9, 10]);
+        let affine = list_registration_record(627, &args[..48], 0, 91, false).unwrap();
+        assert_eq!(affine, words(&[91, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 255, 9, 1, 0]));
+        assert!(list_registration_record(627, &args[..47], 0, 91, false).is_err());
+
+        let modern = list_registration_record(257, &args, 0, 0, false).unwrap();
+        assert_eq!(modern, words(&[0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 255, 9, 10, 0]));
+        assert!(list_registration_record(257, &args[..32], 0, 91, false).is_err());
+    }
+
+    #[test]
+    fn campanella_affine_wrappers_use_the_same_record_and_receiver() {
+        let args = words(&[33, 60, 46, 772f32.to_bits(), 263f32.to_bits(), 772f32.to_bits(),
+            563f32.to_bits(), 0, 1f32.to_bits(), 1f32.to_bits(), 255, 0]);
+        let registered = list_registration_record(626, &args, 0, 91, false).unwrap();
+        let sibling = list_registration_record(627, &args, 0, 91, false).unwrap();
+        assert_eq!(registered, sibling);
+        assert_eq!(registered, words(&[91, 0, 0, 0, 772f32.to_bits(), 263f32.to_bits(),
+            772f32.to_bits(), 563f32.to_bits(), 0, 1f32.to_bits(), 1f32.to_bits(), 255, 0, 1, 0]));
+        for slot in [626, 627] {
+            let contract = CONTRACTS.iter().find(|contract| contract.native == slot).unwrap();
+            assert_eq!((contract.bytes, contract.command), (48, 288));
+        }
     }
 }
 
@@ -2183,12 +2368,13 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
             Source::Resource { handle, .. } => Some(handle), _ => None,
         }).collect::<std::collections::BTreeSet<_>>();
     for handle in resources { host.redraw_image_resource_surface(handle)?; }
-    if !host.data_services.tasks.fes.platform.lists.contains_key(&id) {
+    let Some(list) = host.data_services.tasks.fes.platform.lists.get(&id) else {
         return Ok(());
-    }
+    };
+    let is_utate = host.css_task_sha() == Some(super::css_model::UTATE_SHA);
     let mut layers = Vec::new();
     for ((target, key), entry) in host.data_services.list_native.entries.iter() {
-        if *target != id {
+        if *target != id || matches!(entry.source, Source::Empty) {
             continue;
         }
         let wrapper = entry.current_wrapper().context("list source has no current pixel wrapper")?;
@@ -2214,13 +2400,24 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
             options.scale_y = entry.scale[1];
             options.rotation_radians = entry.rotation;
             options.pivot = entry.base;
+        } else if is_utate && source.metadata().bit_depth == 32
+            && host.data_services.image_control_values.get(&wrapper) == Some(&4)
+        {
+            options.blend_mode = cs2_renderer::BlendMode::ListAlphaFromAlpha;
+        }
+        let layer_key = (u32::MAX, format!("\0list-native:{key:08x}"));
+        if list.layers.get(&layer_key).is_some_and(|previous| {
+            previous.options.blend_mode != options.blend_mode
+        }) {
+            host.data_services.list_native.invalidated.insert((id, *key));
         }
         layers.push((
-            (u32::MAX, format!("\0list-native:{key:08x}")),
+            layer_key,
             Layer {
                 frame: source.clone(),
                 options,
                 priority: entry.priority,
+                affine: None,
             },
         ));
     }
@@ -2411,9 +2608,14 @@ pub(super) fn draw_layer(
     key: &(u32, String),
     frame: &RgbaFrame,
     options: &ImageDrawOptions,
+    affine: Option<AffinePlacement>,
     opaque: &mut Option<bool>,
 ) -> Result<()> {
     if !options.visible || frame.is_empty() { return Ok(()); }
+    if let Some(placement) = affine {
+        return draw_affine_placement(canvas, frame, [frame.width(), frame.height()], placement,
+            u32::from(options.opacity), options.clip, options.blend_mode);
+    }
     let entry = if key.0 == u32::MAX {
         key.1
             .strip_prefix("\0list-native:")
@@ -2493,6 +2695,10 @@ fn draw_plain_frame(
     opaque: &mut Option<bool>,
 ) -> Result<()> {
     if !options.visible || opacity == 0 {
+        return Ok(());
+    }
+    if options.blend_mode.is_list_alpha_mask() {
+        canvas.draw_frame(source, options)?;
         return Ok(());
     }
     let (mut clip_left, mut clip_top) = (0, 0);
@@ -2654,29 +2860,43 @@ struct AffineRaster {
     upper: [i64; 2],
 }
 
-fn affine_raster(source: crate::image_manager::ResourceGeometry, entry: &Entry,
-    base_point: [f32; 2]) -> Result<AffineRaster> {
-    if entry
-        .position
-        .iter()
-        .chain(&base_point)
-        .chain(&entry.scale)
-        .chain(std::iter::once(&entry.rotation))
-        .any(|value| !value.is_finite())
-    {
-        bail!("list affine properties contain a nonfinite value");
+#[derive(Clone, Copy, Debug, PartialEq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
+#[serde(crate = "cs2_runtime::graph_serde")]
+pub(super) struct AffinePlacement {
+    pub(super) position: [f32; 2],
+    pub(super) base: [f32; 2],
+    pub(super) offset: [i32; 2],
+    pub(super) scale: [f32; 2],
+    pub(super) rotation: f32,
+}
+
+impl AffinePlacement {
+    fn from_entry(entry: &Entry, base: [f32; 2], offset: [i32; 2]) -> Self {
+        Self { position: entry.position, base, offset, scale: entry.scale, rotation: entry.rotation }
     }
-    let offset = source.offset;
+
+    pub(super) fn validate(self) -> Result<()> {
+        if self.position.into_iter().chain(self.base).chain(self.scale)
+            .chain([self.rotation]).any(|value| !value.is_finite()) {
+            bail!("list affine properties contain a nonfinite value");
+        }
+        Ok(())
+    }
+}
+
+fn affine_raster(size: [u32; 2], placement: AffinePlacement) -> Result<AffineRaster> {
+    placement.validate()?;
+    let AffinePlacement { position, base, offset, scale, rotation } = placement;
     // This path converts the pixel offset as an unsigned DWORD to float.
     let base = [
-        base_point[0] - (offset[0] as u32) as f32,
-        base_point[1] - (offset[1] as u32) as f32,
+        base[0] - (offset[0] as u32) as f32,
+        base[1] - (offset[1] as u32) as f32,
     ];
-    let forward = Affine15::new(entry.rotation, entry.scale);
+    let forward = Affine15::new(rotation, scale);
     let start = base.map(|value| fixed15(-value));
     let end = [
-        start[0].wrapping_add((source.size[0] as i32).wrapping_shl(15)),
-        start[1].wrapping_add((source.size[1] as i32).wrapping_shl(15)),
+        start[0].wrapping_add((size[0] as i32).wrapping_shl(15)),
+        start[1].wrapping_add((size[1] as i32).wrapping_shl(15)),
     ];
     let vertices = [
         forward.transform(start),
@@ -2684,7 +2904,7 @@ fn affine_raster(source: crate::image_manager::ResourceGeometry, entry: &Entry,
         forward.transform(end),
         forward.transform([start[0], end[1]]),
     ];
-    let position = entry.position.map(truncate);
+    let position = position.map(truncate);
     let mut lower = [0i64; 2];
     let mut upper = [0i64; 2];
     for axis in 0..2 {
@@ -2727,7 +2947,7 @@ fn source_geometry(host: &LoggingHost<'_>, entry: &Entry, frame: &RgbaFrame)
     Ok(crate::image_manager::ResourceGeometry::from_frame(frame))
 }
 
-fn entry_top_left(position: [f32; 2], base: [f32; 2], offset: [i32; 2]) -> [i32; 2] {
+pub(super) fn entry_top_left(position: [f32; 2], base: [f32; 2], offset: [i32; 2]) -> [i32; 2] {
     std::array::from_fn(|axis| {
         truncate(position[axis])
             .wrapping_sub(truncate(base[axis]))
@@ -2745,9 +2965,8 @@ fn entry_bounds(
     if source.size.contains(&0) {
         return Ok(None);
     }
-    let (mut lower, mut upper) = if entry.transform != 0 {
-        let raster = affine_raster(source, entry, base)?;
-        (raster.lower, raster.upper)
+    let (lower, upper) = if entry.transform != 0 {
+        return affine_bounds(source.size, AffinePlacement::from_entry(entry, base, source.offset), size, clip);
     } else {
         let at = entry_top_left(entry.position, base, source.offset);
         (
@@ -2758,6 +2977,17 @@ fn entry_bounds(
             ],
         )
     };
+    Ok(clipped_bounds(lower, upper, size, clip))
+}
+
+pub(super) fn affine_bounds(
+    source_size: [u32; 2], placement: AffinePlacement, size: [u32; 2], clip: Option<Rect>,
+) -> Result<Option<Rect>> {
+    let raster = affine_raster(source_size, placement)?;
+    Ok(clipped_bounds(raster.lower, raster.upper, size, clip))
+}
+
+fn clipped_bounds(mut lower: [i64; 2], mut upper: [i64; 2], size: [u32; 2], clip: Option<Rect>) -> Option<Rect> {
     for axis in 0..2 {
         lower[axis] = lower[axis].max(0);
         upper[axis] = upper[axis].min(i64::from(size[axis]));
@@ -2768,14 +2998,14 @@ fn entry_bounds(
         upper[0] = upper[0].min(i64::from(clip.x) + i64::from(clip.width));
         upper[1] = upper[1].min(i64::from(clip.y) + i64::from(clip.height));
     }
-    Ok((lower[0] < upper[0] && lower[1] < upper[1]).then(|| {
+    (lower[0] < upper[0] && lower[1] < upper[1]).then(|| {
         Rect::new(
             lower[0] as i32,
             lower[1] as i32,
             (upper[0] - lower[0]) as u32,
             (upper[1] - lower[1]) as u32,
         )
-    }))
+    })
 }
 
 fn draw_affine(
@@ -2786,12 +3016,26 @@ fn draw_affine(
     opacity: u32,
     clip: Option<Rect>,
 ) -> Result<()> {
+    draw_affine_placement(canvas, source, geometry.size,
+        AffinePlacement::from_entry(entry, entry.base, geometry.offset), opacity, clip,
+        cs2_renderer::BlendMode::SourceOver)
+}
+
+fn draw_affine_placement(
+    canvas: &mut Canvas,
+    source: &RgbaFrame,
+    size: [u32; 2],
+    placement: AffinePlacement,
+    opacity: u32,
+    clip: Option<Rect>,
+    blend: cs2_renderer::BlendMode,
+) -> Result<()> {
     let AffineRaster {
         base,
         forward,
         mut lower,
         mut upper,
-    } = affine_raster(geometry, entry, entry.base)?;
+    } = affine_raster(size, placement)?;
     lower[0] = lower[0].max(0);
     lower[1] = lower[1].max(0);
     upper[0] = upper[0].min(i64::from(canvas.width()));
@@ -2803,7 +3047,7 @@ fn draw_affine(
         upper[1] = upper[1].min(i64::from(clip.y) + i64::from(clip.height));
     }
     let inverse = forward.inverse();
-    let origin = entry.position.map(fixed15);
+    let origin = placement.position.map(fixed15);
     let pivot = forward
         .transform(base.map(fixed15))
         .map(|value| value >> 15);
@@ -2827,7 +3071,13 @@ fn draw_affine(
             ];
             if let Some(sample) = interpolate15(source, integer, point.map(|value| value & 0x7fff))
             {
-                blend_pixel(canvas, x as i32, y as i32, sample, opacity)?;
+                if blend.is_list_alpha_mask() {
+                    let [r, g, b, a] = sample;
+                    canvas.blend_pixel_with_mode(x as i32, y as i32,
+                        cs2_renderer::Color::rgba(r, g, b, a), blend)?;
+                } else {
+                    blend_pixel(canvas, x as i32, y as i32, sample, opacity)?;
+                }
             }
         }
     }
@@ -3009,6 +3259,25 @@ mod raster_tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn plain_list_alpha_mask_preserves_destination_rgb_and_clip() {
+        let source = RgbaFrame::from_rgba8(5, 1, vec![
+            0, 255, 0, 0, 0, 255, 0, 255, 0, 255, 0, 128, 0, 255, 0, 0, 0, 255, 0, 255,
+        ]).unwrap();
+        let mut canvas = Canvas::new(5, 1).unwrap();
+        for (column, alpha) in [255, 255, 127, 255, 0].into_iter().enumerate() {
+            canvas.set_pixel(column as i32, 0, Color::rgba(80, 90, 100, alpha)).unwrap();
+        }
+        let mut options = ImageDrawOptions::new(Point::new(0, 0));
+        options.clip = Some(Rect::new(1, 0, 3, 1));
+        options.opacity = 128;
+        options.blend_mode = cs2_renderer::BlendMode::ListAlphaFromAlpha;
+        draw_plain_frame(&mut canvas, &source, &options, 128, &mut None).unwrap();
+        for (pixel, alpha) in canvas.pixels().chunks_exact(4).zip([255, 255, 64, 0, 0]) {
+            assert_eq!(pixel, [80, 90, 100, alpha]);
         }
     }
 

@@ -31,6 +31,42 @@ const PROFILES: &[(&str, u32, bool)] = &[
 ];
 const RECORD_BYTES: usize = 0x290;
 const PARAMETERS: usize = 0x10c;
+const KANMI_PACKED: &str = "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26";
+const KANMI_STARTUP: &str = "7e11ce11146b4eb4fa27679f6c2547055f08eeff24c8ab122d2d0dfc959128a4";
+const KANMI_SSCRIPT: &str = "17de548390b8c2b15a4f413418bbf1b408d6dee6ab830879f09cf305f5c128fd";
+
+fn kanmi_particle_producer_matches(runtime: &str, startup: &str, sscript: &str) -> bool {
+    runtime == KANMI_PACKED && startup == KANMI_STARTUP && sscript == KANMI_SSCRIPT
+}
+
+fn kanmi_runtime_pe_sha256(producer: Option<&str>, startup: Option<&str>) -> Option<&'static str> {
+    (producer == Some(KANMI_PACKED) && startup == Some("kcs.int/main.kcs"))
+        .then_some(KANMI_PACKED)
+}
+
+fn particle_control_offset(index: u32) -> Option<u32> {
+    match index {
+        272 => Some(1),
+        273 => Some(2),
+        274 => Some(4),
+        275 => Some(5),
+        426 => Some(6),
+        427 => Some(7),
+        _ => None,
+    }
+}
+
+fn kanmi_particle_operation(
+    producer: Option<&str>, index: u32, target: Option<(u32, u32, u32)>,
+) -> Option<u32> {
+    if producer != Some(KANMI_PACKED) || !matches!(target, Some((16, 0, _))) {
+        return None;
+    }
+    match index {
+        271 | 693 => Some(0),
+        _ => particle_control_offset(index),
+    }
+}
 
 fn command_base(host: &LoggingHost<'_>) -> Result<u32> {
     if host.data_services.particle_external.legacy_kc_view() { return Ok(271); }
@@ -163,10 +199,28 @@ impl LoggingHost<'_> {
         }
         let offset = command.checked_sub(320).filter(|offset| *offset < 8)
             .ok_or_else(|| native_state_error("FES particle operation is outside320..327"))?;
+        self.submit_particle_operation(target, offset, value, bytes)
+    }
+
+    fn submit_particle_operation(
+        &mut self, target: u32, offset: u32, value: u32, bytes: Option<&[u8]>,
+    ) -> Result<u32> {
         self.retain_particle_controls(target);
         let mut output = 0;
         self.receive_particle_body(target, offset, value, bytes, &mut output)?;
         Ok(output)
+    }
+
+    fn kanmi_particle_native_operation(&self, index: u32, target: u32) -> Option<u32> {
+        if self.data_services.particle_message_pe_sha256 != Some(KANMI_PACKED)
+            || self.data_services.particle_external.legacy_kc_view()
+            || self.data_services.native_profile.is_some()
+            || !self.task_is_reachable(target)
+        {
+            return None;
+        }
+        kanmi_particle_operation(self.data_services.particle_message_pe_sha256, index,
+            self.data_services.tasks.message_task_state(target))
     }
 
     fn retain_particle_controls(&mut self, target: u32) {
@@ -262,9 +316,13 @@ impl LoggingHost<'_> {
         if arguments.len() != 24 {
             return Err(native_state_error("particle load requires exactly24 argument bytes"));
         }
-        let command = TaskCommand { target: read_u32(arguments, 0)? as i32,
-            sender: self.current_task_id as i32, code: command_base(self)?, data: [0, 1, 0] };
-        if let Some(mut buffers) = self.pending_owned_task_buffers(command) {
+        let target = read_u32(arguments, 0)?;
+        let operation = self.kanmi_particle_native_operation(index, target);
+        let command = if operation.is_none() {
+            Some(TaskCommand { target: target as i32,
+                sender: self.current_task_id as i32, code: command_base(self)?, data: [0, 1, 0] })
+        } else { None };
+        if let Some(command) = command && let Some(mut buffers) = self.pending_owned_task_buffers(command) {
             let result = self.route_task_command_buffers(command, &mut buffers, &mut 1, 4096)?;
             return Ok(if result.is_some_and(|result| !result.done) { NativeReturn::Retry }
                 else { NativeReturn::Value(1) });
@@ -302,10 +360,14 @@ impl LoggingHost<'_> {
             record[0x108..0x10c].copy_from_slice(&arguments[16..20]);
         }
         // target0 remains the real root, never substituted with the sender.
-        let mut buffers = super::native_tasks::OwnedTaskBuffers::new(None, Some(record))?;
-        if self.route_task_command_buffers(command, &mut buffers, &mut 1, 4096)?
-            .is_some_and(|outcome| !outcome.done)
-        { return Ok(NativeReturn::Retry); }
+        if let Some(command) = command {
+            let mut buffers = super::native_tasks::OwnedTaskBuffers::new(None, Some(record))?;
+            if self.route_task_command_buffers(command, &mut buffers, &mut 1, 4096)?
+                .is_some_and(|outcome| !outcome.done)
+            { return Ok(NativeReturn::Retry); }
+        } else {
+            self.submit_particle_operation(target, operation.unwrap(), 1, Some(&record))?;
+        }
         // The wrapper reports its own successful argument preparation; it does
         // not substitute the receiver's untouched output as a load result.
         Ok(NativeReturn::Value(1))
@@ -318,10 +380,15 @@ impl LoggingHost<'_> {
         if arguments.len() != required {
             return Err(native_state_error("particle control argument byte count is invalid"));
         }
-        let offset = match index { 272 => 1, 273 => 2, 274 => 4, 275 => 5,
-            426 => 6, 427 => 7, _ => unreachable!() };
+        let offset = particle_control_offset(index).expect("particle control native index");
         let value = if required == 8 { read_u32(arguments, 4)? } else { 0 };
-        let command = TaskCommand { target: read_u32(arguments, 0)? as i32,
+        let target = read_u32(arguments, 0)?;
+        if let Some(operation) = self.kanmi_particle_native_operation(index, target) {
+            let parameters = if index == 275 { Some(vm.read(value, 128)?) } else { None };
+            let output = self.submit_particle_operation(target, operation, value, parameters.as_deref())?;
+            return Ok(if index == 274 { NativeReturn::Value(output) } else { NativeReturn::Continue });
+        }
+        let command = TaskCommand { target: target as i32,
             sender: self.current_task_id as i32, code: command_base(self)? + offset,
             data: [0, value, 0] };
         if let Some(mut buffers) = self.pending_owned_task_buffers(command) {
@@ -555,6 +622,10 @@ impl LoggingHost<'_> {
 }
 
 impl super::HeadlessPlayer {
+    pub(super) fn verified_kanmi_runtime_pe_sha256(&self) -> Option<&'static str> {
+        kanmi_runtime_pe_sha256(self.data_services.particle_message_pe_sha256, self.default_entry())
+    }
+
     /// The portable particle protocol can be recovered independently of the
     /// general ordinary-native table. Never use a file-version string to pick
     /// it. The one packed-package binding additionally requires the exact
@@ -567,13 +638,29 @@ impl super::HeadlessPlayer {
         let Some(binary) = self.scan.engine.primary_executable.as_ref() else { return Ok(()); };
         self.data_services.particle_message_pe_sha256 = identified_pe_sha256(&binary.sha256);
         if self.data_services.particle_message_pe_sha256.is_some() { return Ok(()); }
+        let resources = &self.scan.resources;
+        let kanmi_executable = std::path::Path::new(
+            "\u{5c1a}\u{6709}\u{4f73}\u{5bc6}\u{4f34}\u{604b}\u{5fc3}.exe",
+        );
+        if resources.files().iter().any(|file|
+            file.relative_path.as_path() == kanmi_executable && file.size == 4_223_965)
+            && let Ok(runtime) = std::fs::read(resources.root().join(kanmi_executable))
+            && let Ok(Some(startup)) = resources.read_mode("kcs.int/main.kcs", ResourceMode::LooseFirst)
+            && let Ok(sscript) = resources.read_category(b"kcs", "sscript")
+        {
+            let sha256 = super::particle_plugin_digest::sha256;
+            if kanmi_particle_producer_matches(&sha256(&runtime), &sha256(&startup), &sha256(&sscript)) {
+                self.data_services.particle_message_pe_sha256 = Some(KANMI_PACKED);
+                self.log.push("particle ABI: exact Kanmi KCS producer; packed raw numbering unverified".into());
+                return Ok(());
+            }
+        }
         // These identify the installed package only. They are deliberately
         // NOT entries in PROFILES: their packed native tables are not proven.
         if !matches!(binary.sha256.as_str(),
             "21dfeb88edafc4bf19226d158e040687738f592282c578740e9d972127938df7" |
             "42cdb649a805eb489ccb5964b44b21981918ade062d7900e8386d6e146b20908")
         { return Ok(()); }
-        let resources = &self.scan.resources;
         let Some(companion) = resources.resolve_plain_file("cs2_crack.exe")? else {
             self.log.push("particle ABI unresolved: fixed Happiness2 plain companion is absent".into());
             return Ok(());
@@ -651,4 +738,44 @@ fn snapshot_points(snapshot: &particle_vm::ParticleRenderSnapshot) -> Result<Vec
             super::Color::rgba((vertex.color >>16) as u8, (vertex.color >>8) as u8,
                 vertex.color as u8, (vertex.color >>24) as u8))
     }).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kanmi_particle_producer_keeps_raw_numbering_unidentified() {
+        assert!(kanmi_particle_producer_matches(KANMI_PACKED, KANMI_STARTUP, KANMI_SSCRIPT));
+        assert!(!kanmi_particle_producer_matches("other", KANMI_STARTUP, KANMI_SSCRIPT));
+        assert!(!kanmi_particle_producer_matches(KANMI_PACKED, "other", KANMI_SSCRIPT));
+        assert!(!kanmi_particle_producer_matches(KANMI_PACKED, KANMI_STARTUP, "other"));
+        assert_eq!(identified_pe_sha256(KANMI_PACKED), None);
+    }
+
+    #[test]
+    fn kanmi_runtime_identity_requires_verified_producer_and_exact_entry() {
+        let startup = Some("kcs.int/main.kcs");
+        let box_loader = "2044cd9c096c509da8609c0c2174038e0e03255aeaffd57fea6e817406e802ab";
+        assert_eq!(kanmi_runtime_pe_sha256(Some(KANMI_PACKED), startup), Some(KANMI_PACKED));
+        assert_eq!(kanmi_runtime_pe_sha256(Some(box_loader), startup), None);
+        assert_eq!(kanmi_runtime_pe_sha256(None, startup), None);
+        assert_eq!(kanmi_runtime_pe_sha256(Some(KANMI_PACKED), Some("main.kcs")), None);
+        assert_eq!(kanmi_runtime_pe_sha256(Some(KANMI_PACKED), None), None);
+    }
+
+    #[test]
+    fn kanmi_particle_producer_maps_only_verified_slots_on_live_kind16() {
+        for (index, operation) in [(271, 0), (693, 0), (272, 1), (273, 2), (274, 4),
+            (275, 5), (426, 6), (427, 7)] {
+            assert_eq!(kanmi_particle_operation(Some(KANMI_PACKED), index, Some((16, 0, 0))), Some(operation));
+            assert_eq!(kanmi_particle_operation(Some("other"), index, Some((16, 0, 0))), None);
+            assert_eq!(kanmi_particle_operation(Some(KANMI_PACKED), index, Some((16, 1, 0))), None);
+            assert_eq!(kanmi_particle_operation(Some(KANMI_PACKED), index, Some((34, 0, 0))), None);
+            assert_eq!(kanmi_particle_operation(Some(KANMI_PACKED), index, None), None);
+        }
+        for index in [669, 320, 1068, 1069] {
+            assert_eq!(kanmi_particle_operation(Some(KANMI_PACKED), index, Some((16, 0, 0))), None);
+        }
+    }
 }

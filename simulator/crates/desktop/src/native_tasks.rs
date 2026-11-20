@@ -76,6 +76,7 @@ pub(super) struct NativeTaskStore {
     direct_release: Option<Traversal>,
     shared_areas: task_commands::SharedValueAreas,
     message_traversals: BTreeMap<u32, MessageTraversal>,
+    pub(super) synchronous_callers: BTreeMap<u32, Vm>,
     buffered_commands: task_commands2::BufferedTaskCommands,
     lower_commands: BTreeMap<u32, task_controls::LowerPending>,
 }
@@ -1179,7 +1180,7 @@ impl LoggingHost<'_> {
                     .map(|done| done.then_some(false));
             }
             if message_owner == Some(self.current_task_id) {
-                let done = self.dispatch_ordinary_message(target, &mut packet, output, 4096)?;
+                let done = self.dispatch_ordinary_message_with_caller(target, &mut packet, output, 4096, vm)?;
                 return Ok(done.then_some(false));
             }
         }
@@ -1377,7 +1378,7 @@ impl LoggingHost<'_> {
             } else if !self.data_services.tasks.records[&target].active
                 && target != self.current_task_id
             {
-                let done = self.dispatch_ordinary_message(target, &mut packet, output, 4096)?;
+                let done = self.dispatch_ordinary_message_with_caller(target, &mut packet, output, 4096, vm)?;
                 return Ok(done.then_some(false));
             } else {
                 *output = 0;
@@ -1388,8 +1389,14 @@ impl LoggingHost<'_> {
     }
 
     fn dispatch_ordinary_message(
-        &mut self, target: u32, packet: &mut TaskMessage,
-        output: &mut u32, budget: usize,
+        &mut self, target: u32, packet: &mut TaskMessage, output: &mut u32, budget: usize,
+    ) -> Result<bool> {
+        self.dispatch_ordinary_message_with_caller(target, packet, output, budget, None)
+    }
+
+    fn dispatch_ordinary_message_with_caller(
+        &mut self, target: u32, packet: &mut TaskMessage, output: &mut u32,
+        budget: usize, mut caller_vm: Option<&mut Vm>,
     ) -> Result<bool> {
         let caller = self.current_task_id;
         let record = &self.data_services.tasks.records[&target];
@@ -1400,11 +1407,23 @@ impl LoggingHost<'_> {
             *output = 0;
             return Ok(true);
         }
+        if let Some(vm) = caller_vm.as_deref_mut() {
+            let std::collections::btree_map::Entry::Vacant(slot) =
+                self.data_services.tasks.synchronous_callers.entry(caller)
+            else {
+                return Err(native_state_error("synchronous caller VM is already exposed"));
+            };
+            slot.insert(std::mem::take(vm));
+        }
         self.data_services.tasks.records.get_mut(&target).unwrap().message_owner = Some(caller);
         let result = self.with_ordinary_task(target, |host, task| {
             task.dispatch_message(packet, output, host, budget)
                 .map_err(|error| host.task_error(target, error))
         });
+        if let Some(vm) = caller_vm {
+            *vm = self.data_services.tasks.synchronous_callers.remove(&caller)
+                .expect("synchronous dispatch owns its caller VM until it returns");
+        }
         if matches!(result, Ok(true)) {
             self.data_services.tasks.records.get_mut(&target).unwrap().message_owner = None;
         }

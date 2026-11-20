@@ -4,6 +4,19 @@
 use crate::{RuntimeError, RuntimeResult};
 use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::path::Path;
+
+const ISLAND_TEXT_ARCHIVES: [((&str, u64, &str), (&str, u64, &str)); 2] = [
+    (
+        ("scene.int", 2_187_392, "4b510173fee978d6af3baab0c3c78e26694e556790704193037dc34edeeda7de"),
+        ("cnscene.int", 3_142_412, "6c3447a90a6a0bc706d2805cb3c58d8089478a24b51691a76d9f0fc468d0751a"),
+    ),
+    (
+        ("fes.int", 171_679, "96152bcf12f60204c32238ce1eed08ccbe75a39befe9aad47ffe214ce0c12d05"),
+        ("cnfes.int", 172_736, "6bc9f5d3033457555a885802fe820170b917b43df19598f4f7d2fe205ab5919d"),
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -22,7 +35,7 @@ impl TryFrom<u32> for ResourceMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveMount {
-    /// The actual loaded path, independently of the slot's registered prefix.
+    /// The lookup path in archive mode, independently of the slot's registered prefix.
     pub path: Vec<u16>,
     /// Index in ResourceIndex::archives(), or a host-defined archive identity.
     pub archive: usize,
@@ -54,11 +67,16 @@ pub struct ResourceRouter {
     pub slots: Vec<ResourceSlot>,
     pub groups: Vec<ResourceGroup>,
     pub patches: Vec<ArchiveMount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    island_chinese_scene: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    island_chinese_fes: Option<usize>,
 }
 
 impl Default for ResourceRouter {
     fn default() -> Self {
-        Self { slots: vec![ResourceSlot::default(); 256], groups: Vec::new(), patches: Vec::new() }
+        Self { slots: vec![ResourceSlot::default(); 256], groups: Vec::new(), patches: Vec::new(),
+            island_chinese_scene: None, island_chinese_fes: None }
     }
 }
 
@@ -88,6 +106,19 @@ pub(crate) fn encode_wide_name<'a>(name: &str, scratch: &'a mut [u16; MAX_PATH_U
 enum RouteSource<'a> { File(&'a [u16]), Archive(u8), Patch(usize) }
 
 impl ResourceRouter {
+    pub fn is_island_chinese_scene(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
+        Self::matches_archive(self.island_chinese_scene, index, path)
+    }
+
+    pub fn is_island_chinese_fes(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
+        Self::matches_archive(self.island_chinese_fes, index, path)
+    }
+
+    fn matches_archive(archive: Option<usize>, index: &crate::ResourceIndex, path: &Path) -> bool {
+        archive.and_then(|archive| index.archives().get(archive))
+            .is_some_and(|archive| index.root().join(&archive.path) == path)
+    }
+
     pub fn route<T>(
         &self, name: &[u8], mode: ResourceMode,
         file: impl FnMut(&[u16]) -> RuntimeResult<Option<T>>,
@@ -403,6 +434,7 @@ impl ResourceRouter {
                     config.integer(&[b"document", b"INT", format!("need{need:02}").as_bytes()], -1) == slot
                 }) { return Err(error("required startup INT registration failed")); }
             }
+            builder.bind_island_translation();
         } else {
             // For configuration-less tooling, expose actual mounts in stable
             // inventory order. This is an explicit host policy, not proof of
@@ -434,6 +466,45 @@ struct MountBuilder<'a> {
 }
 
 impl MountBuilder<'_> {
+    fn bind_island_translation(&mut self) {
+        for (original, translated) in ISLAND_TEXT_ARCHIVES {
+            let Some(chinese) = self.verified_archive(translated) else { continue; };
+            let Some(japanese) = self.verified_archive(original) else { continue; };
+            let mut mounted = false;
+            for slot in &mut self.router.slots {
+                if let Some(mount) = &mut slot.archive && mount.archive == japanese {
+                    mount.archive = chinese;
+                    mounted = true;
+                }
+            }
+            if mounted {
+                if translated.0 == "cnscene.int" {
+                    self.router.island_chinese_scene = Some(chinese);
+                } else {
+                    self.router.island_chinese_fes = Some(chinese);
+                }
+            }
+        }
+    }
+
+    fn verified_archive(&self, (name, size, sha256): (&str, u64, &str)) -> Option<usize> {
+        let path = self.base.join(name);
+        let (archive, entry) = self.index.archives().iter().enumerate()
+            .find(|(_, entry)| physical_path_equal(&entry.path, &path) && entry.is_readable())?;
+        if !self.index.files().iter().any(|file| file.relative_path == entry.path && file.size == size) {
+            return None;
+        }
+        let file = std::fs::File::open(self.index.root().join(&entry.path)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(size + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 != size {
+            return None;
+        }
+        let mut digest = crate::sha256::Sha256::default();
+        digest.update(&bytes);
+        (digest.finish() == sha256).then_some(archive)
+    }
+
     fn register(&mut self, prefix: &str, directory: &str) -> RuntimeResult<Option<u8>> {
         // PE 52c7f1..52c83b unloads an existing successful mount with the
         // same actual loaded name before taking the first free pointer slot.
@@ -544,4 +615,48 @@ fn patch_number(path: &std::path::Path) -> Option<u8> {
     if name.len() != 12 || !name[..6].eq_ignore_ascii_case(b"update") || !name[8..].eq_ignore_ascii_case(b".int")
         || !name[6..8].iter().all(u8::is_ascii_digit) { return None; }
     Some((name[6] - b'0') * 10 + name[7] - b'0')
+}
+
+#[cfg(test)]
+mod island_translation_tests {
+    use super::*;
+
+    #[test]
+    fn routes_local_island_text_archives_through_original_names() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games/ISLAND");
+        if !root.join("cnscene.int").is_file() || !root.join("cnfes.int").is_file() {
+            return;
+        }
+        let index = crate::ResourceIndex::scan(root).unwrap();
+        let router = index.resource_router().unwrap();
+        let restored: ResourceRouter = serde_json::from_slice(&serde_json::to_vec(router).unwrap()).unwrap();
+        assert_eq!(&restored, router);
+        for (category, name, pack, sha256) in [
+            (b"scene".as_slice(), "BAD_02", "cnscene.int",
+                "eac9dbe3277572bca3505ecd36496b2f4fec852a63fa3cb11b1154d56e2b4f11"),
+            (b"scene".as_slice(), "com01_selC", "cnscene.int",
+                "de3a10ca5b7ed4d4059f66ad2440f6c49c37a7b8a351438012328fac1c479773"),
+            (b"fes".as_slice(), "title", "cnfes.int",
+                "6417ab8bf1bc70729efb1281ff99644b49bf6db2999ee511190559a3de5246de"),
+        ] {
+            let names = index.category_names(category, name).unwrap();
+            let ordinary_candidate = index.find(&names[0]).unwrap();
+            let wide = names[0].encode_utf16().collect::<Vec<_>>();
+            for mode in [ResourceMode::LooseFirst, ResourceMode::Archive, ResourceMode::ArchiveFirst] {
+                let candidate = index.resolve_mode_utf16(&wide, mode).unwrap().unwrap().value;
+                assert_eq!(candidate, ordinary_candidate);
+                let crate::ResourceLocation::Archive { path, .. } = &candidate.location else {
+                    panic!("expected archive entry for {name}");
+                };
+                assert_eq!(*path, index.root().join(pack));
+                assert_eq!(router.is_island_chinese_scene(&index, path), pack == "cnscene.int");
+                assert_eq!(router.is_island_chinese_fes(&index, path), pack == "cnfes.int");
+                let mut digest = crate::sha256::Sha256::default();
+                digest.update(&index.read_candidate(candidate).unwrap());
+                assert_eq!(digest.finish(), sha256);
+            }
+        }
+        assert!(!router.is_island_chinese_scene(&index, &index.root().join("scene.int")));
+    }
 }

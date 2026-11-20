@@ -1652,6 +1652,16 @@ impl FesInterpreter {
             .is_some_and(|block| self.pc >= block.lines.len())
     }
 
+    pub fn return_call_at_block_end(&mut self, depth_floor: usize) -> bool {
+        if self.pending.is_some() || self.calls.len() <= depth_floor || !self.at_block_end() {
+            return false;
+        }
+        let frame = self.calls.pop().expect("call depth exceeds the floor");
+        self.block = frame.block;
+        self.pc = frame.pc;
+        true
+    }
+
     pub fn initialization_pending(&self) -> bool {
         self.declarations_pending
             || self.initialization_cursor.keyblock < self.initialization.keyblocks.len()

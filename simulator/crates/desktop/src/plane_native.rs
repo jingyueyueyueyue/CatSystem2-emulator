@@ -13,8 +13,10 @@ use cs2_runtime::TaskCommand;
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
 use super::canvas_native::VramOverflow;
+use super::css_model::{SHA as TSUNABAN_SHA, UTATE_SHA};
 use super::movie_plane::PlaneCamera;
 use super::movie_plane_render::MoviePlaneProjection;
+use super::particle_external::CAMPANELLA_SHA;
 use super::{DesktopInputTask, HeadlessPlayer, InputRegionState, LoggingHost, SceneNode};
 
 #[path = "plane_history.rs"]
@@ -1012,7 +1014,10 @@ impl LoggingHost<'_> {
                 NativeReturn::Continue
             }));
         }
-        if (id != 0 && self.scene_nodes.get(&id).is_some_and(|node| node.kind != 2))
+        let kind = self.scene_nodes.get(&id).map(|node| node.kind);
+        let legacy_display = abi.slot == 92 && matches!(kind, Some(6 | 47))
+            && self.bind_utate_plane_input_profile()?;
+        if (id != 0 && !legacy_display && kind.is_some_and(|kind| kind != 2))
             || self
                 .movie_host
                 .as_ref()
@@ -1033,6 +1038,13 @@ impl LoggingHost<'_> {
             data: [0; 3],
         };
         let mut output = 0;
+        if legacy_display && kind == Some(6) {
+            packet.data[1] = word(args, 4)?;
+            if self.receive_input_button_command(packet, &mut Default::default(), &mut output, 4096)?.is_none() {
+                return Err(error("legacy button declined its display command"));
+            }
+            return Ok(Some(NativeReturn::Continue));
+        }
         let dispatch = |host: &mut Self,
                         packet,
                         data0: Option<&mut [u8]>,
@@ -1313,10 +1325,20 @@ impl LoggingHost<'_> {
             return Err(error("plane command propagation exceeds 256 levels"));
         }
         let id = command.target as u32;
+        let pe_sha = self.css_task_sha();
+        let legacy_utate_display = matches!(command.code, 47 | 48) && pe_sha == Some(UTATE_SHA);
+        let legacy_string2_profile = match pe_sha {
+            Some(CAMPANELLA_SHA) => Some("campanella-plane-propagation"),
+            Some(TSUNABAN_SHA) => Some("tsunaban-plane-propagation"),
+            _ => None,
+        };
+        let legacy_string2_display = command.code == 48 && legacy_string2_profile.is_some();
         let Some(node) = self
             .scene_nodes
             .get(&id)
-            .filter(|node| node.kind == 2)
+            .filter(|node| node.kind == 2 || (legacy_utate_display && node.kind == 47)
+                || (legacy_string2_display && node.kind == 45)
+                || self.legacy_utate_string_binding(node.kind, command.code))
             .cloned()
         else {
             return Ok(false);
@@ -1563,7 +1585,9 @@ impl LoggingHost<'_> {
                 };
                 if let Some(incoming) = incoming {
                     state.display = if state.show == 0 { 0 } else { incoming };
-                    if let Some(node) = self.scene_nodes.get_mut(&id) {
+                    if let Some(node) = self.scene_nodes.get_mut(&id)
+                        && (!legacy_string2_display || node.kind != 45 || node.initialized)
+                    {
                         node.visible = state.display != 0;
                     }
                     if state.input_configured
@@ -1678,6 +1702,12 @@ impl LoggingHost<'_> {
             self.synchronize_plane_history_control(id, command.code)?;
         }
         if let Some(code) = propagate {
+            let legacy_button_display = code == 48
+                && (legacy_utate_display || legacy_string2_profile.is_some());
+            let mut data = command.data;
+            if code == 48 && (legacy_utate_display || (legacy_string2_display && node.kind == 45)) {
+                data[1] = self.data_services.planes.planes[&id].display;
+            }
             let mut cursor = None;
             loop {
                 let child = self
@@ -1690,13 +1720,35 @@ impl LoggingHost<'_> {
                     .min_by_key(|&child| child as i32);
                 let Some(child) = child else { break };
                 cursor = Some(child as i32);
+                if legacy_button_display && self.data_services.tasks.message_task_state(child)
+                    .is_some_and(|(_, deletion, _)| deletion != 0)
+                {
+                    continue;
+                }
                 let forwarded = TaskCommand {
                     target: child as i32,
                     sender: id as i32,
                     code,
-                    ..command
+                    data,
                 };
+                if legacy_button_display
+                    && self.scene_nodes.get(&child).is_some_and(|node| node.kind == 6)
+                    && self.receive_input_button_command(forwarded, &mut Default::default(), output, 4096)?.is_some()
+                {
+                    continue;
+                }
                 if !self.plane_command_inner(forwarded, buffers, output, depth + 1)? {
+                    if let Some(diagnostic) = legacy_string2_profile {
+                        let child_kind = self.scene_nodes.get(&child).map(|node| node.kind);
+                        self.events.push(super::LogicEvent {
+                            frame: self.frame,
+                            kind: diagnostic.into(),
+                            detail: format!(
+                                "task={} sender={} depth={depth} parent={id} parent_kind={} command={} child={child} child_kind={child_kind:?} forwarded={} data={data:#010x?}",
+                                self.current_task_id, command.sender, node.kind, command.code, forwarded.code,
+                            ),
+                        });
+                    }
                     return Err(error(
                         "plane propagation needs a receiver for its non-plane child",
                     ));
@@ -1820,7 +1872,7 @@ impl LoggingHost<'_> {
                 (parent.position, base)
             }
         };
-        if node.initialized {
+        if node.initialized || self.tsunaban_legacy_string_plane(node.kind) {
             if let Some(state) = self.data_services.planes.planes.get_mut(&id) {
                 state.wrapper.base = [
                     base[0] - offset[0],
@@ -2592,6 +2644,106 @@ fn raster_triangle(
 #[cfg(test)]
 mod unit_canvas_plane_tests {
     use super::*;
+
+    #[test]
+    fn legacy_string2_inherits_plane_display_only_for_verified_receivers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (sha, diagnostic) in [
+            (TSUNABAN_SHA, "tsunaban-plane-propagation"),
+            (CAMPANELLA_SHA, "campanella-plane-propagation"),
+        ] {
+            let save_root = std::env::temp_dir().join(format!(
+                "cs2-string2-display-{}-{}",
+                std::process::id(),
+                &sha[..8],
+            ));
+            let mut player = HeadlessPlayer::open_with_save_root(root, save_root).unwrap();
+            player.with_host(|host| {
+                host.data_services.css_task_pe_sha256 = Some(sha);
+                let sender = host.current_task_id;
+                let parent = host.create_task_object(2, sender, b"message main", b"")?;
+                let string = host.create_task_object(45, parent, b"string", b"")?;
+                let nested = host.create_task_object(2, string, b"nested plane", b"")?;
+                let button = host.create_task_object(6, parent, b"mes btn 0", b"")?;
+                let mut button_config = super::super::OwnedTaskBuffers::new(None, Some(vec![0; 24]))?;
+                let mut output = 0;
+                let command = TaskCommand {
+                    target: parent as i32,
+                    sender: sender as i32,
+                    code: 47,
+                    data: [0, 0, 1],
+                };
+                assert!(host.receive_input_button_command(
+                    TaskCommand { target: button as i32, code: 90, ..command },
+                    &mut button_config, &mut output, 4096,
+                )?.is_some());
+
+                let mut buffers = PlaneCommandBuffers::default();
+                assert!(host.dispatch_plane_command(command, &mut buffers, &mut output)?);
+                assert_eq!(host.data_services.planes.planes[&string].display, 0);
+                assert_eq!(host.input_task.regions.iter().find(|region| region.id() == button).unwrap().words[8], 0);
+
+                let show = TaskCommand { data: [0, 7, 1], ..command };
+                assert!(host.dispatch_plane_command(show, &mut buffers, &mut output)?);
+                assert_eq!(host.data_services.planes.planes[&string].display, 7);
+                assert!(!host.scene_nodes[&string].visible);
+                assert_eq!(host.data_services.planes.planes[&nested].display, 7);
+                assert_eq!(host.input_task.regions.iter().find(|region| region.id() == button).unwrap().words[8], 7);
+
+                host.data_services.planes.planes.get_mut(&string).unwrap().show = 0;
+                assert!(host.dispatch_plane_command(show, &mut buffers, &mut output)?);
+                assert_eq!(host.data_services.planes.planes[&string].display, 0);
+                assert_eq!(host.data_services.planes.planes[&nested].display, 0);
+
+                host.create_task_object(0, parent, b"unsupported child", b"")?;
+                assert!(host.dispatch_plane_command(show, &mut buffers, &mut output).is_err());
+                assert!(host.events.iter().any(|event| event.kind == diagnostic
+                    && event.detail.contains("child_kind=Some(0) forwarded=48")));
+
+                host.data_services.css_task_pe_sha256 = Some("unrelated-pe");
+                let inherit = TaskCommand { target: string as i32, code: 48, ..show };
+                assert!(!host.dispatch_plane_command(inherit, &mut buffers, &mut output)?);
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn tsunaban_native90_binds_legacy_string_but_ignores_button_offsets() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let save_root = std::env::temp_dir().join(format!("cs2-tsunaban-90-{}", std::process::id()));
+        let mut player = HeadlessPlayer::open_with_save_root(root, save_root).unwrap();
+        player.with_host(|host| {
+            let mut parent = SceneNode::new(12, 2, 0, "message main".into());
+            parent.initialized = true;
+            parent.position = [10., 20., 30.];
+            host.scene_nodes.insert(12, parent);
+            host.scene_nodes.insert(14, SceneNode::new(14, 45, 12, "string".into()));
+            host.scene_nodes.insert(16, SceneNode::new(16, 6, 12, "mes btn 0".into()));
+            let args = |target: u32| {
+                [target, 100_f32.to_bits(), 444_f32.to_bits(), 100_f32.to_bits()]
+                    .map(u32::to_le_bytes)
+                    .concat()
+            };
+
+            host.data_services.css_task_pe_sha256 = Some(super::super::css_model::SHA);
+            for target in [14, 16] {
+                assert!(host.legacy_utate_native90(90, &args(target)[..12]).is_err());
+                assert_eq!(host.legacy_utate_native90(90, &args(target))?, Some(NativeReturn::Continue));
+            }
+            let string_plane = &host.data_services.planes.planes[&14];
+            assert_eq!(string_plane.parent_offset, Some([100., 444., 100.]));
+            assert_eq!(string_plane.wrapper.base, [-100., -444., 5100.]);
+            assert_eq!(string_plane.wrapper.position, [10., 20., 30.]);
+            assert!(!host.scene_nodes[&14].initialized);
+            assert_eq!(host.scene_nodes[&16].position, [0.; 3]);
+            assert!(!host.data_services.planes.planes.contains_key(&16));
+
+            host.data_services.css_task_pe_sha256 = Some("unrelated-pe");
+            assert_eq!(host.legacy_utate_native90(90, &args(14))?, None);
+            Ok(())
+        }).unwrap();
+    }
 
     #[test]
     fn unit_canvas_plane_matches_triangle_pixels() -> HostResult<()> {

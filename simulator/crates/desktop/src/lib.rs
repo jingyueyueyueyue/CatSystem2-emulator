@@ -75,6 +75,7 @@ mod message_backend;
 mod message_platform;
 mod input_history_native;
 mod legacy_text_native;
+mod legacy_native925;
 mod ordinary_native;
 mod ordinary_pair_table;
 mod resource_preload;
@@ -106,6 +107,7 @@ mod settings_menu_native;
 #[cfg(windows)]
 mod settings_menu_windows;
 pub use settings_menu_native::{HostEffectSettings, HostGameMenu, HostInputPanel, HostMenuConfirmation, HostMenuItem, HostSettingControl, HostSettingKind, HostSettingsEdit, HostSettingsPage};
+mod legacy_utate_native90;
 mod plane_native;
 mod native_tasks;
 use native_tasks::OwnedTaskBuffers;
@@ -132,6 +134,7 @@ mod css_model_render;
 mod css_model_shader;
 mod backlog_native;
 mod cst_context_native;
+mod story_trace;
 mod cst_window_native;
 mod cst_state;
 mod system_open_native;
@@ -1306,6 +1309,7 @@ struct CstContextState {
     encoding: ScriptTextEncoding,
     source_name: Vec<u8>,
     source_line: u32,
+    story: story_trace::CstStoryPosition,
 }
 
 impl CstContextState {
@@ -3928,6 +3932,32 @@ impl Host for LoggingHost<'_> {
                 }
             }
         }
+        if let Some(result) = legacy_native925::happiness2_companion_native(
+            index, arguments, self.data_services.particle_message_pe_sha256,
+        ) {
+            return Ok(result);
+        }
+        if let Some(result) = legacy_native925::rebellions_native(index, arguments, self.resources) {
+            return Ok(result);
+        }
+        if index == 925 && arguments.is_empty() {
+            const KANMI_SSCRIPT_SHA256: &str =
+                "17de548390b8c2b15a4f413418bbf1b408d6dee6ab830879f09cf305f5c128fd";
+            let verified = match self.data_services.kanmi_native925_verified {
+                Some(verified) => verified,
+                None => {
+                    let verified = self.verified_kanmi_sound_loop_source()?
+                        && self.resources.read_category(b"kcs", "sscript").is_ok_and(|script| {
+                            particle_plugin_digest::sha256(&script) == KANMI_SSCRIPT_SHA256
+                        });
+                    self.data_services.kanmi_native925_verified = Some(verified);
+                    verified
+                }
+            };
+            if verified && !self.data_services.emote.state.backend_ready() {
+                return Ok(NativeReturn::Value(0));
+            }
+        }
         if matches!(index, 906..=933 | 965 | 966 | 1025 | 1027..=1030 | 1047 | 1048) {
             return Err(cs2_script::ScriptError::UnimplementedNativeCall { index });
         }
@@ -3966,6 +3996,9 @@ impl Host for LoggingHost<'_> {
         if index == 116 && let Some(result) = self.image_wrapper_copy_native116(arguments)? {
             return Ok(result);
         }
+        if let Some(result) = self.legacy_utate_native90(index, arguments)? {
+            return Ok(result);
+        }
         if let Some(result) = self.plane_native(index, arguments, vm)? {
             return Ok(result);
         }
@@ -3989,6 +4022,9 @@ impl Host for LoggingHost<'_> {
             1009 => self.image_export_native1009(arguments, vm),
             257..=259 | 263 | 339 | 455 | 462 | 463 | 464 | 622..=625 | 657 | 663 | 732 | 862 | 879..=881 =>
                 self.list_batch_native(index, arguments, vm),
+            626 if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA) =>
+                self.list_contract_native(index, arguments),
+            627 if self.legacy_list_profile()? => self.list_contract_native(index, arguments),
             113 | 118 | 119 | 121 | 241 | 251 | 362..=364 | 369..=376 | 536..=538 | 558 | 641 | 1026 => {
                 self.image_wrapper_native(index, arguments, vm)
             }
@@ -4058,7 +4094,6 @@ impl Host for LoggingHost<'_> {
             | 236
             | 432
             | 909
-            | 925
             | 1027..=1030 => Ok(NativeReturn::Value(0)),
             33 if arguments.is_empty() => {
                 Ok(NativeReturn::Value(self.script_random.next_integer()))
@@ -4085,6 +4120,18 @@ impl Host for LoggingHost<'_> {
             1 | 1040 if arguments.len() >= 4 => {
                 let source = vm.read_string(word(0).unwrap())?;
                 let text = expand_kcs_format_inner(vm, &source, 0, true)?;
+                if self.data_services.story_trace {
+                    let kind = match text.as_slice() {
+                        b"[input]" => Some(0x02),
+                        b"[page]" => Some(0x03),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        for context in self.cst_contexts.values_mut() {
+                            context.story.observe_page(self.frame, kind);
+                        }
+                    }
+                }
                 if let Some(event) = self.events.last_mut() {
                     event.detail.push_str(&format!(" debug={:?}", String::from_utf8_lossy(&text)));
                 }
@@ -4101,7 +4148,7 @@ impl Host for LoggingHost<'_> {
             8 => Err(native_state_error(
                 "native 8 requires exactly 8 argument bytes",
             )),
-            13..=16 => self.string_copy_native(index, arguments, vm),
+            13..=16 => self.cst_string_copy_native(index, arguments, vm),
             17 if arguments.len() == 4 => Ok(NativeReturn::Value(
                 vm.read_string(word(0).unwrap())?.len() as u32,
             )),
@@ -4871,6 +4918,7 @@ impl Host for LoggingHost<'_> {
                     restored.entry(index).or_insert_with(|| data[cursor..end].to_vec());
                     cursor = end + 1;
                 }
+                self.data_services.cst_text_origins = Default::default();
                 *self.string_values = restored;
                 Ok(NativeReturn::Value(1))
             }
@@ -4963,7 +5011,9 @@ impl Host for LoggingHost<'_> {
             }
             276 if arguments.len() >= 8 => {
                 let index = word(0).unwrap();
-                let value = vm.read_string(word(4).unwrap())?;
+                let address = word(4).unwrap();
+                let value = vm.read_string(address)?;
+                self.data_services.cst_text_origins.publish(self.current_task_id, address, index, &value);
                 self.string_values.insert(index, value);
                 Ok(NativeReturn::Continue)
             }
@@ -5248,6 +5298,11 @@ impl Host for LoggingHost<'_> {
                 "native 1002 requires exactly 8 argument bytes",
             )),
             605..=607 | 844 => self.legacy_sound_native(index, arguments, vm),
+            359 if arguments.len() == 16
+                && self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA) =>
+            {
+                self.campanella_configuration_export(arguments, vm)
+            }
             359 if arguments.len() == 16 => {
                 self.ensure_legacy_sound_settings()?;
                 for (index, block) in self.system_config_blocks.iter().enumerate() {
@@ -5285,12 +5340,22 @@ impl Host for LoggingHost<'_> {
                     Err(RuntimeError::ResourceNotFound(_)) => return Ok(NativeReturn::Value(0)),
                     Err(_) => return Err(native_state_error("XML resource read failed")),
                 };
-                let Ok(document) = ConfigXml::parse_runtime(&bytes) else {
+                let first_path = configuration::campanella_boot_first_path(
+                    self.css_task_sha(), &name, || particle_plugin_digest::sha256(&bytes),
+                );
+                let Ok(document) = ConfigXml::parse_runtime_with_first_path(&bytes, first_path) else {
                     return Ok(NativeReturn::Value(0));
                 };
                 let handle = *self.next_xml_handle;
                 *self.next_xml_handle = self.next_xml_handle.saturating_add(1).max(1);
                 self.xml_handles.insert(handle, document);
+                if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA)
+                    && name.eq_ignore_ascii_case("config.int/adv.xml")
+                    && let Some(event) = self.events.last_mut()
+                {
+                    let policy = if first_path.is_some() { "first" } else { "last" };
+                    event.detail.push_str(&format!(" xml_handle={handle} xml_boot_policy={policy}"));
+                }
                 Ok(NativeReturn::Value(handle))
             }
             591 if arguments.len() >= 4 => {
@@ -5325,7 +5390,15 @@ impl Host for LoggingHost<'_> {
                 if document.root == b"document" && parts[0] != b"document" {
                     parts.insert(0, b"document");
                 }
-                Ok(NativeReturn::Value(document.integer(&parts, default as i32) as u32))
+                let value = document.integer(&parts, default as i32) as u32;
+                if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA)
+                    && parts.as_slice() == configuration::CAMPANELLA_BOOT_PATH
+                    && let Some(event) = self.events.last_mut()
+                {
+                    let hit = document.text(&parts).is_some();
+                    event.detail.push_str(&format!(" xml_handle={handle} xml_hit={hit} xml_result={value}"));
+                }
+                Ok(NativeReturn::Value(value))
             }
             593 if arguments.len() >= 4 && word(0) == Some(0) => Ok(NativeReturn::Continue),
             593 if arguments.len() >= 12 => {
@@ -5387,9 +5460,10 @@ impl LoggingHost<'_> {
             )?;
             return Ok(NativeReturn::Continue);
         }
-        let other = self
-            .task_vms
-            .get_mut(&target_task)
+        let live_callers = &mut self.data_services.tasks.synchronous_callers;
+        let synchronous = live_callers.contains_key(&target_task);
+        let other = live_callers.get_mut(&target_task)
+            .or_else(|| self.task_vms.get_mut(&target_task))
             .ok_or_else(|| native_state_error("cross-task VM owner is unavailable"))?;
         if index == 72 {
             cs2_runtime::native_copy_between_vms(
@@ -5399,6 +5473,14 @@ impl LoggingHost<'_> {
             cs2_runtime::native_copy_between_vms(
                 other, target_address, vm, current_address, count, self.data_services.memory_copy_mode,
             )?;
+        }
+        if synchronous {
+            self.events.push(LogicEvent {
+                frame: self.frame,
+                kind: "synchronous-task-memory".into(),
+                detail: format!("native={index} receiver={} caller={target_task} bytes={count}",
+                    self.current_task_id),
+            });
         }
         Ok(NativeReturn::Continue)
     }
@@ -5978,6 +6060,10 @@ impl LoggingHost<'_> {
             return Ok(NativeReturn::Value(handle));
         }
 
+        if let Some(result) = self.legacy_utate_motion_properties_native(index, arguments, vm)? {
+            return Ok(result);
+        }
+
         let expected = match index {
             295 | 296 | 303 | 311 | 314 | 317 => 4,
             297 | 298 | 305 | 308 | 309 | 310 | 312 | 313 => 8,
@@ -6018,6 +6104,9 @@ impl LoggingHost<'_> {
         }
 
         let handle = read_u32(arguments, 0)?;
+        if matches!(index, 296 | 311 | 586) {
+            self.trace_campanella_motion_controller(index, handle, vm);
+        }
         let query = matches!(index, 307 | 309..=311);
         if handle == 0 {
             return Ok(if query {
@@ -6673,22 +6762,15 @@ impl LoggingHost<'_> {
                 let input = read_u32(arguments, 4)? as i32;
                 let record = read_u32(arguments, 8)? as i32;
                 let value = context.document.as_ref().map_or(u32::MAX, |document| {
-                    if input < 0 {
-                        document.inputs.len() as u32
-                    } else if let Some(range) = document.inputs.get(input as usize) {
-                        if record < 0 {
-                            range.len() as u32
-                        } else {
-                            range
-                                .start
-                                .checked_add(record as usize)
-                                .filter(|index| *index < range.end)
-                                .and_then(|index| document.records.get(index))
-                                .map_or(u32::MAX, |record| u32::from(record.kind))
+                    let kind = document.record_kind(input, record);
+                    if self.data_services.story_trace && matches!(kind, 0x02 | 0x03)
+                        && input >= 0 && record >= 0
+                    {
+                        if let Ok(absolute) = i32::try_from(document.inputs[input as usize].start + record as usize) {
+                            context.story.observe_wait(self.frame, kind, input, absolute);
                         }
-                    } else {
-                        u32::MAX
                     }
+                    kind
                 });
                 Ok(NativeReturn::Value(value))
             }
@@ -6927,7 +7009,7 @@ pub struct HeadlessPlayer {
     sound_config: DesktopSoundConfig,
     script_random: ScriptRandom,
     script_encoding: ScriptTextEncoding,
-    font: Vec<cs2_renderer::FontRasterizer>,
+    font: Arc<[text::LoadedFont]>,
     events: Vec<LogicEvent>,
     log: Vec<String>,
     particle_snapshot: ParticleSnapshot,
@@ -6963,7 +7045,7 @@ impl HeadlessPlayer {
         sound_config.load_overrides(&save_root);
         let audio_host = audio_host_for_resources(&scan.resources);
         let movie_host = MpegMovieHost::from_resources(&scan.resources);
-        let font = load_font(&scan.resources);
+        let font = load_font(&scan.resources).into();
         let [canvas_width, canvas_height] = discover_screen_size(&scan.resources)?;
         let canvas = Canvas::new(canvas_width, canvas_height)
             .map_err(|error| anyhow::anyhow!(error))
@@ -7056,6 +7138,8 @@ impl HeadlessPlayer {
             player.log.push(format_diagnostic(diagnostic));
         }
         player.default_entry = discover_start_entry(&player.scan.resources);
+        player.data_services.newton_legacy_gbk =
+            cst_context_native::verified_newton_text_profile(&player.scan.resources);
         player.external_size = discover_heap_size(&player.scan.resources);
         player.configured_shared_slots =
             fes_tasks::startup_shared_slots(&player.scan, player.default_entry.as_deref());
@@ -7097,6 +7181,10 @@ impl HeadlessPlayer {
         player.set_root_task_number_lookup(Some(task_wrapper_native::root_task_number_lookup));
         player.set_kx_plane_view_hook(Some(plane_native::kx_plane_view));
         player.set_kx_plane_install_hook(Some(plane_native::install_kx_plane));
+        player.data_services.message_device.initialize_fonts(
+            &player.scan.resources,
+            Arc::clone(&player.font),
+        );
         player.initialize_message_timing().context("initialize message settings")?;
         player.apply_media_settings().context("initialize movie settings")?;
         if let Some(entry) = &player.default_entry {
@@ -12356,6 +12444,34 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn kanmi_native925_keeps_verified_profiles_and_arity() {
+        use cs2_runtime::native_profile::{ConstantNativeReturn, known_profiles};
+
+        let scratch = TempDir::new();
+        let mut player =
+            HeadlessPlayer::open_with_save_root(&scratch.0, scratch.0.join("profile")).unwrap();
+        player.with_host(|host| {
+            let mut vm = Vm::new();
+            assert!(matches!(host.call(925, &[], &mut vm),
+                Err(cs2_script::ScriptError::UnimplementedNativeCall { index: 925 })));
+            assert_eq!(host.data_services.kanmi_native925_verified, Some(false));
+
+            host.data_services.kanmi_native925_verified = Some(true);
+            assert!(matches!(host.call(925, &[], &mut vm), Ok(NativeReturn::Value(0))));
+            assert!(matches!(host.call(925, &[0; 4], &mut vm),
+                Err(cs2_script::ScriptError::UnimplementedNativeCall { index: 925 })));
+            assert!(matches!(host.call(909, &[], &mut vm),
+                Err(cs2_script::ScriptError::UnimplementedNativeCall { index: 909 })));
+
+            host.data_services.native_profile = Some(known_profiles().iter()
+                .find(|profile| profile.constant(925) == Some(ConstantNativeReturn::Value(1)))
+                .expect("known E-mote profile with native 925 enabled"));
+            assert!(matches!(host.call(925, &[], &mut vm), Ok(NativeReturn::Value(1))));
+            Ok(())
+        }).unwrap();
+    }
+
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
@@ -12372,108 +12488,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
-    }
-
-    #[test]
-    fn report_perf_compatibility_is_lazy_and_scoped_to_a_player() {
-        let temp = TempDir::new();
-        let executable = temp.0.join("cs2.exe");
-        fs::write(&executable, b"not a PE").unwrap();
-        let player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
-        assert!(player.compatibility.get().is_none());
-
-        let mut pe = [0; 0x5a];
-        pe[..2].copy_from_slice(b"MZ");
-        pe[0x3c] = 0x40;
-        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
-        pe[0x44..0x46].copy_from_slice(&0x014c_u16.to_le_bytes());
-        pe[0x54] = 2;
-        pe[0x58..0x5a].copy_from_slice(&0x010b_u16.to_le_bytes());
-        fs::write(&executable, pe).unwrap();
-
-        let report = player.compatibility_report();
-        assert_eq!(report.pe_architecture.as_deref(), Some("x86"));
-        fs::write(&executable, b"not a PE").unwrap();
-        assert_eq!(player.report().compatibility, report);
-        let reopened = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
-        assert_eq!(reopened.compatibility_report().pe_architecture, None);
-    }
-
-    #[test]
-    fn report_perf_partial_frame_keeps_root_checkpoint_and_completed_pixels() {
-        let temp = TempDir::new();
-        for capture_script_evidence in [true, false] {
-            let mut player =
-                HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
-            player.capture_script_evidence = capture_script_evidence;
-            let vm = Vm::from_program(
-                KcsProgram::from_code(&[0x00, 0x00, 0x3b], vec![0; 8], 64).unwrap(),
-            ).unwrap();
-            player.data_services.tasks.set_factory_external(vm.external_binding());
-            player.data_services.tasks.register_external_task(
-                player.current_task_id, 0, &player.data_services.language.languages,
-            ).unwrap();
-            player.vm = Some(vm);
-            player.state.scene.current_script = Some("main.kcs".into());
-            player.state.script.current_script = Some("main.kcs".into());
-            let completed = player.frame_snapshot();
-            assert!(player.state().script.memory.is_none());
-
-            player.frame_phase = PlayerFramePhase::Root;
-            player.run_frames(1, 1).unwrap();
-            assert!(player.frame_in_progress());
-            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 1);
-            assert_eq!(player.frame_rgba(), completed.rgba());
-            if capture_script_evidence {
-                let mut expected = ScriptState::from_vm(player.vm.as_ref().unwrap());
-                expected.current_script = Some("main.kcs".into());
-                player.vm.as_mut().unwrap().write(0, &[0x73]).unwrap();
-                let report = player.report();
-                assert_eq!(report.state.script, expected);
-                assert!(report.frame_in_progress);
-                assert_eq!(report.frame_hash, completed.hash());
-                assert_eq!(report.frame_rgba, completed.rgba());
-            } else {
-                assert!(player.state().script.memory.is_none());
-                assert!(player.compatibility.get().is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn report_perf_window_checks_new_failures_before_trimming_diagnostics() {
-        let temp = TempDir::new();
-        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
-        player.events.push(LogicEvent {
-            frame: 1,
-            kind: "native-call".into(),
-            detail: "native Is Not Implemented".into(),
-        });
-        player.events.extend((2..=20_001).map(|frame| LogicEvent {
-            frame,
-            kind: "logic-frame".into(),
-            detail: String::new(),
-        }));
-        player.log.resize(2_001, "retained".into());
-        let report = player.report();
-        assert_eq!(report.events.len(), 20_001);
-        assert_eq!(report.log.len(), 2_001);
-
-        let mut diagnostics = WindowDiagnostics::default();
-        let failure = diagnostics.check_and_limit(&mut player).unwrap_err();
-        assert!(failure.to_string().contains("failure at frame 1"));
-        assert!(player.events().len() <= 10_000);
-        assert!(player.log().len() <= 1_000);
-        assert_eq!(player.events().last().unwrap().frame, 20_001);
-        diagnostics.check_and_limit(&mut player).unwrap();
-
-        player.events.push(LogicEvent {
-            frame: 20_002,
-            kind: "vm-error".into(),
-            detail: "new failure".into(),
-        });
-        assert!(diagnostics.check_and_limit(&mut player).unwrap_err().to_string()
-            .contains("vm-error new failure"));
     }
 
     fn packed_cst(inputs: &[Vec<(u8, &[u8])>]) -> Vec<u8> {
@@ -12580,6 +12594,56 @@ mod tests {
         let loaded = CssFile::parse(&read_save_css(&save_root, "save0001.dat").unwrap()).unwrap();
         assert_eq!(loaded.record(0x55), Some(b"saved payload".as_slice()));
         assert!(save_path(&save_root, "../outside.dat").is_err());
+    }
+
+    #[test]
+    fn synchronous_task_message_can_copy_from_and_to_its_live_caller() {
+        fn native_instruction(code: &mut Vec<u8>, opcode: u8, operands: &[u32]) {
+            code.push(opcode);
+            for &value in operands {
+                let operand = cs2_script::Operand::immediate(value);
+                code.push(operand.flags.bits());
+                code.extend_from_slice(&operand.payload.to_le_bytes());
+            }
+        }
+
+        let temp = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))
+            .unwrap();
+        let receiver = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(0, b"")?))
+            .unwrap();
+        let mut receiver_code = Vec::new();
+        for index in [72, 73] {
+            let target_address = if index == 72 { 40 } else { 44 };
+            for value in [0, target_address, 4, 48] {
+                native_instruction(&mut receiver_code, 0x25, &[value]);
+            }
+            native_instruction(&mut receiver_code, 0x2b, &[index, 16]);
+        }
+        receiver_code.push(0x3b);
+        let mut receiver_vm = Vm::from_program(
+            KcsProgram::from_code(&receiver_code, vec![0; 64], 64).unwrap(),
+        ).unwrap();
+        receiver_vm.wait_for_message(0).unwrap();
+        player.register_task_vm(receiver, receiver_vm).unwrap();
+
+        let mut caller_code = Vec::new();
+        for value in [receiver, 12, 0, 40] {
+            native_instruction(&mut caller_code, 0x25, &[value]);
+        }
+        native_instruction(&mut caller_code, 0x2b, &[69, 16]);
+        caller_code.push(0x3b);
+        let mut caller_vm = Vm::from_program(
+            KcsProgram::from_code(&caller_code, vec![0; 64], 64).unwrap(),
+        ).unwrap();
+        caller_vm.write(40, b"live").unwrap();
+        player.with_host(|host| {
+            assert_eq!(caller_vm.run(host, 64)?, cs2_script::Step::Halted);
+            assert!(host.data_services.tasks.synchronous_callers.is_empty());
+            Ok(())
+        }).unwrap();
+        assert_eq!(caller_vm.read(44, 4).unwrap(), b"live");
+        assert_eq!(player.unregister_task_vm(receiver).unwrap().read(48, 4).unwrap(), b"live");
     }
 
     #[test]
@@ -13549,7 +13613,7 @@ mod tests {
             .ancestors()
             .nth(3)
             .expect("desktop crate should be inside the simulator workspace")
-            .to_path_buf();
+            .join("games");
         let v401 = workspace_root.join("cs2_full_v401");
         let newton = workspace_root.join("牛顿与苹果树");
         let neko = workspace_root

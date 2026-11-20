@@ -13,11 +13,12 @@ use cs2_runtime::message_object::{
 };
 use cs2_script::{Expression, ExpressionState, FesEvent, FesObjectDefinition, FesObjectInitialization};
 
+use super::cst_context_native::{CstBodySource, CstTextOrigins, body_control_only, join_body_sources};
 use super::fes_driver::{
     FesDriverCommand, FesDriverEffect, FesDriverWait, FesScriptDriver,
 };
 use super::fes_tasks::FesTaskView;
-use super::{FesRuntime, LoggingHost, ScriptTextEncoding, message_backend::DesktopMessageDevice};
+use super::{FesRuntime, LoggingHost, LogicEvent, ScriptTextEncoding, message_backend::DesktopMessageDevice};
 
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BANKS: usize = 65536;
@@ -42,6 +43,8 @@ enum TextRequest {
     Clear,
     Append(Vec<u8>),
     Separator,
+    AppendLegacyGbk(Vec<u8>),
+    AppendDecoded { bytes: Vec<u8>, text: String },
 }
 
 #[derive(Clone, Debug, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -94,6 +97,54 @@ struct TextBank {
     last_frame: Option<u32>,
     #[serde(with = "state::projection")]
     projection: Option<FesTextProjection>,
+    #[serde(skip)]
+    story_body: StoryBodyProgress,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StoryBodyProgress {
+    source: Option<(u64, u64)>,
+    provenance: Option<Vec<CstBodySource>>,
+    natural_complete: Option<(u64, u64)>,
+    committed_epoch: Option<u64>,
+    forced: bool,
+}
+
+impl StoryBodyProgress {
+    fn note_source(&mut self, frame: u64) {
+        let epoch = self.source.map_or(1, |(epoch, _)| epoch.wrapping_add(1));
+        *self = Self { source: Some((epoch, frame)), ..Self::default() };
+    }
+
+    fn note_text(&mut self, frame: u64, keep_prefix: bool, suffix: Option<&[CstBodySource]>) {
+        let prefix = self.provenance.take();
+        self.note_source(frame);
+        self.provenance = suffix.and_then(|suffix| {
+            let prefix = if keep_prefix { prefix.as_deref()? } else { &[] };
+            join_body_sources(prefix, suffix)
+        });
+    }
+
+    fn force(&mut self) {
+        self.forced = true;
+        self.natural_complete = None;
+        self.committed_epoch = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StoryBodyGeneration {
+    pub(super) source_epoch: u64,
+    pub(super) source_frame: u64,
+    pub(super) natural_complete: Option<(u64, u64)>,
+    pub(super) committed_epoch: Option<u64>,
+    pub(super) remaining: u32,
+    pub(super) remaining_segment: u32,
+    pub(super) pending_text: bool,
+    pub(super) drawing: bool,
+    pub(super) skip_pending: bool,
+    pub(super) forced: bool,
+    pub(super) projection: Option<(bool, u8)>,
 }
 
 #[derive(Clone, Debug, Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -102,6 +153,26 @@ struct NovelText {
     division: i32,
     insert_pending: bool,
     speaker: Vec<u8>,
+}
+
+impl NovelText {
+    fn set_decoded_speaker(&mut self, bytes: &[u8], text: &str, encoding: MessageEncoding) {
+        if encoding == MessageEncoding::Unicode {
+            self.speaker = text.as_bytes().to_vec();
+        } else {
+            self.speaker.clear();
+            self.speaker.push(0);
+            self.speaker.extend_from_slice(bytes);
+            self.speaker.push(0);
+            self.speaker.extend_from_slice(text.as_bytes());
+        }
+    }
+
+    fn speaker_parts(&self) -> Result<(&[u8], Option<&str>)> {
+        let Some(tagged) = self.speaker.strip_prefix(&[0]) else { return Ok((&self.speaker, None)); };
+        let end = tagged.iter().position(|&byte| byte == 0).context("missing decoded speaker delimiter")?;
+        Ok((&tagged[..end], Some(std::str::from_utf8(&tagged[end + 1..])?)))
+    }
 }
 
 /// Real submitted RGBA and its plane geometry, ready to merge with image-list
@@ -181,6 +252,48 @@ impl Default for FesTextStore {
 }
 
 impl FesTextStore {
+    pub(super) fn story_body_generation(&self, owner: u32) -> Option<StoryBodyGeneration> {
+        let bank = self.banks.get(&(owner, b"str".to_vec(), 0))?;
+        let (source_epoch, source_frame) = bank.story_body.source?;
+        Some(StoryBodyGeneration {
+            source_epoch,
+            source_frame,
+            natural_complete: bank.story_body.natural_complete,
+            committed_epoch: bank.story_body.committed_epoch,
+            remaining: bank.remaining,
+            remaining_segment: bank.remaining_segment,
+            pending_text: !bank.pending.is_empty() || bank.needs_prepare,
+            drawing: bank.draw.is_some() || bank.message.active(),
+            skip_pending: bank.skip,
+            forced: bank.story_body.forced,
+            projection: bank.projection.as_ref().map(|projection|
+                (projection.options.visible, projection.options.opacity)),
+        })
+    }
+
+    pub(super) fn story_body_sources(&self, owner: u32, source_epoch: u64, origins: &CstTextOrigins)
+        -> Option<&[CstBodySource]>
+    {
+        let bank = self.banks.get(&(owner, b"str".to_vec(), 0))?;
+        let (epoch, _) = bank.story_body.source?;
+        let sources = bank.story_body.provenance.as_deref()?;
+        (epoch == source_epoch && origins.body_is_current(sources)).then_some(sources)
+    }
+
+    pub(super) fn story_novel_segment_ready(&self, owner: u32) -> bool {
+        let Some(bank) = self.banks.get(&(owner, b"str".to_vec(), 0)) else {
+            return false;
+        };
+        bank.novel.is_some()
+            && !bank.source.is_empty()
+            && bank.pending.is_empty()
+            && bank.draw.is_none()
+            && !bank.needs_prepare
+            && bank.remaining_segment == 0
+            && bank.projection.as_ref().is_some_and(|projection|
+                projection.options.visible && projection.options.opacity > 0)
+    }
+
     pub(crate) fn checkpoint_options(&self) -> (i32, bool, u32, i32) {
         (self.next_surface, self.unicode_strings, self.measurement_parameter, self.frame_delay)
     }
@@ -293,6 +406,7 @@ impl FesTextStore {
                 parent_plane: None, priority: 0, visible: false,
                 tint: u32::MAX, alpha: 255, scale: [1.0; 2], rotation: 0.0,
                 clip: None, last_frame: None, projection: None,
+                story_body: StoryBodyProgress::default(),
             });
         }
         self.declarations.insert((owner, definition.offset));
@@ -353,7 +467,8 @@ impl FesTextStore {
                 for key in &keys {
                     let bank = self.banks.get_mut(key).unwrap();
                     let text = normalize_text(raw, bank.message.encoding(), false, encoding)?;
-                    bank.replace(&text)?;
+                    bank.replace_with_codec(&text, host.data_services.newton_legacy_gbk)?;
+                    bank.observe_story_source(key, host);
                 }
             } else if matches!(column, b"POS2" | b"SIZE2") {
                 let reference = super::fes_controls::metadata_reference(raw, encoding)?;
@@ -460,22 +575,60 @@ impl FesTextStore {
                 }
             }
             b"name" => {
+                if keys.iter().all(|key| self.banks[key].novel.is_none()) { return Ok(true); }
                 let raw = raw_after_spaces(&command.source, 2).unwrap_or_default();
+                let decoded = sourced_text(owner, command, verb, raw, driver, shared, host)?;
                 for key in &keys {
-                    self.banks.get_mut(key).unwrap().set_speaker(raw, resource_encoding)?;
+                    let record = self.banks.get_mut(key).unwrap();
+                    record.set_speaker(raw, resource_encoding, decoded.as_ref().map(|value| value.text.as_str()))?;
                 }
             }
             b"str" | b"strsj" | b"apend" => {
                 let raw = raw_after_spaces(&command.source, 2).unwrap_or_default();
+                let decoded = sourced_text(owner, command, verb, raw, driver, shared, host)?;
+                let provenance = (host.data_services.story_trace && verb != b"strsj"
+                    && keys.iter().any(|key| self.banks[key].is_story_body(key)))
+                    .then(|| story_command_sources(raw, command, driver, shared, &host.data_services.cst_text_origins))
+                    .flatten();
                 for key in &keys {
                     let record = self.banks.get_mut(key).unwrap();
-                    let text = normalize_text(raw, record.message.encoding(), verb == b"strsj", resource_encoding)?;
-                    if verb == b"apend" { record.append_body(&text)?; } else { record.replace(&text)?; }
+                    let keep_prefix = verb == b"apend" && !record.source.is_empty();
+                    let legacy_gbk = host.data_services.newton_legacy_gbk
+                        && record.message.encoding() == MessageEncoding::Cp932;
+                    if let Some(SourcedText { text, .. }) = &decoded {
+                        let bytes = if record.message.encoding() == MessageEncoding::Unicode {
+                            text.as_bytes()
+                        } else { raw };
+                        if verb == b"apend" {
+                            record.append_body_text(bytes, legacy_gbk, Some(text))?;
+                        } else {
+                            record.replace_text(bytes, false, Some(text))?;
+                        }
+                        record.observe_story_text(key, host, keep_prefix, provenance.as_deref());
+                        continue;
+                    }
+                    let explicit_cp932 = verb == b"strsj" && legacy_gbk;
+                    let text = normalize_text(raw, record.message.encoding(),
+                        verb == b"strsj" && !explicit_cp932, resource_encoding)?;
+                    if verb == b"apend" {
+                        record.append_body(&text, legacy_gbk)?;
+                    } else {
+                        record.replace_with_codec(&text, legacy_gbk && !explicit_cp932)?;
+                    }
+                    record.observe_story_text(key, host, keep_prefix, provenance.as_deref());
+                }
+                if host.data_services.story_trace && let Some(decoded) = &decoded {
+                    host.events.push(LogicEvent {
+                        frame: host.frame,
+                        kind: "fes-text-sourced-queued".into(),
+                        detail: decoded.trace_detail(raw.len()),
+                    });
                 }
             }
             b"apendmark" => for key in &keys {
                 let record = self.banks.get_mut(key).unwrap();
                 if !record.source_initialized { bail!("STRING apendmark requires initialized text"); }
+                let keep_prefix = !record.source.is_empty();
                 let marker: &[u8] = if record.message.encoding() == MessageEncoding::Unicode {
                     b"\xef\xbf\xbf"
                 } else { b"\xff" };
@@ -483,8 +636,13 @@ impl FesTextStore {
                 record.source.extend_from_slice(marker);
                 record.pending.push_back(TextRequest::Separator);
                 record.needs_prepare = true;
+                record.observe_story_text(key, host, keep_prefix, Some(&[]));
             },
-            b"clear" => for key in &keys { self.banks.get_mut(key).unwrap().replace(&[])?; },
+            b"clear" => for key in &keys {
+                let record = self.banks.get_mut(key).unwrap();
+                record.replace(&[])?;
+                record.observe_story_source(key, host);
+            },
             b"reset" => for key in &keys {
                 let record = self.banks.get_mut(key).unwrap();
                 let size = [word(&record.configuration, 8), word(&record.configuration, 12)];
@@ -496,6 +654,7 @@ impl FesTextStore {
                 }
                 record.inherited = [record.message.encoding() == MessageEncoding::Cp932, true, true, true];
                 record.dirty = true;
+                record.story_body.provenance = None;
             },
             b"draw" => {
                 let segment = optional_number(args, 0, 0, driver, shared)?;
@@ -818,10 +977,59 @@ impl FesTextStore {
 }
 
 impl TextBank {
-    fn set_speaker(&mut self, raw: &[u8], resource_encoding: ScriptTextEncoding) -> Result<()> {
+    fn is_story_body(&self, key: &Key) -> bool {
+        key.1.as_slice() == b"str" && key.2 == 0 && self.novel.is_none() && self.log.is_none()
+    }
+
+    fn observe_story_source(&mut self, key: &Key, host: &LoggingHost<'_>) {
+        if host.data_services.story_trace && self.is_story_body(key) {
+            self.story_body.note_source(host.frame);
+        }
+    }
+
+    fn observe_story_text(&mut self, key: &Key, host: &LoggingHost<'_>, keep_prefix: bool,
+        suffix: Option<&[CstBodySource]>,
+    ) {
+        if host.data_services.story_trace && self.is_story_body(key) {
+            self.story_body.note_text(host.frame, keep_prefix, suffix);
+        }
+    }
+
+    fn observe_story_reveal(&mut self, frame: u64, naturally_updated: bool, start_requested: bool,
+        device: &DesktopMessageDevice,
+    ) {
+        let Some((epoch, _)) = self.story_body.source else { return; };
+        if self.story_body.forced || self.source.is_empty() {
+            return;
+        }
+        if naturally_updated && !self.message.active() && self.message.last_complete()
+            && self.remaining == 0 && self.remaining_segment == 0
+            && self.projection.as_ref().is_some_and(|projection| projection.options.visible)
+        {
+            self.story_body.natural_complete.get_or_insert((epoch, frame));
+        }
+        if self.story_body.natural_complete.is_some()
+            && self.story_body.committed_epoch != Some(epoch)
+            && (start_requested || self.message.configuration().is_some_and(|config| config.ordinary_submit())
+                || self.message.complete_snapshot())
+            && device.surface(self.message.id()).is_some_and(|surface| {
+                surface.generation == self.message.surface_generation() && surface.dirty.is_none()
+                    && surface.submitted.pixels().chunks_exact(4).any(|pixel| pixel[3] != 0)
+            })
+        {
+            self.story_body.committed_epoch = Some(epoch);
+        }
+    }
+
+    fn set_speaker(&mut self, raw: &[u8], resource_encoding: ScriptTextEncoding, decoded: Option<&str>) -> Result<()> {
         if let Some(novel) = &mut self.novel {
             let label = raw.strip_prefix(b"\\pr").unwrap_or(raw);
-            novel.speaker = normalize_text(label, self.message.encoding(), false, resource_encoding)?;
+            if let Some(decoded) = decoded {
+                let label_text = decoded.strip_prefix("\\pr").unwrap_or(decoded);
+                novel.set_decoded_speaker(label, label_text, self.message.encoding());
+            } else {
+                novel.speaker = normalize_text(label, self.message.encoding(), false, resource_encoding)?;
+            }
         }
         Ok(())
     }
@@ -849,37 +1057,75 @@ impl TextBank {
         if self.pending.len() >= MAX_BANKS { bail!("STRING pending request count exceeds limit"); }
         Ok(())
     }
-    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+    fn append(&mut self, bytes: &[u8], legacy_gbk: bool) -> Result<()> {
+        self.append_text(bytes, legacy_gbk, None)
+    }
+    fn append_text(&mut self, bytes: &[u8], legacy_gbk: bool, decoded: Option<&str>) -> Result<()> {
         self.check_append(bytes.len())?;
         self.source.extend_from_slice(bytes);
         self.source_initialized = true;
-        self.pending.push_back(TextRequest::Append(bytes.to_vec()));
+        let request = if let Some(text) = decoded {
+            TextRequest::AppendDecoded { bytes: bytes.to_vec(), text: text.to_owned() }
+        } else if legacy_gbk && self.message.encoding() == MessageEncoding::Cp932 {
+            TextRequest::AppendLegacyGbk(bytes.to_vec())
+        } else {
+            TextRequest::Append(bytes.to_vec())
+        };
+        self.pending.push_back(request);
         self.needs_prepare = true; self.remaining = u32::MAX; self.remaining_segment = u32::MAX;
         Ok(())
     }
-    fn append_body(&mut self, bytes: &[u8]) -> Result<()> {
+    fn append_body(&mut self, bytes: &[u8], legacy_gbk: bool) -> Result<()> {
+        self.append_body_text(bytes, legacy_gbk, None)
+    }
+    fn append_body_text(&mut self, bytes: &[u8], legacy_gbk: bool, decoded: Option<&str>) -> Result<()> {
         if bytes.is_empty() || self.novel.as_ref().is_none_or(|novel| {
             !novel.insert_pending && novel.speaker.is_empty()
         }) {
-            return self.append(bytes);
+            return self.append_text(bytes, legacy_gbk, decoded);
         }
         let novel = self.novel.as_ref().unwrap();
+        let (speaker_raw, speaker_decoded) = novel.speaker_parts()?;
         let mut paragraph = Vec::new();
-        if novel.insert_pending && !self.source.is_empty() {
+        let newline = novel.insert_pending && !self.source.is_empty();
+        if newline {
             paragraph.push(b'\n');
         }
-        if !novel.speaker.is_empty() {
-            paragraph.extend_from_slice(&novel.speaker);
+        if !speaker_raw.is_empty() {
+            paragraph.extend_from_slice(speaker_raw);
             paragraph.push(b'\n');
         }
         paragraph.extend_from_slice(bytes);
-        self.append(&paragraph)?;
+        let text = if decoded.is_some() || speaker_decoded.is_some() {
+            let codec = match self.message.encoding() {
+                MessageEncoding::Unicode => ScriptTextEncoding::Utf8,
+                MessageEncoding::Cp932 if legacy_gbk => ScriptTextEncoding::Gbk,
+                MessageEncoding::Cp932 => ScriptTextEncoding::Cp932,
+            };
+            let mut text = String::new();
+            if newline { text.push('\n'); }
+            if !speaker_raw.is_empty() {
+                if let Some(speaker) = speaker_decoded { text.push_str(speaker); }
+                else { text.push_str(&decode_text(speaker_raw, codec)?); }
+                text.push('\n');
+            }
+            if let Some(body) = decoded { text.push_str(body); }
+            else { text.push_str(&decode_text(bytes, codec)?); }
+            Some(text)
+        } else { None };
+        self.append_text(&paragraph, legacy_gbk, text.as_deref())?;
         let novel = self.novel.as_mut().unwrap();
         novel.insert_pending = false;
         novel.speaker.clear();
         Ok(())
     }
     fn replace(&mut self, bytes: &[u8]) -> Result<()> {
+        self.replace_with_codec(bytes, false)
+    }
+    fn replace_with_codec(&mut self, bytes: &[u8], legacy_gbk: bool) -> Result<()> {
+        self.replace_text(bytes, legacy_gbk, None)
+    }
+    fn replace_text(&mut self, bytes: &[u8], legacy_gbk: bool, decoded: Option<&str>) -> Result<()> {
         if bytes.len() > MAX_TEXT_BYTES { bail!("STRING replacement text exceeds 64 MiB"); }
         if let Some(novel) = &mut self.novel {
             novel.insert_pending = false;
@@ -888,7 +1134,7 @@ impl TextBank {
         self.source.clear(); self.pending.clear();
         self.pending.push_back(TextRequest::Clear);
         self.pending.push_back(TextRequest::Clear);
-        self.append(bytes)?;
+        self.append_text(bytes, legacy_gbk, decoded)?;
         Ok(())
     }
     fn set_size(&mut self, size: [i32; 2]) -> Result<()> {
@@ -900,6 +1146,62 @@ impl TextBank {
         self.metadata.size_dirty = true;
         Ok(())
     }
+}
+
+#[test]
+fn fes_story_body_generation_drops_stale_reveal_and_commit() {
+    let mut store = FesTextStore::default();
+    store.create(65, &FesObjectDefinition {
+        offset: 0, name: b"str".to_vec(), kind: b"STRING".to_vec(),
+        bank_expression: None, banks: 1,
+    }, &defaults(), &mut DesktopMessageDevice::default()).unwrap();
+    let key = (65, b"str".to_vec(), 0);
+    assert!(store.story_body_generation(65).is_none());
+    let bank = store.banks.get_mut(&key).unwrap();
+    bank.story_body.note_source(1105);
+    bank.story_body.natural_complete = Some((1, 1170));
+    bank.story_body.committed_epoch = Some(1);
+    assert!(store.story_body_generation(66).is_none());
+    assert_eq!(store.story_body_generation(65).unwrap().natural_complete, Some((1, 1170)));
+
+    let bank = store.banks.get_mut(&key).unwrap();
+    bank.append(b"next", false).unwrap();
+    bank.story_body.note_source(1501);
+    let next = store.story_body_generation(65).unwrap();
+    assert_eq!((next.source_epoch, next.source_frame), (2, 1501));
+    assert_eq!((next.natural_complete, next.committed_epoch), (None, None));
+    assert!(next.pending_text && next.remaining > 0);
+
+    let bank = store.banks.get_mut(&key).unwrap();
+    bank.story_body.force();
+    bank.observe_story_reveal(1502, true, true, &DesktopMessageDevice::default());
+    let forced = store.story_body_generation(65).unwrap();
+    assert!(forced.forced);
+    assert_eq!((forced.natural_complete, forced.committed_epoch), (None, None));
+}
+
+#[test]
+fn fes_story_body_provenance_requires_every_fragment_of_the_current_page() {
+    let mut progress = StoryBodyProgress::default();
+    let first = CstBodySource { context_handle: 208, load_id: 7, group: 1, absolute_record: 20 };
+    let second = CstBodySource { absolute_record: 21, ..first };
+    let other_page = CstBodySource { group: 2, absolute_record: 24, ..first };
+    progress.note_text(1, false, Some(&[first]));
+    progress.note_text(2, true, Some(&[second]));
+    assert_eq!(progress.source, Some((2, 2)));
+    assert_eq!(progress.provenance.as_deref(), Some([first, second].as_slice()));
+    progress.note_text(3, true, Some(&[]));
+    assert_eq!(progress.provenance.as_deref(), Some([first, second].as_slice()));
+    progress.note_text(4, true, Some(&[other_page]));
+    assert!(progress.provenance.is_none());
+    progress.note_text(5, true, Some(&[other_page]));
+    assert!(progress.provenance.is_none());
+    progress.note_text(6, false, Some(&[other_page]));
+    assert_eq!(progress.provenance.as_deref(), Some([other_page].as_slice()));
+    progress.note_text(7, true, None);
+    assert!(progress.provenance.is_none());
+    progress.note_source(8);
+    assert!(progress.provenance.is_none());
 }
 
 #[test]
@@ -954,7 +1256,7 @@ fn fes_text_name_only_updates_novel_speaker() {
         bank.replace(b"existing text").unwrap();
         bank.clip = Some(Rect::new(10, 5, 50, 30));
         let request_count = bank.pending.len();
-        bank.set_speaker(b"\\pr$fixture", ScriptTextEncoding::Cp932).unwrap();
+        bank.set_speaker(b"\\pr$fixture", ScriptTextEncoding::Cp932, None).unwrap();
         assert_eq!(bank.source, b"existing text");
         assert_eq!(bank.pending.len(), request_count);
         assert_eq!(bank.clip, Some(Rect::new(10, 5, 50, 30)));
@@ -962,6 +1264,28 @@ fn fes_text_name_only_updates_novel_speaker() {
             assert_eq!(novel.speaker, b"$fixture");
         }
     }
+}
+
+#[test]
+fn legacy_fes_text_uses_selected_gbk_and_keeps_separator() {
+    let defaults = defaults();
+    let mut device = DesktopMessageDevice::default();
+    let mut message = MessageObject::new(-1, MessageEncoding::Cp932);
+    let configuration = initial_configuration(MessageEncoding::Cp932, &defaults, 0).unwrap();
+    message.reconfigure(&configuration, None, &mut device).unwrap();
+
+    let ambiguous = b"\xb7\xc7";
+    message.append(ambiguous).unwrap();
+    assert_ne!(message.source(), "\u{975e}");
+    message.clear();
+
+    let raw = b"\xb7\xc7\xff\xd5\xe2";
+    assert!(message.append(raw).is_err());
+    message.append_legacy_gbk(raw).unwrap();
+    assert_eq!(message.source(), "\u{975e}\u{ffff}\u{8fd9}");
+    assert_eq!(message.raw_appends(), &[raw.to_vec()]);
+    assert!(message.append_legacy_gbk(b"\x81").is_err());
+    assert_eq!(message.source(), "\u{975e}\u{ffff}\u{8fd9}");
 }
 
 /// None means this service has made no change. Install in the extra_effect
@@ -1084,9 +1408,19 @@ pub(super) fn update_owner(
     for ((owner, name, index), bank) in &mut data.fes_text.banks {
         if *owner != view.id { continue; }
         if bank.log.is_some() {
-            log::update(bank, next_surface, &mut data.message_device, view, runtime, name, *index, host.backlogs)?;
+            log::update(bank, next_surface, &mut data.message_device, view, runtime, name, *index,
+                host.backlogs, data.newton_legacy_gbk)?;
         } else {
+            let observed = bank.story_body.source.is_some();
+            let forced = observed && bank.skip;
+            let start_requested = bank.draw.is_some();
+            let naturally_updated = observed && !forced && bank.last_frame != Some(view.now)
+                && view.list.is_some() && (bank.message.active() || start_requested);
+            if forced { bank.story_body.force(); }
             render_bank(&mut data.message_device, view, runtime, bank, name, *index)?;
+            if observed {
+                bank.observe_story_reveal(host.frame, naturally_updated, start_requested, &data.message_device);
+            }
         }
     }
     if view.list.is_some() {
@@ -1107,6 +1441,25 @@ pub(super) fn update_owner(
 fn render_bank(
     device: &mut DesktopMessageDevice, view: &FesTaskView, runtime: &FesRuntime,
     bank: &mut TextBank, name: &[u8], index: i32,
+) -> Result<()> {
+    let pixel_less_dummy = uses_canvas_atlas(bank)
+        && word(&bank.configuration, 8) == 0 && word(&bank.configuration, 12) == 0
+        && bank.metadata.size_source.as_ref().is_some_and(|reference| {
+            matches!(reference.frame, 10 | 11)
+                && reference.name.eq_ignore_ascii_case(b"sys_mdummy.hg3")
+        });
+    if pixel_less_dummy {
+        device.without_message_pixels(bank.message.id(), |device| {
+            render_bank_with_surface(device, view, runtime, bank, (name, index), false)
+        })
+    } else {
+        render_bank_with_surface(device, view, runtime, bank, (name, index), true)
+    }
+}
+
+fn render_bank_with_surface(
+    device: &mut DesktopMessageDevice, view: &FesTaskView, runtime: &FesRuntime,
+    bank: &mut TextBank, (name, index): (&[u8], i32), allocate_surface: bool,
 ) -> Result<()> {
     let scale = device.time_scale;
     let parent = bank.parent_plane.as_ref().map(|name|
@@ -1172,6 +1525,8 @@ fn render_bank(
                 bank.message.advance_display(0, MessageCopy::Full, device)?;
             }
             TextRequest::Append(bytes) => bank.message.append(&bytes)?,
+            TextRequest::AppendLegacyGbk(bytes) => bank.message.append_legacy_gbk(&bytes)?,
+            TextRequest::AppendDecoded { bytes, text } => bank.message.append_decoded(&bytes, &text)?,
             TextRequest::Separator => bank.message.append_separator()?,
         }
         bank.pending.pop_front();
@@ -1201,7 +1556,9 @@ fn render_bank(
         bank.message.frame_update(view.now, scale, device)?;
         bank.last_frame = Some(view.now);
     }
-    device.sync_object(&bank.message)?;
+    if allocate_surface {
+        device.sync_object(&bank.message)?;
+    }
     bank.remaining = bank.message.remaining_all()?;
     bank.remaining_segment = bank.message.remaining_segment()?;
     if let Some(layout) = bank.message.layout() {
@@ -1248,6 +1605,55 @@ fn render_bank(
     });
 
     Ok(())
+}
+
+#[test]
+fn fes_dummy_text_defers_pixels_without_skipping_layout() {
+    let mut store = FesTextStore::default();
+    let mut device = DesktopMessageDevice::default();
+    let runtime = FesRuntime::new(cs2_script::FesDocument { sections: Vec::new() });
+    let view = FesTaskView {
+        id: 39, parent: 8, context: Vec::new(), list: None, now: 269, paused: 0,
+    };
+    for (offset, name, frame, size) in [
+        (0, b"name".as_slice(), 11, [471, 28]),
+        (1, b"str".as_slice(), 10, [819, 125]),
+    ] {
+        store.create(view.id, &FesObjectDefinition {
+            offset, name: name.to_vec(), kind: b"STRING".to_vec(), bank_expression: None, banks: 1,
+        }, &defaults(), &mut device).unwrap();
+        let bank = store.banks.get_mut(&(view.id, name.to_vec(), 0)).unwrap();
+        bank.metadata.size_source = Some(super::fes_controls::metadata_reference(
+            format!("sys_mdummy.hg3:{frame}").as_bytes(), ScriptTextEncoding::Cp932,
+        ).unwrap());
+        bank.set_size([0, 0]).unwrap();
+        bank.replace(b"\n").unwrap();
+        bank.draw = Some(0);
+        render_bank(&mut device, &view, &runtime, bank, name, 0).unwrap();
+        assert_eq!(bank.message.source(), "\n");
+        assert!(bank.pending.is_empty() && bank.draw.is_none());
+        assert!(bank.message.layout().is_some());
+        assert!(bank.projection.is_none());
+        assert!(device.surface(bank.message.id()).is_none());
+
+        let mut wrong_resource = bank.clone();
+        wrong_resource.metadata.size_source.as_mut().unwrap().name = b"required.hg3".to_vec();
+        let mut wrong_frame = bank.clone();
+        wrong_frame.metadata.size_source.as_mut().unwrap().frame = 9;
+        let mut partial_size = bank.clone();
+        partial_size.set_size([0, 28]).unwrap();
+        for mut invalid in [wrong_resource, wrong_frame, partial_size] {
+            let error = render_bank(&mut device, &view, &runtime, &mut invalid, name, 0).unwrap_err();
+            assert!(format!("{error:#}").contains("message pixel surface"));
+        }
+
+        bank.set_size(size).unwrap();
+        let next_view = FesTaskView { now: view.now + 1, ..view.clone() };
+        render_bank(&mut device, &next_view, &runtime, bank, name, 0).unwrap();
+        assert_eq!(bank.message.source(), "\n");
+        let surface = device.surface(bank.message.id()).unwrap();
+        assert_eq!([surface.submitted.width(), surface.submitted.height()], size.map(|dimension| dimension as u32));
+    }
 }
 
 fn uses_canvas_atlas(bank: &TextBank) -> bool {
@@ -1438,6 +1844,360 @@ fn raw_after_spaces(source: &[u8], count: usize) -> Option<&[u8]> {
     }
     source.get(cursor..).map(|bytes| &bytes[..bytes.iter().position(|&byte| byte == 0).unwrap_or(bytes.len())])
 }
+
+fn decode_text(bytes: &[u8], codec: ScriptTextEncoding) -> Result<String> {
+    if codec == ScriptTextEncoding::Utf8 {
+        return Ok(std::str::from_utf8(bytes)?.to_owned());
+    }
+    let decoder = if codec == ScriptTextEncoding::Gbk { encoding_rs::GBK } else { encoding_rs::SHIFT_JIS };
+    let mut result = String::new();
+    for (index, part) in bytes.split(|&byte| byte == 0xff).enumerate() {
+        if index != 0 { result.push('\u{ffff}'); }
+        let decoded = decoder.decode_without_bom_handling_and_without_replacement(part)
+            .with_context(|| format!("invalid {codec:?} FES text from declared source"))?;
+        result.push_str(&decoded);
+    }
+    Ok(result)
+}
+
+struct SourcedText {
+    text: String,
+    literal: ScriptTextEncoding,
+    variables: Vec<ScriptTextEncoding>,
+}
+
+impl SourcedText {
+    fn trace_detail(&self, length: usize) -> String {
+        let first = first_text_codepoint(&self.text)
+            .map_or_else(|| "none".into(), |character| format!("U+{:04X}", u32::from(character)));
+        format!("bytes={length} first={first} fes={:?} cst={:?}", self.literal, self.variables)
+    }
+}
+
+fn first_text_codepoint(mut text: &str) -> Option<char> {
+    loop {
+        text = text.trim_start_matches(|character: char|
+            character.is_control() || character == '\u{ffff}' || character == '[');
+        let Some(after_escape) = text.strip_prefix('\\') else { return text.chars().next() };
+        let marker = after_escape.as_bytes().first()?.to_ascii_lowercase();
+        match marker {
+            b'n' | b'r' | b'@' => text = &after_escape[1..],
+            b'p' => {
+                text = &after_escape[1..];
+                if text.as_bytes().first().is_some_and(|byte| matches!(byte.to_ascii_lowercase(), b'c' | b'l' | b'r')) {
+                    text = &text[1..];
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn fes_text_statement(driver: &FesScriptDriver, offset: usize) -> Option<(&[u8], &[u8])> {
+    driver.interpreter.program.blocks.iter().find_map(|block| {
+        let index = block.lines.binary_search_by_key(&offset, |line| line.offset).ok()?;
+        let template = raw_after_spaces(&block.lines[index].bytes, 2)?;
+        Some((block.name.as_slice(), template))
+    })
+}
+
+fn story_command_sources(raw: &[u8], command: &FesDriverCommand, driver: &FesScriptDriver,
+    shared: &ExpressionState, origins: &CstTextOrigins,
+) -> Option<Vec<CstBodySource>> {
+    if body_control_only(raw) { return Some(Vec::new()); }
+    let (_, template) = fes_text_statement(driver, command.offset)?;
+    story_template_sources(template, raw, shared, origins)
+}
+
+fn story_template_sources(mut template: &[u8], mut expanded: &[u8], shared: &ExpressionState,
+    origins: &CstTextOrigins,
+) -> Option<Vec<CstBodySource>> {
+    let mut sources = Vec::new();
+    while let Some(start) = template.windows(4).position(|part| part == b"$str") {
+        let literal = &template[..start];
+        if !body_control_only(literal) { return None; }
+        expanded = expanded.strip_prefix(literal)?;
+        let digits = &template[start + 4..];
+        let count = digits.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        let id = std::str::from_utf8(&digits[..count]).ok()?.parse::<u32>().ok()?;
+        let bytes = shared.strings.get(&id).map_or(&[][..], Vec::as_slice);
+        expanded = expanded.strip_prefix(bytes)?;
+        if !body_control_only(bytes) {
+            sources = join_body_sources(&sources, origins.shared_body(id, bytes)?)?;
+        }
+        template = &digits[count + usize::from(digits.get(count) == Some(&b';'))..];
+    }
+    (expanded == template && body_control_only(template)).then_some(sources)
+}
+
+fn sourced_text(
+    owner: u32, command: &FesDriverCommand, verb: &[u8], raw: &[u8], driver: &FesScriptDriver,
+    shared: &ExpressionState, host: &mut LoggingHost<'_>,
+) -> Result<Option<SourcedText>> {
+    if raw.is_ascii() || verb == b"strsj" { return Ok(None); }
+    let literal = if driver.is_island_gbk_fes_source() { ScriptTextEncoding::Gbk }
+        else { host.text_encoding };
+    let Some((block, template)) = fes_text_statement(driver, command.offset) else { return Ok(None); };
+    let origins = &host.data_services.cst_text_origins;
+    let trace = host.data_services.story_trace;
+    let mut variables = Vec::new();
+    let mut failure = None;
+    let decoded = decode_sourced_text_with_failure(
+        template, raw, literal, host.text_encoding, driver.is_island_gbk_fes_source(),
+        |id| {
+            let bytes = shared.strings.get(&id).map_or(&[][..], Vec::as_slice);
+            let codec = origins.shared(id, bytes);
+            if trace && let Some(codec) = codec && !variables.contains(&codec) {
+                variables.push(codec);
+            }
+            (bytes, codec)
+        },
+        |part| failure = Some(part),
+    );
+    if let Some(part) = failure && eden_diagnostic_fes(host, driver) == Some(true) {
+        let resolved_cst = match host.cst_resource_with_source(b"scene", b"BLAOP1_END.cst") {
+            Ok(Some((_, resource))) if resource.bytes.len() == 26298
+                && super::particle_plugin_digest::sha256(&resource.bytes)
+                    == "c09bcb90152977cd9d21b68ec019d627ccc80136036503a5ce376a2ae6020561" => "v1-patch",
+            Ok(Some(_)) => "other",
+            Ok(None) => "missing",
+            Err(_) => "lookup-error",
+        };
+        host.events.push(LogicEvent {
+            frame: host.frame,
+            kind: "fes-text-eden-decode-error".into(),
+            detail: format!("task={owner} resource=meswnd.fes block={} offset={:#x} resolved_cst={resolved_cst} {}",
+                String::from_utf8_lossy(block), command.offset, part.diagnostic_detail()),
+        });
+    }
+    Ok(decoded?.map(|text| SourcedText { text, literal, variables }))
+}
+
+fn eden_diagnostic_fes(host: &LoggingHost<'_>, driver: &FesScriptDriver) -> Option<bool> {
+    const MESWND_SIZE: usize = 4971;
+    if host.css_task_sha() != Some("c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c") {
+        return None;
+    }
+    let names = host.resources.category_names(b"fes", "meswnd.fes").ok()?;
+    let candidate = names.iter().find_map(|name| host.resources.find(name))?;
+    if candidate.size != MESWND_SIZE as u64 { return None; }
+    let bytes = host.resources.read_candidate_bounded(candidate, MESWND_SIZE).ok()??;
+    if super::particle_plugin_digest::sha256(&bytes)
+        != "24d7b9d39471a48939c6ad5329e5f21d2431d8cc4b2168992c1e9cf0ee9ee205" {
+        return None;
+    }
+    let document = cs2_script::FesDocument::parse(&bytes).ok()?;
+    let program = cs2_script::FesProgram::from_document(&document).ok()?;
+    Some(program == driver.interpreter.program)
+}
+
+struct SourcedPart<'a> {
+    bytes: &'a [u8],
+    codec: ScriptTextEncoding,
+    variable: Option<(u32, bool)>,
+}
+
+impl SourcedPart<'_> {
+    fn diagnostic_detail(&self) -> String {
+        let source = match self.variable {
+            None => "literal".into(),
+            Some((id, true)) => format!("shared-tagged variable={id}"),
+            Some((id, false)) => format!("shared-default variable={id}"),
+        };
+        let bad_at = malformed_text_offset(self.bytes, self.codec)
+            .map_or_else(|| "unknown".into(), |offset| offset.to_string());
+        format!("source={source} codec={:?} bytes={} bad_at={bad_at}", self.codec, self.bytes.len())
+    }
+}
+
+fn malformed_text_offset(bytes: &[u8], codec: ScriptTextEncoding) -> Option<usize> {
+    let encoding = match codec {
+        ScriptTextEncoding::Utf8 => return std::str::from_utf8(bytes).err().map(|err| err.valid_up_to()),
+        ScriptTextEncoding::Gbk => encoding_rs::GBK,
+        ScriptTextEncoding::Cp932 => encoding_rs::SHIFT_JIS,
+    };
+    let mut base = 0;
+    let mut output = [0; 256];
+    for part in bytes.split(|&byte| byte == 0xff) {
+        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut consumed = 0;
+        loop {
+            let (result, read, _) = decoder.decode_to_utf8_without_replacement(&part[consumed..], &mut output, true);
+            consumed += read;
+            match result {
+                encoding_rs::DecoderResult::InputEmpty => break,
+                encoding_rs::DecoderResult::OutputFull => continue,
+                encoding_rs::DecoderResult::Malformed(length, after) => {
+                    return consumed.checked_sub(usize::from(length) + usize::from(after))
+                        .map(|offset| base + offset);
+                }
+            }
+        }
+        base += part.len() + 1;
+    }
+    None
+}
+
+#[cfg(test)]
+pub(super) fn decode_sourced_text<'a>(
+    template: &'a [u8], expected: &[u8], literal: ScriptTextEncoding,
+    default_variable_codec: ScriptTextEncoding, sourced: bool,
+    variable: impl FnMut(u32) -> (&'a [u8], Option<ScriptTextEncoding>),
+) -> Result<Option<String>> {
+    decode_sourced_text_with_failure(template, expected, literal, default_variable_codec, sourced, variable, |_| {})
+}
+
+fn decode_sourced_text_with_failure<'a>(
+    mut template: &'a [u8], expected: &[u8], literal: ScriptTextEncoding,
+    default_variable_codec: ScriptTextEncoding, mut sourced: bool,
+    mut variable: impl FnMut(u32) -> (&'a [u8], Option<ScriptTextEncoding>),
+    mut on_failure: impl FnMut(SourcedPart<'a>),
+) -> Result<Option<String>> {
+    let literal_part = |bytes: &'a [u8]| SourcedPart { bytes, codec: literal, variable: None };
+    let mut parts = Vec::new();
+    while let Some(start) = template.windows(4).position(|part| part == b"$str") {
+        let digits = &template[start + 4..];
+        let count = digits.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        if count == 0 {
+            parts.push(literal_part(&template[..start + 4]));
+            template = digits;
+            continue;
+        }
+        parts.push(literal_part(&template[..start]));
+        let id = digits[..count].iter().fold(0u32, |id, byte| {
+            id.wrapping_mul(10).wrapping_add(u32::from(*byte - b'0'))
+        });
+        let (bytes, codec) = variable(id);
+        sourced |= codec.is_some();
+        parts.push(SourcedPart {
+            bytes, codec: codec.unwrap_or(default_variable_codec), variable: Some((id, codec.is_some())),
+        });
+        template = &digits[count + usize::from(digits.get(count) == Some(&b';'))..];
+    }
+    parts.push(literal_part(template));
+    if !sourced || !parts.iter().flat_map(|part| part.bytes.iter()).eq(expected) {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    for part in parts {
+        match decode_text(part.bytes, part.codec) {
+            Ok(decoded) => text.push_str(&decoded),
+            Err(error) => {
+                on_failure(part);
+                return Err(error);
+            }
+        }
+    }
+    Ok(Some(text))
+}
+
+#[test]
+fn fes_sourced_failure_reports_only_the_rejected_segment() {
+    let cp932 = ScriptTextEncoding::Cp932;
+    let mut details = Vec::new();
+    let result = decode_sourced_text_with_failure(
+        b"\x81\x79$str1000;$str1001;\x81\x7a", b"\x81\x79A\xff\xec\xcdB\x81\x7a",
+        cp932, cp932, false,
+        |id| match id {
+            1000 => (b"A\xff\xec\xcd", None),
+            1001 => (b"B", Some(cp932)),
+            _ => unreachable!(),
+        },
+        |part| details.push(part.diagnostic_detail()),
+    );
+    assert_eq!(result.unwrap_err().to_string(), "invalid Cp932 FES text from declared source");
+    assert_eq!(details, ["source=shared-default variable=1000 codec=Cp932 bytes=4 bad_at=2"]);
+    assert_eq!(malformed_text_offset(&[vec![b'A'; 512], vec![0x81]].concat(), cp932), Some(512));
+}
+
+#[test]
+fn fes_sourced_text_keeps_cp932_literals_and_gbk_and_utf8_variables() {
+    let raw = b"\x81\x69\xd6\xd0\x81\x6a\xe6\x97\xa5\xff";
+    let decode = |expected: &[u8]| decode_sourced_text(
+        b"\x81\x69$str1000;\x81\x6a$str1001;\xff", expected,
+        ScriptTextEncoding::Cp932, ScriptTextEncoding::Cp932, false,
+        |id| match id {
+            1000 => (b"\xd6\xd0", Some(ScriptTextEncoding::Gbk)),
+            1001 => (b"\xe6\x97\xa5", Some(ScriptTextEncoding::Utf8)),
+            _ => unreachable!(),
+        },
+    );
+    let text = decode(raw).unwrap().unwrap();
+    assert_eq!(text, "\u{ff08}\u{4e2d}\u{ff09}\u{65e5}\u{ffff}");
+    let defaults = defaults();
+    let mut device = DesktopMessageDevice::default();
+    let mut message = MessageObject::new(-1, MessageEncoding::Cp932);
+    let configuration = initial_configuration(MessageEncoding::Cp932, &defaults, 0).unwrap();
+    message.reconfigure(&configuration, None, &mut device).unwrap();
+    message.append_decoded(raw, &text).unwrap();
+    assert_eq!(message.source(), text);
+    assert_eq!(message.raw_appends(), &[raw.to_vec()]);
+    assert!(decode(&raw[..raw.len() - 1]).unwrap().is_none());
+    assert!(decode_sourced_text(b"$str1000", b"\x81", ScriptTextEncoding::Cp932,
+        ScriptTextEncoding::Cp932, false,
+        |_| (b"\x81", Some(ScriptTextEncoding::Gbk))).is_err());
+    assert_eq!(decode_sourced_text(b"\xd6\xd0$str1000", b"\xd6\xd0\x81\x69",
+        ScriptTextEncoding::Gbk, ScriptTextEncoding::Cp932, true,
+        |_| (b"\x81\x69", None)).unwrap().as_deref(), Some("\u{4e2d}\u{ff08}"));
+}
+
+#[test]
+fn fes_text_apend_keeps_speaker_and_body_byte_sources() {
+    let mut store = FesTextStore::default();
+    let mut device = DesktopMessageDevice::default();
+    let kind = b"NVSTRING".to_vec();
+    store.create(12, &FesObjectDefinition {
+        offset: 0,
+        name: kind.clone(),
+        kind: kind.clone(),
+        bank_expression: None,
+        banks: 1,
+    }, &defaults(), &mut device).unwrap();
+    let bank = store.banks.get_mut(&(12, kind, 0)).unwrap();
+    let ambiguous = b"\xc2\xa9";
+    let body = decode_sourced_text(b"$str1000", ambiguous, ScriptTextEncoding::Cp932,
+        ScriptTextEncoding::Cp932, false, |_| (ambiguous, Some(ScriptTextEncoding::Utf8)))
+        .unwrap().unwrap();
+
+    bank.set_speaker(b"\\pr\xc2\xa9", ScriptTextEncoding::Cp932, None).unwrap();
+    bank.append_body_text(ambiguous, true, Some(&body)).unwrap();
+    let Some(TextRequest::AppendDecoded { bytes, text }) = bank.pending.pop_back() else {
+        panic!("missing sourced paragraph");
+    };
+    assert_eq!(bytes, b"\xc2\xa9\n\xc2\xa9");
+    assert_eq!(text, "\u{6f0f}\n\u{a9}");
+
+    bank.set_speaker(b"\\pr\xc2\xa9", ScriptTextEncoding::Cp932, Some("\\pr\u{a9}")).unwrap();
+    bank.append_body(ambiguous, true).unwrap();
+    let Some(TextRequest::AppendDecoded { bytes, text }) = bank.pending.pop_back() else {
+        panic!("missing paragraph with sourced speaker");
+    };
+    assert_eq!(bytes, b"\xc2\xa9\n\xc2\xa9");
+    assert_eq!(text, "\u{a9}\n\u{6f0f}");
+    assert!(bank.novel.as_ref().unwrap().speaker.is_empty());
+}
+
+#[test]
+fn fes_sourced_trace_omits_text_and_skips_leading_message_controls() {
+    let decoded = SourcedText {
+        text: "\u{ffff}\\n\\pc\u{8d77}private text".into(),
+        literal: ScriptTextEncoding::Cp932,
+        variables: vec![ScriptTextEncoding::Gbk, ScriptTextEncoding::Utf8],
+    };
+    assert_eq!(decoded.trace_detail(24), "bytes=24 first=U+8D77 fes=Cp932 cst=[Gbk, Utf8]");
+    assert_eq!(first_text_codepoint("\n\\r"), None);
+    assert_eq!(first_text_codepoint("\\nA\u{8d77}"), Some('A'));
+}
+
+#[test]
+fn fes_unicode_input_honors_declared_gbk_even_when_also_valid_utf8() {
+    let bytes = b"\xc2\xa9";
+    assert_eq!(normalize_text(bytes, MessageEncoding::Unicode, false, ScriptTextEncoding::Gbk).unwrap(),
+        "\u{6f0f}".as_bytes());
+    assert_eq!(normalize_text(bytes, MessageEncoding::Unicode, false, ScriptTextEncoding::Utf8).unwrap(), bytes);
+    assert!(normalize_text(b"\x81", MessageEncoding::Unicode, false, ScriptTextEncoding::Gbk).is_err());
+}
+
 fn unicode_layout_font(mut raw: &[u8]) -> Result<Vec<u16>> {
     let mut font = Vec::new();
     while !raw.is_empty() {
@@ -1466,18 +2226,12 @@ fn normalize_text(raw: &[u8], encoding: MessageEncoding, sjis: bool, resource: S
         return Ok(text.as_bytes().to_vec());
     }
     if encoding == MessageEncoding::Unicode {
-        if std::str::from_utf8(raw).is_ok() { return Ok(raw.to_vec()); }
-        if matches!(resource, ScriptTextEncoding::Cp932) {
-            bail!("STRING8 source is not valid UTF-8");
+        if resource == ScriptTextEncoding::Gbk {
+            let text = encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(raw)
+                .context("STRING8 text has invalid GBK resource bytes")?;
+            return Ok(text.as_bytes().to_vec());
         }
-        return match resource {
-            ScriptTextEncoding::Gbk => {
-                let (text, _, errors) = encoding_rs::GBK.decode(raw);
-                if errors { bail!("STRING8 text has invalid GBK resource bytes"); }
-                Ok(text.as_bytes().to_vec())
-            }
-            _ => bail!("STRING8 text is not valid UTF-8"),
-        };
+        std::str::from_utf8(raw).context("STRING8 source is not valid UTF-8")?;
     }
     Ok(raw.to_vec())
 }

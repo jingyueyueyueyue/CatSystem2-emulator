@@ -127,6 +127,7 @@ impl HeadlessPlayer {
         self.commit_cst_context_restore(prepared.contexts);
         self.css_handles = prepared.containers;
         self.string_values = prepared.strings;
+        self.data_services.cst_text_origins = Default::default();
         self.data_services.databases = prepared.databases;
         self.data_services.cst_windows = prepared.windows;
         self.integer_maps = prepared.maps;
@@ -175,6 +176,7 @@ impl HeadlessPlayer {
                 localization: saved.localization.as_ref().map(CstLocalizationSnapshot::restore).transpose()?,
                 encoding,
                 source_name: saved.source_name.clone(), source_line: saved.source_line,
+                story: Default::default(),
             });
         }
         Ok(PreparedCstContexts(contexts))

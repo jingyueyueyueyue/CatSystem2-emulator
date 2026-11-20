@@ -35,6 +35,7 @@ struct History {
     frame: RgbaFrame,
     options: ImageDrawOptions,
     priority: i32,
+    affine: Option<super::AffinePlacement>,
 }
 
 pub(super) struct ListSurface {
@@ -51,7 +52,7 @@ impl ListSurface {
             tiles: self.tiles.iter().map(|t| (rect(t.bounds), t.dirty.map(rect))).collect(),
             history: self.history.iter().map(|(key, h)| (key.clone(), HistorySnapshot {
                 bounds: h.bounds.map(rect), frame: crate::image_manager::capture_frame(&h.frame),
-                options: options(&h.options), priority: h.priority,
+                options: options(&h.options, h.affine), priority: h.priority,
             })).collect(),
             intermediate: self.intermediate.iter().map(|(key, area)| (key.clone(), area.map(rect))).collect(),
         }
@@ -78,7 +79,7 @@ impl ListSurface {
         let history = s.history.iter().map(|(key, h)| Ok((key.clone(), History {
             bounds: h.bounds.as_ref().map(unrect),
             frame: crate::image_manager::restore_frame(&h.frame)?,
-            options: unoptions(&h.options)?, priority: h.priority,
+            options: unoptions(&h.options)?, priority: h.priority, affine: h.options.affine,
         }))).collect::<Result<_>>()?;
         Ok(Self { size: s.size, tiles, history, intermediate: s.intermediate.iter()
             .map(|(key, area)| (key.clone(), area.as_ref().map(unrect))).collect() })
@@ -230,6 +231,10 @@ fn bounds(
     size: [u32; 2],
 ) -> Result<Option<Rect>> {
     if layer.frame.is_empty() { return Ok(None); }
+    if let Some(placement) = layer.affine {
+        return super::affine_bounds([layer.frame.width(), layer.frame.height()], placement,
+            size, layer.options.clip);
+    }
     if key.0 == u32::MAX
         && let Some(number) = key
             .1
@@ -325,6 +330,7 @@ fn compose_inner(
                 !native
                     && (!same_render_frame(&old.frame, &layer.frame)
                         || !options_equal(&old.options, &layer.options)
+                        || old.affine != layer.affine
                         || old.priority != layer.priority)
             });
         let history = if changed {
@@ -352,6 +358,7 @@ fn compose_inner(
                 frame: layer.frame.clone(),
                 options: layer.options.clone(),
                 priority: layer.priority,
+                affine: layer.affine,
             },
         );
     }
@@ -455,7 +462,7 @@ fn compose_inner(
                 continue;
             };
             options.clip = Some(clip);
-            super::draw_layer(host, id, &mut canvas, key, &layer.frame, &options, &mut opaque)?;
+            super::draw_layer(host, id, &mut canvas, key, &layer.frame, &options, layer.affine, &mut opaque)?;
         }
     }
     let output = RgbaFrame::from_rgba8(canvas.width(), canvas.height(), canvas.pixels().to_vec())?;

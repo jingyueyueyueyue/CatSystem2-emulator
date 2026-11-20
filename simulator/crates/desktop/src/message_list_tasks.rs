@@ -109,6 +109,11 @@ impl LoggingHost<'_> {
         &mut self, index: u32, args: &[u8],
     ) -> Result<NativeReturn> {
         let target = read_u32(args, 0)?;
+        if index == 572 && args.len() == 4 && target == 0
+            && !self.data_services.tasks.message_lists.tasks.contains_key(&target)
+        {
+            return Ok(NativeReturn::Continue);
+        }
         let source = if index == 571 { read_u32(args, 4)? } else { 0 };
         // The original wrapper unwraps the opaque object before routing,
         // including when the target is missing. This CST object is not a VM

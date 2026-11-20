@@ -8,14 +8,18 @@ use cs2_formats::{ConfigError, ConfigXml};
 use cs2_runtime::TaskCommand;
 use cs2_runtime::language::{
     LanguageChangeRequest, LanguageState, LanguageTarget, MAX_LANGUAGE_CHANGE_REQUESTS,
+    MAX_LANGUAGE_QUERY_PREFIX_BYTES,
 };
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
+
+const NEKO_STEAM_PE: &str = "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc";
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct LanguageNativeServices {
     pub(super) languages: LanguageState,
     pub(super) system_settings_dirty: u32,
     pub(super) platform: super::language_platform::LanguagePlatformState,
+    query_story_prefixes: bool,
     language_change_requests: VecDeque<LanguageChangeRequest>,
     configuration_broadcast: Option<ConfigurationBroadcast>,
 }
@@ -62,6 +66,10 @@ impl LanguageNativeServices {
         matches!(index, 533 | 1036 | 1053 | 1062)
     }
 
+    pub(super) fn configure_prefix_query(&mut self, pe_sha256: Option<&str>) {
+        self.query_story_prefixes = pe_sha256 == Some(NEKO_STEAM_PE);
+    }
+
     /// task_id is the sender's raw DWORD, including any signed-id bit pattern.
     /// Every successful supported call returns status 2 without a return value.
     pub(super) fn call(
@@ -74,13 +82,18 @@ impl LanguageNativeServices {
         match index {
             533 => self.system_settings_dirty = 1,
             1036 => {
-                let primary_output = argument(arguments, 0)?;
-                let message_output = argument(arguments, 4)?;
+                let first_output = argument(arguments, 0)?;
+                let second_output = argument(arguments, 4)?;
                 // Both starts must be valid before either output is modified.
-                vm.read(primary_output, 1)?;
-                vm.read(message_output, 1)?;
-                self.write_prefix(vm, primary_output, 0)?;
-                self.write_prefix(vm, message_output, 1)?;
+                vm.read(first_output, 1)?;
+                vm.read(second_output, 1)?;
+                let [first, second] = if self.query_story_prefixes {
+                    [LanguageTarget::MainText, LanguageTarget::Subtitle]
+                } else {
+                    [LanguageTarget::Interface, LanguageTarget::MainText]
+                };
+                self.write_prefix(vm, first_output, first)?;
+                self.write_prefix(vm, second_output, second)?;
             }
             1053 => {
                 let mode = argument(arguments, 0)?;
@@ -254,11 +267,25 @@ impl LanguageNativeServices {
         Ok(true)
     }
 
-    fn write_prefix(&self, vm: &mut Vm, address: u32, mode: u32) -> Result<()> {
+    fn write_prefix(&self, vm: &mut Vm, address: u32, target: LanguageTarget) -> Result<()> {
         // The query clears each destination before copying that prefix. This
         // also defines overlap order and the observable prefix-capacity error.
         vm.write(address, &[0])?;
-        let mut output = self.languages.query_prefix(mode)?.to_vec();
+        let languages = &self.languages;
+        let prefix = match target {
+            LanguageTarget::Interface => languages.query_prefix(0)?,
+            LanguageTarget::MainText => languages.query_prefix(1)?,
+            LanguageTarget::Subtitle => {
+                let prefix = languages.prefixes.get(languages.subtitle_index as usize)
+                    .or_else(|| languages.prefixes.get(languages.default_index as usize))
+                    .map_or(&[][..], |prefix| super::trim_nul(prefix));
+                if prefix.len() > MAX_LANGUAGE_QUERY_PREFIX_BYTES {
+                    return Err(error("language query prefix exceeds 4095 bytes"));
+                }
+                prefix
+            }
+        };
+        let mut output = prefix.to_vec();
         output.push(0);
         vm.write(address, &output)
     }
@@ -275,4 +302,44 @@ fn argument(arguments: &[u8], offset: usize) -> Result<u32> {
 
 fn error(message: &'static str) -> ScriptError {
     ScriptError::InvalidStructuredText { offset: 0, message }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cs2_script::KcsProgram;
+
+    #[test]
+    fn query_1036_uses_neko_main_and_subtitle_without_changing_legacy_abi() -> Result<()> {
+        let program = KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?;
+        let mut vm = Vm::from_program(program)?;
+        let mut service = LanguageNativeServices::new(LanguageState {
+            prefixes: vec![b"en".to_vec(), b"jp".to_vec(), b"cn".to_vec()],
+            default_index: 0,
+            primary_index: 0,
+            message_index: 2,
+            subtitle_index: 1,
+        });
+        let mut arguments = [0_u8; 8];
+        arguments[..4].copy_from_slice(&4_u32.to_le_bytes());
+        arguments[4..].copy_from_slice(&16_u32.to_le_bytes());
+
+        service.configure_prefix_query(Some(NEKO_STEAM_PE));
+        service.call(1036, &arguments, &mut vm, 0)?;
+        assert_eq!(vm.read(4, 3)?, b"cn\0");
+        assert_eq!(vm.read(16, 3)?, b"jp\0");
+
+        service.languages.message_index = 1;
+        service.languages.subtitle_index = u32::MAX;
+        service.call(1036, &arguments, &mut vm, 0)?;
+        assert_eq!(vm.read(4, 3)?, b"jp\0");
+        assert_eq!(vm.read(16, 3)?, b"en\0");
+
+        service.configure_prefix_query(Some("unrecognized"));
+        service.call(1036, &arguments, &mut vm, 0)?;
+        assert_eq!(vm.read(4, 3)?, b"en\0");
+        assert_eq!(vm.read(16, 3)?, b"jp\0");
+        assert_eq!(service.languages.selections(), [0, 1, u32::MAX]);
+        Ok(())
+    }
 }

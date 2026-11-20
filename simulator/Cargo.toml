@@ -34,6 +34,16 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+[profile.playthrough]
+inherits = "dev"
+opt-level = 1
+debug = 0
+lto = "off"
+strip = "debuginfo"
+
+[profile.playthrough.package.cs2-renderer]
+opt-level = 3
+
 # Keep actual Android integration iterations out of whole-program LTO.
 [profile.android-integration]
 inherits = "dev"

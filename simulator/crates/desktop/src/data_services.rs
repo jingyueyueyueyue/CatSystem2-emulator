@@ -53,6 +53,9 @@ pub(super) struct PreparedDataTables {
 
 #[derive(Default)]
 pub(super) struct DataServices {
+    pub(super) newton_legacy_gbk: bool,
+    pub(super) cst_text_origins: super::cst_context_native::CstTextOrigins,
+    pub(super) story_trace: bool,
     pub(super) achievements: super::achievement_native::AchievementState,
     pub(super) top_clock: super::top_task_native::TopClockState,
     pub(super) frame_capture: super::frame_capture::FrameCaptureState,
@@ -98,6 +101,7 @@ pub(super) struct DataServices {
     pub(super) particle_external: super::particle_external::ParticleExternalStore,
     pub(super) particle_message_pe_sha256: Option<&'static str>,
     pub(super) native_profile: Option<&'static cs2_runtime::native_profile::FeatureProfile>,
+    pub(super) kanmi_native925_verified: Option<bool>,
     pub(super) css_task_pe_sha256: Option<&'static str>,
     pub(super) css_models: super::css_model::CssModelStore,
     pub(super) language: super::language_native::LanguageNativeServices,

@@ -294,6 +294,8 @@ mod tests {
         let Some(root) = std::env::var_os("CS2_SAMPLE_ROOT").map(std::path::PathBuf::from) else {
             return;
         };
+        let catalog = root.join("games");
+        let root = if catalog.is_dir() { catalog } else { root };
         for (relative, expected) in [
             ("cs2_full_v401/system/cs2_open.exe", 0x1658_0a97),
             (
@@ -305,12 +307,12 @@ mod tests {
                 0x0f6b_b0ae,
             ),
             (
-                "games/catsystem2/webm-runtime/ISLAND/ISLAND.exe",
+                "ISLAND/ISLAND.exe",
                 0x0878_7c5d,
             ),
             ("Yukikoi Melt/YukikoiMelt.exe", 0x23a8_93a2),
             (
-                "games/catsystem2/grisaia-series/\u{679c}\u{3064}\u{308b}\u{3053}\u{3068}\u{306a}\u{304d}\u{672a}\u{6765}\u{3088}\u{308a}/Hatsumira.exe",
+                "\u{679c}\u{3064}\u{308b}\u{3053}\u{3068}\u{306a}\u{304d}\u{672a}\u{6765}\u{3088}\u{308a}/Hatsumira.exe",
                 0xe113_742d,
             ),
         ] {

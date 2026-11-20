@@ -305,7 +305,7 @@ mod tests {
             .ancestors()
             .nth(3)
             .expect("runtime crate should be inside the simulator workspace")
-            .to_path_buf();
+            .join("games");
         let samples = [
             ("cs2_full_v401", EngineVariant::V401),
             ("牛顿与苹果树", EngineVariant::Legacy),

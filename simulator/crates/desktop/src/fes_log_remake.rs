@@ -3,10 +3,12 @@
 //! This is not the clear/append history-import protocol of ordinary1034.
 use super::*;
 use cs2_formats::{CstFile, CstlTable};
+use crate::cst_context_native::decode_cst_dialogue;
 
 struct Scene {
     document: CstFile,
     localization: Option<CstlTable>,
+    encoding: ScriptTextEncoding,
 }
 
 /// Called with the live text store taken out of DataServices. Bank and language
@@ -118,9 +120,10 @@ fn remake_backlog(host: &mut LoggingHost<'_>, handle: u32, language: Option<&str
 }
 
 fn load_scene(host: &LoggingHost<'_>, source: &[u8]) -> Result<Scene> {
-    let (resolved, bytes) = host.backlog_resource(b"scene", source, false)?
+    let (resolved, resource) = host.cst_resource_with_source(b"scene", source)?
         .context("LOGSTRING remake source CST is unavailable; retained history is unchanged")?;
-    let document = CstFile::parse(&bytes).context("LOGSTRING remake source CST is malformed")?;
+    let encoding = host.cst_scene_encoding_override(&resource).unwrap_or(host.text_encoding);
+    let document = CstFile::parse(&resource.bytes).context("LOGSTRING remake source CST is malformed")?;
     let mut adjacent = resolved;
     if let Some(dot) = adjacent.rfind('.').filter(|&dot|
         adjacent[..dot].rfind(['/', '\\']).is_none_or(|slash| slash < dot)) {
@@ -130,7 +133,7 @@ fn load_scene(host: &LoggingHost<'_>, source: &[u8]) -> Result<Scene> {
     let localization = host.backlog_read(&adjacent, false)?
         .map(|bytes| CstlTable::parse_prefix(&bytes).map(|(table, _)| table))
         .transpose().context("LOGSTRING remake adjacent CSTL is malformed")?;
-    Ok(Scene { document, localization })
+    Ok(Scene { document, localization, encoding })
 }
 
 fn read_input(scene: &Scene, input: usize, language: &str) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
@@ -147,14 +150,14 @@ fn read_input(scene: &Scene, input: usize, language: &str) -> Result<(Vec<u8>, O
             0x20 => {
                 let bytes = if let Some(table) = bound {
                     table.segment(language, input, fragment).unwrap_or("").as_bytes().to_vec()
-                } else { base_utf8(&record.text)? };
+                } else { base_utf8(&record.text, scene.encoding)? };
                 fragment += 1;
                 bytes
             }
             0x21 => {
                 let bytes = if let Some(table) = bound {
                     table.message(language, input).map_or("", |message| &message.name).as_bytes().to_vec()
-                } else { base_utf8(&record.text)? };
+                } else { base_utf8(&record.text, scene.encoding)? };
                 check_record(&bytes)?;
                 name = Some(bytes);
                 continue;
@@ -181,11 +184,106 @@ fn check_record(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn base_utf8(bytes: &[u8]) -> Result<Vec<u8>> {
-    let bytes = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
-    // The recovered scene getter explicitly converts base CST CP932 to UTF-8;
-    // it does not infer an encoding from the selected localization language.
-    let (text, _, errors) = encoding_rs::SHIFT_JIS.decode(bytes);
-    if errors { bail!("LOGSTRING remake base CST contains invalid CP932"); }
-    Ok(text.as_bytes().to_vec())
+fn base_utf8(bytes: &[u8], codec: ScriptTextEncoding) -> Result<Vec<u8>> {
+    Ok(decode_cst_dialogue(bytes, codec).context("LOGSTRING remake base CST")?.into_owned().into_bytes())
+}
+
+#[test]
+fn log_remake_keeps_declared_base_codec_and_bound_utf8_overrides() {
+    use cs2_formats::{CstLengthInfo, CstRecord, CstVariant, CstlMessage};
+
+    let mut scene = Scene {
+        document: CstFile {
+            variant: CstVariant::Uncompressed,
+            length: CstLengthInfo { declared: 0, actual: 0 },
+            script_length: CstLengthInfo { declared: 0, actual: 0 },
+            diagnostics: Vec::new(),
+            records: vec![
+                CstRecord { kind: 0x21, text: b"\xc2\xa9".to_vec() },
+                CstRecord { kind: 0x20, text: b"\\r\xc2\xa9".to_vec() },
+                CstRecord { kind: 0x20, text: b"\\r!".to_vec() },
+            ],
+            inputs: std::iter::once(0..3).collect(),
+        },
+        localization: Some(CstlTable {
+            languages: vec!["bound".into()],
+            messages: vec![vec![CstlMessage { name: String::new(), content: "\u{65e5}\u{1f}".into() }]],
+        }),
+        encoding: ScriptTextEncoding::Cp932,
+    };
+    for (codec, expected) in [
+        (ScriptTextEncoding::Cp932, "\u{ff82}\u{ff69}"),
+        (ScriptTextEncoding::Gbk, "\u{6f0f}"),
+        (ScriptTextEncoding::Utf8, "\u{a9}"),
+    ] {
+        scene.encoding = codec;
+        assert_eq!(read_input(&scene, 0, "unbound").unwrap(),
+            (format!("{expected}!").into_bytes(), Some(expected.as_bytes().to_vec())));
+        assert_eq!(read_input(&scene, 0, "bound").unwrap(),
+            ("\u{65e5}".as_bytes().to_vec(), Some(Vec::new())));
+    }
+    scene.document.records[1].text = b"\x81".to_vec();
+    assert!(read_input(&scene, 0, "unbound").is_err());
+}
+
+#[test]
+#[ignore = "requires the installed Grisaia Eden game and an isolated profile"]
+fn grisaia_eden_mixed_archive_text_backlog_and_cst_reopen() -> Result<()> {
+    use crate::particle_plugin_digest::sha256;
+    use cs2_runtime::object_graph::{decode_component, encode_component};
+    use cs2_script::{Host, NativeReturn, Vm};
+
+    let root = std::env::var_os("CS2_EDEN_TEXT_TEST_ROOT").context("installed game root required")?;
+    let profile = std::path::PathBuf::from(std::env::var_os("CS2_EDEN_TEXT_TEST_PROFILE")
+        .context("isolated profile required")?);
+    std::fs::create_dir_all(&profile).context("create isolated CST checkpoint directory")?;
+    let mut player = crate::HeadlessPlayer::open_with_save_root(&root, &profile)?;
+    let mut vm = Vm::new();
+    vm.bind_external(vec![0; 4096])?;
+    let scene_name = 0x8000_0100;
+    let output = 0x8000_0400;
+    let args = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let body_hash = "69d0b63f3c4b50667d993303eb8e5772e087455965f97a81f6fea41c8d34ac72";
+    let speaker_hash = "3398206e602e12d0af463cd54c3b90086cc6762e60a56aadba859012c37f78c6";
+    let handle = player.with_host(|host| {
+        let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
+            bail!("no CST context handle");
+        };
+        let japanese = load_scene(host, b"bla018G_A.cst")?;
+        assert_eq!(japanese.encoding, ScriptTextEncoding::Cp932);
+        let (row, _) = read_input(&japanese, 0, "unbound")?;
+        assert_eq!(sha256(&row), "34bb1de6f71e0f4b6cb596b22768d8d5ff95cbf5a19714b69d74d7f95d694516");
+
+        vm.write(scene_name, b"aft_002.cst\0")?;
+        assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
+        host.read_cst_record(327, &args(&[handle, output, 0, 48]), &mut vm)?;
+        host.call(276, &args(&[1000, output]), &mut vm)?;
+        let raw = vm.read_string(output)?;
+        let origin = host.data_services.cst_text_origins.shared(1000, &raw);
+        assert_eq!(origin, Some(ScriptTextEncoding::Gbk));
+        let decoded = super::decode_sourced_text(b"$str1000", &raw, ScriptTextEncoding::Cp932,
+            ScriptTextEncoding::Cp932, false, |_| (&raw, origin))?.context("missing FES text")?;
+        assert_eq!(sha256(decoded.as_bytes()), body_hash);
+
+        let chinese = load_scene(host, b"aft_002.cst")?;
+        let (row, speaker) = read_input(&chinese, 0, "unbound")?;
+        assert_eq!(sha256(&row), body_hash);
+        assert_eq!(sha256(&speaker.context("missing history speaker")?), speaker_hash);
+        Ok(handle)
+    })?;
+
+    let checkpoint = profile.join("cst-checkpoint.bin");
+    std::fs::write(&checkpoint, encode_component(&player.cst_context_snapshots()?)?)
+        .context("write isolated CST checkpoint")?;
+    drop(player);
+    let mut reopened = crate::HeadlessPlayer::open_with_save_root(&root, &profile)?;
+    let snapshot = decode_component(&std::fs::read(checkpoint).context("read isolated CST checkpoint")?)?;
+    reopened.commit_cst_context_restore(crate::HeadlessPlayer::prepare_cst_context_restore(&snapshot)?);
+    reopened.with_host(|host| {
+        host.read_cst_record(1037, &args(&[handle, output, 0, 47]), &mut vm)?;
+        assert_eq!(sha256(&vm.read_string(output)?), speaker_hash);
+        host.read_cst_record(1037, &args(&[handle, output, 0, 48]), &mut vm)?;
+        assert_eq!(sha256(&vm.read_string(output)?), body_hash);
+        Ok(())
+    })
 }

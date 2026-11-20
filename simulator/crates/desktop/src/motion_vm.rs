@@ -10,15 +10,39 @@ type Result<T> = cs2_script::Result<T>;
 
 pub(super) const EXTERNAL: u32 = 0x8000_0000;
 pub(super) const EXTERNAL_SIZE: usize = 0x4a8;
-const ELAPSED: u32 = EXTERNAL + 0x90;
-const RUNNING: u32 = EXTERNAL + 0x94;
-const FINISHING: u32 = EXTERNAL + 0x98;
-const PARAMETERS: u32 = EXTERNAL + 0x9c;
-const SAVE_POINTER: u32 = EXTERNAL + 0x49c;
-const SAVE_LENGTH: u32 = EXTERNAL + 0x4a0;
-const EXTERNAL_VALUE: u32 = EXTERNAL + 0x4a4;
+const ELAPSED: usize = 0x90;
+const RUNNING: usize = 0x94;
+const FINISHING: usize = 0x98;
+const PARAMETERS: usize = 0x9c;
+const SAVE_POINTER: usize = 0x49c;
+const SAVE_LENGTH: usize = 0x4a0;
+const EXTERNAL_VALUE: usize = 0x4a4;
 const LIMIT: usize = 64 * 1024 * 1024;
 const INDEFINITE: f32 = f32::from_bits(0xffc0_0000);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExternalLayout {
+    Default,
+    Campanella,
+}
+
+impl ExternalLayout {
+    fn offset(self, modern: usize) -> usize {
+        modern - if self == Self::Campanella { 4 } else { 0 }
+    }
+
+    fn address(self, modern: usize) -> u32 {
+        EXTERNAL + self.offset(modern) as u32
+    }
+
+    fn size(self) -> usize {
+        self.offset(EXTERNAL_SIZE)
+    }
+
+    fn property_count(self) -> usize {
+        self.offset(ELAPSED) / 4
+    }
+}
 
 fn invalid(message: &'static str) -> ScriptError {
     ScriptError::InvalidStructuredText { offset: 0, message }
@@ -115,6 +139,8 @@ enum Invocation {
 pub(super) struct MotionRunner {
     program: MotionProgram,
     vm: Vm,
+    layout: ExternalLayout,
+    short_display: u32,
     base_time: u32,
     stack_end: usize,
     storage_end: usize,
@@ -130,6 +156,14 @@ impl MotionRunner {
     }
 
     pub(super) fn from_program(program: MotionProgram, start: MotionStart<'_>) -> Result<Self> {
+        Self::with_external_layout(program, start, ExternalLayout::Default)
+    }
+
+    pub(super) fn with_external_layout(
+        program: MotionProgram,
+        start: MotionStart<'_>,
+        layout: ExternalLayout,
+    ) -> Result<Self> {
         let name = snapshot_name(start.name)?;
         let stack_end = program.program.data.len() + program.program.stack_size;
         if stack_end == 0 && !start.saved_data.is_empty() {
@@ -141,18 +175,18 @@ impl MotionRunner {
             .checked_add(start.saved_data.len())
             .filter(|&n| n <= LIMIT)
             .ok_or_else(|| invalid("motion saved storage exceeds 64 MiB"))?;
-        let mut external = vec![0; EXTERNAL_SIZE];
-        store_words(&mut external, 0, &start.properties);
-        store_words(&mut external, 0x94, &[1]);
-        store_words(&mut external, 0x9c, &start.parameters);
-        store_words(&mut external, 0x4a4, &[start.external_value]);
+        let mut external = vec![0; layout.size()];
+        store_words(&mut external, 0, &start.properties[..layout.property_count()]);
+        store_words(&mut external, layout.offset(RUNNING), &[1]);
+        store_words(&mut external, layout.offset(PARAMETERS), &start.parameters);
+        store_words(&mut external, layout.offset(EXTERNAL_VALUE), &[start.external_value]);
         let mut vm = Vm::new();
         vm.load_program(program.program.clone(), external)?;
         let snapshot_data = if start.saved_data.is_empty() {
             None
         } else {
             let base = vm.allocate_region(start.saved_data)?;
-            vm.write(EXTERNAL | 0x49c, &words_as_bytes(&[
+            vm.write(layout.address(SAVE_POINTER), &words_as_bytes(&[
                 base, start.saved_data.len() as u32,
             ]))?;
             Some((base, start.saved_data.len()))
@@ -160,6 +194,8 @@ impl MotionRunner {
         Ok(Self {
             program,
             vm,
+            layout,
+            short_display: if layout == ExternalLayout::Campanella { start.properties[35] } else { 0 },
             base_time: start.base_time,
             stack_end,
             storage_end,
@@ -171,16 +207,22 @@ impl MotionRunner {
     }
 
     pub(super) fn state(&self) -> Result<MotionState> {
-        let bytes = self.vm.read(EXTERNAL, EXTERNAL_SIZE)?;
+        let bytes = self.external_bytes()?;
+        let layout = self.layout;
+        let word = |modern| word_at(&bytes, layout.offset(modern));
         Ok(MotionState {
-            properties: std::array::from_fn(|i| word_at(&bytes, i * 4)),
-            elapsed: word_at(&bytes, 0x90),
-            running: word_at(&bytes, 0x94),
-            finishing: word_at(&bytes, 0x98),
-            parameters: std::array::from_fn(|i| word_at(&bytes, 0x9c + i * 4)),
-            save_address: word_at(&bytes, 0x49c),
-            save_length: word_at(&bytes, 0x4a0),
-            external_value: word_at(&bytes, 0x4a4),
+            properties: std::array::from_fn(|index| if index < layout.property_count() {
+                word_at(&bytes, index * 4)
+            } else {
+                self.short_display
+            }),
+            elapsed: word(ELAPSED),
+            running: word(RUNNING),
+            finishing: word(FINISHING),
+            parameters: std::array::from_fn(|index| word(PARAMETERS + index * 4)),
+            save_address: word(SAVE_POINTER),
+            save_length: word(SAVE_LENGTH),
+            external_value: word(EXTERNAL_VALUE),
         })
     }
 
@@ -204,19 +246,23 @@ impl MotionRunner {
 
     pub(super) fn set_properties(&mut self, properties: &[u32; 36]) -> Result<()> {
         self.require_idle()?;
-        self.vm.write(EXTERNAL, &words_as_bytes(properties))
+        self.vm.write(EXTERNAL, &words_as_bytes(&properties[..self.layout.property_count()]))?;
+        if self.layout == ExternalLayout::Campanella {
+            self.short_display = properties[35];
+        }
+        Ok(())
     }
 
     pub(super) fn set_parameters(&mut self, parameters: &[u32]) -> Result<()> {
         self.require_idle()?;
         let mut bytes = [0; 1024];
         store_words(&mut bytes, 0, &parameters[..parameters.len().min(256)]);
-        self.vm.write(PARAMETERS, &bytes)
+        self.vm.write(self.layout.address(PARAMETERS), &bytes)
     }
 
     pub(super) fn request_finish(&mut self) -> Result<()> {
         self.require_idle()?;
-        self.vm.write(FINISHING, &1_u32.to_le_bytes())
+        self.vm.write(self.layout.address(FINISHING), &1_u32.to_le_bytes())
     }
 
     pub(super) fn read_memory(&self, address: u32, length: usize) -> Result<Vec<u8>> {
@@ -231,7 +277,7 @@ impl MotionRunner {
     }
 
     pub(super) fn external_bytes(&self) -> Result<Vec<u8>> {
-        self.vm.read(EXTERNAL, EXTERNAL_SIZE)
+        self.vm.read(EXTERNAL, self.layout.size())
     }
 
     /// Register a snapshot source separately from script-visible pointer fields.
@@ -245,8 +291,8 @@ impl MotionRunner {
             self.read_memory(address, length)?;
         }
         self.snapshot_data = (address != 0).then_some((address, length));
-        self.vm.write(SAVE_POINTER, &address.to_le_bytes())?;
-        self.vm.write(SAVE_LENGTH, &(length as u32).to_le_bytes())
+        self.vm.write(self.layout.address(SAVE_POINTER), &address.to_le_bytes())?;
+        self.vm.write(self.layout.address(SAVE_LENGTH), &(length as u32).to_le_bytes())
     }
 
     /// `now` is controller-local time, after speed/origin conversion.
@@ -264,11 +310,11 @@ impl MotionRunner {
             ));
         }
         if self.invocation.is_none() {
-            if self.vm.read_u32(FINISHING)? == 0 && now < self.base_time {
+            if self.vm.read_u32(self.layout.address(FINISHING))? == 0 && now < self.base_time {
                 return Ok(MotionProgress::NotStarted);
             }
             self.vm
-                .write(ELAPSED, &now.wrapping_sub(self.base_time).to_le_bytes())?;
+                .write(self.layout.address(ELAPSED), &now.wrapping_sub(self.base_time).to_le_bytes())?;
             self.vm.reset_execution()?;
             self.invocation = Some(Invocation::Update);
         }
@@ -288,13 +334,13 @@ impl MotionRunner {
     ) -> Result<MotionProgress> {
         if !matches!(self.invocation, Some(Invocation::Finish(_))) {
             let saved = [
-                self.vm.read_u32(ELAPSED)?,
-                self.vm.read_u32(RUNNING)?,
-                self.vm.read_u32(FINISHING)?,
+                self.vm.read_u32(self.layout.address(ELAPSED))?,
+                self.vm.read_u32(self.layout.address(RUNNING))?,
+                self.vm.read_u32(self.layout.address(FINISHING))?,
             ];
             self.invocation = Some(Invocation::Finish(saved));
-            self.vm.write(ELAPSED, &u32::MAX.to_le_bytes())?;
-            self.vm.write(FINISHING, &1_u32.to_le_bytes())?;
+            self.vm.write(self.layout.address(ELAPSED), &u32::MAX.to_le_bytes())?;
+            self.request_finish_word()?;
             if let Err(error) = self.vm.reset_execution() {
                 self.restore_finish()?;
                 return Err(error);
@@ -305,6 +351,10 @@ impl MotionRunner {
             self.restore_finish()?;
         }
         result
+    }
+
+    fn request_finish_word(&mut self) -> Result<()> {
+        self.vm.write(self.layout.address(FINISHING), &1_u32.to_le_bytes())
     }
 
     pub(super) fn snapshot(&self, now: u32, group: i32) -> Result<MotionSnapshot> {
@@ -337,13 +387,14 @@ impl MotionRunner {
         MotionMemory {
             end: self.storage_end,
             stack_end: self.stack_end,
+            external_size: self.layout.size(),
         }
         .range(address, length)
     }
 
     fn restore_finish(&mut self) -> Result<()> {
         if let Some(Invocation::Finish(saved)) = self.invocation.take() {
-            self.vm.write(ELAPSED, &words_as_bytes(&saved))?;
+            self.vm.write(self.layout.address(ELAPSED), &words_as_bytes(&saved))?;
         }
         Ok(())
     }
@@ -370,11 +421,13 @@ impl MotionRunner {
                 self.program.program.data.len(),
                 self.stack_end,
                 self.storage_end,
+                self.layout.size(),
             )?;
             let mut host = NativeHost {
                 services,
                 storage_end: self.storage_end,
                 stack_end: self.stack_end,
+                layout: self.layout,
             };
             let step = self.vm.run(&mut host, 1)?;
             if step != Step::Yield {
@@ -410,10 +463,12 @@ fn preflight(
     stack_start: usize,
     stack_end: usize,
     storage_end: usize,
+    external_size: usize,
 ) -> Result<()> {
     let memory = MotionMemory {
         end: storage_end,
         stack_end,
+        external_size,
     };
     let mut sp = vm.stack_pointer();
     let pop = |sp: &mut usize| -> Result<u32> {
@@ -627,6 +682,7 @@ struct NativeHost<'a, S> {
     services: &'a mut S,
     storage_end: usize,
     stack_end: usize,
+    layout: ExternalLayout,
 }
 
 impl<S: MotionServices> Host for NativeHost<'_, S> {
@@ -646,6 +702,7 @@ impl<S: MotionServices> Host for NativeHost<'_, S> {
         let memory = MotionMemory {
             end: self.storage_end,
             stack_end: self.stack_end,
+            external_size: self.layout.size(),
         };
         match index {
             0 => {
@@ -780,7 +837,7 @@ impl<S: MotionServices> Host for NativeHost<'_, S> {
                 memory.write_array(vm, words[0], &transform(vector, matrix))?;
             }
             38 => {
-                memory.write(vm, RUNNING, &0_u32.to_le_bytes())?;
+                memory.write(vm, self.layout.address(RUNNING), &0_u32.to_le_bytes())?;
                 return Ok(NativeReturn::YieldVoid);
             }
             39 => return Ok(NativeReturn::Value(self.services.random_integer())),
@@ -828,12 +885,13 @@ pub(super) fn native_argument_words(index: u32) -> Option<usize> {
 struct MotionMemory {
     end: usize,
     stack_end: usize,
+    external_size: usize,
 }
 
 impl MotionMemory {
     fn range(&self, address: u32, length: usize) -> Result<()> {
         let limit = if address & EXTERNAL != 0 {
-            EXTERNAL_SIZE
+            self.external_size
         } else if (address as usize) < self.stack_end {
             self.stack_end
         } else {
@@ -880,7 +938,7 @@ impl MotionMemory {
     fn string(&self, vm: &Vm, address: u32) -> Result<Vec<u8>> {
         self.range(address, 1)?;
         let available = if address & EXTERNAL != 0 {
-            EXTERNAL_SIZE
+            self.external_size
         } else if (address as usize) < self.stack_end {
             self.stack_end
         } else {

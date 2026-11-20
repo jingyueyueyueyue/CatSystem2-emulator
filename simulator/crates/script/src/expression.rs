@@ -120,6 +120,12 @@ pub fn eval_expression_parameter(source: &[u8], state: &mut ExpressionState) -> 
     if source.len() > MAX_EXPRESSION_BYTES {
         return Err(expression_error(0, "expression is too long"));
     }
+    if let Some(name) = source.trim_ascii().strip_prefix(b"%")
+        && name.first().is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && name.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Ok(0);
+    }
     eval_expression_fallback_with_text(source.strip_suffix(b"%").unwrap_or(source), state)
 }
 
@@ -798,6 +804,22 @@ mod tests {
         assert_eq!(eval_expression_parameter(b"\"\x81\x40\"+7%", &mut state).unwrap(), 7);
         assert_eq!(eval_expression_parameter(b"1+(2 3)", &mut state).unwrap(), 5);
         assert!(eval_expression(b"1+(2 3)", &mut state).is_err());
+    }
+
+    #[test]
+    fn parameter_expression_preserves_standalone_percent_identifier_result() {
+        let mut state = ExpressionState::new(1);
+        state.current = 42;
+        state.shared[0] = 9;
+        state.named.entry("mes_off".into()).or_default().insert(0, 11);
+        let original = state.clone();
+
+        assert_eq!(eval_expression_parameter(b"%mes_off", &mut state).unwrap(), 0);
+        assert_eq!(eval_expression_parameter(b" %unknown \t", &mut state).unwrap(), 0);
+        assert_eq!(state, original);
+        assert_eq!(eval_expression_parameter(b"11%4", &mut state).unwrap(), 3);
+        assert!(eval_expression_parameter(b"%mes_off)", &mut state).is_err());
+        assert!(eval_expression(b"%mes_off", &mut state).is_err());
     }
 
     #[test]

@@ -1,11 +1,28 @@
 use super::{ScriptTextEncoding, read_entry_with_fallback};
 use anyhow::Result;
-use cs2_renderer::{Canvas, Color, Point};
+use cs2_renderer::{Canvas, Color, FontRasterizer, Point};
 use cs2_runtime::ResourceIndex;
 use std::collections::BTreeSet;
 use std::path::Path;
+#[cfg(any(windows, target_os = "android"))]
+use std::path::PathBuf;
+use std::sync::Arc;
 
-pub(super) fn load_font(resources: &ResourceIndex) -> Vec<cs2_renderer::FontRasterizer> {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FontOrigin {
+    Resource(String),
+    #[cfg(any(windows, target_os = "android"))]
+    System(PathBuf),
+}
+
+#[derive(Debug)]
+pub(super) struct LoadedFont {
+    pub origin: Arc<FontOrigin>,
+    pub index: u32,
+    pub rasterizer: Arc<FontRasterizer>,
+}
+
+pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
     let mut fonts = Vec::new();
     let names = resources
         .files()
@@ -33,7 +50,7 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<cs2_renderer::FontRast
             continue;
         }
         if let Ok(bytes) = read_entry_with_fallback(resources, &name) {
-            append_faces(&mut fonts, &bytes);
+            append_faces(&mut fonts, FontOrigin::Resource(name), &bytes);
         }
     }
 
@@ -49,8 +66,9 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<cs2_renderer::FontRast
             "simsunb.ttf",
             "arial.ttf",
         ] {
-            if let Ok(bytes) = std::fs::read(windows.join("Fonts").join(name)) {
-                append_faces(&mut fonts, &bytes);
+            let path = windows.join("Fonts").join(name);
+            if let Ok(bytes) = std::fs::read(&path) {
+                append_faces(&mut fonts, FontOrigin::System(path), &bytes);
             }
         }
     }
@@ -67,8 +85,12 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<cs2_renderer::FontRast
                 continue;
             }
             if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(font) = cs2_renderer::FontRasterizer::from_bytes(&bytes, 0) {
-                    fonts.push(font);
+                if let Ok(font) = FontRasterizer::from_bytes(&bytes, 0) {
+                    fonts.push(LoadedFont {
+                        origin: Arc::new(FontOrigin::System(path)),
+                        index: 0,
+                        rasterizer: Arc::new(font),
+                    });
                     system_faces += 1;
                     cjk_loaded |= cjk;
                 }
@@ -126,7 +148,8 @@ fn android_font_priority(name: &str) -> u8 {
     }
 }
 
-fn append_faces(fonts: &mut Vec<cs2_renderer::FontRasterizer>, bytes: &[u8]) {
+fn append_faces(fonts: &mut Vec<LoadedFont>, origin: FontOrigin, bytes: &[u8]) {
+    let origin = Arc::new(origin);
     let count = if bytes.starts_with(b"ttcf") {
         bytes
             .get(8..12)
@@ -140,15 +163,19 @@ fn append_faces(fonts: &mut Vec<cs2_renderer::FontRasterizer>, bytes: &[u8]) {
         if fonts.len() >= 64 {
             break;
         }
-        if let Ok(font) = cs2_renderer::FontRasterizer::from_bytes(bytes, face) {
-            fonts.push(font);
+        if let Ok(font) = FontRasterizer::from_bytes(bytes, face) {
+            fonts.push(LoadedFont {
+                origin: Arc::clone(&origin),
+                index: face,
+                rasterizer: Arc::new(font),
+            });
         }
     }
 }
 
 pub(super) fn draw_message_text(
     canvas: &mut Canvas,
-    fonts: &[cs2_renderer::FontRasterizer],
+    fonts: &[LoadedFont],
     speaker: &str,
     text: &str,
     encoding: ScriptTextEncoding,
@@ -182,7 +209,7 @@ pub(super) fn draw_message_text(
 
 fn draw_text_block(
     canvas: &mut Canvas,
-    fonts: &[cs2_renderer::FontRasterizer],
+    fonts: &[LoadedFont],
     text: &str,
     origin: Point,
     size: u32,
@@ -213,6 +240,7 @@ fn draw_text_block(
             |character, size, bold, italic| {
                 let font = fonts
                     .iter()
+                    .map(|face| &face.rasterizer)
                     .find(|font| font.has_character(character))
                     .ok_or_else(|| cs2_renderer::RendererError::Decode {
                         message: format!(

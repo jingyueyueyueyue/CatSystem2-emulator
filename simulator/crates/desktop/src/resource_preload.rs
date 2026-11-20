@@ -1,7 +1,7 @@
 //! Ordinary 434..438's explicit resource queue and cached bytes.
 //! A portable synchronous worker completes a requested batch at 436. It keeps
 //! real resource failures distinct from a completed, missing-file attempt.
-use cs2_runtime::{ResourceIndex, RuntimeError, resource_router::ResourceMode};
+use cs2_runtime::{ResourceCandidate, ResourceIndex, RuntimeError, resource_router::ResourceMode};
 use cs2_script::{NativeReturn, Result, Vm};
 
 use super::{cp932_to_utf8, expand_kcs_format, native_state_error, read_u32};
@@ -10,12 +10,18 @@ const MAX_LIVE: usize = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
+pub(super) struct SourcedResource {
+    pub source: ResourceCandidate,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 struct Request {
     name: String,
     priority: i32,
     age: i32,
     attempted: bool,
-    bytes: Option<Vec<u8>>,
+    resource: Option<SourcedResource>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,8 +35,12 @@ pub(super) struct ResourcePreloads {
 impl ResourcePreloads {
     pub(crate) fn graph_request_count(&self) -> usize { self.requests.len() }
     pub(super) fn cached(&self, name: &str) -> Option<&[u8]> {
+        self.cached_with_source(name).map(|resource| resource.bytes.as_slice())
+    }
+
+    pub(super) fn cached_with_source(&self, name: &str) -> Option<&SourcedResource> {
         self.requests.iter().find(|request| request.name.eq_ignore_ascii_case(name))
-            .and_then(|request| request.bytes.as_deref())
+            .and_then(|request| request.resource.as_ref())
     }
 
     pub(super) fn call(
@@ -76,7 +86,7 @@ impl ResourcePreloads {
                         }
                         self.requests.push(Request {
                             name: resolved.clone(), priority, age: priority,
-                            attempted: false, bytes: None,
+                            attempted: false, resource: None,
                         });
                     }
                 }
@@ -90,9 +100,9 @@ impl ResourcePreloads {
                     self.completed_through = 0;
                     for request in &mut self.requests {
                         if request.attempted { continue; }
-                        let bytes = read_optional(resources, &request.name, MAX_LIVE - self.bytes)?;
-                        let total = self.bytes + bytes.as_ref().map_or(0, Vec::capacity);
-                        request.bytes = bytes;
+                        let resource = read_optional(resources, &request.name, MAX_LIVE - self.bytes)?;
+                        let total = self.bytes + resource.as_ref().map_or(0, |resource| resource.bytes.capacity());
+                        request.resource = resource;
                         request.attempted = true;
                         self.bytes = total;
                         self.completed_through = request.priority;
@@ -116,7 +126,7 @@ impl ResourcePreloads {
                     let mut reclaimed = 0;
                     self.requests.retain(|request| {
                         if request.priority < 0 {
-                            reclaimed += request.bytes.as_ref().map_or(0, Vec::capacity);
+                            reclaimed += request.resource.as_ref().map_or(0, |resource| resource.bytes.capacity());
                             false
                         } else { true }
                     });
@@ -150,11 +160,11 @@ fn formatted(vm: &Vm, address: u32) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-fn read_optional(resources: &ResourceIndex, name: &str, remaining: usize) -> Result<Option<Vec<u8>>> {
+fn read_optional(resources: &ResourceIndex, name: &str, remaining: usize) -> Result<Option<SourcedResource>> {
     let Some(candidate) = resources.resolve_mode_candidate(name, ResourceMode::LooseFirst)
         .map_err(|_| native_state_error("native 436 resource routing failed"))? else { return Ok(None); };
     match resources.read_candidate_bounded(candidate, remaining) {
-        Ok(bytes) => Ok(bytes),
+        Ok(bytes) => Ok(bytes.map(|bytes| SourcedResource { source: candidate.clone(), bytes })),
         Err(RuntimeError::ResourceNotFound(_)) => Ok(None),
         Err(RuntimeError::Io { source, .. }) if matches!(source.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
@@ -178,7 +188,7 @@ mod tests {
 
         assert!(read_optional(&resources, "resource.bin", 4).unwrap().is_none());
         assert!(read_optional(&resources, "missing.bin", 5).unwrap().is_none());
-        assert_eq!(read_optional(&resources, "resource.bin", 5).unwrap().unwrap(), b"grown");
+        assert_eq!(read_optional(&resources, "resource.bin", 5).unwrap().unwrap().bytes, b"grown");
         assert_eq!(resources.read("resource.bin").unwrap(), b"grown");
         std::fs::remove_dir_all(root).unwrap();
     }

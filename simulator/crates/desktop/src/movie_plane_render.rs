@@ -205,6 +205,24 @@ impl MpegMovieHost {
 }
 
 impl HeadlessPlayer {
+    pub fn host_replay_movie_diagnostics(&self) -> Result<Vec<String>> {
+        let presentations = self.movie_host.scene_movie_presentations();
+        self.movie_playbacks.iter().map(|(&handle, &playback)| {
+            let plane = self.movie_host.planes.movies.get(&handle);
+            let host = plane.map_or(&self.movie_host, |movie| movie.player.as_ref());
+            let surface = host.frame_surface();
+            let sample = host.replay_playback_sample(playback)?;
+            let composited = presentations.iter().find(|receipt| {
+                receipt.playback == playback && std::sync::Arc::ptr_eq(&receipt.surface, &surface)
+            }).map(|receipt| receipt.time);
+            Ok(format!(
+                "handle={handle} target={:?} resource={:?} playback={playback} active={} looped={:?} decoded_pts={:?} composited_pts={composited:?}",
+                plane.map(|movie| movie.target), self.movie_resources.get(&handle), sample.is_some(),
+                sample.map(|(looped, _)| looped), sample.and_then(|(_, pts)| pts),
+            ))
+        }).collect()
+    }
+
     /// Call only after the app's real pixel surface/texture was presented.
     /// Merely requesting a report or composing a Canvas is not presentation.
     pub fn acknowledge_movie_frame(&self) -> Result<()> {

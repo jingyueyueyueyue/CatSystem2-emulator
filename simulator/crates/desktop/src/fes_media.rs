@@ -29,6 +29,10 @@ pub(super) use image_source::{apply_difimage_attribute, apply_difimage_reference
     apply_image_source_command, request_image_file, update_image_sources};
 pub(crate) use image_source::{initialize_image_idn, source_image, release_image_source,
     release_image_sources, validate_image_source_bindings, source_draw_options, prepare_raw_image_source};
+#[cfg(test)]
+pub(super) fn install_ordinary_frame(layer: &mut FesMediaLayer, image: cs2_renderer::RgbaFrame) {
+    image_source::install_ordinary_frame(layer, image);
+}
 
 const BACKGROUND: &str = "\0driver.baseimg";
 const BACKGROUND_PENDING: &str = "\0driver.baseimg.pending";
@@ -185,6 +189,18 @@ impl FesRuntime {
             driver.fallback_command(command, expression)?;
             return Ok(true);
         }
+        if subcommand == "draw"
+            && targets.iter().all(|target| {
+                matches!(target, Target::Image(key) if self.media[key].kind == "BUTTON")
+            })
+        {
+            events.push(LogicEvent {
+                frame,
+                kind: "fes-media".into(),
+                detail: format!("object={name:?} command=draw action=ignored-by-button targets={}", targets.len()),
+            });
+            return Ok(true);
+        }
         if !matches!(
             subcommand.as_str(),
             "pos"
@@ -199,12 +215,23 @@ impl FesRuntime {
                 | "anm"
                 | "fade"
                 | "enable"
+                | "coordmode"
         ) {
             bail!("unsupported FES media subcommand {subcommand:?} for {name:?}");
         }
         let args = &command.parameters[2..];
 
-        if subcommand == "load" {
+        if subcommand == "coordmode" {
+            if !targets.iter().all(|target| matches!(target, Target::Image(key) if self.media[key].kind == "IMAGE")) {
+                bail!("unsupported FES media subcommand {subcommand:?} for {name:?}");
+            }
+            let mode = number(args, 0, Some(0), command.context.current, driver, expression)?;
+            for target in &targets {
+                if let Target::Image(key) = target {
+                    self.media.get_mut(key).context("FES coordmode target disappeared")?.source.coordmode = mode;
+                }
+            }
+        } else if subcommand == "load" {
             for target in &targets {
                 // Unlike ordinary property arguments, IMAGE load evaluates its
                 // frame number separately for every valid target bank.

@@ -185,6 +185,16 @@ pub(super) fn composite(
     diffuse_alpha_only: bool,
 ) -> Result<()> {
     let size = texture_size(source)?;
+    const MAX_EXACT_HALF_PIXEL_AREA: u32 = 1 << 23;
+    if diffuse_alpha_only
+        && target.dimensions() == (source.width(), source.height())
+        && (1..=4096).contains(&source.width())
+        && (1..=4096).contains(&source.height())
+        && source.width() * source.height() <= MAX_EXACT_HALF_PIXEL_AREA
+    {
+        composite_unit_diffuse(target, source, alpha);
+        return Ok(());
+    }
     draw_quad(
         target,
         source,
@@ -193,6 +203,34 @@ pub(super) fn composite(
         u32::from(alpha) << 24 | 0x00ff_ffff,
         diffuse_alpha_only,
     )
+}
+
+fn composite_unit_diffuse(target: &mut Canvas, source: &RgbaFrame, alpha: u8) {
+    match alpha {
+        0 => {}
+        255 => {
+            target.pixels_mut().copy_from_slice(source.pixels());
+            for pixel in target.pixels_mut().chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+        _ => {
+            let factor = u16::from(alpha);
+            let inverse = 255 - factor;
+            for (destination, sample) in target
+                .pixels_mut()
+                .chunks_exact_mut(4)
+                .zip(source.pixels().chunks_exact(4))
+            {
+                for channel in 0..3 {
+                    destination[channel] = ((u16::from(sample[channel]) * factor
+                        + u16::from(destination[channel]) * inverse + 127) / 255) as u8;
+                }
+                destination[3] = ((factor * factor + u16::from(destination[3]) * inverse + 127)
+                    / 255) as u8;
+            }
+        }
+    }
 }
 
 fn ring_index(x: i32, y: i32) -> i32 {
@@ -470,4 +508,71 @@ fn effect_triangle_alpha(
         argb,
         diffuse_alpha_only,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..width * height * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn compare_composite(
+        width: u32,
+        height: u32,
+        alpha: u8,
+        diffuse: bool,
+        destination: [u32; 2],
+    ) -> Result<()> {
+        let source = RgbaFrame::from_rgba8(width, height, bytes(width, height, 7))?;
+        let [target_width, target_height] = destination;
+        let mut baseline = Canvas::from_rgba8(
+            target_width,
+            target_height,
+            bytes(target_width, target_height, 42),
+        )?;
+        let mut actual = baseline.clone();
+        let texture = texture_size(&source)?;
+        draw_quad(
+            &mut baseline,
+            &source,
+            texture,
+            full_quad(&source, texture),
+            u32::from(alpha) << 24 | 0x00ff_ffff,
+            diffuse,
+        )?;
+        composite(&mut actual, &source, alpha, diffuse)?;
+        assert!(
+            baseline.pixels() == actual.pixels(),
+            "RGBA mismatch for {width}x{height} -> {destination:?}, alpha={alpha}, diffuse={diffuse}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unit_diffuse_composite_matches_triangle_rgba() -> Result<()> {
+        for alpha in 0..=255 {
+            compare_composite(5, 7, alpha, true, [5, 7])?;
+        }
+        for alpha in [0, 1, 127, 254, 255] {
+            compare_composite(1280, 720, alpha, true, [1280, 720])?;
+        }
+        compare_composite(4096, 1, 173, true, [4096, 1])?;
+        compare_composite(1, 4096, 173, true, [1, 4096])?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_quad_fallback_matches_triangle_rgba() -> Result<()> {
+        compare_composite(7, 5, 213, true, [4, 8])?;
+        compare_composite(7, 5, 213, false, [7, 5])?;
+        compare_composite(4097, 1, 213, true, [4097, 1])
+    }
 }

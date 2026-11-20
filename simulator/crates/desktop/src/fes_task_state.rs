@@ -520,6 +520,26 @@ impl HeadlessPlayer {
             { bail!("FES checkpoint slot and live object metadata differ"); }
             let external = tasks.checkpoint_external_binding(id).context("restored FES external binding is absent")?;
             object.checkpoint_binding(&external, true)?;
+            if let (Some(name), Some(runtime)) = (object.name.as_ref(), object.runtime.as_mut())
+                && let Some(driver) = runtime.driver.as_mut()
+            {
+                let resources = &self.scan.resources;
+                let requested = String::from_utf8_lossy(&super::cp932_to_utf8(name)).into_owned();
+                if let Ok(names) = resources.category_names(b"fes", &requested)
+                    && let Some(candidate) = names.iter().find_map(|name| resources.find(name))
+                {
+                    let island_source = super::is_island_gbk_fes_source(resources, candidate);
+                    if (island_source || candidate.size == super::REBELLIONS_MESSAGE_FES_SIZE as u64)
+                        && let Ok(bytes) = resources.read_candidate(candidate)
+                        && super::parse_document(&bytes).is_ok_and(|document| document == runtime.document)
+                    {
+                        driver.set_island_gbk_fes_source(island_source);
+                        driver.set_rebellions_message_fes_source(
+                            super::is_rebellions_message_fes_source(resources, &bytes),
+                        );
+                    }
+                }
+            }
             if let Some(driver) = object.runtime.as_ref().and_then(|runtime| runtime.driver.as_ref()) {
                 let node = saved.nodes.get(&id).context("FES checkpoint scene node is absent")?;
                 if driver.interpreter.local_values() != node.fes_parameters.as_slice() {

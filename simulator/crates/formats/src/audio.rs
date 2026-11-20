@@ -370,7 +370,9 @@ fn validate_pages(data: &[u8], require_eos: bool) -> Result<(), OggVorbisError> 
         }
 
         let granule = u64::from_le_bytes(header[6..14].try_into().unwrap());
-        complete_timed_packet = granule != u64::MAX && granule != 0 && !lacing.is_empty();
+        complete_timed_packet = granule != u64::MAX
+            && granule != 0
+            && lacing.iter().any(|&lace| lace != 255);
         if granule != u64::MAX {
             if previous_granule.is_some_and(|previous| granule < previous) {
                 return Err(OggVorbisError::InvalidGranulePosition { page: page_index });
@@ -391,7 +393,7 @@ fn validate_pages(data: &[u8], require_eos: bool) -> Result<(), OggVorbisError> 
         page_index += 1;
     }
 
-    if previous_continued || !saw_end && (require_eos || !complete_timed_packet) {
+    if !saw_end && (require_eos || !complete_timed_packet) {
         return Err(OggVorbisError::Truncated);
     }
     Ok(())
@@ -507,6 +509,12 @@ mod tests {
         assert!(matches!(validate_pages(&complete[..complete.len() - 1], false), Err(OggVorbisError::Truncated)));
         let continuing = [first.as_slice(), &ogg_page(0, 1, 4, &[255], &[0; 255])].concat();
         assert!(matches!(validate_pages(&continuing, false), Err(OggVorbisError::Truncated)));
+        let timed_with_tail = [first.as_slice(), &ogg_page(0, 1, 4, &[2, 255], &[0; 257])].concat();
+        assert!(validate_pages(&timed_with_tail, false).is_ok());
+        assert!(matches!(validate_pages(&timed_with_tail, true), Err(OggVorbisError::Truncated)));
+        assert!(matches!(validate_pages(&timed_with_tail[..timed_with_tail.len() - 1], false), Err(OggVorbisError::Truncated)));
+        let invalid_end = [first.as_slice(), &ogg_page(4, 1, 4, &[2, 255], &[0; 257])].concat();
+        assert!(matches!(validate_pages(&invalid_end, false), Err(OggVorbisError::InvalidPageFlags { page: 1 })));
         let mut corrupt = complete;
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(matches!(validate_pages(&corrupt, false), Err(OggVorbisError::PageChecksum { page: 1, .. })));

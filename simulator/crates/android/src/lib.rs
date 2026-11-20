@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Mutex;
 use cs2_desktop::{HeadlessPlayer, HostFrameTiming};
 use cs2_runtime::{InputEvent, InputKey};
 use cs2_runtime::message_object::MessageTextInputEvent;
@@ -14,6 +15,7 @@ struct Sessions {
     next: u64,
     players: BTreeMap<u64, HeadlessPlayer>,
     displayed_frames: BTreeMap<u64, DisplayedFrame>,
+    story_traces: BTreeMap<u64, StoryTrace>,
     error: CString,
     clipboard: CString,
     clipboard_units: Vec<u16>,
@@ -49,6 +51,61 @@ impl DisplayedFrame {
 const FRAME_CHANGED: i32 = 1;
 const FRAME_UNCHANGED: i32 = 4;
 
+const STORY_HEARTBEAT_FRAMES: u64 = 30;
+const STORY_SCENE_LIMIT: usize = 256;
+static LAST_STORY_SESSION: Mutex<u64> = Mutex::new(0);
+
+#[derive(Default)]
+struct StoryTrace {
+    session: u64,
+    seq: u64,
+    last_frame: u64,
+    state: &'static str,
+    scene: String,
+    group: i32,
+    record: i32,
+    row: CString,
+}
+
+impl StoryTrace {
+    fn new() -> Option<Self> {
+        let mut last = LAST_STORY_SESSION.lock().ok()?;
+        *last = last.checked_add(1)?;
+        Some(Self { session: *last, ..Self::default() })
+    }
+
+    fn observe(&mut self, snapshot: (u64, &'static str, &str, i32, i32)) -> Option<&CStr> {
+        let (frame, state, scene, group, record) = snapshot;
+        let state = match state {
+            "page" | "choice" | "active" | "ended" => state,
+            _ => "unknown",
+        };
+        let scene = if !scene.is_empty() && scene.len() <= STORY_SCENE_LIMIT
+            && scene.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)) {
+            scene
+        } else {
+            "-"
+        };
+        if (state, scene, group, record) != (self.state, self.scene.as_str(), self.group, self.record) {
+            self.seq = self.seq.checked_add(1)?;
+            self.state = state;
+            self.scene.clear();
+            self.scene.push_str(scene);
+            self.group = group;
+            self.record = record;
+        } else {
+            self.last_frame = self.last_frame.min(frame);
+            if frame - self.last_frame < STORY_HEARTBEAT_FRAMES { return None; }
+        }
+        self.last_frame = frame;
+        self.row = CString::new(format!(
+            "v1 session={} seq={} frame={frame} state={state} scene={scene} group={group} record={record}",
+            self.session, self.seq,
+        )).ok()?;
+        Some(&self.row)
+    }
+}
+
 thread_local! {
     static SESSIONS: RefCell<Sessions> = RefCell::new(Sessions::default());
 }
@@ -77,7 +134,7 @@ unsafe fn path(value: *const c_char) -> Result<String, String> {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_char) -> u64 {
+pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_char, story: i32) -> u64 {
     call(0, |sessions| {
         let game = unsafe { path(game)? };
         let saves = unsafe { path(saves)? };
@@ -92,10 +149,18 @@ pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_c
         player.enable_host_system_open_queue();
         player.enable_host_tweet_queue();
         player.enable_host_dialog_queue();
+        if story != 0 {
+            player.enable_host_story_trace();
+        }
         player.load_startup().map_err(|error| format!("Load startup: {error:#}"))?;
         let id = sessions.next.checked_add(1).ok_or("Android session ids exhausted")?;
         sessions.next = id;
         sessions.players.insert(id, player);
+        if story != 0 {
+            if let Some(trace) = StoryTrace::new() {
+                sessions.story_traces.insert(id, trace);
+            }
+        }
         Ok(id)
     })
 }
@@ -106,6 +171,7 @@ pub extern "C" fn cs2_android_close(id: u64) -> i32 {
         sessions.players.get_mut(&id).ok_or("Android session is absent")?.cancel_host_tweet_requests();
         sessions.players.remove(&id).ok_or("Android session is absent")?;
         sessions.displayed_frames.remove(&id);
+        sessions.story_traces.remove(&id);
         sessions.message_revisions.remove(&id);
         sessions.scene_revisions.remove(&id);
         Ok(0)
@@ -379,20 +445,18 @@ pub extern "C" fn cs2_android_message_list_action(
     })
 }
 
+/// The optional story row is borrowed from the session; consume it before the next native call.
 #[unsafe(no_mangle)]
-pub extern "C" fn cs2_android_step(id: u64, budget: u32) -> i32 {
-    step(id, budget, None)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cs2_android_step_timed(id: u64, budget: u32, timing: *mut HostFrameTiming) -> i32 {
-    step(id, budget, unsafe { timing.as_mut() })
-}
-
-fn step(id: u64, budget: u32, timing: Option<&mut HostFrameTiming>) -> i32 {
+pub unsafe extern "C" fn cs2_android_step(
+    id: u64, budget: u32, timing: *mut HostFrameTiming, story_row: *mut *const c_char,
+) -> i32 {
+    let story_row = unsafe { story_row.as_mut() }.map(|output| {
+        *output = std::ptr::null();
+        output
+    });
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
-        let step = if let Some(timing) = timing {
+        let step = if let Some(timing) = unsafe { timing.as_mut() } {
             let (result, sample) = HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
             *timing = sample;
             result
@@ -423,7 +487,7 @@ fn step(id: u64, budget: u32, timing: Option<&mut HostFrameTiming>) -> i32 {
             }
         }
         player.limit_host_diagnostics(10_000, 1_000);
-        Ok(if player.quit_requested() {
+        let result = if player.quit_requested() {
             2
         } else if !completed {
             0
@@ -433,7 +497,13 @@ fn step(id: u64, budget: u32, timing: Option<&mut HostFrameTiming>) -> i32 {
             FRAME_UNCHANGED
         } else {
             FRAME_CHANGED
-        })
+        };
+        if completed {
+            if let (Some(output), Some(trace)) = (story_row, sessions.story_traces.get_mut(&id)) {
+                *output = trace.observe(player.host_story_trace()).map_or(std::ptr::null(), CStr::as_ptr);
+            }
+        }
+        Ok(result)
     })
 }
 
@@ -743,5 +813,58 @@ mod frame_tests {
         assert!(!frame.matches([2, 1], &changed));
         frame.record([2, 1], &changed);
         assert!(frame.matches([2, 1], &changed));
+    }
+}
+
+#[cfg(test)]
+mod story_trace_tests {
+    use super::*;
+
+    #[test]
+    fn sequences_transitions_and_repeats_only_on_heartbeat() {
+        let mut trace = StoryTrace::new().unwrap();
+        let session = trace.session;
+        let expected = format!("v1 session={session} seq=1 frame=5 state=page scene=Scene_1.cst-2 group=-1 record=9");
+        assert_eq!(trace.observe((5, "page", "Scene_1.cst-2", -1, 9)).unwrap().to_str().unwrap(), expected);
+        assert!(trace.observe((5, "page", "Scene_1.cst-2", -1, 9)).is_none());
+        assert!(trace.observe((34, "page", "Scene_1.cst-2", -1, 9)).is_none());
+        assert_eq!(trace.observe((35, "page", "Scene_1.cst-2", -1, 9)).unwrap().to_str().unwrap(),
+            expected.replace("frame=5", "frame=35"));
+        for (index, snapshot) in [
+            (36, "choice", "Scene_1.cst-2", -1, 9),
+            (37, "choice", "next", -1, 9),
+            (38, "choice", "next", 2, 9),
+            (39, "choice", "next", 2, 10),
+            (40, "ended", "next", 2, 10),
+        ].into_iter().enumerate() {
+            let (frame, state, scene, group, record) = snapshot;
+            let seq = index + 2;
+            assert_eq!(trace.observe(snapshot).unwrap().to_str().unwrap(),
+                format!("v1 session={session} seq={seq} frame={frame} state={state} scene={scene} group={group} record={record}"));
+        }
+        assert!(trace.observe((0, "ended", "next", 2, 10)).is_none());
+        assert!(trace.observe((29, "ended", "next", 2, 10)).is_none());
+        assert!(trace.observe((30, "ended", "next", 2, 10)).unwrap().to_str().unwrap().contains(" seq=6 "));
+    }
+
+    #[test]
+    fn resets_sequence_per_session_and_redacts_invalid_fields() {
+        let mut first = StoryTrace::new().unwrap();
+        let mut second = StoryTrace::new().unwrap();
+        assert!(first.session > 0 && second.session > first.session);
+        let too_long = "a".repeat(STORY_SCENE_LIMIT + 1);
+        for (index, scene) in ["", "line of dialogue", "dir/scene", "dir\\scene", "a\nforged", "\0", "\u{00e9}", &too_long].into_iter().enumerate() {
+            let frame = index as u64;
+            let session = first.session;
+            let record = index as i32;
+            let seq = index + 1;
+            assert_eq!(first.observe((frame, "bad state", scene, i32::MIN, record)).unwrap().to_str().unwrap(),
+                format!("v1 session={session} seq={seq} frame={frame} state=unknown scene=- group=-2147483648 record={record}"));
+        }
+        let session = second.session;
+        let frame = u64::MAX;
+        let scene = "Z".repeat(STORY_SCENE_LIMIT);
+        assert_eq!(second.observe((frame, "active", &scene, i32::MAX, i32::MIN)).unwrap().to_str().unwrap(),
+            format!("v1 session={session} seq=1 frame={frame} state=active scene={scene} group=2147483647 record=-2147483648"));
     }
 }

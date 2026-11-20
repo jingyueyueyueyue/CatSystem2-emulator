@@ -2174,6 +2174,14 @@ impl MessageObject {
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.append_with_legacy_codec(bytes, encoding_rs::SHIFT_JIS)
+    }
+
+    pub fn append_legacy_gbk(&mut self, bytes: &[u8]) -> Result<()> {
+        self.append_with_legacy_codec(bytes, encoding_rs::GBK)
+    }
+
+    fn append_with_legacy_codec(&mut self, bytes: &[u8], codec: &'static encoding_rs::Encoding) -> Result<()> {
         if !self.configured() {
             return Ok(());
         }
@@ -2190,10 +2198,16 @@ impl MessageObject {
                     if index != 0 {
                         text.push('\u{ffff}');
                     }
-                    let (decoded, _, errors) = encoding_rs::SHIFT_JIS.decode(part);
-                    if errors {
-                        return Err(invalid("message append has invalid CP932 input"));
-                    }
+                    let decoded = if std::ptr::eq(codec, encoding_rs::GBK) {
+                        codec.decode_without_bom_handling_and_without_replacement(part)
+                            .ok_or_else(|| invalid("message append has invalid GBK input"))?
+                    } else {
+                        let (decoded, _, errors) = codec.decode(part);
+                        if errors {
+                            return Err(invalid("message append has invalid CP932 input"));
+                        }
+                        decoded
+                    };
                     text.push_str(&decoded);
                 }
                 text
@@ -2201,14 +2215,22 @@ impl MessageObject {
             MessageEncoding::Unicode => {
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| invalid("message append has invalid UTF-8 input"))?;
-                if text.encode_utf16().count() >= 4096 {
-                    return Err(invalid(
-                        "Unicode message append needs fewer than 4096 UTF-16 units",
-                    ));
-                }
                 text.to_owned()
             }
         };
+        self.append_decoded(bytes, &text)
+    }
+
+    pub fn append_decoded(&mut self, bytes: &[u8], text: &str) -> Result<()> {
+        if !self.configured() {
+            return Ok(());
+        }
+        if bytes.contains(&0) || text.contains('\0') {
+            return Err(invalid("message append contains an embedded zero"));
+        }
+        if self.encoding == MessageEncoding::Unicode && text.encode_utf16().count() >= 4096 {
+            return Err(invalid("Unicode message append needs fewer than 4096 UTF-16 units"));
+        }
         if self.source.len().saturating_add(text.len()) > MAX_BYTES
             || self.raw_appends.len() >= MAX_ENTRIES
             || self
@@ -2221,7 +2243,7 @@ impl MessageObject {
         {
             return Err(invalid("message append storage limit exceeded"));
         }
-        self.source.push_str(&text);
+        self.source.push_str(text);
         self.raw_appends.push(bytes.to_vec());
         self.valid = false;
         self.complete_snapshot = false;
@@ -2640,6 +2662,15 @@ impl MessageObject {
         if !self.configured() {
             return Ok(None);
         }
+        #[cfg(not(target_os = "android"))]
+        if self.reveal_trace_enabled() && !self.source.is_empty() {
+            eprintln!(
+                "message-reveal start id={} gen={} task={} previous_task={} playback={} limit={} display={:?} scale={:?}",
+                self.id, self.surface_generation, elapsed, self.last_input_time,
+                self.playback_time, limit, display, time_scale,
+            );
+        }
+        let continuing = self.active && self.segment_limit == limit;
         self.segment_limit = limit;
         match display {
             MessagePlaneDisplay::Unreachable => Ok(None),
@@ -2649,7 +2680,9 @@ impl MessageObject {
             }
             MessagePlaneDisplay::Visible => {
                 self.prepare(time_scale, backend)?;
-                self.last_input_time = elapsed;
+                if !continuing {
+                    self.last_input_time = elapsed;
+                }
                 self.active = true;
                 // Full startup copy must not refresh complete_snapshot.
                 self.advance_display(self.playback_time, MessageCopy::Full, backend)
@@ -2686,6 +2719,14 @@ impl MessageObject {
         if !self.active || !self.configured() {
             return Ok(None);
         }
+        #[cfg(not(target_os = "android"))]
+        if self.reveal_trace_enabled() && !self.source.is_empty() {
+            eprintln!(
+                "message-reveal tick id={} gen={} task={} previous_task={} delta={} playback={}",
+                self.id, self.surface_generation, elapsed, self.last_input_time,
+                elapsed.wrapping_sub(self.last_input_time), self.playback_time,
+            );
+        }
         self.prepare(time_scale, backend)?;
         let update = self.advance_display(self.playback_time, self.ordinary_copy(), backend)?;
         // Original body 0x187186..0x187192 stores !advance.complete.
@@ -2696,6 +2737,19 @@ impl MessageObject {
             .wrapping_add(elapsed.wrapping_sub(self.last_input_time));
         self.last_input_time = elapsed;
         Ok(Some(update))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn reveal_trace_enabled(&self) -> bool {
+        static TARGET: std::sync::OnceLock<Option<RevealTraceTarget>> = std::sync::OnceLock::new();
+        match TARGET.get_or_init(|| match std::env::var("CS2_MESSAGE_REVEAL_TRACE").ok()?.trim() {
+            "fes" => Some(RevealTraceTarget::Fes),
+            id => id.parse().ok().map(RevealTraceTarget::Object),
+        }) {
+            Some(RevealTraceTarget::Fes) => self.id < 0,
+            Some(RevealTraceTarget::Object(id)) => self.id == *id,
+            None => false,
+        }
     }
 
     fn ordinary_copy(&self) -> MessageCopy {
@@ -2797,6 +2851,20 @@ impl MessageObject {
                 }
             }
         }
+        #[cfg(not(target_os = "android"))]
+        if self.reveal_trace_enabled() && !self.source.is_empty() {
+            let first_pending = (0..end)
+                .find(|&index| {
+                    self.states[index] != MessageGlyphState::Complete && self.is_glyph(index)
+                })
+                .map(|index| (index, self.deadlines[index]));
+            eprintln!(
+                "message-reveal scan id={} gen={} playback={} effective={} speed={} time_origin={} deadline_origin={} char_delay={} limit={} end={} separator={} first_pending={:?} prepare={} process={} phase={:?} force={} copy={:?}",
+                self.id, self.surface_generation, now, elapsed, self.speed, self.time_origin,
+                self.deadline_origin, configuration.value(0x74), self.segment_limit, end,
+                stopped_at_separator, first_pending, prepare.len(), process.len(), phase, force, copy,
+            );
+        }
         let painted = backend.paint(MessageRenderRequest {
             object: self,
             configuration,
@@ -2853,6 +2921,148 @@ impl MessageObject {
             newly_complete: painted.completed,
             complete,
         })
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+enum RevealTraceTarget {
+    Fes,
+    Object(i32),
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        copy: Option<MessageCopy>,
+    }
+
+    impl MessageBackend for RecordingBackend {
+        fn layout(
+            &mut self,
+            _configuration: &MessageConfiguration,
+            atoms: &[MessageAtom],
+            _previous: Option<&MessageLayout>,
+        ) -> Result<MessageLayout> {
+            Ok(MessageLayout {
+                entries: (0..atoms.len())
+                    .map(|index| MessageLayoutEntry {
+                        atom: Some(index),
+                        position: [index as i32 * 10, 0],
+                        size: [10, 10],
+                        line: 0,
+                        display_anchor: None,
+                    })
+                    .collect(),
+                line_count: u32::from(!atoms.is_empty()),
+                ..Default::default()
+            })
+        }
+
+        fn decode_user_glyph(&mut self, _: &[u8], _: u32) -> Result<Option<MessageUserGlyph>> {
+            unreachable!()
+        }
+
+        fn paint(&mut self, request: MessageRenderRequest<'_>) -> Result<MessagePaintResult> {
+            self.copy = Some(request.copy);
+            Ok(MessagePaintResult {
+                prepared: request.prepare.to_vec(),
+                completed: request.process.to_vec(),
+                copied_dirty: request.copy == MessageCopy::Dirty && !request.process.is_empty(),
+                failure: None,
+            })
+        }
+    }
+
+    fn timed_message(backend: &mut RecordingBackend, scale: Option<u32>) -> MessageObject {
+        let encoding = MessageEncoding::Cp932;
+        let configuration = MessageDefaults {
+            font_name: Vec::new(),
+            bold: false,
+            shadow: 0,
+            outline: 0,
+            glyph_parameter: None,
+            gradual: false,
+        }
+        .configuration(encoding)
+        .unwrap();
+        let mut bytes = configuration.bytes().to_vec();
+        bytes[0x74..0x78].copy_from_slice(&7u32.to_le_bytes());
+        let submit = configuration.canvas_fields() + 8;
+        bytes[submit..submit + 4].copy_from_slice(&1u32.to_le_bytes());
+        let mut message = MessageObject::new(-1, encoding);
+        message.recreate(&bytes, scale, backend).unwrap();
+        message.append_decoded("\u{300c}AB".as_bytes(), "\u{300c}AB").unwrap();
+        message.append_separator().unwrap();
+        message.append(b"C").unwrap();
+        message
+    }
+
+    #[test]
+    fn message_reveal_ticks_cross_character_deadlines_without_input() {
+        let mut backend = RecordingBackend::default();
+        let scale = Some(5);
+        let mut message = timed_message(&mut backend, scale);
+        let start = message
+            .start(0, MessagePlaneDisplay::Visible, 100, scale, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.deadlines()[..3], [0, 3, 7]);
+        assert_eq!(start.newly_complete, [0]);
+        assert_eq!(backend.copy, Some(MessageCopy::Full));
+        for (task_time, playback, expected) in [
+            (100, 0, &[][..]),
+            (103, 3, &[][..]),
+            (104, 4, &[1][..]),
+            (107, 7, &[][..]),
+            (108, 8, &[2][..]),
+        ] {
+            let update = message.frame_update(task_time, scale, &mut backend).unwrap().unwrap();
+            assert_eq!(message.playback_time(), playback);
+            assert_eq!(update.newly_complete, expected);
+            assert_eq!(backend.copy, Some(MessageCopy::Dirty));
+        }
+        assert!(!message.active());
+        assert_eq!(message.remaining_segment().unwrap(), 0);
+        assert_eq!(message.remaining_all().unwrap(), 1);
+        assert!(message.frame_update(109, scale, &mut backend).unwrap().is_none());
+    }
+
+    #[test]
+    fn repeated_message_start_preserves_character_deadlines_and_task_delta() {
+        let mut backend = RecordingBackend::default();
+        let scale = Some(5);
+        let mut message = timed_message(&mut backend, scale);
+        for (task, playback, expected) in [
+            (952, 0, &[0][..]),
+            (953, 1, &[][..]),
+            (953, 1, &[][..]),
+            (954, 2, &[][..]),
+            (955, 3, &[][..]),
+            (956, 4, &[1][..]),
+            (957, 5, &[][..]),
+            (958, 6, &[][..]),
+            (959, 7, &[][..]),
+            (960, 8, &[2][..]),
+        ] {
+            let start = message.start(0, MessagePlaneDisplay::Visible, task, scale, &mut backend)
+                .unwrap().unwrap();
+            let tick = message.frame_update(task, scale, &mut backend).unwrap().unwrap();
+            assert_eq!(message.playback_time(), playback);
+            assert_eq!(start.newly_complete, expected);
+            assert!(tick.newly_complete.is_empty());
+        }
+        assert!(!message.active());
+        assert_eq!(message.remaining_segment().unwrap(), 0);
+        assert_eq!(message.remaining_all().unwrap(), 1);
+
+        message.start(0, MessagePlaneDisplay::Visible, 1000, scale, &mut backend).unwrap();
+        assert_eq!(message.last_input_time, 1000);
+        message.start(1, MessagePlaneDisplay::Visible, 1001, scale, &mut backend).unwrap();
+        message.frame_update(1001, scale, &mut backend).unwrap();
+        assert_eq!(message.playback_time(), 8);
     }
 }
 
