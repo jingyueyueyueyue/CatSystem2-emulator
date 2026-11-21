@@ -501,6 +501,30 @@ pub(super) fn body_shell(player: &HeadlessPlayer, frame: u64) -> Option<BodyWait
         marked, group, record })
 }
 
+pub(super) fn ordinary_input_diagnostic(player: &HeadlessPlayer, frame: u64) -> Option<String> {
+    let shell = body_shell(player, frame)?;
+    let flow = window(player, b"flow", b"GAME_WAIT", false, 2, frame)?;
+    let receiver = *player.task_parents.get(&shell.owner)?;
+    let exact_receiver = parent_sscript(player, flow, shell.owner);
+    let input = &player.data_services.messages;
+    let regions: Vec<_> = player.scene_nodes.iter().filter(|(_, node)| node.name == "bottom button")
+        .map(|(&id, node)| {
+            let registration = player.input_task.regions.iter().find(|entry| entry.id() == id);
+            let button = input.input_buttons.get(&id);
+            (id, node.parent, registration.map(|entry| &entry.words),
+                button.map(|button| (&button.state, button.execution_checkpoint().3)),
+                input.input_masks.contains_key(&id))
+        }).collect();
+    let wait_packet_seen = player.events().iter().rev().take_while(|event| event.frame >= shell.marked)
+        .any(|event| event.kind == "native-call" && wait_packet(&event.detail, shell.owner, 0x02));
+    let ready_region = exact_receiver.and_then(|receiver| enter_region(player, receiver));
+    Some(format!("receiver={receiver} exact_receiver={exact_receiver:?} ready_region={ready_region:?} \
+        wait_packet={wait_packet_seen} key_enabled={} forced_enter={:?} forced_select={:?} \
+        regions(id,parent,registration,state_and_active,masked)={regions:?}",
+        player.input_task.key_enabled[LOGICAL_ENTER], input.device_keys.forced_queries(LOGICAL_ENTER as u32),
+        input.device_keys.forced_queries(0)))
+}
+
 
 fn novel_shell(player: &HeadlessPlayer, frame: u64) -> Option<(BodyWaitShell<'_>, u32)> {
     quiet_root(player, frame)?;

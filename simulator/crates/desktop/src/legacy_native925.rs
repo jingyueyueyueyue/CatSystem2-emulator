@@ -54,10 +54,20 @@ fn rebellions_native_with_fingerprints(
     runtime_sha256: impl FnOnce() -> Option<String>,
     script_sha256: impl FnOnce() -> Option<String>,
 ) -> Option<NativeReturn> {
-    verified_zero_argument_native925(index, arguments, || {
-        runtime_sha256().as_deref() == Some(REBELLIONS_PE_SHA256)
-            && script_sha256().as_deref() == Some(REBELLIONS_SSCRIPT_SHA256)
-    })
+    match (index, arguments) {
+        // REBELLIONS.exe RVA 0xaad40 returns status 2 without reading
+        // arguments or writing the result slot.
+        (439, _) => {
+            (runtime_sha256().as_deref() == Some(REBELLIONS_PE_SHA256))
+                .then_some(NativeReturn::Continue)
+        }
+        (925, []) => {
+            (runtime_sha256().as_deref() == Some(REBELLIONS_PE_SHA256)
+                && script_sha256().as_deref() == Some(REBELLIONS_SSCRIPT_SHA256))
+            .then_some(NativeReturn::Value(0))
+        }
+        _ => None,
+    }
 }
 
 fn verified_zero_argument_native925(
@@ -115,5 +125,23 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[test]
+    fn rebellions_native439_leaves_the_result_slot_untouched() {
+        let unknown_script = || -> Option<String> { panic!("callback does not read script") };
+        assert_eq!(
+            rebellions_native_with_fingerprints(
+                439,
+                &[0; 8],
+                || Some(REBELLIONS_PE_SHA256.to_owned()),
+                unknown_script,
+            ),
+            Some(NativeReturn::Continue),
+        );
+        assert_eq!(
+            rebellions_native_with_fingerprints(439, &[0; 8], || None, unknown_script),
+            None,
+        );
     }
 }
