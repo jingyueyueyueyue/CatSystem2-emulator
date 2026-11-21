@@ -2125,10 +2125,10 @@ impl FesTask {
             }
         }
         if candidate.name.eq_ignore_ascii_case("title.fes")
-            && host.css_task_sha() == Some(REBELLIONS_MESSAGE_PE_SHA256)
             && bytes.len() == 3041
             && super::particle_plugin_digest::sha256(bytes)
                 == "d905d8308cbb70adfa06f9de47a7c13fc2bfe6bd0018e76a0f6e08ea2620099b"
+            && is_rebellions_fes_game(host.resources)
         {
             // The two-button layout contains an extra '1' after the y anchor.
             for section in document.sections.iter_mut().filter(|section| section.header == b"SETBTN00") {
@@ -2956,11 +2956,14 @@ fn is_rebellions_message_fes_source(resources: &cs2_runtime::ResourceIndex, byte
     } else {
         REBELLIONS_NOVEL_FES.iter().find_map(|(_, size, sha)| (bytes.len() == *size).then_some(*sha))
     };
-    expected.is_some_and(|expected| sha256(bytes) == expected)
-        && resources.resolve_plain_file("REBELLIONS.exe").ok().flatten()
-            .filter(|candidate| candidate.size == REBELLIONS_MESSAGE_PE_SIZE as u64)
-            .and_then(|candidate| resources.read_candidate_bounded(candidate, REBELLIONS_MESSAGE_PE_SIZE).ok().flatten())
-            .is_some_and(|bytes| sha256(&bytes) == REBELLIONS_MESSAGE_PE_SHA256)
+    expected.is_some_and(|expected| sha256(bytes) == expected) && is_rebellions_fes_game(resources)
+}
+
+fn is_rebellions_fes_game(resources: &cs2_runtime::ResourceIndex) -> bool {
+    resources.resolve_plain_file("REBELLIONS.exe").ok().flatten()
+        .filter(|candidate| candidate.size == REBELLIONS_MESSAGE_PE_SIZE as u64)
+        .and_then(|candidate| resources.read_candidate_bounded(candidate, REBELLIONS_MESSAGE_PE_SIZE).ok().flatten())
+        .is_some_and(|bytes| super::particle_plugin_digest::sha256(&bytes) == REBELLIONS_MESSAGE_PE_SHA256)
 }
 
 fn message_button_notification(key: u32, bank: u32, block: &[u8], context_free: bool) -> bool {
