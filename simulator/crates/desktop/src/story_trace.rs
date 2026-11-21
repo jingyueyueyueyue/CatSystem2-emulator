@@ -2142,6 +2142,7 @@ impl HeadlessPlayer {
             ([languages.primary_index, languages.message_index, languages.subtitle_index], local)
         });
         let daydream_save_panel = self.host_daydream_save_panel_diagnostic();
+        let rebellions_input = story_trace_20::ordinary_input_diagnostic(self, frame);
         format!(
             "trace_enabled={} profile={:?} pe_sha256={:?} startup={:?} \
              frame={frame} state={state} scene={scene} group={group} record={record} \
@@ -2158,7 +2159,8 @@ impl HeadlessPlayer {
              legacy_fes_body={legacy_fes_body:?} legacy_07={legacy_07:?} daydream_empty_body(context,body,raw_bytes,empty,raw_bytes)={daydream_empty_body:?} \
              eyecatch_08(window,owner)={eyecatch_08:?} legacy_11_13_enter={legacy_11_13_enter:?} \
              eden_layout_complete={eden_layout_complete:?} eden_live_enter={eden_live_enter:?} labyrinth15={labyrinth15:?} \
-             djibril10={djibril10:?} radio_r94_enter={radio_r94_enter:?} daydream_save_panel={daydream_save_panel:?}",
+             djibril10={djibril10:?} radio_r94_enter={radio_r94_enter:?} daydream_save_panel={daydream_save_panel:?} \
+             rebellions_input={rebellions_input:?}",
             self.data_services.story_trace,
             self.host_story_trace_profile(),
             self.host_story_pe_sha256(),
