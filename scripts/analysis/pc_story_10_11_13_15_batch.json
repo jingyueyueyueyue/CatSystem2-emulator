@@ -1,0 +1,47 @@
+{
+  "10": {
+    "frames": 755,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "trace-native:325",
+      "move:708:190,222", "require-hit:710:39", "710:190,222", "inspect-log:755"
+    ]
+  },
+  "11": {
+    "frames": 2700,
+    "inputs": [
+      "story-trace", "story-events", "capture-every:0", "no-final-capture",
+      "legacy-11-radio-stop",
+      "trace-native:266", "trace-native:267", "trace-native:268",
+      "trace-native:69", "trace-native:70", "trace-native:702", "trace-native:989",
+      "trace-native:13", "trace-native:276", "trace-native:630",
+      "trace-native:1002", "trace-native:1037", "trace-native:1038", "trace-native:1051",
+      "215:13", "385:13", "550:13",
+      "move:605:1154,473", "require-hit:612:15", "612:1154,473",
+      "require-hit:810:62", "810:640,360",
+      "require-hit:890:62", "890:640,360",
+      "require-hit:970:62", "970:640,360"
+    ]
+  },
+  "13": {
+    "frames": 5600,
+    "inputs": [
+      "story-trace", "story-events", "capture-every:0", "no-final-capture",
+      "legacy-11-13-enter:13",
+      "trace-native:266", "trace-native:267", "trace-native:268",
+      "trace-native:327", "trace-native:276", "trace-native:630",
+      "require-hit:241:20", "241:640,441",
+      "require-hit:361:55", "361:640,549"
+    ]
+  },
+  "15": {
+    "frames": 5600,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:276", "trace-native:325", "trace-native:326", "trace-native:327",
+      "trace-native:520", "trace-native:527", "trace-native:528", "trace-native:630",
+      "move:691:512,353", "require-hit:692:20", "692:512,353",
+      "require-hit:821:67", "821:400,130",
+      "inspect-log:5300", "inspect-log:5600"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "12": {
+    "frames": 2400,
+    "diagnostics": [
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:520",
+      "trace-native:530",
+      "trace-native:531",
+      "trace-native:905"
+    ],
+    "route": {
+      "label": "Hatsumira: two verified Enter presses, stop at op001 g2/r92",
+      "idle_frames": 1100,
+      "page_scenes": [],
+      "hatsumira_r72": "observe_r92",
+      "steps": []
+    }
+  }
+}

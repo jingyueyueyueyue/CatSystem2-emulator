@@ -1,0 +1,39 @@
+{
+  "12": {
+    "frames": 720,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:108",
+      "trace-native:110",
+      "trace-native:143",
+      "trace-native:447",
+      "trace-native:448",
+      "trace-native:450",
+      "trace-native:630",
+      "move:208:640,443",
+      "inspect-log:208",
+      "move:234:640,443",
+      "inspect-log:234",
+      "move:719:640,443",
+      "inspect-log:719",
+      "inspect-log:720"
+    ]
+  },
+  "review": {
+    "mode": "Observe the original title from startup without clicks, keys or captures.",
+    "runtime_pe": {"name": "Hatsumira.exe", "sha256": "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78"},
+    "startup": "kcs.int/main.kcs",
+    "native_wait": "0xc29",
+    "title_member_sha256": "4e6e23a102f2a07446e3daa1d15e8ee2a232ac3d0380ba210d63564bc04ed9df",
+    "flow_member_sha256": "679d9f5370ae5afecbadd0362df560009072cc0746770449e1def0bf255909d7",
+    "expected": "At the settled title, flow/LOOP_TITLE and title/WAIT_USER are stable with no pending callbacks or movie; the historical Start point was 640,443, region 15.",
+    "historical_route": {"point": [640, 443], "region": 15, "title_owner": 8, "task_name": "btn_def", "candidate_order": [3, 15, 37, 7], "response": 1, "root_resume": [2, 640, 443, 0], "next_scenes": ["start", "op001"]},
+    "hold": "Require the live default title page, btn_def bank and BTN_START binding, and the title-to-flow receiver path before a click route. The historical receiver response was propagation (1). The known route progressed via the root message resume."
+  }
+}

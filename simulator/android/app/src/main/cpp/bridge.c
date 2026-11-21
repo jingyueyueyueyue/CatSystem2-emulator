@@ -534,20 +534,39 @@ JNIEXPORT jint JNICALL JNI(nativeSystemOpenResult)(
     free(bytes);
     return result;
 }
-JNIEXPORT jint JNICALL JNI(nativeInput)(
-    JNIEnv *env, jclass type, jlong handle, jint kind, jint a, jint b
+static jint dispatch_input(
+    jlong handle, jint kind, jint a, jint b, jlong event_to_ui_ms, jlong ui_to_worker_us
 ) {
-    (void)env; UNUSED_TYPES;
+    uint64_t input_mono_us = 0;
     if (perf.handle && perf.handle == (uint64_t)handle) {
         if (kind == 1 && a == 0) {
+            input_mono_us = perf_now_ns() / 1000;
             __android_log_print(ANDROID_LOG_INFO, PERF_TAG, "primary_down session=%" PRIu64
-                                " input_mono_us=%" PRIu64, perf.handle, perf_now_ns() / 1000);
+                                " input_mono_us=%" PRIu64, perf.handle, input_mono_us);
         } else if (kind == 5 && a == 0) {
             perf_flush();
             perf.last_post_ns = 0;
         }
     }
-    return cs2_android_input((uint64_t)handle, (uint32_t)kind, (int32_t)a, (int32_t)b);
+    const jint result = cs2_android_input((uint64_t)handle, (uint32_t)kind, (int32_t)a, (int32_t)b);
+    if (input_mono_us && event_to_ui_ms >= 0 && ui_to_worker_us >= 0) {
+        __android_log_print(ANDROID_LOG_INFO, PERF_TAG, "primary_down_timing session=%" PRIu64
+                            " input_mono_us=%" PRIu64 " event_to_ui_ms=%" PRId64 " ui_to_worker_us=%" PRId64,
+                            (uint64_t)handle, input_mono_us, (int64_t)event_to_ui_ms, (int64_t)ui_to_worker_us);
+    }
+    return result;
+}
+JNIEXPORT jint JNICALL JNI(nativeInput)(
+    JNIEnv *env, jclass type, jlong handle, jint kind, jint a, jint b
+) {
+    (void)env; UNUSED_TYPES;
+    return dispatch_input(handle, kind, a, b, -1, -1);
+}
+JNIEXPORT jint JNICALL JNI(nativeTimedPrimaryDown)(
+    JNIEnv *env, jclass type, jlong handle, jlong event_to_ui_ms, jlong ui_to_worker_us
+) {
+    (void)env; UNUSED_TYPES;
+    return dispatch_input(handle, 1, 0, 0, event_to_ui_ms, ui_to_worker_us);
 }
 JNIEXPORT jint JNICALL JNI(nativeText)(
     JNIEnv *env, jclass type, jlong handle, jint kind, jbyteArray input, jint start, jint end

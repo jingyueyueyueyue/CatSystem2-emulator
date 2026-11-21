@@ -1,0 +1,63 @@
+{
+  "11": {
+    "frames": 1230,
+    "inputs": [
+      "story-trace",
+      "capture-every:0",
+      "no-final-capture",
+      "215:13",
+      "385:13",
+      "550:13",
+      "move:605:1154,473",
+      "require-hit:612:15",
+      "612:1154,473",
+      "require-hit:810:62",
+      "810:640,360",
+      "require-hit:890:62",
+      "890:640,360",
+      "require-hit:970:62",
+      "970:640,360",
+      "inspect-log:1013",
+      "inspect-log:1068",
+      "inspect-log:1230"
+    ]
+  },
+  "probe_anchors": {
+    "baseline": {
+      "run": "2026-11/20261120_034606_576472_sfjj6byl_playthrough",
+      "source_tree_sha256": "a6285baa75e0243f37e95cffaf1499e92fda188b1b7d9a21bb8c3b041ac37a59",
+      "events_log_line": 9613,
+      "movie_request_frame": 1068,
+      "last_observed_frame": 3412
+    },
+    "scene": "scene.int::00_001.cst",
+    "records": {"draw": 49, "movie_load": 50, "bare_wait": 51, "movie_play": 53},
+    "movie_resource": "movie.int::radio_wave.mpg",
+    "raw_baseline": {
+      "run": "2026-11/20261120_042248_969714_i8aguzmo_playthrough",
+      "source_tree_sha256": "780c479f9bc7d1c85d383b435d5cc0fedf54029e5a17db38ae817f04536bf8f7",
+      "wipe": {"task": 13, "configure_frame": 972, "enable_frame": 973, "duration_ticks": 38, "mode": 1, "depth": 45000, "mask": 345, "last_query_frame": 1230},
+      "movie_load": {"task": 30, "frame": 1068},
+      "draw_native_observed": false,
+      "movie_play_observed": false
+    },
+    "original_abi": {
+      "pe_sha256": "4ccb48ad4bb6bfb5a15a45b8e1f2c2e62072cfad9f1487f869561a473770ed94",
+      "table_va": "0x9f1d38",
+      "520": {"va": "0x606f30", "message": "0x179", "vm": ["target"], "result": "active"},
+      "527": {"va": "0x606db0", "message": "0x180", "vm": ["target", "duration", "mode", "depth"], "record": ["mode", "depth", "duration"]},
+      "528": {"va": "0x606e20", "message": "0x181", "vm": ["target", "enable"]},
+      "530": {"va": "0x607480", "message": "0x183", "vm": ["target", "duration", "mode", "depth", "mask"], "record": ["mode", "depth", "duration", "resolved_mask", 0]},
+      "531": {"va": "0x6074f0", "message": "0x184", "vm": ["target", "enable"]},
+      "701": {"va": "0x604520", "message": "0x2b", "vm": ["target", "name_address"], "record": [0, 0, 0, "resolved_name"]},
+      "702": {"va": "0x604990", "message": "0x57", "vm": ["target"], "result": "movie_handle"}
+    },
+    "last_input_frame": 970,
+    "acceptance": [
+      "Preserve the known entry prefix; a masked pointer mismatch stops the probe before that click.",
+      "Keep native calls unfiltered. Follow Wipe 530/531/520 to natural release; the bare rdraw command at record 49 did not create a Draw in the raw baseline. Treat 527/528 as static evidence unless they actually appear.",
+      "Check that the bare wait exits and vcom play -1 follows the 701 load. Verify playback and natural completion separately; do not infer them from the load request or a fixed frame number.",
+      "Frame 1230 is a sampling cap, not a pass condition. Do not add input after the entry prefix."
+    ]
+  }
+}

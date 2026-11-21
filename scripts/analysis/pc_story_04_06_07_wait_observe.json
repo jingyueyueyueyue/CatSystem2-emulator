@@ -1,0 +1,59 @@
+{
+  "7": {
+    "frames": 4200,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:265", "trace-native:266", "trace-native:268", "trace-native:269",
+      "trace-native:325", "trace-native:326", "trace-native:630", "trace-native:645", "trace-native:882",
+      "move:1130:176,256", "require-hit:1140:20", "1140:176,256",
+      "inspect-log:1120", "inspect-log:1183", "inspect-log:1500", "inspect-log:2400",
+      "inspect-log:3354", "inspect-log:3380", "inspect-log:3381", "inspect-log:3382",
+      "inspect-log:3410", "inspect-log:3437", "inspect-log:4200"
+    ]
+  },
+  "4": {
+    "frames": 1320,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:71", "trace-native:104", "trace-native:105",
+      "trace-native:325", "trace-native:326", "trace-native:327", "trace-native:520", "trace-native:527", "trace-native:528",
+      "trace-native:530", "trace-native:531", "trace-native:630", "trace-native:645", "trace-native:882",
+      "215:638,446", "require-hit:215:19", "move:372:165,386", "390:165,386", "require-hit:390:15",
+      "inspect-log:670", "inspect-log:840", "inspect-log:900", "inspect-log:1080", "inspect-log:1320"
+    ]
+  },
+  "6": {
+    "frames": 1440,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:71", "trace-native:104", "trace-native:105",
+      "trace-native:325", "trace-native:326", "trace-native:327", "trace-native:530",
+      "trace-native:630", "trace-native:645", "trace-native:882",
+      "move:500:98,208", "require-hit:530:18", "530:98,208",
+      "move:640:98,104", "require-hit:660:10", "660:98,104",
+      "inspect-log:900", "inspect-log:1310", "inspect-log:1440"
+    ]
+  },
+  "review": {
+    "mode": "按 07、04、06 顺序单槽复跑。只发已有遮罩命中守卫的入口点击。帧号用于入口对照与日志取样。",
+    "baseline": "20261120_071449_937759_dvb0l0be_playthrough",
+    "07": {
+      "prior_run": "F:/CS2-build-cache/playthrough/2026-11/20261120_064548_054086_6jcynzd7_playthrough",
+      "interrupted_run": "20261120_081753_417370_obfhg8ow_playthrough/07.events.log 在 f1183 截断。已见 f1141 根点击回执，需从冷入口复跑到 com01。",
+      "expect": "Same OP handle naturally releases (268) before com01 g0/r3 wait 60. Then abs 56 nonempty text and abs 57 input. At native 71/0x9b3 require no movie or queued message, visible str[0] and keywait, and no later body without input. Preserve the f4200/6000/7200 baseline at 07.host.log:195, :260, :390.",
+      "callback": "For exact sscript.kcs e45413514526ffe3c52febd8081009d3404953c8d7c26fffdca01d8142646f49, seek 645(owner,0,1) and 630 on the same meswnd owner. Resolve the block pointer against active KCS; 0x477b9 is the original string initializer for MES_WAITINPUT, not an assumed live pointer. The paired calls and keywait anm/disp are not a direct read of local 100 or same-generation commit.",
+      "hold": "Named WAIT_KEY=false is expected for the observed 07 path: pinned sscript has no WAIT_KEY token, and meswnd.fes:715 uses local 100. Missing current generation or local wait observation keeps this run unkeyed. First proposed successor is current abs 61 after the two 40-unit fades and wait, then abs 62. The next body/wait 67/68 needs a natural rdraw 30."
+    },
+    "04": {
+      "prior_run": "F:/CS2-build-cache/playthrough/2026-11/20261120_060957_411669_uom5538o_playthrough",
+      "expect": "Natural rdraw 60, then two 530 registrations with 531 enable, finite 520 polls and 531 disable of the same task (prior f760 and f851). Then __tar01 abs 53 nonempty and abs 54 input, native 71/0xea8 and MES_SHOW/WAIT_KEY=true. The same 4808 pixels before and after the transition do not prove a new composed body.",
+      "next": "Body/wait pairs 66/67, 69/70, 72/73, 84/85. Require natural rdraw 15 at abs 62 and 80. This probe stops at the opening wait without sending a body key."
+    },
+    "06": {
+      "prior_run": "F:/CS2-build-cache/playthrough/2026-11/20261120_062045_718254_qofyap_8_playthrough",
+      "expect": "C01_01 abs 61 nonempty, abs 64 empty, abs 65 input. Prior f1440 has native 71/0xc72, MES_SHOW/WAIT_KEY=true, no movie or pending message, body alpha 4873 and prompt alpha 852. Empty text does not establish a new page generation.",
+      "next": "Past single press reached body/wait 98/107 after natural frameoff fade 30 and wait 210. Static successors 109/110, 111/112 and 113/118. Abs 106 and 117 are empty. The old press frame is not an input schedule."
+    },
+    "approval": "Do not send body input on this build until an exact profile proves the current scene wait, a single ready foreground receiver, no modal/choice/auto/media/transition/queued input, and a fresh nonempty CST body naturally completed and submitted in the same generation. After one normal press require one matching resume and the exact successor body and wait before any further input. Stop on changed hit, engine error, unrelated wait or missing provenance."
+  }
+}

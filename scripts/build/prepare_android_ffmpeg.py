@@ -278,6 +278,8 @@ def main() -> None:
     parser.add_argument("--api", type=int, default=26)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--workspace-root", type=Path, default=ROOT,
+                        help="Owning workspace when this script runs from a frozen source snapshot.")
     parser.add_argument("--source-archive", type=Path)
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--integration", action="store_true",
@@ -287,8 +289,10 @@ def main() -> None:
         parser.error("--jobs must be in1..64")
     output = (args.output or (DEFAULT_OUTPUT.with_name(DEFAULT_OUTPUT.name + "_integration")
                              if args.integration else DEFAULT_OUTPUT)).resolve()
-    if not output.is_relative_to((ROOT / "archive").resolve()):
-        owned_media = (build_cache_directory("android", args.integration) / "ffmpeg").resolve()
+    workspace_root = args.workspace_root.resolve(strict=True)
+    if not output.is_relative_to((workspace_root / "archive").resolve()):
+        owned_media = (build_cache_directory("android", args.integration, workspace_root=workspace_root)
+                       / "ffmpeg").resolve()
         if output != owned_media:
             parser.error("Media output must stay in archive or the verified workspace-owned FFmpeg cache")
     report = plan(args.ndk.resolve(), output, args.api, args.host, args.jobs, args.integration)

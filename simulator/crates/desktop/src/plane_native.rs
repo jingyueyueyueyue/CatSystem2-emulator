@@ -227,6 +227,8 @@ impl PlaneState {
 #[derive(Clone, Debug, Default)]
 pub struct PlaneServices {
     pub(super) vram_overflow: Option<VramOverflow>,
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    sampled_planes: std::cell::RefCell<SampledPlanes>,
     planes: BTreeMap<u32, PlaneState>,
     order: Vec<u32>,
     order_depths: BTreeMap<u32, u32>,
@@ -2021,7 +2023,8 @@ impl LoggingHost<'_> {
                 .is_some_and(|pixel| {
                     self.data_services.image_wrapper_pixels.get(&source_id) == Some(pixel)
                 });
-        let updated = copy_wrapper(target, source, to, from, shared_pixels)?;
+        let top_down = [self.is_list_output_wrapper(source_id), self.is_list_output_wrapper(target_id)];
+        let updated = copy_wrapper(target, source, to, from, shared_pixels, top_down)?;
         if let Some(updated) = updated {
             self.replace_image_wrapper_pixels(target_id, updated)?;
         }
@@ -2168,7 +2171,7 @@ pub(super) fn draw_plane_with_view(
     let polygons = plane_polygons(vertices);
     let triangles = || plane_triangles(&polygons);
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-    if draw_gpu_triangles(canvas, source, services.vram_overflow.as_ref(), triangles(),
+    if draw_gpu_triangles(canvas, source, triangles(),
         color, clip, blend)
     {
         return Ok(true);
@@ -2345,8 +2348,16 @@ pub(super) fn draw_plane_group<'a>(
             }
             continue;
         }
+        if plane.source.is_some() {
+            let Some(job) = sampled_plane([canvas.width(), canvas.height()], services, &plane)? else {
+                super::perf_detail::textured_triangle_rejected(true);
+                return Ok(false);
+            };
+            prepared.push(job);
+            continue;
+        }
         let polygons = plane_polygons(plane.vertices);
-        match prepare_gpu_triangles([canvas.width(), canvas.height()], plane.source, services.vram_overflow.as_ref(), true,
+        match prepare_gpu_triangles([canvas.width(), canvas.height()],
             plane_triangles(&polygons), plane.argb, plane.clip, plane.blend) {
             Some(Some(job)) => prepared.push(job),
             Some(None) => {},
@@ -2356,6 +2367,119 @@ pub(super) fn draw_plane_group<'a>(
     if prepared.is_empty() { return Ok(true); }
     let jobs: Vec<_> = prepared.iter().map(GpuPlane::job).collect();
     Ok(gpu_raster::draw_plane_group(canvas, &jobs))
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+#[derive(Debug, Default)]
+struct SampledPlanes(std::collections::VecDeque<SampledPlane>);
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+impl Clone for SampledPlanes {
+    fn clone(&self) -> Self { Self::default() }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+#[derive(Debug)]
+struct SampledPlane {
+    source: cs2_renderer::FramePixelIdentity,
+    vertices: [[f64; 6]; 4],
+    clip: Option<Rect>,
+    rgb: u32,
+    dimensions: [u32; 2],
+    pixels: RgbaFrame,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+fn sampled_plane(
+    dimensions: [u32; 2], services: &PlaneServices, plane: &PlaneGeometry<'_>,
+) -> HostResult<Option<GpuPlane<'static>>> {
+    use super::gpu_raster::RasterRect;
+
+    const CACHE_BYTES: usize = 16 * 1024 * 1024;
+    let [width, height] = dimensions;
+    let size = u64::from(width) * u64::from(height) * 4;
+    let Some(source) = plane.source else { return Ok(None) };
+    if !matches!(plane.blend, BlendMode::SourceOver | BlendMode::Multiply)
+        || size > CACHE_BYTES as u64 / 2
+        || plane.vertices.iter().any(|point| !(0. ..=1.).contains(&point[2]) || point[3] <= 0.)
+    {
+        return Ok(None);
+    }
+
+    // A convex quad covers each pixel once under the triangle top-left rule.
+    // It can be sampled into a transparent texture before applying plane opacity.
+    let corners = [0, 1, 3, 2].map(|index| plane.vertices[index]);
+    let turns = std::array::from_fn::<_, 4, _>(|i| {
+        let (a, b, c) = (corners[i], corners[(i + 1) % 4], corners[(i + 2) % 4]);
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    });
+    if !(turns.iter().all(|&turn| turn > 0.) || turns.iter().all(|&turn| turn < 0.)) {
+        return Ok(None);
+    }
+
+    let source_size = services.vram_overflow.as_ref().map_or(
+        [source.width(), source.height()], VramOverflow::dimensions,
+    );
+    let source_size = [source_size[0].max(source.width()), source_size[1].max(source.height())];
+    // Perspective-correct coordinates stay within the vertex extrema for
+    // positive reciprocal W. Include an extra texel on both ends for rounding.
+    let bounds = std::array::from_fn::<_, 2, _>(|axis| {
+        let samples = plane.vertices.map(|point| point[axis + 4] / point[3]);
+        let low = samples.into_iter().fold(f64::INFINITY, f64::min).floor() - 1.;
+        let high = samples.into_iter().fold(f64::NEG_INFINITY, f64::max).ceil() + 1.;
+        [low, high].map(|value| value.clamp(0., f64::from(source_size[axis])) as u32)
+    });
+    let origin = [bounds[0][0], bounds[1][0]];
+    let sample_size = bounds.map(|[low, high]| high - low);
+    let sample_bytes = u64::from(sample_size[0]) * u64::from(sample_size[1]) * 4;
+    if sample_bytes == 0 || sample_bytes > CACHE_BYTES as u64 / 2 {
+        return Ok(None);
+    }
+    let packed;
+    let (samples, sample_origin) = if let Some(atlas) = services.vram_overflow.as_ref() {
+        packed = atlas.pack_region(source, origin, sample_size)?;
+        (&packed, origin)
+    } else {
+        (source, [0; 2])
+    };
+
+    let rgb = plane.argb & 0x00ff_ffff;
+    let mut cache = services.sampled_planes.borrow_mut();
+    let hit = cache.0.iter().position(|entry| {
+        entry.dimensions == dimensions && entry.vertices == plane.vertices
+            && entry.clip == plane.clip && entry.rgb == rgb && entry.source.matches(samples)
+    });
+    let entry = if let Some(index) = hit {
+        cache.0.remove(index).unwrap()
+    } else {
+        let mut target = Canvas::new(width, height)?;
+        for triangle in plane_triangles(&plane_polygons(plane.vertices)) {
+            raster_triangle_from(
+                &mut target, triangle, 0xff00_0000 | rgb,
+                Some(samples), sample_origin, None, plane.clip, BlendMode::SourceOver,
+            )?;
+        }
+        let mut resident: usize = cache.0.iter().map(|entry| entry.pixels.pixels().len()).sum();
+        while resident + size as usize > CACHE_BYTES || cache.0.len() >= 8 {
+            resident -= cache.0.pop_front().unwrap().pixels.pixels().len();
+        }
+        SampledPlane {
+            source: samples.pixel_identity(), vertices: plane.vertices, clip: plane.clip,
+            rgb, dimensions, pixels: target.into_frame(),
+        }
+    };
+    let pixels = entry.pixels.clone();
+    cache.0.push_back(entry);
+    Ok(Some(GpuPlane {
+        rect: RasterRect { origin: [0; 2], size: dimensions },
+        source: Some(pixels),
+        atlas: None,
+        kind: GpuPlaneKind::Span {
+            source_origin: [0; 2],
+            opacity: (plane.argb >> 24) as u8,
+            multiply: plane.blend == BlendMode::Multiply,
+        },
+    }))
 }
 
 /// Supply this depth to the common scene sort; translation.z is not the plane
@@ -2690,7 +2814,6 @@ impl<'a> GpuPlane<'a> {
 fn draw_gpu_triangles(
     canvas: &mut Canvas,
     source: Option<&RgbaFrame>,
-    overflow: Option<&VramOverflow>,
     triangles: impl Iterator<Item = [[f64; 6]; 3]>,
     argb: u32,
     clip: Option<Rect>,
@@ -2698,7 +2821,13 @@ fn draw_gpu_triangles(
 ) -> bool {
     use super::gpu_raster;
     if !gpu_raster::available() { return false; }
-    match prepare_gpu_triangles([canvas.width(), canvas.height()], source, overflow, overflow.is_some(),
+    // The CPU floors interpolated f64 coordinates for nearest sampling.
+    // WGSL f32 can cross a texel boundary even on an axis-aligned 2x scale.
+    if source.is_some() {
+        super::perf_detail::textured_triangle_rejected(false);
+        return false;
+    }
+    match prepare_gpu_triangles([canvas.width(), canvas.height()],
         triangles, argb, clip, blend)
     {
         Some(Some(plane)) => {
@@ -2711,22 +2840,17 @@ fn draw_gpu_triangles(
 }
 
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-fn prepare_gpu_triangles<'a>(
+fn prepare_gpu_triangles(
     dimensions: [u32; 2],
-    source: Option<&RgbaFrame>,
-    overflow: Option<&'a VramOverflow>,
-    canvas_texture: bool,
     triangles: impl Iterator<Item = [[f64; 6]; 3]>,
     argb: u32,
     clip: Option<Rect>,
     blend: BlendMode,
-) -> Option<Option<GpuPlane<'a>>> {
+) -> Option<Option<GpuPlane<'static>>> {
     use super::gpu_raster::RasterRect;
     let mut vertices = Vec::new();
     let mut lower = [f64::INFINITY; 2];
     let mut upper = [f64::NEG_INFINITY; 2];
-    let mut uv_lower = [f64::INFINITY; 2];
-    let mut uv_upper = [f64::NEG_INFINITY; 2];
     for mut triangle in triangles {
         let [a, b, c] = triangle;
         let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
@@ -2739,9 +2863,6 @@ fn prepare_gpu_triangles<'a>(
             for axis in 0..2 {
                 lower[axis] = lower[axis].min(point[axis]);
                 upper[axis] = upper[axis].max(point[axis]);
-                let uv = point[axis + 4] / point[3];
-                uv_lower[axis] = uv_lower[axis].min(uv);
-                uv_upper[axis] = uv_upper[axis].max(uv);
             }
         }
         vertices.push(triangle);
@@ -2756,50 +2877,36 @@ fn prepare_gpu_triangles<'a>(
     let start: [i64; 2] = std::array::from_fn(|i| (lower[i].floor() as i64).max(0).max(clip_min[i]));
     let end: [i64; 2] = std::array::from_fn(|i| (upper[i].ceil() as i64).min(bounds[i]).min(clip_max[i]));
     if (0..2).any(|i| start[i] >= end[i]) { return Some(None); }
-    let mut sampled = source.cloned();
-    let mut source_origin = [0; 2];
-    let resident_atlas = (canvas_texture
-        && source.is_some_and(|frame| super::gpu_raster::can_use_atlas(frame, overflow)))
-        .then_some(overflow);
-    if let (Some(source), Some(atlas)) = (source, overflow) {
-        let viewport = [source.width(), source.height()];
-        if (0..2).any(|axis| uv_upper[axis] >= f64::from(viewport[axis])) {
-            let extent = atlas.dimensions();
-            if (0..2).any(|axis| extent[axis] < viewport[axis]) { return None; }
-            let first = uv_lower.map(|value| value.floor().max(0.) as u32);
-            let last: [u32; 2] = std::array::from_fn(|axis| {
-                (uv_upper[axis].floor() + 1.).clamp(0., f64::from(extent[axis])) as u32
-            });
-            if (0..2).any(|axis| first[axis] >= last[axis]) { return Some(None); }
-            let size = std::array::from_fn(|axis| last[axis] - first[axis]);
-            if resident_atlas.is_some() {
-                source_origin = first;
-            } else {
-                if u64::from(size[0]) * u64::from(size[1]) > 4 * 1024 * 1024 { return None; }
-                sampled = Some(atlas.pack_region(source, first, size).ok()?);
-            }
-            for point in vertices.iter_mut().flatten() {
-                for axis in 0..2 { point[axis + 4] -= f64::from(first[axis]) * point[3]; }
-            }
-        }
-    }
     Some(Some(GpuPlane {
         rect: RasterRect { origin: start.map(|value| value as u32),
             size: std::array::from_fn(|i| (end[i] - start[i]) as u32) },
-        source: sampled,
-        atlas: resident_atlas,
+        source: None,
+        atlas: None,
         kind: GpuPlaneKind::Triangles {
             vertices: vertices.into_iter().map(|triangle| triangle.map(|point| point.map(|value| value as f32))).collect(),
-            source_origin, argb, blend,
+            source_origin: [0; 2], argb, blend,
         },
     }))
 }
 
 fn raster_triangle(
     canvas: &mut Canvas,
+    v: [[f64; 6]; 3],
+    argb: u32,
+    source: Option<&RgbaFrame>,
+    overflow: Option<&VramOverflow>,
+    clip: Option<Rect>,
+    blend: BlendMode,
+) -> HostResult<()> {
+    raster_triangle_from(canvas, v, argb, source, [0; 2], overflow, clip, blend)
+}
+
+fn raster_triangle_from(
+    canvas: &mut Canvas,
     mut v: [[f64; 6]; 3],
     argb: u32,
     source: Option<&RgbaFrame>,
+    source_origin: [u32; 2],
     overflow: Option<&VramOverflow>,
     clip: Option<Rect>,
     blend: BlendMode,
@@ -2857,64 +2964,174 @@ fn raster_triangle(
                 as u32,
         );
     }
-    let top_left = |a: [f64; 6], b: [f64; 6]| b[1] < a[1] || b[1] == a[1] && b[0] > a[0];
-    for y in min_y..max_y {
-        for x in min_x..max_x {
-            let p = [f64::from(x) + 0.5, f64::from(y) + 0.5];
+    if min_x >= max_x || min_y >= max_y {
+        return Ok(());
+    }
+    let [from, to] = [[v[1], v[2], v[0]], [v[2], v[0], v[1]]];
+    let top_left: [bool; 3] = std::array::from_fn(|i| {
+        to[i][1] < from[i][1] || (to[i][1] == from[i][1] && to[i][0] > from[i][0])
+    });
+    let dx: [f64; 3] = std::array::from_fn(|i| to[i][0] - from[i][0]);
+    let dy: [f64; 3] = std::array::from_fn(|i| to[i][1] - from[i][1]);
+    let modulation = Color::rgba(
+        (argb >> 16) as u8,
+        (argb >> 8) as u8,
+        argb as u8,
+        (argb >> 24) as u8,
+    );
+    let stride = canvas.width() as usize * 4;
+    let bounds_pixels = u64::from(max_x - min_x) * u64::from(max_y - min_y);
+    let workers = if source.is_some() && bounds_pixels >= 256 * 1024 && max_y - min_y >= 64 {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(4))
+    } else {
+        1
+    };
+    let overflow_pixel = overflow.map(VramOverflow::pixel_sampler);
+    let draw_row = |row: &mut [u8], y: u32| {
+        let row = row[min_x as usize * 4..max_x as usize * 4].as_chunks_mut::<4>().0;
+        let y = f64::from(y) + 0.5;
+        let base: [f64; 3] = std::array::from_fn(|i| dx[i] * (y - from[i][1]));
+        for (x, target) in (min_x..max_x).zip(row) {
+            let x = f64::from(x) + 0.5;
             let weights = [
-                edge(v[1], v[2], p[0], p[1]),
-                edge(v[2], v[0], p[0], p[1]),
-                edge(v[0], v[1], p[0], p[1]),
+                base[0] - dy[0] * (x - from[0][0]),
+                base[1] - dy[1] * (x - from[1][0]),
+                base[2] - dy[2] * (x - from[2][0]),
             ];
             if weights.iter().enumerate().any(|(i, &value)| {
-                value < 0. || value == 0. && !top_left(v[(i + 1) % 3], v[(i + 2) % 3])
+                value < 0. || value == 0. && !top_left[i]
             }) {
                 continue;
             }
-            let mut color = Color::rgba(
-                (argb >> 16) as u8,
-                (argb >> 8) as u8,
-                argb as u8,
-                (argb >> 24) as u8,
-            );
-            if let Some(source) = source {
-                let rhw: f64 = (0..3).map(|i| weights[i] * v[i][3] / area).sum();
-                let uv: [f64; 2] = std::array::from_fn(|axis| {
-                    (0..3)
-                        .map(|i| weights[i] * v[i][axis + 4] / area)
-                        .sum::<f64>()
-                        / rhw
-                });
-                let sx = uv[0].floor() as i64;
-                let sy = uv[1].floor() as i64;
-                let (Ok(sx), Ok(sy)) = (u32::try_from(sx), u32::try_from(sy)) else {
+            let color = if let Some(source) = source {
+                // Keep the reference evaluation order at texel boundaries.
+                let interpolate = |axis| {
+                    0. + weights[0] * v[0][axis] / area
+                        + weights[1] * v[1][axis] / area
+                        + weights[2] * v[2][axis] / area
+                };
+                let rhw = interpolate(3);
+                let sx = (interpolate(4) / rhw).floor() as i64;
+                let sy = (interpolate(5) / rhw).floor() as i64;
+                let (Ok(sx), Ok(sy)) = (
+                    u32::try_from(sx.saturating_sub(i64::from(source_origin[0]))),
+                    u32::try_from(sy.saturating_sub(i64::from(source_origin[1]))),
+                ) else {
                     continue;
                 };
                 let pixel = if sx < source.width() && sy < source.height() {
                     let offset = (sy as usize * source.width() as usize + sx as usize) * 4;
                     let bytes = &source.pixels()[offset..offset + 4];
                     Color::rgba(bytes[0], bytes[1], bytes[2], bytes[3])
-                } else if let Some(pixel) = overflow.and_then(|atlas| atlas.pixel(sx, sy)) {
+                } else if let Some(pixel) = overflow_pixel.as_ref().and_then(|sample| sample(sx, sy)) {
                     pixel
                 } else {
                     continue;
                 };
-                color = Color::rgba(
-                    (u16::from(pixel.r) * u16::from(color.r) / 255) as u8,
-                    (u16::from(pixel.g) * u16::from(color.g) / 255) as u8,
-                    (u16::from(pixel.b) * u16::from(color.b) / 255) as u8,
-                    (u16::from(pixel.a) * u16::from(color.a) / 255) as u8,
-                );
-            }
-            canvas.blend_pixel_with_mode(x as i32, y as i32, color, blend)?;
+                Color::rgba(
+                    (u16::from(pixel.r) * u16::from(modulation.r) / 255) as u8,
+                    (u16::from(pixel.g) * u16::from(modulation.g) / 255) as u8,
+                    (u16::from(pixel.b) * u16::from(modulation.b) / 255) as u8,
+                    (u16::from(pixel.a) * u16::from(modulation.a) / 255) as u8,
+                )
+            } else {
+                modulation
+            };
+            cs2_renderer::blend_into(target, color, blend);
         }
-    }
+    };
+    cs2_renderer::draw_pixel_rows(
+        &mut canvas.pixels_mut()[min_y as usize * stride..max_y as usize * stride],
+        stride,
+        min_y,
+        workers,
+        draw_row,
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod unit_canvas_plane_tests {
     use super::*;
+
+    #[test]
+    fn large_textured_triangle_matches_serial_strips() -> HostResult<()> {
+        let [width, height] = [768, 512];
+        let texture = (0..width * height)
+            .flat_map(|index| {
+                let value = (index * 31 + index / width) as u8;
+                [value, value.rotate_left(3), value ^ 67, [0, 1, 127, 254, 255][(index % 5) as usize]]
+            })
+            .collect();
+        let source = RgbaFrame::from_rgba8(width, height, texture)?;
+        let triangle = [
+            [-3.5, 0.25, 0.5, 1., 13.25, 9.75],
+            [769.0, 8.5, 0.5, 2., 1516.5, 21.0],
+            [9.5, 513.25, 0.5, 0.75, 18.75, 375.0],
+        ];
+        let mut parallel = Canvas::new(width, height)?;
+        parallel.clear(Color::rgba(51, 71, 171, 199));
+        let mut serial = parallel.clone();
+        let draw = |canvas: &mut Canvas, clip| {
+            raster_triangle_from(canvas, triangle, 0xcbf1c981, Some(&source), [13, 9], None,
+                Some(clip), BlendMode::Multiply)
+        };
+        draw(&mut parallel, Rect::new(4, 5, width - 8, height - 10))?;
+        let mut top = 5;
+        while top < height - 5 {
+            let rows = 32.min(height - 5 - top);
+            draw(&mut serial, Rect::new(4, top as i32, width - 8, rows))?;
+            top += rows;
+        }
+        assert_ne!(parallel.pixel(20, 20)?, Color::rgba(51, 71, 171, 199));
+        assert_eq!(parallel.pixels(), serial.pixels());
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    #[test]
+    fn sampled_plane_preserves_fractional_raster_and_opacity() -> HostResult<()> {
+        let dimensions = [12, 9];
+        let rgba: Vec<_> = (0..56).flat_map(|i| [i * 3, 255 - i * 3, i * 2, i * 4]).collect();
+        let source = RgbaFrame::from_rgba8(8, 7, rgba)?;
+        let vertices = [
+            [-1.25, -0.75, 0.5, 1., 0., 0.],
+            [9.25, 0.25, 0.5, 2., 16., 0.],
+            [0.25, 7.25, 0.5, 1., 0., 7.],
+            [10.75, 8.25, 0.5, 2., 16., 14.],
+        ];
+        let services = PlaneServices::default();
+        let clip = Some(Rect::new(1, 1, 9, 7));
+        let mut prior: Option<RgbaFrame> = None;
+        for blend in [BlendMode::SourceOver, BlendMode::Multiply] {
+            for opacity in [0, 1, 170, 255] {
+                let argb = u32::from(opacity) << 24 | 0x0087_aae1;
+                let plane = PlaneGeometry { vertices, source: Some(&source), argb, clip, blend };
+                let mapped = sampled_plane(dimensions, &services, &plane)?.unwrap().source.unwrap();
+                if let Some(prior) = &prior {
+                    assert!(prior.pixel_identity().matches(&mapped));
+                }
+                let mut expected = Canvas::new(dimensions[0], dimensions[1])?;
+                expected.clear(Color::rgba(190, 75, 20, 128));
+                let mut actual = expected.clone();
+                for triangle in plane_triangles(&plane_polygons(vertices)) {
+                    raster_triangle(&mut expected, triangle, argb, Some(&source), None, clip, blend)?;
+                }
+                for (out, input) in actual.pixels_mut().chunks_exact_mut(48)
+                    .zip(mapped.pixels().chunks_exact(48))
+                {
+                    if blend == BlendMode::Multiply {
+                        multiply_unit_plane_span(input, out, opacity);
+                    } else {
+                        blend_unit_plane_span(input, out, opacity);
+                    }
+                }
+                assert_eq!(actual.pixels(), expected.pixels(), "{blend:?} {opacity}");
+                prior = Some(mapped);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn legacy_string2_inherits_plane_display_only_for_verified_receivers() {
@@ -3212,7 +3429,7 @@ pub(super) fn draw_fes_motion_frame(
     let triangles = || (1..polygon.len().saturating_sub(1))
         .map(|index| [polygon[0], polygon[index], polygon[index + 1]]);
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-    if draw_gpu_triangles(canvas, Some(frame), None, triangles(), color, None, options.blend_mode) {
+    if draw_gpu_triangles(canvas, Some(frame), triangles(), color, None, options.blend_mode) {
         return Ok(());
     }
     for triangle in triangles() {
@@ -3246,12 +3463,18 @@ fn request_rect(args: &[u8], offset: usize) -> Result<CopyRect> {
     })
 }
 
+pub(super) fn native_image_offset(frame: &RgbaFrame, x: u32, y: u32, top_down: bool) -> usize {
+    let row = if top_down { y } else { frame.height() - 1 - y };
+    (row as usize * frame.width() as usize + x as usize) * 4
+}
+
 pub(super) fn copy_wrapper(
     target: &RgbaFrame,
     source: &RgbaFrame,
     to: CopyRect,
     from: CopyRect,
     alias: bool,
+    top_down: [bool; 2],
 ) -> Result<Option<RgbaFrame>> {
     let local = |request: CopyRect, added: [i32; 2], frame: &RgbaFrame| -> Option<[i32; 4]> {
         let offset = frame.metadata().offset;
@@ -3295,13 +3518,12 @@ pub(super) fn copy_wrapper(
         return Ok(None);
     }
     let mut pixels = target.pixels().to_vec();
-    let offset = |frame: &RgbaFrame, x: i32, y: i32| {
-        ((frame.height() as usize - 1 - y as usize) * frame.width() as usize + x as usize) * 4
-    };
+    let source_offset = |x, y| native_image_offset(source, x as u32, y as u32, top_down[0]);
+    let target_offset = |x, y| native_image_offset(target, x as u32, y as u32, top_down[1]);
     if sw == dw && sh == dh {
         for row in 0..dh {
-            let s = offset(source, src[0], src[1] + row);
-            let d = offset(target, dst[0], dst[1] + row);
+            let s = source_offset(src[0], src[1] + row);
+            let d = target_offset(dst[0], dst[1] + row);
             let length = dw as usize * 4;
             if alias {
                 pixels.copy_within(s..s + length, d);
@@ -3324,7 +3546,7 @@ pub(super) fn copy_wrapper(
                     source.pixels()
                 };
                 let sample = |sx: i32, sy: i32| -> [u8; 4] {
-                    let i = offset(source, sx, sy);
+                    let i = source_offset(sx, sy);
                     std::array::from_fn(|axis| input[i + axis])
                 };
                 let pixel = if average {
@@ -3385,7 +3607,7 @@ pub(super) fn copy_wrapper(
                     }
                     output
                 };
-                let d = offset(target, dst[0] + x, dst[1] + y);
+                let d = target_offset(dst[0] + x, dst[1] + y);
                 pixels[d..d + 4].copy_from_slice(&pixel);
             }
         }

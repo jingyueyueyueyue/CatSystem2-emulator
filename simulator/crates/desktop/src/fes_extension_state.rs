@@ -51,7 +51,7 @@ pub(super) fn motion_extensions(text: &FesTextStore, controls: &FesControlStore,
             .and_then(|bank| driver.adapter.object_bank_definition(&identity.1, bank))
             .context("control checkpoint motion bank declaration is absent")?;
         match definition.kind_name.as_slice() {
-            b"SLIDER" | b"SCROLL2" => { proof.sliders.insert(identity); },
+            b"SLIDER" | b"SCROLL2" | b"SCROLL" => { proof.sliders.insert(identity); },
             b"VIEWPORT" | b"IMGWND" => { proof.inert.insert(identity); },
             _ => bail!("control checkpoint motion identity belongs to a different object kind"),
         }

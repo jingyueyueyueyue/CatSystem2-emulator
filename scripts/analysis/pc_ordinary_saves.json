@@ -1,0 +1,18 @@
+{
+  "schema": "cs2-ordinary-saves/v1",
+  "approved": {},
+  "review_policy": {
+    "opt_in": "Pass --ordinary-saves and set ordinary_save to an approved ID in the scenario.",
+    "resource_tree_sha256": "Hash the UTF-8 concatenation of '<file sha256>  <game-root-relative path>\n' for all regular files under the game root, sorted by slash-separated relative path.",
+    "evidence": "Approve only a normal slot written by an identified producer and read in a separate process by the exact integration consumer, after staging only the archived slot. Verify the restored line and advancement to a different line. Staging alone is not load acceptance."
+  },
+  "pending": {
+    "v401-pc-slot-0": {
+      "status": "pending_verification",
+      "game": "games/cs2_full_v401",
+      "slot": 0,
+      "historical_receipt": "reports/android_save_acceptance_20261118.md:69",
+      "reason": "Historical reopen used a private executable and the entire isolated profile. No approved production save provenance or single-file reopen on an identified integration build."
+    }
+  }
+}

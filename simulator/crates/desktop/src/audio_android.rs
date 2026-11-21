@@ -125,6 +125,8 @@ pub(crate) struct Output {
     accepted_frames: u64,
     last_consumed: u64,
     frame_origin: u64,
+    // The first positive program-frame counter may arrive after PLAY's ack.
+    first_consumption: Option<(crate::perf_detail::audio::Shared, u64, &'static str)>,
     staged_device: Option<StagedDevice>,
     paused: bool,
     started: bool,
@@ -188,6 +190,7 @@ impl Output {
             accepted_frames: 0,
             last_consumed: 0,
             frame_origin: 0,
+            first_consumption: None,
             staged_device: None,
             paused: true,
             started: false,
@@ -302,16 +305,39 @@ impl Output {
                 "AAudio returned invalid or regressing device frame counters",
             ));
         }
-        let read = (read as u64).saturating_sub(self.frame_origin);
-        let written = (written as u64).saturating_sub(self.frame_origin);
-        if read < self.last_consumed {
+        let program_read = (read as u64).saturating_sub(self.frame_origin);
+        let program_written = (written as u64).saturating_sub(self.frame_origin);
+        if program_read < self.last_consumed {
             return Err(error("AAudio returned invalid or regressing device frame counters"));
         }
         // Endpoint counters are the actual audio consumer, not the game frame
         // clock. Clamp underrun silence to samples the app submitted.
-        let consumed = read.min(written).min(self.accepted_frames);
+        let consumed = program_read.min(program_written).min(self.accepted_frames);
         self.last_consumed = self.last_consumed.max(consumed);
-        Ok((self.last_consumed, written))
+        if self.first_consumption.as_ref().is_some_and(|(_, position, _)| consumed > *position)
+            && let Some((command, position, route)) = self.first_consumption.take()
+        {
+            let elapsed_us = command.elapsed().as_micros();
+            let state = unsafe { AAudioStream_getState(stream.as_ptr()) };
+            let xruns = unsafe { AAudioStream_getXRunCount(stream.as_ptr()) };
+            report_audio(&format!(
+                "audio_first_consume audio_id={} channel={} name={} route={route} rate={} channels={} elapsed_us={elapsed_us} state={state} position={position} consumed={consumed} device_read={read} device_written={written} accepted={} pending={} origin={} xruns={xruns}",
+                command.id, command.channel, command.name(), self.rate, self.channels,
+                self.accepted_frames, self.pending_frames, self.frame_origin,
+            ));
+        }
+        Ok((self.last_consumed, program_written))
+    }
+
+    fn observe_start(&mut self, position: u64, route: &'static str) {
+        self.first_consumption = crate::perf_detail::audio::active().map(|command| {
+            report_audio(&format!(
+                "audio_start_probe audio_id={} channel={} name={} route={route} rate={} channels={} elapsed_us={} position={position} accepted={} pending={} origin={}",
+                command.id, command.channel, command.name(), self.rate, self.channels,
+                command.elapsed().as_micros(), self.accepted_frames, self.pending_frames, self.frame_origin,
+            ));
+            (command, position, route)
+        });
     }
 
     fn wait_state(&mut self, expected: i32, start_position: Option<u64>) -> RuntimeResult<()> {
@@ -343,8 +369,9 @@ impl Output {
                     && start.elapsed() >= START_BUFFER_RETRY_DELAY
                 {
                     can_expand_start_buffer = false;
-                    let size = unsafe {
-                        AAudioStream_setBufferSizeInFrames(stream.as_ptr(), self.device_buffer_capacity)
+                    let size = {
+                        let _timing = Stage::ConfirmExpand.begin();
+                        unsafe { AAudioStream_setBufferSizeInFrames(stream.as_ptr(), self.device_buffer_capacity) }
                     };
                     if size > self.device_buffer_size && size <= self.device_buffer_capacity {
                         self.device_buffer_size = size;
@@ -352,6 +379,7 @@ impl Output {
                             .max(size as u64 + u64::from(self.rate / 10));
                     }
                 }
+                let _timing = Stage::ConfirmPump.begin();
                 self.pump()?;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -381,13 +409,14 @@ impl Output {
             } else {
                 STATE_WAIT_SLICE
             };
-            let result = unsafe {
-                AAudioStream_waitForStateChange(
+            let result = {
+                let _timing = Stage::StateWait.begin();
+                unsafe { AAudioStream_waitForStateChange(
                     stream.as_ptr(),
                     state,
                     &mut next,
                     left.min(slice).as_nanos() as i64,
-                )
+                ) }
             };
             if result < 0 && next == state {
                 // A bounded wait timeout is expected while an async request
@@ -452,13 +481,18 @@ impl MovieAudioOutput for Output {
     }
 
     fn pause(&mut self, paused: bool) -> RuntimeResult<()> {
+        if paused {
+            self.first_consumption = None;
+        }
         if paused && self.staged_device.is_some() {
             return Ok(());
         }
+        let mut route = if self.started { "resume" } else { "cold" };
         if let Some(staged) = self.staged_device.take() {
             if let StagedDevice::Started(xruns) = staged
                 && self.can_activate_standby(xruns)
             {
+                self.observe_start(0, "started");
                 self.pump()?;
                 let stream = self.validate_device()?;
                 if unsafe { AAudioStream_getXRunCount(stream.as_ptr()) } != xruns {
@@ -481,6 +515,9 @@ impl MovieAudioOutput for Output {
                 fresh.pending_frames = self.pending_frames;
                 fresh.accepted_frames = self.accepted_frames;
                 drop(std::mem::replace(self, fresh));
+                route = "reopened";
+            } else {
+                route = "opened";
             }
         }
         let stream = self.validate_device()?;
@@ -496,6 +533,7 @@ impl MovieAudioOutput for Output {
         } else {
             self.pump()?;
             let (position, _) = self.counters()?;
+            self.observe_start(position, route);
             {
                 let _timing = Stage::Request.begin();
                 check("request start", unsafe { AAudioStream_requestStart(stream.as_ptr()) })?;
@@ -554,6 +592,16 @@ fn check(operation: &str, result: i32) -> RuntimeResult<()> {
             "AAudio {operation}: {}",
             result_text(result)
         )))
+    }
+}
+
+fn report_audio(message: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: i32, tag: *const c_char, text: *const c_char) -> i32;
+    }
+    if let Ok(message) = std::ffi::CString::new(message) {
+        unsafe { __android_log_write(4, c"CS2Audio".as_ptr(), message.as_ptr()); }
     }
 }
 

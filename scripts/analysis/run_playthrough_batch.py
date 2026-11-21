@@ -18,20 +18,38 @@ import stat
 import subprocess
 import tempfile
 import time
+from xml.etree import ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = ROOT / "reports/startup_inventory_20261116.json"
 ADDITIONAL_GAMES = ROOT / "reports/pc_playthrough_additional_games_20261120.json"
 GIB = 1024 ** 3
+ADMISSION_POLL_SECONDS = 15
 STATE_FRAME = re.compile(rb"replay frame=([0-9]+)(?=\s)")
 LEGACY_FRAME = re.compile(rb"frame=([0-9]+) logic-frame(?:\s|$)")
 STATE_EVENT_FRAME = re.compile(rb"(?:story )?frame=([0-9]+) (?:[a-z][a-z0-9-]*(?=\s|$)|state=)")
+STORY_POSITION = re.compile(
+    rb"(?:story|replay) frame=([0-9]+) state=([^ ]+) scene=(.*) group=(-?[0-9]+) record=(-?[0-9]+)(?=\s)"
+)
+ROUTE_STOP = re.compile(rb"replay frame=([0-9]+): (.+)")
+TRAILING_MOVIE_DIAGNOSTIC = re.compile(rb"frame [0-9]+: movie .+")
 REPLAY_STATUS = re.compile(rb"replay_status=([a-z][a-z0-9_]*)(?=\s)")
+ENDING_EVENT = re.compile(rb"replay frame=([0-9]+) ending_(card|verified)=([A-Za-z0-9_]+)(?=\s)")
 ENGINE_ERROR = re.compile(rb"frame=([0-9]+) (task-error|vm-error) (.*)")
 ROUTE_DIAGNOSTIC = re.compile(r"trace-native:[0-9]+|inspect-log:[1-9][0-9]*")
+GUARDED_BODY_INPUT = re.compile(
+    r"legacy-(?:(?:02|06|16|19)-(?:enter|continue|opening|segment)|02-next-segment|(?:02|16)-continuous"
+    r"|(?:04|05)-(?:enter|opening|segment)"
+    r"|11-13-(?:enter|continue):(?:11|13)|11-radio-(?:stop|r94-enter)|13-r(?:139|188))"
+    r"|labyrinth15-(?:next|opening|r19-enter-observe|cross-window-successor)|djibril10-op01-next"
+)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SAVE_NAME = re.compile(r"save(?:[0-9]+|gen)\.dat|slot_.*\.cs2save", re.IGNORECASE)
+REUSABLE_ATTEMPT_STATUSES = {
+    "checkpoint_reached", "engine_error", "unexpected_branch", "unknown_state",
+    "unrecognized_wait", "input_missed", "checkpoint_mismatch",
+}
 
 
 def write_json(path, value):
@@ -77,7 +95,7 @@ def checked_path(path):
     return plain_stat(path)
 
 
-def resource_tree_sha256(root):
+def resource_tree_sha256(root, *, include_saves=False):
     if not stat.S_ISDIR(checked_path(root).st_mode):
         raise ValueError(f"not a game directory: {root}")
     files = []
@@ -87,7 +105,8 @@ def resource_tree_sha256(root):
             manifest_path(path.name)
             info = plain_stat(path)
             name = path.name.lower()
-            if SAVE_NAME.fullmatch(name) or name.endswith(".profile") or name in ("save", "saves", "savedata"):
+            if not include_saves and (SAVE_NAME.fullmatch(name) or name.endswith(".profile")
+                                      or name in ("save", "saves", "savedata")):
                 raise ValueError(f"resource tree contains a save or profile: {path}")
             if stat.S_ISDIR(info.st_mode):
                 pending.append(path)
@@ -166,14 +185,19 @@ def stage_ordinary_save(save, game_path, player, profile):
 
 
 class ReplayProgress:
-    def __init__(self, state_mode):
+    def __init__(self, state_mode, guarded_body=False):
         self.state_mode = state_mode
+        self.expects_checkpoint = state_mode or guarded_body
         self.frame_pattern = STATE_FRAME if state_mode else LEGACY_FRAME
         self.frame = None
         self.last_advance = None
         self.replay_status = None
         self.first_engine_error = None
+        self.last_story_position = None
+        self.last_page_wait = None
         self.event_line = 0
+        self.ending_card = None
+        self.verified_ending = None
 
     def sample(self, stream):
         previous = self.frame
@@ -201,8 +225,29 @@ class ReplayProgress:
                 if self.frame is None or frame > self.frame:
                     self.frame = frame
             status_match = REPLAY_STATUS.match(line)
-            if status_match and (self.state_mode or status_match[1] != b"completed"):
+            if status_match and (self.expects_checkpoint or status_match[1] != b"completed"):
                 self.replay_status = status_match[1].decode("ascii")
+            if position := STORY_POSITION.match(line):
+                frame = int(position[1])
+                if self.last_story_position is None or frame >= self.last_story_position["frame"]:
+                    observed = {
+                        "frame": frame,
+                        "state": position[2].decode("utf-8", errors="replace"),
+                        "scene": position[3].decode("utf-8", errors="replace"),
+                        "group": int(position[4]),
+                        "record": int(position[5]),
+                        "line": self.event_line,
+                    }
+                    self.last_story_position = observed
+                    if observed["state"] == "page" and observed["group"] >= 0 and observed["record"] >= 0:
+                        self.last_page_wait = observed
+            if self.state_mode and (event := ENDING_EVENT.match(line)):
+                frame, kind, name = int(event[1]), event[2], event[3].decode("ascii")
+                if kind == b"card":
+                    self.ending_card = (name, frame)
+                elif self.ending_card and self.ending_card[0] == name and self.ending_card[1] < frame:
+                    self.verified_ending = {"id": name, "card_frame": self.ending_card[1],
+                                            "clear_verified_frame": frame, "log_line": self.event_line}
         if self.frame != previous:
             self.last_advance = time.monotonic()
 
@@ -223,7 +268,9 @@ class ReplayProgress:
             return "scenario_error"
         if exit_code != 0:
             return "process_error"
-        return self.replay_status or ("missing_replay_status" if self.state_mode else "visual_review_required")
+        if self.replay_status == "completed":
+            return "checkpoint_reached"
+        return self.replay_status or ("missing_replay_status" if self.expects_checkpoint else "visual_review_required")
 
 
 def wait_for_replay(process, events, progress, deadline, poll_interval):
@@ -245,8 +292,90 @@ def wait_for_replay(process, events, progress, deadline, poll_interval):
     return False
 
 
+def route_stop_diagnostics(host_path):
+    # A guarded replay can append movie diagnostics after the final wait snapshot.
+    with host_path.open("rb") as stream:
+        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
+        lines = stream.read().splitlines()
+    diagnostics = {}
+    while lines and TRAILING_MOVIE_DIAGNOSTIC.fullmatch(lines[-1]):
+        lines.pop()
+    if lines and lines[-1].startswith(b"replay wait: "):
+        diagnostics["wait"] = lines.pop()[len(b"replay wait: "):].decode("utf-8", errors="replace")
+    if lines and (reason := ROUTE_STOP.fullmatch(lines[-1])) and not reason[2].startswith(b"verified "):
+        diagnostics.update(frame=int(reason[1]), reason=reason[2].decode("utf-8", errors="replace"))
+    return diagnostics or None
+
+
+def seed_fast_text_profile(profile):
+    """Set the fastest standard message speed in a private replay profile."""
+    profile.mkdir(exist_ok=True)
+    setup = profile / "setup.xml"
+    if setup.exists():
+        document = ET.parse(setup).getroot()
+        if document.tag != "document":
+            raise ValueError(f"Unexpected setup.xml root: {setup}")
+    else:
+        document = ET.Element("document")
+    message = document.find("MESSAGE")
+    if message is None:
+        message = ET.SubElement(document, "MESSAGE")
+    speed = message.find("speed")
+    if speed is None:
+        speed = ET.SubElement(message, "speed")
+    speed.text = "0"
+    ET.ElementTree(document).write(setup, encoding="utf-8", xml_declaration=True)
+    return {"message_speed": 0, "setup_sha256": file_sha256(setup)}
+
+
+def load_attempt_history(cache_root, indices):
+    receipts = {}
+    filenames = {f"{index:02}.json": index for index in indices}
+    paths = cache_root.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]/*_playthrough/??.json")
+    for path in sorted(paths, reverse=True):
+        index = filenames.get(path.name)
+        if index is None:
+            continue
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            key = receipt.get("attempt_key")
+            if (receipt.get("index") == index and is_sha256(key)
+                    and receipt.get("status") in REUSABLE_ATTEMPT_STATUSES
+                    and isinstance(receipt.get("seconds"), (float, int))
+                    and not receipt.get("timed_out")
+                    and all(Path(receipt[field]).is_file() for field in ("stdout", "stderr"))):
+                receipts.setdefault((index, key), (path, receipt))
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            continue
+    return receipts
+
+
+def attempt_key(player_sha256, game_path, command_args, timeout, stall_seconds, env,
+                save_receipt, text_setup, neko_language):
+    # A different build, resource tree, route, or starting profile requires a new replay.
+    cache_variables = {"CS2_BUILD_CACHE_ROOT", "CS2_MEDIA_CACHE"}
+    settings = {
+        "version": 1,
+        "player_sha256": player_sha256,
+        "game": str(game_path),
+        "resource_tree_sha256": (save_receipt["resource_tree_sha256"] if save_receipt
+                                 else resource_tree_sha256(game_path, include_saves=True)),
+        "command_args": command_args,
+        "timeout": timeout,
+        "stall_seconds": stall_seconds,
+        "environment": {key: value for key, value in env.items()
+                        if key.startswith("CS2_") and key not in cache_variables},
+        "slot": [save_receipt["slot"], save_receipt["sha256"]] if save_receipt else None,
+        "fast_text": text_setup,
+        "neko_language": neko_language,
+    }
+    encoded = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def run_case(index, game, frames, inputs, player, output, timeout, env, *,
-             route=None, diagnostics=(), stall_seconds=30, ordinary_save=None):
+             route=None, diagnostics=(), stall_seconds=30, ordinary_save=None, neko_language=None,
+             fast_text=False, reuse_attempts=None):
     game_root = ROOT / game["root"]
     game_path = game_root
     if ordinary_save is None:
@@ -269,14 +398,22 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
 
     started = time.monotonic()
     profile = prefix.with_suffix(".profile")
+    if neko_language is not None:
+        from stage_neko_cold_language import seed_language_profile
+
+        seed_language_profile(profile, neko_language)
     events_path = prefix.with_suffix(".events.log")
     host_path = prefix.with_suffix(".host.log")
-    progress = ReplayProgress(route is not None)
+    progress = ReplayProgress(route is not None, guarded_body=any(GUARDED_BODY_INPUT.fullmatch(item) for item in inputs))
     stall_window = min(stall_seconds, timeout / 2)
     timed_out = False
     exit_code = None
+    pid = None
     save_receipt = None
+    text_setup = None
     save_rejected = False
+    key = None
+    reuse_unavailable = None
     if ordinary_save is not None:
         save_id, save = ordinary_save
         try:
@@ -285,7 +422,30 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
             save_rejected = True
             save_receipt = {"id": save_id, "status": "rejected", "reason": str(error)}
     if not save_rejected:
-        deadline = (started if ordinary_save is None else time.monotonic()) + timeout
+        if fast_text:
+            text_setup = seed_fast_text_profile(profile)
+        if reuse_attempts is not None:
+            player_sha256, history = reuse_attempts
+            try:
+                key = attempt_key(player_sha256, game_path, [frames, route, inputs, diagnostics],
+                                  timeout, stall_seconds, env, save_receipt, text_setup, neko_language)
+            except (OSError, ValueError) as error:
+                reuse_unavailable = str(error)
+            previous = history.get((index, key))
+            if previous is not None:
+                path, receipt = previous
+                record = {
+                    "index": index, "game": str(game_path), "status": "skipped_attempt",
+                    "attempt_key": key, "previous_status": receipt["status"],
+                    "previous_receipt": str(path), "previous_seconds": receipt["seconds"],
+                    "last_story_position": receipt.get("last_story_position"),
+                    "first_engine_error": receipt.get("first_engine_error"),
+                    "route_stop": receipt.get("route_stop"),
+                    "seconds": 0, "captures": [],
+                }
+                write_json(output / f"{index:02}.json", record)
+                return record
+        deadline = time.monotonic() + timeout
         with events_path.open("xb") as events, host_path.open("xb") as host, \
                 events_path.open("rb") as reader:
             try:
@@ -294,6 +454,7 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
                 host.write(f"{error}\n".encode("utf-8", errors="backslashreplace"))
             else:
                 with process:
+                    pid = process.pid
                     timed_out = wait_for_replay(process, reader, progress, deadline,
                                                 min(1, stall_window / 4))
                     if not timed_out:
@@ -313,8 +474,11 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
         "status": status,
         "replay_status": progress.replay_status,
         "first_engine_error": progress.first_engine_error,
+        "last_story_position": progress.last_story_position,
+        "last_page_wait": progress.last_page_wait,
         "timed_out": timed_out,
         "exit_code": exit_code,
+        "pid": pid,
         "seconds": round(finished - started, 2),
         "last_frame": progress.frame,
         "frame_idle_seconds": None if frame_idle_seconds is None else round(frame_idle_seconds, 2),
@@ -327,6 +491,25 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
     }
     if save_receipt is not None:
         record["ordinary_save"] = save_receipt
+    if neko_language is not None:
+        record["neko_language"] = neko_language
+    if text_setup is not None:
+        record["fast_text"] = text_setup
+    if key is not None:
+        record["attempt_key"] = key
+    if reuse_unavailable is not None:
+        record["attempt_reuse_unavailable"] = reuse_unavailable
+    if progress.expects_checkpoint and not save_rejected and status in {
+        "unexpected_branch", "unknown_state", "unrecognized_wait", "input_missed",
+        "checkpoint_mismatch", "frame_limit",
+    }:
+        record["route_stop"] = route_stop_diagnostics(host_path)
+    if status == "checkpoint_reached" and progress.verified_ending:
+        ending = progress.verified_ending
+        capture = f"{prefix.name}.{ending['card_frame']:04}.png"
+        if capture in record["captures"]:
+            record["status"] = "ending_verified"
+            record["ending"] = {**ending, "card": capture}
     write_json(output / f"{index:02}.json", record)
     return record
 
@@ -352,10 +535,12 @@ def available_ram_bytes():
     return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
 
-def run_batch(cases, player, output, args, env, ordinary_saves=None):
+def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_text=False,
+              reuse_attempts=None):
     pending = deque(cases)
-    active = set()
-    save_rejected = False
+    active = {}
+    case_failed = False
+    admission_deadline = None
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         while pending or active:
             while pending and len(active) < args.jobs:
@@ -370,6 +555,13 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None):
                         "free_ram_bytes": free_ram, "required_ram_bytes": required_ram,
                         "free_disk_bytes": free_disk, "required_disk_bytes": required_disk,
                     }
+                    now = time.monotonic()
+                    if admission_deadline is None and args.admission_wait_seconds > 0:
+                        admission_deadline = now + args.admission_wait_seconds
+                        print(f"Waiting for playback resources: {json.dumps(resources)}", flush=True)
+                    if admission_deadline is not None and now < admission_deadline:
+                        time.sleep(min(ADMISSION_POLL_SECONDS, admission_deadline - now))
+                        continue
                     for index, game, settings in pending:
                         write_json(output / f"{index:02}.json", {
                             "index": index, "game": game["root"],
@@ -380,21 +572,38 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None):
                         print(f"{index:02}: resource_deferred", flush=True)
                     print(f"Admission paused: {json.dumps(resources)}", flush=True)
                     return 1
+                if admission_deadline is not None:
+                    print("Playback resources available; resuming batch", flush=True)
+                    admission_deadline = None
                 index, game, settings = pending.popleft()
                 save_id = settings.get("ordinary_save")
                 ordinary_save = None if save_id is None else (save_id, ordinary_saves[save_id])
-                active.add(pool.submit(run_case, index, game, settings.get("frames", args.frames),
-                                       settings.get("inputs", []), player, output, args.timeout, env,
-                                       route=settings.get("route"), diagnostics=settings.get("diagnostics", ()),
-                                       stall_seconds=args.stall_seconds,
-                                       ordinary_save=ordinary_save))
+                task = pool.submit(run_case, index, game, settings.get("frames", args.frames),
+                                   settings.get("inputs", []), player, output, args.timeout, env,
+                                   route=settings.get("route"), diagnostics=settings.get("diagnostics", ()),
+                                   stall_seconds=args.stall_seconds,
+                                   ordinary_save=ordinary_save, neko_language=settings.get("neko_language"),
+                                   fast_text=fast_text, reuse_attempts=reuse_attempts)
+                active[task] = (index, game, settings)
             if active:
-                done, active = wait(active, return_when=FIRST_COMPLETED)
+                recheck_resources = pending and len(active) < args.jobs
+                done, _ = wait(active, return_when=FIRST_COMPLETED,
+                               timeout=ADMISSION_POLL_SECONDS if recheck_resources else None)
                 for task in done:
-                    result = task.result()
-                    save_rejected |= result["status"] == "ordinary_save_rejected"
+                    index, game, settings = active.pop(task)
+                    try:
+                        result = task.result()
+                    except (OSError, ValueError) as error:
+                        result = {
+                            "index": index, "game": game["root"],
+                            "mode": "state" if "route" in settings else "frame",
+                            "status": "case_setup_failed", "exit_code": None,
+                            "seconds": 0, "captures": [], "reason": str(error),
+                        }
+                        write_json(output / f"{index:02}.json", result)
+                    case_failed |= result["status"] in {"ordinary_save_rejected", "case_setup_failed"}
                     print(f'{result["index"]:02}: {result["status"]}, {result["seconds"]}s', flush=True)
-    return int(save_rejected)
+    return int(case_failed)
 
 
 def load_inventory(path):
@@ -433,6 +642,55 @@ def new_output_directory(cache_root, now):
     month.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=now.strftime("%Y%m%d_%H%M%S_%f_"),
                                  suffix="_playthrough", dir=month))
+
+
+def find_cleared_cases(games, indices, cache_root):
+    """Reuse completed first-ending receipts across candidates in the same test campaign."""
+    pending = {index: (ROOT / games[index]["root"]).resolve() for index in indices}
+    cleared = {}
+    batches = cache_root.resolve().glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]/*_playthrough")
+    for batch in sorted(batches, reverse=True):
+        if not pending:
+            break
+        for index, game_path in tuple(pending.items()):
+            receipt_path = batch / f"{index:02}.json"
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if (receipt.get("status") != "ending_verified" or receipt.get("index") != index
+                        or Path(receipt["game"]) != game_path or receipt.get("exit_code") != 0
+                        or receipt.get("replay_status") != "completed" or receipt.get("timed_out")
+                        or receipt.get("first_engine_error")):
+                    continue
+                ending = receipt["ending"]
+                card_frame = ending["card_frame"]
+                if (type(card_frame) is not int or card_frame < 0
+                        or type(ending["clear_verified_frame"]) is not int
+                        or not re.fullmatch(r"[A-Za-z0-9_]+", ending["id"])):
+                    continue
+                card = f"{index:02}.{card_frame:04}.png"
+                case_dir = batch / f"{index:02}"
+                if (ending["clear_verified_frame"] <= card_frame or ending["card"] != card
+                        or not (case_dir / card).is_file()):
+                    continue
+                identity_path = batch / "build_identity.json"
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                if not all(is_sha256(identity.get(key)) for key in ("sha256", "source_tree_sha256")):
+                    continue
+                progress = ReplayProgress(state_mode=True)
+                with (case_dir / f"{index:02}.events.log").open("rb") as events:
+                    progress.sample(events)
+                if (progress.first_engine_error or progress.replay_status != "completed"
+                        or not progress.verified_ending
+                        or any(ending.get(key) != value for key, value in progress.verified_ending.items())):
+                    continue
+            except (OSError, ValueError, TypeError, AttributeError, KeyError):
+                # A partial, outdated or removed receipt cannot exclude a game.
+                continue
+            cleared[index] = {"index": index, "game": str(game_path), "status": "skipped_cleared",
+                              "ending": ending, "ending_receipt": str(receipt_path),
+                              "ending_build_identity": str(identity_path)}
+            del pending[index]
+    return cleared
 
 
 def identify_player(player, *, require_integration=False):
@@ -477,7 +735,15 @@ def main():
                         help="JSON keyed by sample index; repeat for disjoint groups of selected games")
     parser.add_argument("--ordinary-saves", type=Path,
                         help="reviewed manifest; only scenarios with an approved ordinary_save ID preload a slot")
+    parser.add_argument("--skip-cleared", action="store_true",
+                        help="first-ending campaign: skip games with an archived verified ending")
+    parser.add_argument("--fast-text", action="store_true",
+                        help="seed the fastest native text speed in each isolated replay profile")
+    parser.add_argument("--reuse-attempts", action="store_true",
+                        help="reuse a prior checkpoint or diagnosed stop for identical replay inputs")
     parser.add_argument("--frames", type=int, default=12)
+    parser.add_argument("--button-probe", action="store_true",
+                        help="record actual mouse targets at fixed-frame inspect checkpoints")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--stall-seconds", type=float, default=30,
@@ -486,6 +752,8 @@ def main():
     parser.add_argument("--disk-per-job-gib", type=float, default=2, help="disk budget per replay (default 2 GiB)")
     parser.add_argument("--reserve-ram-gib", type=float, default=2, help="RAM headroom (default 2 GiB)")
     parser.add_argument("--reserve-disk-gib", type=float, default=20, help="disk headroom (default 20 GiB)")
+    parser.add_argument("--admission-wait-seconds", type=int, default=0,
+                        help="wait this long for resources before deferring cases (default immediate)")
     args = parser.parse_args()
     games, default_indices = load_inventory(args.inventory)
     indices = list(dict.fromkeys(args.indices)) if args.indices else default_indices
@@ -493,17 +761,27 @@ def main():
         parser.error("sample index outside the inventory")
     if min(args.jobs, args.frames, args.timeout) < 1:
         parser.error("jobs, frames and timeout must be positive")
+    if args.admission_wait_seconds < 0:
+        parser.error("admission wait must be nonnegative")
     budgets = (args.stall_seconds, args.ram_per_job_gib, args.disk_per_job_gib,
                args.reserve_ram_gib, args.reserve_disk_gib)
     if any(not math.isfinite(value) or value <= 0 for value in budgets):
         parser.error("stall seconds and resource budgets must be finite and positive")
+    now = datetime.now().astimezone()
+    default_root = Path("F:/CS2-build-cache/playthrough") if os.name == "nt" else ROOT / "archive"
+    cache_override = os.environ.get("CS2_BUILD_CACHE_ROOT")
+    cache_root = Path(cache_override) / "playthrough" if cache_override else default_root
+    if not cache_root.is_absolute():
+        parser.error("CS2_BUILD_CACHE_ROOT must be an absolute path")
     try:
-        scenarios = load_scenarios(args.scenarios, indices)
+        cleared = find_cleared_cases(games, indices, cache_root) if args.skip_cleared else {}
+        pending = [index for index in indices if index not in cleared]
+        scenarios = load_scenarios(args.scenarios, pending)
         ordinary_saves = load_ordinary_saves(args.ordinary_saves) if args.ordinary_saves else {}
     except (OSError, ValueError) as error:
         parser.error(str(error))
     cases = []
-    for index in indices:
+    for index in pending:
         settings = scenarios.get(str(index), {})
         if not isinstance(settings, dict):
             parser.error(f"scenario {index} must be a JSON object")
@@ -525,14 +803,17 @@ def main():
             save_id = settings["ordinary_save"]
             if not isinstance(save_id, str) or not save_id or save_id not in ordinary_saves:
                 parser.error(f"scenario {index} ordinary_save must name an approved --ordinary-saves entry")
+        if "neko_language" in settings and (
+            index != 1 or settings["neko_language"] not in ("jp", "cn")
+            or "route" not in settings or "ordinary_save" in settings
+        ):
+            parser.error("neko_language requires a fresh state route for sample 01 and jp or cn")
+        if args.button_probe:
+            if "route" in settings:
+                parser.error("--button-probe requires fixed-frame scenarios")
+            settings = {**settings, "inputs": [*inputs, "button-probe"]}
         cases.append((index, games[index], settings))
 
-    now = datetime.now().astimezone()
-    default_root = Path("F:/CS2-build-cache/playthrough") if os.name == "nt" else ROOT / "archive"
-    cache_override = os.environ.get("CS2_BUILD_CACHE_ROOT")
-    cache_root = Path(cache_override) / "playthrough" if cache_override else default_root
-    if not cache_root.is_absolute():
-        parser.error("CS2_BUILD_CACHE_ROOT must be an absolute path")
     try:
         if any("ordinary_save" in settings for _, _, settings in cases):
             candidate = args.player.absolute()
@@ -548,11 +829,17 @@ def main():
     output = new_output_directory(cache_root, now)
     write_json(output / "build_identity.json", source)
     print(output, flush=True)
+    for index in indices:
+        if index in cleared:
+            write_json(output / f"{index:02}.json", cleared[index])
+            print(f"{index:02}: skipped_cleared ({cleared[index]['ending']['id']})", flush=True)
     env = os.environ.copy()
     env.setdefault("CS2_MEDIA_CACHE", str(output / "movie-input"))
     if os.name == "nt":
         env["PATH"] = os.pathsep.join(("C:/msys64/mingw64/bin", env.get("PATH", "")))
-    return run_batch(cases, player, output, args, env, ordinary_saves)
+    reuse_attempts = (source["sha256"], load_attempt_history(cache_root, pending)) if args.reuse_attempts else None
+    return run_batch(cases, player, output, args, env, ordinary_saves, fast_text=args.fast_text,
+                     reuse_attempts=reuse_attempts)
 
 
 if __name__ == "__main__":

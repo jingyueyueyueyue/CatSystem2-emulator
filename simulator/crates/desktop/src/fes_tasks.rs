@@ -26,6 +26,10 @@ const LEGACY_SHARED_SLOTS: usize = 1024;
 const REBELLIONS_MESSAGE_FES_SIZE: usize = 3943;
 const REBELLIONS_MESSAGE_FES_SHA256: &str =
     "4ff3b5efdad654cb1d581f1cde55cd46fdfa4a6918471377e69779d1f5535022";
+pub(super) const REBELLIONS_NOVEL_FES: [(&str, usize, &str); 2] = [
+    ("novelwnd01.fes", 3880, "38baff83143a3651fdb675e4aefd2778c31d0d05019c8a13c20d7b0624916490"),
+    ("novelwnd01m.fes", 3960, "a6c275bd0db99bb0ca182d1ab4e8ab541fa9c1329797245541340b3620cfdcc5"),
+];
 const REBELLIONS_MESSAGE_PE_SIZE: usize = 4_350_976;
 const REBELLIONS_MESSAGE_PE_SHA256: &str =
     "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3";
@@ -34,6 +38,17 @@ const KANMI_MESSAGE_FES_SHA256: &str =
     "98edd179cca0c4bc511a0dd411745d69c7cd681bbefb2370322abad189ac5639";
 const KANMI_PE_SHA256: &str =
     "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26";
+const DAYDREAM_MESSAGE_FES: (u64, &str) =
+    (3465, "d07bd0cbfa5c4855ef2abc6a4be01847857d0e74e4c19db7f54130df127c3773");
+const NEKO_MESSAGE_FES_SIZE: usize = 6673;
+const NEKO_MESSAGE_FES_SHA256: &str =
+    "d0ffd1e76683486ea388ed9f60ec454406d7234329149b25d62bdfc00e808dd6";
+const NEKO_PE_SHA256: &str =
+    "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc";
+pub(super) const NEWTON_MESSAGE_FES: (u64, &str) =
+    (3333, "61db832ffb40ef1c91f84c78d204fa6fbc9abda55e6116d0b48f19d9cf8cef37");
+const NEWTON_CINEMA_FES: (u64, &str) =
+    (3030, "707cf6541aff274d25f7bfc1647ab9518013dd279fce50a9bc0f7bcc8deddd09");
 
 pub(super) fn startup_shared_slots(scan: &cs2_runtime::GameScan, entry: Option<&str>) -> usize {
     super::discover_shared_slots(&scan.resources)
@@ -530,6 +545,14 @@ impl FesTaskStore {
     pub(super) fn release(&mut self, id: u32) {
         self.platform.remove_task(id);
         self.slots.remove(&id);
+    }
+
+    pub(super) fn detach_image_list(&mut self, list: u32) {
+        for object in self.slots.values_mut().filter_map(|slot| slot.object.as_mut()) {
+            if object.list.as_ref().is_some_and(|binding| binding.task == list) {
+                object.list = None;
+            }
+        }
     }
 }
 
@@ -1729,9 +1752,14 @@ impl FesTask {
             .ok_or_else(|| native_state_error("FES system driver is missing"))?;
         let system = self.system.as_ref().unwrap();
         let now = system.now;
-        let bounded_block = (kanmi_message_notification(
-            key, value, block, system.object.is_none() && system.input.is_none(),
-        ) && self.verified_kanmi_message_driver(host, &mut driver)).then_some(block);
+        let context_free = system.object.is_none() && system.input.is_none();
+        // A nested SETBUTTON return belongs to the notification that called it.
+        let bounded_block = ((message_button_notification(key, value, block, context_free)
+            && (self.verified_bounded_message_driver(host, &mut driver, block)
+                || self.verified_newton_message_driver(host, &mut driver)))
+            || (neko_message_notification(key, value, block, context_free)
+                && self.verified_neko_message_driver(host, &mut driver)))
+            .then_some(block);
         let result = (|| {
             self.apply_data_commands(host, &mut driver);
             if !self.system.as_ref().unwrap().entered {
@@ -2064,7 +2092,10 @@ impl FesTask {
                 let staged = runtime.driver.take().unwrap();
                 previous.set_island_gbk_fes_source(staged.is_island_gbk_fes_source());
                 previous.set_rebellions_message_fes_source(staged.is_rebellions_message_fes_source());
-                previous.kanmi_message_fes_source = staged.kanmi_message_fes_source;
+                previous.bounded_message_fes_source = staged.bounded_message_fes_source;
+                previous.neko_message_fes_source = staged.neko_message_fes_source;
+                previous.newton_message_fes_source = staged.newton_message_fes_source;
+                previous.sudden_message_fes_source = staged.sudden_message_fes_source;
                 previous.interpreter = staged.interpreter;
                 previous.adapter = staged.adapter;
                 previous.set_task_id(self.id);
@@ -2081,31 +2112,109 @@ impl FesTask {
         candidate: &cs2_runtime::ResourceCandidate,
         bytes: &[u8],
     ) -> Result<FesRuntime> {
-        let mut runtime = self.new_runtime(parse_document(bytes)?)?;
+        let mut document = parse_document(bytes)?;
+        if candidate.name.eq_ignore_ascii_case("saveload.fes")
+            && bytes.len() == 3583
+            && super::particle_plugin_digest::sha256(bytes)
+                == "4554ea15abb1c4d41525f5a017359d95b502ab88db0909c1d20313ee1bee36a8"
+        {
+            // The original no-data block closes its save/load condition
+            // twice. Keep the else branch attached so Load disables empty slots.
+            for section in document.sections.iter_mut().filter(|section| section.header == b"SETDATA_NODATA") {
+                section.lines.retain(|line| line.offset != 0x270d || line.bytes != b"endif");
+            }
+        }
+        if candidate.name.eq_ignore_ascii_case("title.fes")
+            && host.css_task_sha() == Some(REBELLIONS_MESSAGE_PE_SHA256)
+            && bytes.len() == 3041
+            && super::particle_plugin_digest::sha256(bytes)
+                == "d905d8308cbb70adfa06f9de47a7c13fc2bfe6bd0018e76a0f6e08ea2620099b"
+        {
+            // The two-button layout contains an extra '1' after the y anchor.
+            for section in document.sections.iter_mut().filter(|section| section.header == b"SETBTN00") {
+                if let Some(line) = section.lines.iter_mut()
+                    .find(|line| line.offset == 0x1e4a && line.bytes == b"btn_1i[0] pos @+90 @1")
+                {
+                    line.bytes.pop();
+                }
+            }
+        }
+        let mut runtime = self.new_runtime(document)?;
         let driver = runtime.driver.as_mut().unwrap();
         driver.set_island_gbk_fes_source(is_island_gbk_fes_source(host.resources, candidate));
         driver.set_rebellions_message_fes_source(is_rebellions_message_fes_source(host.resources, bytes));
-        driver.kanmi_message_fes_source = Some(is_kanmi_message_fes_source(host, bytes));
+        driver.bounded_message_fes_source = Some(bounded_message_fes_identity(host)
+            .is_some_and(|(size, sha)| bytes.len() as u64 == size && super::particle_plugin_digest::sha256(bytes) == sha));
+        driver.neko_message_fes_source = Some(is_neko_message_fes_source(host, bytes));
+        driver.newton_message_fes_source = Some(is_newton_message_fes_source(host, candidate, bytes));
+        driver.sudden_message_fes_source = Some(super::fes_task_platform::is_sudden_message_fes(bytes));
         Ok(runtime)
     }
 
-    fn verified_kanmi_message_driver(&self, host: &LoggingHost<'_>, driver: &mut FesScriptDriver) -> bool {
-        if host.data_services.particle_message_pe_sha256 != Some(KANMI_PE_SHA256) {
+    fn verified_bounded_message_driver(
+        &self, host: &LoggingHost<'_>, driver: &mut FesScriptDriver, block: &[u8],
+    ) -> bool {
+        if host.css_task_sha() == Some(super::story_trace::story_trace_15::PE) && block != b"MES_SETSTATE" {
             return false;
         }
-        if let Some(verified) = driver.kanmi_message_fes_source {
+        if let Some(verified) = driver.bounded_message_fes_source {
+            return verified;
+        }
+        let Some((size, sha)) = bounded_message_fes_identity(host) else { return false; };
+        let verified = self.name.as_deref()
+            .and_then(|name| host.fes_resource_names(name).ok())
+            .and_then(|names| names.iter().find_map(|name| host.resources.find(name)))
+            .filter(|candidate| candidate.size == size)
+            .and_then(|candidate| host.resources.read_candidate(candidate).ok())
+            .filter(|bytes| super::particle_plugin_digest::sha256(bytes) == sha)
+            .and_then(|bytes| parse_document(&bytes).ok())
+            .and_then(|document| FesProgram::from_document(&document).ok())
+            .is_some_and(|program| program == driver.interpreter.program);
+        driver.bounded_message_fes_source = Some(verified);
+        verified
+    }
+
+    fn verified_neko_message_driver(&self, host: &LoggingHost<'_>, driver: &mut FesScriptDriver) -> bool {
+        if host.css_task_sha() != Some(NEKO_PE_SHA256) {
+            return false;
+        }
+        if let Some(verified) = driver.neko_message_fes_source {
+            return verified;
+        }
+        // A CSS-restored driver has no cached source identity. Rebind it only
+        // when the selected archive member yields its exact interpreter program.
+        let verified = self.name.as_deref()
+            .and_then(|name| host.fes_resource_names(name).ok())
+            .and_then(|names| names.iter().find_map(|name| host.resources.find(name)))
+            .filter(|candidate| candidate.size == NEKO_MESSAGE_FES_SIZE as u64)
+            .and_then(|candidate| host.resources.read_candidate(candidate).ok())
+            .filter(|bytes| is_neko_message_fes_source(host, bytes))
+            .and_then(|bytes| parse_document(&bytes).ok())
+            .and_then(|document| FesProgram::from_document(&document).ok())
+            .is_some_and(|program| program == driver.interpreter.program);
+        driver.neko_message_fes_source = Some(verified);
+        verified
+    }
+
+    fn verified_newton_message_driver(&self, host: &LoggingHost<'_>, driver: &mut FesScriptDriver) -> bool {
+        if !is_newton_message_host(host) {
+            return false;
+        }
+        if let Some(verified) = driver.newton_message_fes_source {
             return verified;
         }
         let verified = self.name.as_deref()
             .and_then(|name| host.fes_resource_names(name).ok())
             .and_then(|names| names.iter().find_map(|name| host.resources.find(name)))
-            .filter(|candidate| candidate.size == KANMI_MESSAGE_FES_SIZE as u64)
-            .and_then(|candidate| host.resources.read_candidate(candidate).ok())
-            .filter(|bytes| is_kanmi_message_fes_source(host, bytes))
+            .filter(|candidate| newton_message_fes_digest(candidate).is_some())
+            .and_then(|candidate| {
+                let bytes = host.resources.read_candidate(candidate).ok()?;
+                is_newton_message_fes_source(host, candidate, &bytes).then_some(bytes)
+            })
             .and_then(|bytes| parse_document(&bytes).ok())
             .and_then(|document| FesProgram::from_document(&document).ok())
             .is_some_and(|program| program == driver.interpreter.program);
-        driver.kanmi_message_fes_source = Some(verified);
+        driver.newton_message_fes_source = Some(verified);
         verified
     }
 
@@ -2499,6 +2608,11 @@ impl FesTask {
     ) -> Result<EffectResult> {
         match effect {
             FesDriverEffect::MediaStatementReturned => Ok(EffectResult::Continue),
+            FesDriverEffect::SharedStringWrite { destination, source } => {
+                let bytes = host.string_values.get(destination).map_or(&[][..], Vec::as_slice);
+                host.data_services.cst_text_origins.note_shared_string_write(*destination, *source, bytes);
+                Ok(EffectResult::Continue)
+            }
             FesDriverEffect::ExecKcs { name, external } => {
                 self.begin_child(FesChildKind::Kcs, name, [0; 16], external)?;
                 if self.advance_child(host, budget)? {
@@ -2512,7 +2626,14 @@ impl FesTask {
                 parameters,
                 external,
             } => {
+                let opening = self.pending_child.is_none()
+                    && self.child_fes.is_none()
+                    && self.child_kcs.is_none();
                 self.begin_child(FesChildKind::Fes, name, *parameters, external)?;
+                if opening {
+                    // The parent polls _EXITCODE_ while the new dialog is open.
+                    driver.set_child_exit_code(-1);
+                }
                 if self.advance_child(host, budget)? {
                     Ok(EffectResult::Continue)
                 } else {
@@ -2830,35 +2951,99 @@ fn is_island_gbk_fes_source(resources: &cs2_runtime::ResourceIndex,
 
 fn is_rebellions_message_fes_source(resources: &cs2_runtime::ResourceIndex, bytes: &[u8]) -> bool {
     let sha256 = super::particle_plugin_digest::sha256;
-    bytes.len() == REBELLIONS_MESSAGE_FES_SIZE
-        && sha256(bytes) == REBELLIONS_MESSAGE_FES_SHA256
+    let expected = if bytes.len() == REBELLIONS_MESSAGE_FES_SIZE {
+        Some(REBELLIONS_MESSAGE_FES_SHA256)
+    } else {
+        REBELLIONS_NOVEL_FES.iter().find_map(|(_, size, sha)| (bytes.len() == *size).then_some(*sha))
+    };
+    expected.is_some_and(|expected| sha256(bytes) == expected)
         && resources.resolve_plain_file("REBELLIONS.exe").ok().flatten()
             .filter(|candidate| candidate.size == REBELLIONS_MESSAGE_PE_SIZE as u64)
             .and_then(|candidate| resources.read_candidate_bounded(candidate, REBELLIONS_MESSAGE_PE_SIZE).ok().flatten())
             .is_some_and(|bytes| sha256(&bytes) == REBELLIONS_MESSAGE_PE_SHA256)
 }
 
-fn kanmi_message_notification(key: u32, bank: u32, block: &[u8], context_free: bool) -> bool {
+fn message_button_notification(key: u32, bank: u32, block: &[u8], context_free: bool) -> bool {
     key == 343 && bank == 0 && context_free && matches!(block, b"MES_SHOW" | b"MES_SETSTATE")
 }
 
-fn is_kanmi_message_fes_source(host: &LoggingHost<'_>, bytes: &[u8]) -> bool {
-    bytes.len() == KANMI_MESSAGE_FES_SIZE
-        && host.data_services.particle_message_pe_sha256 == Some(KANMI_PE_SHA256)
-        && super::particle_plugin_digest::sha256(bytes) == KANMI_MESSAGE_FES_SHA256
+fn bounded_message_fes_identity(host: &LoggingHost<'_>) -> Option<(u64, &'static str)> {
+    use super::story_trace::story_trace_15 as labyrinth;
+    let source = if host.data_services.particle_message_pe_sha256 == Some(KANMI_PE_SHA256) {
+        (KANMI_MESSAGE_FES_SIZE as u64, KANMI_MESSAGE_FES_SHA256)
+    } else if host.css_task_sha() == Some(super::story_trace::DAYDREAM_PE) {
+        DAYDREAM_MESSAGE_FES
+    } else if host.css_task_sha() == Some(labyrinth::PE) {
+        (labyrinth::MESWND.0 as u64, labyrinth::MESWND.1)
+    } else {
+        return None;
+    };
+    (super::discover_start_entry(host.resources).as_deref() == Some("kcs.int/main.kcs")).then_some(source)
+}
+
+fn neko_message_notification(key: u32, bank: u32, block: &[u8], context_free: bool) -> bool {
+    key == 343 && bank == 0 && context_free && block == b"MES_SETSTATE"
+}
+
+fn is_neko_message_fes_source(host: &LoggingHost<'_>, bytes: &[u8]) -> bool {
+    host.css_task_sha() == Some(NEKO_PE_SHA256)
+        && bytes.len() == NEKO_MESSAGE_FES_SIZE
+        && super::particle_plugin_digest::sha256(bytes) == NEKO_MESSAGE_FES_SHA256
         && super::discover_start_entry(host.resources).as_deref() == Some("kcs.int/main.kcs")
 }
 
+fn is_newton_message_host(host: &LoggingHost<'_>) -> bool {
+    use super::cst_context_native::{NEWTON_LOCALIZED_PE, NEWTON_PE};
+    matches!(host.css_task_sha(), Some(NEWTON_PE | NEWTON_LOCALIZED_PE))
+}
+
+fn newton_message_fes_digest(candidate: &cs2_runtime::ResourceCandidate) -> Option<&'static str> {
+    let cs2_runtime::ResourceLocation::Archive { path, .. } = &candidate.location else { return None; };
+    if !path.file_name()?.eq_ignore_ascii_case("fes.int") {
+        return None;
+    }
+    let (size, digest) = if candidate.name.eq_ignore_ascii_case("meswnd.fes") {
+        NEWTON_MESSAGE_FES
+    } else if candidate.name.eq_ignore_ascii_case("cinema.fes")
+        || candidate.name.eq_ignore_ascii_case("meswndaa.fes")
+    {
+        NEWTON_CINEMA_FES
+    } else {
+        return None;
+    };
+    (candidate.size == size).then_some(digest)
+}
+
+fn is_newton_message_fes_source(
+    host: &LoggingHost<'_>, candidate: &cs2_runtime::ResourceCandidate, bytes: &[u8],
+) -> bool {
+    is_newton_message_host(host)
+        && newton_message_fes_digest(candidate).is_some_and(|digest| {
+            super::discover_start_entry(host.resources).as_deref() == Some("kcs.int/main.kcs")
+                && super::particle_plugin_digest::sha256(bytes) == digest
+        })
+}
+
 #[test]
-fn kanmi_message_notification_rejects_other_shapes() {
-    assert!(kanmi_message_notification(343, 0, b"MES_SHOW", true));
-    assert!(kanmi_message_notification(343, 0, b"MES_SETSTATE", true));
-    assert!(!kanmi_message_notification(341, 0, b"MES_SHOW", true));
-    assert!(!kanmi_message_notification(343, 1, b"MES_SHOW", true));
-    assert!(!kanmi_message_notification(343, 0, b"MES_SHOW", false));
-    assert!(!kanmi_message_notification(343, 0, b"MES_WAITINPUT", true));
-    assert!(!kanmi_message_notification(343, 0, b"MES_DRAW", true));
-    assert!(!kanmi_message_notification(343, 0, b"MES_ISDRAW", true));
+fn neko_message_notification_rejects_other_shapes() {
+    assert!(neko_message_notification(343, 0, b"MES_SETSTATE", true));
+    assert!(!neko_message_notification(341, 0, b"MES_SETSTATE", true));
+    assert!(!neko_message_notification(343, 1, b"MES_SETSTATE", true));
+    assert!(!neko_message_notification(343, 0, b"MES_SETSTATE", false));
+    assert!(!neko_message_notification(343, 0, b"MES_SHOW", true));
+    assert!(!neko_message_notification(343, 0, b"MES_DRAW", true));
+}
+
+#[test]
+fn message_button_notification_rejects_other_shapes() {
+    assert!(message_button_notification(343, 0, b"MES_SHOW", true));
+    assert!(message_button_notification(343, 0, b"MES_SETSTATE", true));
+    assert!(!message_button_notification(341, 0, b"MES_SHOW", true));
+    assert!(!message_button_notification(343, 1, b"MES_SHOW", true));
+    assert!(!message_button_notification(343, 0, b"MES_SHOW", false));
+    assert!(!message_button_notification(343, 0, b"MES_WAITINPUT", true));
+    assert!(!message_button_notification(343, 0, b"MES_DRAW", true));
+    assert!(!message_button_notification(343, 0, b"MES_ISDRAW", true));
 }
 
 fn parse_document(bytes: &[u8]) -> Result<FesDocument> {

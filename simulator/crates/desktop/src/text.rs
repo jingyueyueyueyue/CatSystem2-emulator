@@ -4,6 +4,7 @@ use anyhow::Result;
 use cs2_renderer::{Canvas, Color, FontRasterizer, Point};
 use cs2_runtime::ResourceIndex;
 use std::collections::BTreeSet;
+use std::io::{self, Read};
 use std::path::Path;
 #[cfg(any(windows, target_os = "android"))]
 use std::path::PathBuf;
@@ -14,6 +15,16 @@ pub(super) enum FontOrigin {
     Resource(String),
     #[cfg(any(windows, target_os = "android"))]
     System(PathBuf),
+}
+
+impl FontOrigin {
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Resource(name) => name,
+            #[cfg(any(windows, target_os = "android"))]
+            Self::System(path) => path.to_str().unwrap_or("<unnamed system font>"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -48,6 +59,21 @@ impl LoadedFont {
         })
             .as_deref().filter(|font| font.has_character(character))
     }
+}
+
+pub(super) fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let limit = FontRasterizer::MAX_FONT_BYTES;
+    if file.metadata()?.len() > limit as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "font data exceeds the 64 MiB limit"));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "font data exceeds the 64 MiB limit"));
+    }
+    Ok(bytes)
 }
 
 pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
@@ -95,7 +121,7 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
             "arial.ttf",
         ] {
             let path = windows.join("Fonts").join(name);
-            if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(bytes) = read_font_file(&path) {
                 append_faces(&mut fonts, FontOrigin::System(path), bytes);
             }
         }
@@ -112,7 +138,7 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
             if (cjk && cjk_loaded) || system_faces == 4 || fonts.len() >= 64 {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(bytes) = read_font_file(&path) {
                 if ttf_parser::Face::parse(&bytes, 0).is_ok() {
                     fonts.push(LoadedFont {
                         origin: Arc::new(FontOrigin::System(path)),
@@ -178,6 +204,9 @@ fn android_font_priority(name: &str) -> u8 {
 }
 
 fn append_faces(fonts: &mut Vec<LoadedFont>, origin: FontOrigin, bytes: Vec<u8>) {
+    if bytes.len() > FontRasterizer::MAX_FONT_BYTES {
+        return;
+    }
     let origin = Arc::new(origin);
     let count = if bytes.starts_with(b"ttcf") {
         bytes

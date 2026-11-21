@@ -1,0 +1,121 @@
+{
+  "11": {
+    "frames": 2700,
+    "inputs": [
+      "story-trace",
+      "story-events",
+      "capture-every:0",
+      "no-final-capture",
+      "legacy-11-13-continue:11",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:13",
+      "trace-native:276",
+      "trace-native:630",
+      "trace-native:1002",
+      "trace-native:1037",
+      "trace-native:1038",
+      "trace-native:1051",
+      "215:13",
+      "385:13",
+      "550:13",
+      "move:605:1154,473",
+      "require-hit:612:15",
+      "612:1154,473",
+      "require-hit:810:62",
+      "810:640,360",
+      "require-hit:890:62",
+      "890:640,360",
+      "require-hit:970:62",
+      "970:640,360"
+    ]
+  },
+  "13": {
+    "frames": 5600,
+    "inputs": [
+      "story-trace",
+      "story-events",
+      "capture-every:0",
+      "no-final-capture",
+      "legacy-11-13-continue:13",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:327",
+      "trace-native:276",
+      "trace-native:630",
+      "require-hit:241:20",
+      "241:640,441",
+      "require-hit:361:55",
+      "361:640,549"
+    ]
+  },
+  "after_first_successor": {
+    "11": [
+      {
+        "group": 2,
+        "wait": 90,
+        "body": [
+          89
+        ]
+      }
+    ],
+    "13": [
+      {
+        "group": 6,
+        "wait": 109,
+        "body": [
+          108
+        ],
+        "body_bytes": 12,
+        "body_sha256": "c556ad756ecf5fc2a48769a508caede6aa1cefdf2d47e822f90c2a2e6c4d04be"
+      },
+      {
+        "group": 7,
+        "wait": 111,
+        "body": [
+          110
+        ],
+        "body_bytes": 26,
+        "body_sha256": "2f95ac73a89a8b24cd0d316cc56fb946962a15131a84b0709a6ff0f7336fbc84"
+      },
+      {
+        "group": 8,
+        "wait": 113,
+        "body": [
+          112
+        ],
+        "body_bytes": 74,
+        "body_sha256": "6053c6a648eb599757dfb4de744bdfad58ee195b80598add59815f08d37065bd"
+      },
+      {
+        "group": 9,
+        "wait": 115,
+        "body": [
+          114
+        ],
+        "body_bytes": 132,
+        "body_sha256": "00c6f80bd1f24ea308261226ee988abead1fc999f4ba72383822989a94c25b00"
+      },
+      {
+        "group": 10,
+        "wait": 119,
+        "body": [
+          118
+        ],
+        "body_bytes": 56,
+        "body_sha256": "c46c34f2ce1778a9679f474cff10fdc3d2b8bc0934354df91e78f81075c2282a"
+      },
+      {
+        "group": 11,
+        "wait": 121,
+        "body": [
+          120
+        ],
+        "body_bytes": 72,
+        "body_sha256": "afd665f11474fe4b30e5a2c6adc4ccc3eca1ac7626dfd2e22ba56a7898eaf756"
+      }
+    ]
+  }
+}

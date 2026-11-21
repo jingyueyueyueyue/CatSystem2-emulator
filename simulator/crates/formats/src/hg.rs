@@ -1,4 +1,6 @@
 use crate::util::{MAX_BUFFER, MAX_ITEMS, inflate_exact, range, u32_at};
+
+const MAX_NATIVE_HG3_PIXELS: usize = 128 * 1024 * 1024;
 use image::{ImageReader, Limits};
 use std::io::Cursor;
 use thiserror::Error;
@@ -236,11 +238,11 @@ struct PixelLayout {
 }
 
 impl PixelLayout {
-    fn for_frame(frame: &HgFrame) -> Result<Self, HgError> {
-        Self::for_dimensions(frame.width, frame.height, frame.bit_depth)
+    fn for_frame(frame: &HgFrame, pixel_limit: usize) -> Result<Self, HgError> {
+        Self::for_dimensions(frame.width, frame.height, frame.bit_depth, pixel_limit)
     }
 
-    fn for_dimensions(width: u32, height: u32, bit_depth: u32) -> Result<Self, HgError> {
+    fn for_dimensions(width: u32, height: u32, bit_depth: u32, pixel_limit: usize) -> Result<Self, HgError> {
         if width == 0 || height == 0 {
             return Err(HgError::InvalidDimensions);
         }
@@ -268,7 +270,7 @@ impl PixelLayout {
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or(HgError::PixelOutputTooLarge)?;
-        if raw_size > MAX_BUFFER || visible_bytes > MAX_BUFFER {
+        if raw_size > pixel_limit || visible_bytes > pixel_limit {
             return Err(HgError::PixelOutputTooLarge);
         }
         Ok(Self {
@@ -290,7 +292,7 @@ fn decode_hg3_pixels(
     if let Some(encoded) = frame.encoded_image.as_ref() {
         return decode_encoded_pixels(frame, data, encoded, format);
     }
-    let layout = PixelLayout::for_frame(frame)?;
+    let layout = PixelLayout::for_frame(frame, MAX_NATIVE_HG3_PIXELS)?;
     let slices = native_image_slices(frame, data)?;
     if slices.len() == 1 {
         let (literals, commands) = read_pixel_streams(data, &slices[0].image)?;
@@ -302,7 +304,9 @@ fn decode_hg3_pixels(
     let row_bytes = (frame.width as usize).checked_mul(4).ok_or(HgError::PixelOutputTooLarge)?;
     for slice in slices {
         let (literals, commands) = read_pixel_streams(data, &slice.image)?;
-        let layout = PixelLayout::for_dimensions(frame.width, slice.row_count, frame.bit_depth)?;
+        let layout = PixelLayout::for_dimensions(
+            frame.width, slice.row_count, frame.bit_depth, MAX_NATIVE_HG3_PIXELS,
+        )?;
         // Each slice starts with a horizontal predictor. Later rows predict
         // only from rows in the same slice, never from the preceding tag.
         let decoded = decode_native_pixels(
@@ -496,7 +500,7 @@ fn decode_hg2_pixels(
         return Err(HgError::InvalidHeader);
     }
     let image = frame.image.as_ref().ok_or(HgError::InvalidFrame)?;
-    let layout = PixelLayout::for_frame(frame)?;
+    let layout = PixelLayout::for_frame(frame, MAX_BUFFER)?;
     let (literals, commands) = read_pixel_streams(data, image)?;
     decode_native_pixels(
         &literals, &commands, frame.height, layout, format,
@@ -667,7 +671,9 @@ fn expand_runs(literals: &[u8], commands: &[u8], minimum_size: usize) -> Result<
     if size < minimum_size {
         return Err(HgError::InvalidPixelCommands);
     }
-    if size > MAX_BUFFER || size % 4 != 0 {
+    // Large native rasters have already passed the geometry limit. Their
+    // run stream may expand only to the validated, four-byte-aligned size.
+    if size > MAX_BUFFER.max(minimum_size.next_multiple_of(4)) || size % 4 != 0 {
         return Err(HgError::InvalidPixelCommands);
     }
 
@@ -989,9 +995,16 @@ fn parse_hg3(data: &[u8]) -> Result<HgFile, HgError> {
 
             if next == 0 {
                 let padding = data.get(tag_end..frame_end).ok_or(HgError::InvalidFrame)?;
-                let padded_control_tag = padding.len() == 9
-                    && offset_next != 0
+                // The final frame of the Daydream update asset evb93_a.hg3
+                // also has nine zero bytes after cptype, ending on an aligned boundary.
+                let extended_padding = if offset_next == 0 {
+                    padding.len() == 9
+                } else {
+                    (8..=15).contains(&padding.len())
+                };
+                let padded_control_tag = extended_padding
                     && tag_name == b"cptype"
+                    && length == 4
                     && frame_end.is_multiple_of(8);
                 if (padding.len() > 7 && !padded_control_tag) || padding.iter().any(|&byte| byte != 0)
                 {

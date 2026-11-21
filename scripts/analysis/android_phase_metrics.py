@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 from android_surface_metrics import parse_snapshots
@@ -37,6 +38,7 @@ def summary(values):
     return {'samples': len(ordered), 'mean_ms': sum(ordered) / len(ordered) / 1000,
             'p50_ms': ordered[math.ceil(len(ordered) * .5) - 1] / 1000,
             'p95_ms': ordered[math.ceil(len(ordered) * .95) - 1] / 1000,
+            'p99_ms': ordered[math.ceil(len(ordered) * .99) - 1] / 1000,
             'max_ms': ordered[-1] / 1000}
 
 
@@ -97,9 +99,48 @@ def append_session_metrics(result, log, session, rows, whole_session):
         if record is not None:
             result[kind] = record
     unchanged = list(parse_named_rows(log, 'unchanged', session))
-    if unchanged and not whole_session:
-        frames = [row['frame'] for row in rows if row['frame']]
+    frames = [row['frame'] for row in rows if row['frame']]
+    if not whole_session:
         unchanged = [row for row in unchanged if frames and frames[0] <= row['frame'] <= frames[-1]]
+    gpu = {}
+    for row in parse_named_rows(log, 'gpu_output', session):
+        if whole_session or frames and frames[0] <= row['frame'] <= frames[-1]:
+            key = row['frame'], row['call']
+            if gpu.setdefault(key, row) != row:
+                raise ValueError('Conflicting GPU output record for one frame and step call.')
+    if gpu:
+        gpu_rows = list(gpu.values())
+        result['gpu_output'] = {
+            'rows': len(gpu_rows),
+            'textured_group_rejects': sum(row['textured_group_rejects'] for row in gpu_rows),
+            'textured_single_rejects': sum(row['textured_single_rejects'] for row in gpu_rows),
+        }
+        for kind in ('device', 'packed'):
+            fields = ('calls', 'failed', 'bytes')
+            result['gpu_output'][kind] = {
+                **{field: sum(row[f'{kind}_{field}'] for row in gpu_rows) for field in fields},
+                'wall_per_sampled_step': summary([row[f'{kind}_us'] for row in gpu_rows
+                                                  if row[f'{kind}_calls']]),
+            }
+    emote = {}
+    for row in parse_named_rows(log, 'emote_gpu', session):
+        if whole_session or frames and frames[0] <= row['frame'] <= frames[-1]:
+            key = row['frame'], row['call']
+            if emote.setdefault(key, row) != row:
+                raise ValueError('Conflicting E-mote GPU record for one frame and step call.')
+    if emote:
+        emote_rows = list(emote.values())
+        timings = ('collect_us', 'evaluate_us', 'prepare_us', 'scanlines_cpu_us',
+                   'pack_cpu_us', 'encode_us', 'readback_us', 'repair_us')
+        result['emote_gpu'] = {
+            'rows': len(emote_rows),
+            'poses': sum(row['poses'] for row in emote_rows),
+            'draws': sum(row['draws'] for row in emote_rows),
+            'pixels': sum(row['pixels'] for row in emote_rows),
+            'repaired': sum(row['repaired'] for row in emote_rows),
+            'timings': {field: summary([row[field] for row in emote_rows]) for field in timings},
+            'timing_note': 'collect includes evaluate and prepare; scanlines and pack are CPU work inside prepare',
+        }
     if unchanged:
         measures = ('step_us', 'script_us', *SCRIPT_PHASES, *SCRIPT_LOAD_PHASES, 'image_read_us',
                     'image_decode_us', 'image_patch_us', 'compose_us', *COMPOSE_PHASES,
@@ -122,7 +163,7 @@ def append_session_metrics(result, log, session, rows, whole_session):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('log', type=Path, help='adb logcat -v raw -s CS2Perf:I')
+    parser.add_argument('log', type=Path, help='raw or threadtime Logcat with CS2Perf rows')
     parser.add_argument('--session', type=int, required=True)
     parser.add_argument('--first-post', type=int, default=1)
     parser.add_argument('--last-post', type=int, default=(1 << 63) - 1)
@@ -130,7 +171,8 @@ def main():
                         help='filter to the actual-present time span from the same device boot and replay phase')
     args = parser.parse_args()
     try:
-        log = args.log.read_text(encoding='utf-8-sig')
+        log = re.sub(r'^.*?\bCS2Perf[ \t]*:[ \t]*', '',
+                     args.log.read_text(encoding='utf-8-sig'), flags=re.MULTILINE)
         rows = parse(log, args.session, args.first_post, args.last_post)
         if args.surface_snapshots is not None:
             snapshots = parse_snapshots(args.surface_snapshots.read_bytes())

@@ -1,0 +1,76 @@
+{
+  "6": {
+    "settings-font-menu": {
+      "before": 608, "click": 611, "after": 663, "region": 137,
+      "inputs": ["move:497:111,411", "require-hit:498:20", "498:111,411",
+        "move:610:832,87", "require-hit:611:137", "611:832,87"]
+    },
+    "settings-font-select": {
+      "before": 663, "click": 666, "after": 716, "region": 139,
+      "inputs": ["move:497:111,411", "require-hit:498:20", "498:111,411",
+        "move:610:832,87", "require-hit:611:137", "611:832,87",
+        "move:665:726,145", "require-hit:666:139", "666:726,145"]
+    },
+    "settings-advanced-auto": {
+      "before": 608, "click": 611, "after": 663, "region": 38,
+      "inputs": ["move:497:111,411", "require-hit:498:20", "498:111,411",
+        "move:610:221,284", "require-hit:611:38", "611:221,284"]
+    },
+    "settings-return": {
+      "before": 608, "click": 611, "after": 716, "region": 102,
+      "inputs": ["move:497:111,411", "require-hit:498:20", "498:111,411",
+        "move:610:1142,660", "require-hit:611:102", "611:1142,660"]
+    },
+    "settings-title-disabled": {
+      "before": 608, "click": 611, "after": 663, "region": 108, "expectation": "disabled",
+      "inputs": ["move:497:111,411", "require-hit:498:20", "498:111,411",
+        "move:610:142,660", "611:142,660"]
+    }
+  },
+  "7": {
+    "settings-font-menu": {
+      "before": 1058, "click": 1061, "after": 1113, "region": 56,
+      "inputs": ["move:952:176,435", "require-hit:953:22", "953:176,435",
+        "move:1060:747,174", "require-hit:1061:56", "1061:747,174"]
+    },
+    "settings-font-select": {
+      "before": 1113, "click": 1116, "after": 1166, "region": 58,
+      "inputs": ["move:952:176,435", "require-hit:953:22", "953:176,435",
+        "move:1060:747,174", "require-hit:1061:56", "1061:747,174",
+        "move:1115:738,227", "require-hit:1116:58", "1116:738,227"]
+    },
+    "settings-speed": {
+      "before": 1058, "click": 1061, "after": 1113, "region": 32,
+      "inputs": ["move:952:176,435", "require-hit:953:22", "953:176,435",
+        "move:1060:709,461", "require-hit:1061:32", "1061:709,461"]
+    },
+    "settings-return": {
+      "before": 1058, "click": 1061, "after": 1166, "region": 50,
+      "inputs": ["move:952:176,435", "require-hit:953:22", "953:176,435",
+        "move:1060:1215,660", "require-hit:1061:50", "1061:1215,660"]
+    }
+  },
+  "9": {
+    "settings-font-menu": {
+      "before": 487, "click": 490, "after": 542, "region": 43,
+      "inputs": ["move:381:195,459", "require-hit:382:16", "382:195,459",
+        "move:489:726,188", "require-hit:490:43", "490:726,188"]
+    },
+    "settings-font-select": {
+      "before": 542, "click": 545, "after": 595, "region": 45,
+      "inputs": ["move:381:195,459", "require-hit:382:16", "382:195,459",
+        "move:489:726,188", "require-hit:490:43", "490:726,188",
+        "move:544:716,237", "require-hit:545:45", "545:716,237"]
+    },
+    "settings-speed": {
+      "before": 487, "click": 490, "after": 542, "region": 24,
+      "inputs": ["move:381:195,459", "require-hit:382:16", "382:195,459",
+        "move:489:648,452", "require-hit:490:24", "490:648,452"]
+    },
+    "settings-return": {
+      "before": 487, "click": 490, "after": 595, "region": 42,
+      "inputs": ["move:381:195,459", "require-hit:382:16", "382:195,459",
+        "move:489:1164,683", "require-hit:490:42", "490:1164,683"]
+    }
+  }
+}

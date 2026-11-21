@@ -613,11 +613,13 @@ impl WavAudioHost {
                     // before its handle is returned to the script thread.
                     .spawn({
                         let parameters = parameters.clone();
+                        let resource = request.resource.clone();
                         move || {
                             let startup_error = started_sender.clone();
                             let result = audio_profile::with_worker(worker_timing, || {
                                 pcm_worker::run_playback(
                                     prepared,
+                                    &resource,
                                     parameters,
                                     silence_millis,
                                     loop_spec,
@@ -738,6 +740,20 @@ mod tests {
         ));
         assert!(host.active.is_empty());
     }
+
+    #[test]
+    fn pcm_volume_pan_and_reused_silence_preserve_chunks() {
+        let chunk = apply_pcm_volume_pan(vec![1000, 2000, -1000, -2000], 2, 0.5, 0.5);
+        assert_eq!(chunk, [250, 1000, -250, -1000]);
+        let chunk = apply_pcm_volume_pan(vec![1000, -1000], 1, 1.0, 0.0);
+        assert_eq!(chunk, [1000, -1000]);
+        let mut silence = Vec::with_capacity(8);
+        silence.resize(4, 0);
+        assert_eq!(silence, [0; 4]);
+        silence.clear();
+        silence.resize(2, 0);
+        assert_eq!(silence, [0; 2]);
+    }
 }
 
 fn apply_pcm_volume_pan(mut samples: Vec<i16>, channels: u8, volume: f32, pan: f32) -> Vec<i16> {
@@ -777,6 +793,7 @@ mod pcm_worker {
 
     pub(super) fn run_playback(
         prepared: Arc<PreparedAudio>,
+        resource: &str,
         parameters: Arc<AudioParameters>,
         silence_millis: u32,
         loop_spec: AudioLoop,
@@ -793,9 +810,13 @@ mod pcm_worker {
             let _ = started.send(Err(clone_error(&error)));
             return Err(error);
         }
+        let decode_error = |frame, cause| {
+            RuntimeError::Host(format!("decode SOUND resource {resource:?} at frame {frame}: {cause}"))
+        };
         let mut source = {
             let _timing = Stage::Reader.begin();
-            prepared.reader()?
+            let position = saved.as_ref().map_or(0, |state| state.cursor.position);
+            prepared.reader().map_err(|cause| decode_error(position, cause))?
         };
         let restoring = saved.is_some();
         let mut cursor = match saved.as_ref().map(|state| Ok(state.cursor.clone())).unwrap_or_else(|| PcmCursor::new(
@@ -840,6 +861,7 @@ mod pcm_worker {
         };
         output.pause(true)?;
         let chunk_frames = (sample_rate as usize / 100).max(1);
+        let mut silence = Vec::new();
         let mut signal = saved.as_ref().map_or_else(|| SignalMeter::new(sample_rate), |s| s.signal.clone());
         let mut pass_marked = saved.as_ref().is_some_and(|s| s.pass_marked);
         let initial_silence = saved.as_ref().map_or(u64::from(sample_rate) * u64::from(silence_millis) / 1000, |s| s.initial_silence);
@@ -849,19 +871,18 @@ mod pcm_worker {
         while !restoring && (cursor.position < cursor.end(&parameters)? || silent_frames != 0) {
             if silent_frames != 0 {
                 let frames = silent_frames.min(chunk_frames as u64) as usize;
-                if !output.submit(&vec![0; frames * usize::from(channels)])? {
+                silence.clear();
+                silence.resize(frames * usize::from(channels), 0);
+                if !output.submit(&silence)? {
                     break;
                 }
                 silent_frames -= frames as u64;
-                signal.submitted(
-                    &vec![0; frames * usize::from(channels)],
-                    channels,
-                    &parameters,
-                );
+                signal.submitted(&silence, channels, &parameters);
                 continue;
             }
             let end = (cursor.position + chunk_frames).min(cursor.end(&parameters)?);
-            let samples = source.read(cursor.position, end)?;
+            let samples = source.read(cursor.position, end)
+                .map_err(|cause| decode_error(cursor.position, cause))?;
             let (volume, pan) = parameters.values();
             let chunk = apply_pcm_volume_pan(samples.to_vec(), channels, volume, pan);
             if !output.submit(&chunk)? {
@@ -938,15 +959,13 @@ mod pcm_worker {
                 repeats.refresh(&parameters);
                 if silent_frames != 0 {
                     let frames = silent_frames.min(chunk_frames as u64) as usize;
-                    if !output.submit(&vec![0; frames * usize::from(channels)])? {
+                    silence.clear();
+                    silence.resize(frames * usize::from(channels), 0);
+                    if !output.submit(&silence)? {
                         break;
                     }
                     silent_frames -= frames as u64;
-                    signal.submitted(
-                        &vec![0; frames * usize::from(channels)],
-                        channels,
-                        &parameters,
-                    );
+                    signal.submitted(&silence, channels, &parameters);
                     continue;
                 }
                 if cursor.position == cursor.end(&parameters)? {
@@ -966,7 +985,8 @@ mod pcm_worker {
                     }
                 }
                 let end = (cursor.position + chunk_frames).min(cursor.end(&parameters)?);
-                let samples = source.read(cursor.position, end)?;
+                let samples = source.read(cursor.position, end)
+                    .map_err(|cause| decode_error(cursor.position, cause))?;
                 let (volume, pan) = parameters.values();
                 let chunk = apply_pcm_volume_pan(samples.to_vec(), channels, volume, pan);
                 if !output.submit(&chunk)? {

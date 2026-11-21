@@ -83,6 +83,7 @@ pub(super) struct PlaneMovie {
 pub(super) struct MoviePresentation {
     pub surface: Arc<MovieFrameSurface>,
     pub playback: u64,
+    pub sequence: u64,
     pub time: f64,
 }
 
@@ -92,19 +93,21 @@ pub(super) struct MoviePresentation {
 pub(super) struct MovieDrawSnapshot {
     pub surface: Arc<MovieFrameSurface>,
     pub playback: u64,
+    pub sequence: u64,
     pub frame: Arc<MovieFrame>,
     pub rectangle: Option<[i32; 4]>,
 }
 
 impl MovieDrawSnapshot {
     pub(super) fn read(surface: Arc<MovieFrameSurface>) -> RuntimeResult<Option<Self>> {
-        let Some((playback, frame)) = surface.latest()? else {
+        let Some((playback, sequence, frame)) = surface.frame_for_composition()? else {
             return Ok(None);
         };
         let rectangle = surface.display_rectangle()?;
         Ok(Some(Self {
             surface,
             playback,
+            sequence,
             frame,
             rectangle,
         }))
@@ -126,11 +129,15 @@ pub(super) struct MoviePlanes {
 
 impl MpegMovieHost {
     pub(super) fn record_movie_presentation(&mut self, receipt: MoviePresentation) {
+        #[cfg(target_os = "android")]
+        receipt.surface.trace_frame(receipt.playback, 2, "first_composited", receipt.time);
         if let Some(previous) = self.planes.presentations.iter_mut().find(|previous| {
             previous.playback == receipt.playback
                 && Arc::ptr_eq(&previous.surface, &receipt.surface)
         }) {
-            previous.time = previous.time.max(receipt.time);
+            if receipt.sequence > previous.sequence {
+                *previous = receipt;
+            }
         } else {
             self.planes.presentations.push(receipt);
         }

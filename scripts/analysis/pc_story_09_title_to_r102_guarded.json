@@ -1,0 +1,692 @@
+{
+  "9": {
+    "frames": 4800,
+    "diagnostics": [
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:327",
+      "trace-native:520",
+      "trace-native:530",
+      "trace-native:531",
+      "trace-native:905"
+    ],
+    "route": {
+      "label": "09 New Game, guarded sc01 waits through r102",
+      "idle_frames": 1600,
+      "page_scenes": [],
+      "kanmi_exact": {
+        "contract": "kanmi-title-r102/v1",
+        "startup": "kcs.int/main.kcs",
+        "runtime_pe_sha256": "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26",
+        "flow_fes_sha256": "8a22b583e1e6dca573c2cbc56097a2134a5f3a3c21a4075fea077bd1c1fa5fea",
+        "title_fes_sha256": "b737c7557f43be7c399173cd181532dc6af01cbe4f6ebf5cbda3df5861ab40fb",
+        "scene_cst_sha256": "7c0d796d069db416291effc217aa3664ba449f23ce43b88a11a5d13cfff1a55e"
+      },
+      "steps": [
+        {
+          "label": "New Game: title/WAIT, main bank btn1[0], unique consuming receipt",
+          "wait": {
+            "state": "title",
+            "window": "title",
+            "hit": {
+              "point": [
+                140,
+                354
+              ],
+              "region": 14
+            }
+          },
+          "probe_points": [
+            [
+              140,
+              354
+            ]
+          ],
+          "click": [
+            140,
+            354
+          ],
+          "mouse_press": {
+            "candidates": [
+              3,
+              14,
+              23,
+              7
+            ],
+            "region": 14,
+            "key": 0,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 0,
+            "record": 41,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "First body: one Enter, confirm live sscript consumption and fresh r42 commit",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 0,
+            "record": 41,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 1,
+            "record": 43,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r43: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 1,
+            "record": 43,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 2,
+            "record": 45,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r45: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 2,
+            "record": 45,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 3,
+            "record": 47,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r47: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 3,
+            "record": 47,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 4,
+            "record": 49,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r49: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 4,
+            "record": 49,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 5,
+            "record": 51,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r51: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 5,
+            "record": 51,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 6,
+            "record": 53,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r53: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 6,
+            "record": 53,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 7,
+            "record": 78,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r78: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 7,
+            "record": 78,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 8,
+            "record": 80,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r80: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 8,
+            "record": 80,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 9,
+            "record": 83,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r83: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 9,
+            "record": 83,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 10,
+            "record": 85,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r85: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 10,
+            "record": 85,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 11,
+            "record": 87,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r87: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 11,
+            "record": 87,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 12,
+            "record": 89,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r89: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 12,
+            "record": 89,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 13,
+            "record": 91,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r91: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 13,
+            "record": 91,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 14,
+            "record": 93,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r93: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 14,
+            "record": 93,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 15,
+            "record": 96,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r96: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 15,
+            "record": 96,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 16,
+            "record": 98,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r98: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 16,
+            "record": 98,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 17,
+            "record": 100,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "sc01 r100: one guarded Enter",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 17,
+            "record": 100,
+            "window": "meswnd"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 60,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 18,
+            "record": 102,
+            "window": "meswnd"
+          }
+        },
+        {
+          "label": "Stop at the committed sc01 g18/r102 wait",
+          "wait": {
+            "state": "page",
+            "scene": "sc01",
+            "group": 18,
+            "record": 102,
+            "window": "meswnd"
+          }
+        }
+      ]
+    }
+  },
+  "checkpoints": [
+    {
+      "group": 0,
+      "wait": 41,
+      "body": 40,
+      "ordinal": 40,
+      "body_bytes": 36,
+      "sha256": "083db64025d0aeb20c32afecf83b5ce4d7b5d3c463afc3e1de54e3bdfbcd2160"
+    },
+    {
+      "group": 1,
+      "wait": 43,
+      "body": 42,
+      "ordinal": 0,
+      "body_bytes": 44,
+      "sha256": "d98cd24ba038bad4e2da98b1435205fdc69f7537fc03d84ef0bd306ecb734e37"
+    },
+    {
+      "group": 2,
+      "wait": 45,
+      "body": 44,
+      "ordinal": 0,
+      "body_bytes": 116,
+      "sha256": "54af1818f56ff89ff04e837551c4d368e4e959a1978820200c06035cc9f213cb"
+    },
+    {
+      "group": 3,
+      "wait": 47,
+      "body": 46,
+      "ordinal": 0,
+      "body_bytes": 34,
+      "sha256": "4c7a13d187d1f75658b9d2536787103c0bf277df9750ea1270f89160e8d04075"
+    },
+    {
+      "group": 4,
+      "wait": 49,
+      "body": 48,
+      "ordinal": 0,
+      "body_bytes": 140,
+      "sha256": "e54ff0485aff4acfb3bfc1ad3e516194e565aff873634aa2ff38ff4a818f78c0"
+    },
+    {
+      "group": 5,
+      "wait": 51,
+      "body": 50,
+      "ordinal": 0,
+      "body_bytes": 46,
+      "sha256": "e754b9fb904ffa97f701c6598ed403174eeb671ca558ebeaac1763b0c6485618"
+    },
+    {
+      "group": 6,
+      "wait": 53,
+      "body": 52,
+      "ordinal": 0,
+      "body_bytes": 100,
+      "sha256": "abdbff4794e230cb8a8982695e4e83cdd6c192e2ce1d82fd33409436c5c9ac48"
+    },
+    {
+      "group": 7,
+      "wait": 78,
+      "body": 77,
+      "ordinal": 23,
+      "body_bytes": 157,
+      "sha256": "eb228d6347b8bdd6c4169c597bb0a7802aba8f17356fe78b8f5b261e594dcb8a"
+    },
+    {
+      "group": 8,
+      "wait": 80,
+      "body": 79,
+      "ordinal": 0,
+      "body_bytes": 92,
+      "sha256": "2666f7eac0b54baa836131517eb4ddbd617275ed44b157bc68b8f2230f82539b"
+    },
+    {
+      "group": 9,
+      "wait": 83,
+      "body": 82,
+      "ordinal": 1,
+      "body_bytes": 16,
+      "sha256": "48fe5067664a4d2aff9ca39e6589e56dd43a7d97f88ad8891131787e1b9ae068",
+      "speaker": 81,
+      "speaker_bytes": 4,
+      "speaker_sha256": "660933a9d6c6358a938dac08275a48301e150b4a1c6d12e6ef199451e028c888"
+    },
+    {
+      "group": 10,
+      "wait": 85,
+      "body": 84,
+      "ordinal": 0,
+      "body_bytes": 36,
+      "sha256": "f88fb61822a591b993a3e5ababfe89d9134685c084b55d5bd4991e342fc60f98"
+    },
+    {
+      "group": 11,
+      "wait": 87,
+      "body": 86,
+      "ordinal": 0,
+      "body_bytes": 104,
+      "sha256": "ebe65d394f037fd2ec75b94c65231d4b90c75c81cfff90cd34357ec045ee80d7"
+    },
+    {
+      "group": 12,
+      "wait": 89,
+      "body": 88,
+      "ordinal": 0,
+      "body_bytes": 82,
+      "sha256": "424aa94db4476c066aa47e761374a0e4c21817223ac163fd87abf37c0916d984"
+    },
+    {
+      "group": 13,
+      "wait": 91,
+      "body": 90,
+      "ordinal": 0,
+      "body_bytes": 100,
+      "sha256": "f485595e71977dd1cb41e8055f58ce8c8fe6076cd440891fba8f3656d821e45a"
+    },
+    {
+      "group": 14,
+      "wait": 93,
+      "body": 92,
+      "ordinal": 0,
+      "body_bytes": 66,
+      "sha256": "1ec254db570e871fc5ce2808acffad6fac3323017bc529228881a2b6ef55ac38"
+    },
+    {
+      "group": 15,
+      "wait": 96,
+      "body": 95,
+      "ordinal": 1,
+      "body_bytes": 64,
+      "sha256": "cdd53a24d185b067170109c015636eebf25d02cf1206a9e9270a7323b672441c",
+      "speaker": 94,
+      "speaker_bytes": 4,
+      "speaker_sha256": "660933a9d6c6358a938dac08275a48301e150b4a1c6d12e6ef199451e028c888"
+    },
+    {
+      "group": 16,
+      "wait": 98,
+      "body": 97,
+      "ordinal": 0,
+      "body_bytes": 58,
+      "sha256": "26f00eabed28c014155558fe0c0c4ac1ac18a07779483f643d2f9be1b482dec3"
+    },
+    {
+      "group": 17,
+      "wait": 100,
+      "body": 99,
+      "ordinal": 0,
+      "body_bytes": 50,
+      "sha256": "581f6c34bd7cc814c05fac3af490af09d817e1b366d852a7a9d0ad8993f7f995"
+    },
+    {
+      "group": 18,
+      "wait": 102,
+      "body": 101,
+      "ordinal": 0,
+      "body_bytes": 110,
+      "sha256": "7786af2027da97fe66aeb85c9bf4b1aaf9bb2a6185304a68a9fc3832c3718986"
+    }
+  ]
+}

@@ -223,6 +223,8 @@ fn decode_adpcm(
     let frames = match fact {
         None => maximum,
         Some(declared) if declared <= maximum => declared,
+        // Some legacy mono effects overcount a short final block by one sample.
+        Some(declared) if channels == 1 && tail != 0 && declared - maximum == 1 => maximum,
         Some(declared)
             if full > 0
                 && declared % frames_per_block == 0
@@ -332,4 +334,26 @@ fn word32(bytes: &[u8], offset: usize) -> RuntimeResult<u32> {
         .get(offset..offset + 4)
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
         .ok_or_else(|| error("WAV DWORD is truncated"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_adpcm;
+
+    #[test]
+    fn mono_adpcm_accepts_one_sample_overcount_only_with_short_final_block() {
+        let mut format = [0; 26];
+        for (offset, word) in [(16, 8_u16), (18, 2036), (20, 1), (22, 256)] {
+            format[offset..offset + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        let data = vec![0; 19_059];
+        let decode =
+            |data: &[u8], fact| decode_adpcm(&format, data, Some(fact), 44_100, 1, 1024, 4);
+
+        let (_, _, _, samples) = decode(&data, 37_891).unwrap();
+        assert_eq!(samples.len(), 37_890);
+        assert!(decode(&data, 37_892).is_err());
+        assert!(decode(&data[..1024], 2037).is_err());
+        assert!(decode(&data[..1029], 2037).is_err());
+    }
 }

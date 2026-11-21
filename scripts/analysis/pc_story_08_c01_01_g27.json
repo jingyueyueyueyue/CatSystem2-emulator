@@ -1,0 +1,43 @@
+{
+  "8": {
+    "frames": 24800,
+    "route": {
+      "label": "08 c01_01: 27 guarded Enter presses through g27/264",
+      "idle_frames": 5500,
+      "page_scenes": [],
+      "eyecatch_08_exit": true,
+      "eyecatch_08_first_body": true,
+      "eyecatch_08_next_body": true,
+      "steps": [],
+      "guarded_body_last_group": 27
+    },
+    "diagnostics": [
+      "trace-native:69",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:614",
+      "trace-native:616",
+      "trace-native:619",
+      "inspect-log:4000",
+      "inspect-log:5400",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:530",
+      "trace-native:531"
+    ]
+  },
+  "review": {
+    "anchor": [5, 174],
+    "first_successor": [6, 180],
+    "terminal": [27, 264],
+    "next_wait": [28, 402],
+    "first_reset_record": 270,
+    "scene_transfer": [42, 508, "c01_02"],
+    "member": "scene/c01_01.cst",
+    "sha256": "942ca2dbd98382b7196ba97f8b38709d672ce5d9c97d62068a9e3b423dafdee2",
+    "patch": "archive/2026-11/20261121_pc_story_08_c01_01_g27.patch"
+  }
+}

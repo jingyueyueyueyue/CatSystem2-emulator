@@ -1,0 +1,54 @@
+{
+  "11": {
+    "frames": 1800,
+    "inputs": [
+      "story-trace", "story-events", "capture-every:0", "no-final-capture",
+      "trace-native:266", "trace-native:267", "trace-native:268",
+      "215:13", "385:13", "550:13",
+      "move:605:1154,473", "require-hit:612:15", "612:1154,473",
+      "require-hit:810:62", "810:640,360",
+      "require-hit:890:62", "890:640,360",
+      "require-hit:970:62", "970:640,360",
+      "inspect-log:1555", "inspect-log:1650", "inspect-log:1800"
+    ]
+  },
+  "13": {
+    "frames": 4400,
+    "inputs": [
+      "story-trace", "story-events", "capture-every:0", "no-final-capture",
+      "trace-native:266", "trace-native:267", "trace-native:268",
+      "trace-native:327", "trace-native:276", "trace-native:630",
+      "require-hit:241:20", "241:640,441",
+      "require-hit:361:55", "361:640,549",
+      "inspect-log:3950", "inspect-log:4400"
+    ]
+  },
+  "acceptance": {
+    "11": {
+      "profile": "Legacy11Observation",
+      "pe": "4ccb48ad4bb6bfb5a15a45b8e1f2c2e62072cfad9f1487f869561a473770ed94",
+      "scene": "00_001",
+      "window": "cinema",
+      "flow": "GAME_WAIT",
+      "root_wait": "0xd6d",
+      "entry_buttons": ["Keyboard(13)", "Keyboard(13)", "Keyboard(13)", "MouseButton(0)", "MouseButton(0)", "MouseButton(0)", "MouseButton(0)"],
+      "source": {"probe": "August", "native": 1037, "stored": "Cp932", "output": "Utf8"},
+      "first": {"group": 0, "wait": 81, "body": [79, 80]},
+      "next": {"group": 1, "wait": 86, "body": [84, 85]},
+      "movies": 1
+    },
+    "13": {
+      "profile": "Legacy13Observation",
+      "pe": "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c",
+      "scene": "BLAOP1_END",
+      "window": "meswnd",
+      "flow": "LOOP_GAME",
+      "root_wait": "0xad0",
+      "entry_buttons": ["MouseButton(0)", "MouseButton(0)"],
+      "source": {"probe": "Eden", "native": 327, "stored": "Gbk", "output": "Gbk"},
+      "first": {"group": 4, "wait": 103, "body": [102], "body_bytes": 97, "body_sha256": "76edde16c681945bf1f5e2f69bc5b6551e70d313e843a635631d9898a67e8863"},
+      "next": {"group": 5, "wait": 107, "body": [106], "body_bytes": 38, "body_sha256": "079b32e0085774185b0cbfd72b1c99b2bf601a34a006583cf46fb8196dc9d7e3"},
+      "movies": 0
+    }
+  }
+}

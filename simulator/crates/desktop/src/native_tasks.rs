@@ -1476,7 +1476,9 @@ impl LoggingHost<'_> {
         }
         if self.task_parents.contains_key(&id) || self.scene_nodes.contains_key(&id) {
             self.ensure_task_record(id)?;
-            self.data_services.tasks.render.delete_frame_effect(id);
+            // The render receiver unregisters its callback on command 3.
+            // A replacement may register before deferred task destruction.
+            self.data_services.tasks.render.release(id);
             if self.data_services.tasks.records[&id].kind == 2 {
                 self.release_plane_history(id);
                 self.clear_plane_mesh(id);

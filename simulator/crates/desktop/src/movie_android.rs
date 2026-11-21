@@ -1,14 +1,14 @@
 //! Android FFmpeg shared-library C API, loaded without changing the JNI shell.
 //! AVIO owns only explicit callbacks into a bounded, replayable archive stream.
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use cs2_formats::{MovieMetadata, MovieTimeBase};
-use cs2_runtime::RuntimeResult;
+use cs2_runtime::{MediaResourceReader, ResourceCandidate, ResourceIndex, RuntimeResult};
 
 use crate::media_process::{Cancellation, error};
 
@@ -179,13 +179,49 @@ fn loader_error() -> String {
     }
 }
 
-/// Runtime's decrypting archive reader is forward-only. AVIO backward seeks
-/// reopen the same indexed resource and decrypt/discard to the requested byte.
-/// No whole-movie allocation, cache file or guest process is needed.
+#[derive(Clone)]
+pub(super) enum MovieSource {
+    Indexed(Arc<ResourceIndex>, ResourceCandidate),
+    Streaming(Resolver, String),
+}
+
+impl MovieSource {
+    fn open(&self) -> RuntimeResult<MovieReader> {
+        match self {
+            Self::Indexed(resources, candidate) => resources
+                .open_media_candidate(candidate, MAX_BYTES)
+                .map(MovieReader::Indexed),
+            Self::Streaming(resolve, name) => resolve(name).map(MovieReader::Streaming),
+        }
+    }
+
+    fn length(&self) -> Option<u64> {
+        match self {
+            Self::Indexed(_, candidate) => Some(candidate.size),
+            Self::Streaming(..) => None,
+        }
+    }
+}
+
+enum MovieReader {
+    Indexed(MediaResourceReader),
+    Streaming(Box<dyn Read + Send>),
+}
+
+impl Read for MovieReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Indexed(reader) => reader.read(output),
+            Self::Streaming(reader) => reader.read(output),
+        }
+    }
+}
+
+/// Indexed sources use bounded seeks. Generic streams can be reopened
+/// and scanned when the caller only provides a Read implementation.
 struct ResourceIO {
-    resolve: Resolver,
-    name: String,
-    reader: Box<dyn Read + Send>,
+    source: MovieSource,
+    reader: MovieReader,
     position: u64,
     length: Option<u64>,
     cancel: Cancellation,
@@ -196,7 +232,7 @@ struct ResourceIO {
 impl ResourceIO {
     fn read(&mut self, output: &mut [u8]) -> RuntimeResult<usize> {
         self.check()?;
-        if self.length.is_some_and(|length| self.position == length) {
+        if output.is_empty() || self.length.is_some_and(|length| self.position == length) {
             return Ok(0);
         }
         let remaining = MAX_BYTES.saturating_sub(self.position);
@@ -216,7 +252,7 @@ impl ResourceIO {
         let remaining = self.length.map_or(remaining, |length| {
             remaining.min(length.saturating_sub(self.position))
         });
-        let count = output.len().min(remaining as usize);
+        let count = output.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let read = loop {
             match self.reader.read(&mut output[..count]) {
                 Err(cause) if cause.kind() == std::io::ErrorKind::Interrupted => {
@@ -245,7 +281,7 @@ impl ResourceIO {
             return Err(error("Android movie read cancelled"));
         }
         if Instant::now() >= self.deadline {
-            return Err(error("Android movie AVIO operation exceeded20s"));
+            return Err(error("Android movie AVIO operation exceeded 20s"));
         }
         Ok(())
     }
@@ -255,7 +291,7 @@ impl ResourceIO {
         let whence = whence & !SEEK_FORCE;
         if whence == SEEK_SIZE || (whence == 2 && self.length.is_none()) {
             if self.length.is_none() {
-                let mut reader = (self.resolve)(&self.name)?;
+                let mut reader = self.source.open()?;
                 let mut length = 0_u64;
                 let mut buffer = [0_u8; 64 * 1024];
                 loop {
@@ -291,8 +327,16 @@ impl ResourceIO {
         if target > MAX_BYTES || self.length.is_some_and(|length| target > length) {
             return Err(error("Android movie seek leaves its bounded resource"));
         }
+        if target == self.position {
+            return Ok(Some(target));
+        }
+        if let MovieReader::Indexed(reader) = &mut self.reader {
+            self.position = reader.seek(SeekFrom::Start(target))
+                .map_err(|cause| error(format!("seek Android indexed movie: {cause}")))?;
+            return Ok(Some(self.position));
+        }
         if target < self.position {
-            self.reader = (self.resolve)(&self.name)?;
+            self.reader = self.source.open()?;
             self.position = 0;
         }
         let mut discard = [0_u8; 64 * 1024];
@@ -362,7 +406,7 @@ pub(super) enum Frame {
         height: u32,
         time: f64,
         duration: Option<f64>,
-        rgba: Vec<u8>,
+        rgba: Arc<[u8]>,
     },
     Audio {
         time: f64,
@@ -378,18 +422,16 @@ pub(super) struct Decoder {
 
 impl Decoder {
     pub(super) fn open(
-        resolve: Resolver,
-        name: &str,
-        length: Option<u64>,
+        source: MovieSource,
         demuxer: &str,
         mask: u32,
         cancel: Cancellation,
     ) -> RuntimeResult<(Self, MovieMetadata, bool)> {
         let api = api()?;
-        let reader = resolve(name)?;
+        let reader = source.open()?;
+        let length = source.length();
         let mut io = Box::new(ResourceIO {
-            resolve,
-            name: name.to_owned(),
+            source,
             reader,
             position: 0,
             length,
@@ -505,7 +547,7 @@ impl Decoder {
                     time: frame.pts_seconds,
                     duration: (frame.flags & 8 != 0 && frame.reserved != 0)
                         .then_some(f64::from(frame.reserved) / 1_000_000.),
-                    rgba: bytes.to_vec(),
+                    rgba: Arc::from(bytes),
                 }))
             }
             2 => {
@@ -542,15 +584,11 @@ impl Drop for Decoder {
 }
 
 pub(super) fn probe(
-    resolve: Resolver,
-    name: &str,
-    length: Option<u64>,
+    source: MovieSource,
     format: super::movie::MovieFormat,
 ) -> RuntimeResult<(MovieMetadata, bool)> {
     let (_, metadata, audio) = Decoder::open(
-        resolve,
-        name,
-        length,
+        source,
         format.demuxer_name(),
         VIDEO | AUDIO,
         Cancellation::in_process(),
@@ -558,8 +596,8 @@ pub(super) fn probe(
     Ok((metadata, audio))
 }
 
-pub(super) fn signature(resolve: &Resolver, name: &str) -> RuntimeResult<Vec<u8>> {
-    let mut reader = resolve(name)?;
+pub(super) fn signature(source: &MovieSource) -> RuntimeResult<Vec<u8>> {
+    let mut reader = source.open()?;
     let mut prefix = vec![0; 64];
     let mut read = 0;
     while read < prefix.len() {
@@ -573,4 +611,41 @@ pub(super) fn signature(resolve: &Resolver, name: &str) -> RuntimeResult<Vec<u8>
     }
     prefix.truncate(read);
     Ok(prefix)
+}
+
+pub(super) struct MovieTrace {
+    pub load: u64,
+    pub playback: u64,
+    start: Instant,
+    seen: std::sync::atomic::AtomicU8,
+}
+
+impl MovieTrace {
+    pub fn begin() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_LOAD: AtomicU64 = AtomicU64::new(1);
+        Self::new(NEXT_LOAD.fetch_add(1, Ordering::Relaxed), 0)
+    }
+
+    pub fn new(load: u64, playback: u64) -> Self {
+        Self { load, playback, start: Instant::now(), seen: Default::default() }
+    }
+
+    pub fn event(&self, stage: &str, details: std::fmt::Arguments<'_>) {
+        #[link(name = "log")]
+        unsafe extern "C" {
+            fn __android_log_write(priority: i32, tag: *const c_char, text: *const c_char) -> i32;
+        }
+        let message = format!("load={} playback={} stage={stage} elapsed_us={} {details}",
+            self.load, self.playback, self.start.elapsed().as_micros());
+        if let Ok(message) = CString::new(message) {
+            unsafe { __android_log_write(4, c"CS2Movie".as_ptr(), message.as_ptr()) };
+        }
+    }
+
+    pub fn first(&self, bit: u8, stage: &str, details: std::fmt::Arguments<'_>) {
+        if self.seen.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+            self.event(stage, details);
+        }
+    }
 }

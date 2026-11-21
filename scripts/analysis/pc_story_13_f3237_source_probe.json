@@ -1,0 +1,36 @@
+{
+  "13": {
+    "frames": 3850,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:327", "trace-native:276",
+      "require-hit:241:20", "241:640,441", "require-hit:361:55", "361:640,549",
+      "inspect-log:3450", "inspect-log:3650", "inspect-log:3850"
+    ],
+    "review": {
+      "baseline": "20261120_053135_850856_q1i4f7x8_playthrough/13.events.log:11084",
+      "resource": "scene.int::BLAOP1_END.cst",
+      "expected": "After the two verified entry clicks, send no input. Observe actual movie completion and entry to BLAOP1_END group 4. Verify records 101 and 102 via native 276 and CST read 327, then the new body and record 103 wait. A later frame cap alone cannot prove the original failure was reached.",
+      "source_regression": {
+        "sample": 17,
+        "reported_screenshot_match": {
+          "events_log": "20261119_172847_197628_playthrough/17.events.log:11344",
+          "frame": 647,
+          "native": 630,
+          "arguments_hex": "0c000000658207007482070000000000",
+          "pc": "0x92c",
+          "fes_task": 12,
+          "error": "message append has invalid CP932 input"
+        },
+        "verified_0538": {
+          "source_tree_sha256": "a0d4dcb6ed144822fa71c168fcdc7e8fddfd05b5808c2f5184b6f040be0574cd",
+          "source_receipt": "20261120_054039_473184_l5va565h_playthrough/17.events.log:2152",
+          "body_layer": "20261120_054039_473184_l5va565h_playthrough/17.host.log:110",
+          "completion_receipt": "20261120_054039_473184_l5va565h_playthrough/17.host.log:127",
+          "result": "f647 passes with UTF-8 CST data and CP932 FES literals; prologue 0/18 has a naturally completed body at f1163 and the same generation is committed by f1500."
+        },
+        "require_for_13": "Keep 17 as the direct regression for the reported error, not proof of a common root cause. For 13, identify the failing FES segment and trace its bytes to the selected resource or an intermediate copy. Preserve proven CP932 literals and original Japanese resources. Decoder relaxation or disappearance of the error alone is not a pass."
+      }
+    }
+  }
+}

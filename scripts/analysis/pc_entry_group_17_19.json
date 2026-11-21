@@ -1,0 +1,37 @@
+{
+  "17": {
+    "frames": 690,
+    "inputs": [
+      "capture-every:0",
+      "capture:644",
+      "capture:646"
+    ]
+  },
+  "18": {
+    "frames": 1120,
+    "inputs": [
+      "capture-every:0",
+      "capture:855",
+      "875:183,434",
+      "capture:876",
+      "capture:937",
+      "capture:1000",
+      "capture:1001",
+      "capture:1020",
+      "capture:1040",
+      "capture:1120"
+    ]
+  },
+  "19": {
+    "frames": 2410,
+    "inputs": [
+      "capture-every:0",
+      "capture:2270",
+      "2270:335,488",
+      "capture:2271",
+      "move:2304:40,32",
+      "capture:2313",
+      "capture:2379"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "6": {
+    "frames": 3800,
+    "inputs": [
+      "capture:450", "move:500:98,208", "capture:520", "530:98,208",
+      "capture:531", "capture:600", "move:640:98,104", "capture:655",
+      "660:98,104", "capture:661", "capture:760", "capture:820", "capture:850",
+      "887:13", "capture:907", "957:13", "capture:977", "capture:1400",
+      "1420:13", "capture:1485", "capture:1600", "capture:1750", "capture:1900",
+      "1920:13", "capture:1950", "capture:2100", "2210:13", "capture:2260",
+      "2320:13", "capture:2370", "2430:13", "capture:2480", "2540:13",
+      "capture:2590", "2650:13", "capture:2700", "2760:13", "capture:2810",
+      "2870:13", "capture:2920", "2980:13", "capture:3030", "3090:13",
+      "capture:3140", "3200:13", "capture:3240", "capture:3360",
+      "capture:3480", "capture:3600", "3610:13", "capture:3660",
+      "3730:13", "capture:3790"
+    ]
+  }
+}

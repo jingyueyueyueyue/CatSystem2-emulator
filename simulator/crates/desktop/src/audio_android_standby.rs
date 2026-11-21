@@ -7,7 +7,7 @@ use super::{
 };
 use crate::movie_audio::MovieAudioOutput;
 use std::sync::{
-    Arc, mpsc,
+    Arc, Mutex, mpsc,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -21,9 +21,14 @@ const REFILL_INTERVAL: Duration = Duration::from_millis(5);
 const STARTED_GRACE: Duration = Duration::from_millis(150);
 const OPEN_POLL: Duration = Duration::from_millis(100);
 
+// Ogg, WAV and replacement hosts can all own pools. A cancelled worker
+// keeps its slot while the driver finishes opening or closing its stream.
+const MAX_STANDBY_WORKERS: usize = 2;
+static STANDBY_WORKERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
 pub(crate) struct StandbyPool {
     devices: Vec<Standby>,
-    legacy_formats: [Arc<AtomicBool>; 4],
+    legacy_formats: [Arc<AtomicBool>; 5],
 }
 
 impl Default for StandbyPool {
@@ -37,26 +42,25 @@ impl Default for StandbyPool {
 
 impl StandbyPool {
     pub(crate) fn prepare(&mut self, rate: u32, channels: u8) {
-        if !matches!(rate, 44_100 | 48_000) || !matches!(channels, 1 | 2) {
-            return;
-        }
         // The 44.1 kHz dialogue/stereo and mono effect formats commonly
         // follow one another. Retain at most one device of either layout.
-        let formats: &[u8] = if rate == 44_100 {
-            &[channels, 3 - channels]
-        } else {
-            std::slice::from_ref(&channels)
+        let formats: &[(u8, usize)] = match (rate, channels) {
+            (44_100, 1) => &[(1, 0), (2, 1)],
+            (44_100, 2) => &[(2, 1), (1, 0)],
+            (48_000, 1) => &[(1, 2)],
+            (48_000, 2) => &[(2, 3)],
+            (22_050, 1) => &[(1, 4)],
+            _ => return,
         };
         self.devices.retain(|standby| {
-            !standby.done() && formats.iter().any(|&channels| {
+            !standby.done() && formats.iter().any(|&(channels, _)| {
                 standby.matches_format(rate, channels)
             })
         });
-        for &channels in formats {
+        for &(channels, format) in formats {
             if let Some(standby) = self.devices.iter().find(|s| s.matches_format(rate, channels)) {
                 standby.extend();
             } else {
-                let format = usize::from(rate == 48_000) * 2 + (channels as usize - 1);
                 if let Some(standby) = Standby::spawn(rate, channels, self.legacy_formats[format].clone()) {
                     self.devices.push(standby);
                 }
@@ -83,19 +87,25 @@ struct Flags {
 
 impl Standby {
     fn spawn(rate: u32, channels: u8, legacy: Arc<AtomicBool>) -> Option<Self> {
+        let mut workers = STANDBY_WORKERS.lock().unwrap_or_else(|error| error.into_inner());
+        workers.retain(|worker| !worker.is_finished());
+        if workers.len() >= MAX_STANDBY_WORKERS {
+            return None;
+        }
         let (claim, commands) = mpsc::channel();
         let flags = Arc::new(Flags {
             state: AtomicU8::new(WARMING),
             extend: AtomicBool::new(false),
         });
         let worker_flags = flags.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("cs2-aaudio-standby".into())
             .spawn(move || {
                 let _ = run(rate, channels, &commands, &worker_flags, &legacy);
                 worker_flags.state.store(DONE, Ordering::Release);
             })
             .ok()?;
+        workers.push(worker);
         Some(Self { format: (rate, channels), flags, claim })
     }
 
@@ -180,25 +190,26 @@ fn run_silent(
     output.pause(false)?;
     let started = Instant::now();
     let mut deadline = started + KEEP_ALIVE;
+    let mut last_claimable = started;
     while Instant::now() < deadline {
         if flags.extend.swap(false, Ordering::AcqRel) {
             deadline = Instant::now() + KEEP_ALIVE;
         }
         output.pump()?;
-        let Some((read, _, _, state)) = output.standby_counters() else {
+        let Some((read, _, _, _)) = output.standby_counters() else {
             return Ok(WarmExit::OpenOnly);
         };
-        if state != STARTED && started.elapsed() >= STARTED_GRACE {
-            // A legacy transport that stays STARTING would require waiting
-            // out the silent prefix before it could prove program progress.
-            // Prepare the opening separately and keep normal start/PCM
-            // confirmation at the instant of the next actual PLAY.
-            return Ok(WarmExit::OpenOnly);
-        }
         if output.accepted_frames.saturating_sub(read) < 3 * step {
             output.submit(&silence)?;
         }
         let can_claim = output.promotion_origin(2 * step).is_some();
+        if can_claim {
+            last_claimable = Instant::now();
+        } else if last_claimable.elapsed() >= STARTED_GRACE {
+            // Some routes report STARTED without usable device progress.
+            // Keep an opened lease and confirm the start when PLAY arrives.
+            return Ok(WarmExit::OpenOnly);
+        }
         flags.state.store(if can_claim { READY } else { WARMING }, Ordering::Release);
         match commands.recv_timeout(REFILL_INTERVAL) {
             Ok(reply) => {

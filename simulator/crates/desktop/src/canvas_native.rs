@@ -246,15 +246,22 @@ impl VramOverflow {
     }
 
     pub(super) fn pixel(&self, x: u32, y: u32) -> Option<Color> {
-        let column = x / self.tile[0];
-        let row = y / self.tile[1];
-        if column >= self.grid[0] || row >= self.grid[1] {
-            return None;
+        self.pixel_sampler()(x, y)
+    }
+
+    pub(super) fn pixel_sampler(&self) -> impl Fn(u32, u32) -> Option<Color> + Sync + '_ {
+        let Self { tile, grid, pixels, .. } = self;
+        move |x, y| {
+            let column = x / tile[0];
+            let row = y / tile[1];
+            if column >= grid[0] || row >= grid[1] {
+                return None;
+            }
+            let offset = ((y % tile[1]) as usize * tile[0] as usize + (x % tile[0]) as usize) * 4;
+            Some(pixels.get(&(row * grid[0] + column)).map_or(Color::TRANSPARENT, |bytes| {
+                Color::rgba(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3])
+            }))
         }
-        let offset = self.byte_offset(x, y);
-        Some(self.pixels.get(&(row * self.grid[0] + column)).map_or(Color::TRANSPARENT, |bytes| {
-            Color::rgba(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3])
-        }))
     }
 
     pub(super) fn row_span(&self, x: u32, y: u32, width: u32) -> (u32, Option<&[u8]>) {

@@ -553,8 +553,8 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
             2
         } else if !completed {
             0
-        } else if sessions.displayed_frames.get(&id)
-            .is_some_and(|frame| frame.matches_player(player))
+        } else if !player.has_unsubmitted_movie_frame().map_err(|cause| cause.to_string())?
+            && sessions.displayed_frames.get(&id).is_some_and(|frame| frame.matches_player(player))
         {
             FRAME_UNCHANGED
         } else {
@@ -847,6 +847,7 @@ pub unsafe extern "C" fn cs2_android_copy_frame(
 pub extern "C" fn cs2_android_frame_posted(id: u64) -> i32 {
     call(-1, |sessions| {
         let player = sessions.players.get(&id).ok_or("Android session is absent")?;
+        player.acknowledge_movie_frame().map_err(|cause| cause.to_string())?;
         sessions.displayed_frames.entry(id).or_default().record_player(player);
         Ok(0)
     })

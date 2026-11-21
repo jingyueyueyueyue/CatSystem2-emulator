@@ -1,0 +1,193 @@
+{
+  "2": {
+    "frames": 2700,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:1033",
+      "trace-native:1037",
+      "trace-native:1038",
+      "move:695:105,64",
+      "move:730:400,144",
+      "require-hit:745:26",
+      "745:400,144",
+      "require-hit:805:35",
+      "805:400,144",
+      "legacy-02-continue"
+    ]
+  },
+  "4": {
+    "frames": 1320,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:1033",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:530",
+      "trace-native:531",
+      "trace-native:630",
+      "trace-native:645",
+      "trace-native:882",
+      "215:638,446",
+      "require-hit:215:19",
+      "move:372:165,386",
+      "390:165,386",
+      "require-hit:390:15",
+      "inspect-log:670",
+      "inspect-log:840",
+      "inspect-log:900",
+      "inspect-log:1080",
+      "inspect-log:1320",
+      "trace-native:1037",
+      "trace-native:1038"
+    ]
+  },
+  "5": {
+    "frames": 2280,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:1033",
+      "trace-native:1037",
+      "trace-native:1038",
+      "trace-native:616",
+      "require-hit:260:13",
+      "260:400,300",
+      "require-hit:380:13",
+      "380:400,300",
+      "move:860:235,509",
+      "require-hit:885:15",
+      "885:235,509",
+      "inspect-log:214",
+      "inspect-log:309",
+      "inspect-log:434",
+      "inspect-log:509",
+      "inspect-log:984",
+      "inspect-log:1720",
+      "inspect-log:2050",
+      "inspect-log:2280"
+    ]
+  },
+  "6": {
+    "frames": 2400,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:530",
+      "trace-native:630",
+      "trace-native:645",
+      "trace-native:882",
+      "move:500:98,208",
+      "require-hit:530:18",
+      "530:98,208",
+      "move:640:98,104",
+      "require-hit:660:10",
+      "660:98,104",
+      "legacy-06-continue"
+    ]
+  },
+  "7": {
+    "frames": 5600,
+    "diagnostics": [
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:265",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:269",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:630",
+      "trace-native:645"
+    ],
+    "route": {
+      "label": "07 natural OP exit, one guarded Enter from com01 0/57, stop at 1/62",
+      "idle_frames": 600,
+      "page_scenes": [],
+      "kamikaze_post_op": {
+        "keyboard_press": {
+          "region": 64,
+          "receiver": 8,
+          "key": 2,
+          "group": 0,
+          "response": 0
+        }
+      },
+      "steps": []
+    }
+  },
+  "16": {
+    "frames": 2100,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "require-hit:425:14",
+      "425:640,480",
+      "require-hit:661:15",
+      "661:66,72",
+      "require-hit:1041:62",
+      "1041:640,420",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "legacy-16-continue"
+    ]
+  },
+  "19": {
+    "frames": 3400,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "require-hit:2270:17",
+      "2270:335,488",
+      "move:2304:40,32",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "legacy-19-continue"
+    ]
+  }
+}

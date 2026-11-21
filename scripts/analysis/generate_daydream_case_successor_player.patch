@@ -1,0 +1,290 @@
+--- a/simulator/crates/desktop/src/story_trace.rs
++++ b/simulator/crates/desktop/src/story_trace.rs
+@@ -1056,7 +1056,7 @@
+         false
+     }
+ 
+-    pub fn host_daydream_case_blocked(&self, started: u64) -> bool {
++    pub fn host_daydream_case_blocked(&self, started: u64, advancing: bool) -> bool {
+         if self.host_story_trace_profile() != Some(StoryTraceProfile::Daydream) {
+             return true;
+         }
+@@ -1067,11 +1067,13 @@
+         if stories.next().is_some() {
+             return true;
+         }
+-        let expected = story.and_then(|story| daydream_first_case_records(&story.scene));
++        let expected = story.and_then(|story| daydream_case_records(&story.scene));
+         if story.is_some_and(|story| {
+             [story.page, story.candidate].into_iter().flatten().any(|(_, kind, group, record)| {
+                 matches!(kind, 0x02 | 0x03)
+-                    && (kind != 0x02 || !expected.is_some_and(|(_, wait, _)| (group, record) == (0, wait)))
++                    && (kind != 0x02 || !expected.is_some_and(|(_, pages)| {
++                        (group, record) == (0, pages[0].0) || advancing && (group, record) == (1, pages[1].0)
++                    }))
+             })
+         }) {
+             return true;
+@@ -1081,7 +1083,7 @@
+             let Some(driver) = runtime.driver.as_ref() else { return false; };
+             let block = driver.interpreter.current_block();
+             if wait_key {
+-                return !expected.is_some_and(|(window, _, _)| name == window.as_bytes() && block == b"MES_SHOW");
++                return !expected.is_some_and(|(window, _)| name == window.as_bytes() && block == b"MES_SHOW");
+             }
+             !matches!(name, b"flow" | b"ttlflow" | b"title" | b"meswnd" | b"cinema")
+                 && !driver.has_pending_handler()
+@@ -1089,14 +1091,19 @@
+         })
+     }
+ 
+-    pub fn host_daydream_first_case(&self, started: u64, scene: &str) -> Option<i32> {
++    pub fn host_daydream_case_body(
++        &self, started: u64, scene: &str, group: usize,
++    ) -> Option<(i32, (u32, u64, u32, u64, u64), String)> {
+         let frame = self.state.clock.frame;
+         if self.host_story_trace_profile() != Some(StoryTraceProfile::Daydream) {
+             return None;
+         }
+-        let Some((window, record, expected)) = daydream_first_case_records(scene) else { return None; };
+-        let Some(shell) = self.host_body_wait_shell(frame) else { return None; };
+-        if shell.loaded <= started || (shell.scene, shell.group, shell.record, shell.window) != (scene, 0, record, window) {
++        let (window, pages) = daydream_case_records(scene)?;
++        let &(record, expected) = pages.get(group)?;
++        let shell = self.host_body_wait_shell(frame)?;
++        if shell.loaded <= started
++            || (shell.scene, shell.group, shell.record, shell.window) != (scene, group as i32, record, window)
++        {
+             return None;
+         }
+         let (sources, _, composed) = self.host_current_body(shell, frame);
+@@ -1105,12 +1112,39 @@
+             && self.data_services.cst_text_origins.body_is_current(sources)) else { return None; };
+         let generation = self.data_services.fes_text.story_body_generation(shell.owner)?;
+         let (_, complete) = generation.natural_complete?;
+-        eprintln!(
+-            "frame {frame}: Daydream first CASE scene={scene} group=0 record={record} window={window} owner={} context={} load={} loaded={} marked={} sources={expected:?} epoch={} source_frame={} natural_complete={complete} composed=true",
+-            shell.owner, shell.context, sources[0].load_id, shell.loaded, shell.marked,
+-            generation.source_epoch, generation.source_frame,
++        let stage = if group == 0 { "first" } else { "second" };
++        let load = sources[0].load_id;
++        let anchor = (shell.context, load, shell.owner, generation.source_epoch, generation.source_frame);
++        let evidence = format!(
++            "frame {frame}: Daydream {stage} CASE scene={scene} group={group} record={record} window={window} owner={} context={} load={load} loaded={} marked={} sources={expected:?} epoch={} source_frame={} natural_complete={complete} composed=true",
++            shell.owner, shell.context, shell.loaded, shell.marked, generation.source_epoch, generation.source_frame,
+         );
+-        Some(record)
++        Some((record, anchor, evidence))
++    }
++
++    pub fn host_daydream_case_enter(&self, scene: &str, context: u32, owner: u32) -> Option<(u32, u32)> {
++        let (_, [(first, _), (second, _)]) = daydream_case_records(scene)?;
++        let document = self.cst_contexts.get(&context)?.document.as_ref()?;
++        if !adjacent_cst_input_waits(document, (0, first), Some((1, second))) {
++            return None;
++        }
++        let between = document.records.get(first as usize + 1..second as usize)?;
++        let layout: &[(u32, &[u8])] = match scene {
++            "c01_01_01" => &[(0x20, b"")],
++            "c02_01_01" => &[(0x30, b"rdraw"), (0x30, b"pcm K_c02_01_002"), (0x21, b""), (0x20, b"")],
++            "c03_01_01" => &[(0x30, b"se 0 se4029"), (0x20, b"")],
++            _ => return None,
++        };
++        if between.len() != layout.len() || !between.iter().zip(layout).all(|(row, &(kind, command))| {
++            u32::from(row.kind) == kind && if kind == 0x30 {
++                row.text.trim_ascii() == command
++            } else {
++                !row.text.trim_ascii().is_empty()
++            }
++        }) {
++            return None;
++        }
++        self.legacy_bottom_enter(owner)
+     }
+ 
+     fn host_body_wait_shell(&self, frame: u64) -> Option<BodyWaitShell<'_>> {
+@@ -1151,8 +1185,10 @@
+             return None;
+         }
+         let (marked, group, record) = story.settled_body_record(frame)?;
+-        let body = match (profile, daydream_first_case_records(&story.scene)) {
+-            (StoryTraceProfile::Daydream, Some((window, first, _))) if (group, record) == (0, first) => window,
++        let body = match (profile, daydream_case_records(&story.scene)) {
++            (StoryTraceProfile::Daydream, Some((window, pages)))
++                if usize::try_from(group).ok().and_then(|group| pages.get(group))
++                    .is_some_and(|&(wait, _)| wait == record) => window,
+             _ => body,
+         };
+         if legacy.is_some_and(|profile| legacy_11_13_records(profile, &story.scene, group, record).is_none()
+@@ -1566,11 +1602,13 @@
+     }
+ }
+ 
+-fn daydream_first_case_records(scene: &str) -> Option<(&'static str, i32, &'static [usize])> {
++type DaydreamCasePage = (i32, &'static [usize]);
++
++fn daydream_case_records(scene: &str) -> Option<(&'static str, [DaydreamCasePage; 2])> {
+     match scene {
+-        "c01_01_01" => Some(("cinema", 66, &[65])),
+-        "c02_01_01" => Some(("meswnd", 66, &[64, 65])),
+-        "c03_01_01" => Some(("cinema", 62, &[60, 61])),
++        "c01_01_01" => Some(("cinema", [(66, &[65]), (68, &[67])])),
++        "c02_01_01" => Some(("meswnd", [(66, &[64, 65]), (71, &[70])])),
++        "c03_01_01" => Some(("cinema", [(62, &[60, 61]), (65, &[64])])),
+         _ => None,
+     }
+ }
+--- a/simulator/crates/desktop/examples/story_route/mod.rs
++++ b/simulator/crates/desktop/examples/story_route/mod.rs
+@@ -520,6 +520,8 @@
+     eyecatch_08_exit: bool,
+     #[serde(default)]
+     daydream_case_start: bool,
++    #[serde(default)]
++    daydream_case_first_advance: bool,
+     #[serde(default)]
+     island_bad02: bool,
+     kanmi_exact: Option<KanmiExact>,
+@@ -613,10 +615,39 @@
+     receipt: Option<u64>,
+     loads: Vec<String>,
+     unexpected: bool,
++    turn: Option<DaydreamCaseTurn>,
++}
++
++struct DaydreamCaseTurn {
++    started: u64,
++    anchor: DaydreamBodyAnchor,
++    expected: KeyboardPress,
++    receipt: KeyboardPressReceipt,
+ }
+ 
+ impl DaydreamCasePress {
+     fn observe_receipts(&mut self, player: &HeadlessPlayer) {
++        let receipts = player.host_input_route_receipts();
++        if let Some(turn) = &mut self.turn {
++            let consumers = receipts.iter().filter(|receipt| {
++                receipt.frame > turn.started && receipt.pressed != 0 && receipt.response == 0
++            }).count();
++            if consumers > 0 {
++                let events = player.events();
++                let verified = turn.receipt.observe(&turn.expected, turn.started, receipts, events);
++                if let Some(receipt) = verified.filter(|receipt| consumers == 1
++                    && events.iter().rev().take_while(|event| event.frame >= receipt.frame).any(|event| {
++                        event.frame == receipt.frame && event.kind == "input-wait"
++                            && event.detail == "native 71 address=0xd6d"
++                    }))
++                {
++                    eprintln!("frame {}: Daydream verified CASE Enter and VM resume {receipt:?}", receipt.frame);
++                } else {
++                    turn.receipt = KeyboardPressReceipt::Rejected;
++                }
++            }
++            return;
++        }
+         for receipt in player.host_input_route_receipts().iter().filter(|receipt| {
+             receipt.frame > self.started && receipt.pressed != 0 && receipt.response <= 1
+         }) {
+@@ -656,8 +687,8 @@
+         }
+     }
+ 
+-    fn poll(&self, player: &HeadlessPlayer, frame: u64, idle: u64) -> Decision {
+-        if self.unexpected || player.host_daydream_case_blocked(self.started) {
++    fn poll(&mut self, player: &HeadlessPlayer, frame: u64, idle: u64, advance: bool) -> Decision {
++        if self.unexpected || player.host_daydream_case_blocked(self.started, self.turn.is_some()) {
+             return Decision::Stop("unexpected_branch", format!(
+                 "unexpected Daydream input route, menu, or CST load after title: {:?}", self.loads,
+             ));
+@@ -665,17 +696,48 @@
+         if self.receipt.is_none() {
+             return Decision::Stop("input_missed", "missing Daydream title left press receipt".into());
+         }
+-        if self.loads.len() == DAYDREAM_CASE_PATHS[0].len()
+-            && let Some(scene) = self.loads.last()
+-            && let Some(record) = player.host_daydream_first_case(self.started, scene)
+-        {
+-            println!("replay frame={frame} state=page scene={scene} group=0 record={record}");
+-            println!("replay frame={frame} checkpoint=\"Daydream: stop at the first CASE body wait\"");
+-            return Decision::Done;
+-        }
+-        if frame - self.started >= idle {
++        if self.loads.len() == DAYDREAM_CASE_PATHS[0].len() && let Some(scene) = self.loads.last() {
++            if let Some(turn) = &self.turn {
++                if turn.receipt != KeyboardPressReceipt::Verified {
++                    return Decision::Stop("input_missed", format!("Daydream CASE Enter receipt: {:?}", turn.receipt));
++                }
++                if let Some((record, (context, load, owner, epoch, source_frame), evidence)) =
++                    player.host_daydream_case_body(self.started, scene, 1)
++                {
++                    let (before_context, before_load, before_owner, before_epoch, _) = turn.anchor;
++                    if (context, load, owner) != (before_context, before_load, before_owner)
++                        || epoch <= before_epoch || source_frame <= turn.started
++                    {
++                        return Decision::Stop("checkpoint_mismatch", "Daydream CASE successor is not a fresh same-window body".into());
++                    }
++                    eprintln!("{evidence}");
++                    println!("replay frame={frame} state=page scene={scene} group=1 record={record}");
++                    println!("replay frame={frame} checkpoint=\"Daydream: stop at the second CASE body wait\"");
++                    return Decision::Done;
++                }
++            } else if let Some((record, anchor, evidence)) = player.host_daydream_case_body(self.started, scene, 0) {
++                eprintln!("{evidence}");
++                println!("replay frame={frame} state=page scene={scene} group=0 record={record}");
++                if !advance {
++                    println!("replay frame={frame} checkpoint=\"Daydream: stop at the first CASE body wait\"");
++                    return Decision::Done;
++                }
++                let (context, _, owner, _, _) = anchor;
++                let Some((region, receiver)) = player.host_daydream_case_enter(scene, context, owner) else {
++                    return Decision::Stop("checkpoint_mismatch", "Daydream CASE Enter withheld: adjacent CST or live bottom button did not match".into());
++                };
++                eprintln!("frame {frame}: Daydream CASE Enter scene={scene} owner={owner} region={region} receiver={receiver}");
++                self.turn = Some(DaydreamCaseTurn {
++                    started: frame, anchor, expected: KeyboardPress { region, receiver, key: 2, group: 0, response: 0 },
++                    receipt: KeyboardPressReceipt::Awaiting,
++                });
++                return Decision::Input(Action::Key(InputKey::Keyboard(13)));
++            }
++        }
++        let started = self.turn.as_ref().map_or(self.started, |turn| turn.started);
++        if frame - started >= idle {
+             return Decision::Stop("unrecognized_wait", format!(
+-                "Daydream first CASE body wait not confirmed: {:?}", self.loads,
++                "Daydream CASE body wait not confirmed after frame {started}: {:?}", self.loads,
+             ));
+         }
+         Decision::Wait
+@@ -919,9 +981,12 @@
+                 && route.hatsumira_r72.is_none() && route.neko_ordinary.is_none(),
+                 "ISLAND BAD_02 requires a guarded route to the beach choice");
+         }
++        ensure!(!route.daydream_case_first_advance || route.daydream_case_start,
++            "Daydream first CASE advance requires the guarded title route");
+         if route.daydream_case_start {
+             ensure!(route.kanmi_exact.is_none() && !route.eyecatch_08_exit
+                 && route.kamikaze_post_op.is_none() && !route.grisaia_14_first_advance
++                && !route.campanella_18_first_advance && !route.island_bad02
+                 && route.rebellions_r15.is_none() && route.hatsumira_r72.is_none()
+                 && route.neko_ordinary.is_none() && route.page_scenes.is_empty()
+                 && route.page_click.is_none() && route.page_fallback_before.is_none()
+@@ -1422,8 +1487,8 @@
+         if let Some(replay) = &mut self.island_bad02 {
+             return replay.poll(player, frame, self.route.idle_frames, output);
+         }
+-        if let Some(press) = &self.daydream_case_press {
+-            return Ok(press.poll(player, frame, self.route.idle_frames));
++        if let Some(press) = &mut self.daydream_case_press {
++            return Ok(press.poll(player, frame, self.route.idle_frames, self.route.daydream_case_first_advance));
+         }
+         if let Some(campanella) = &mut self.campanella {
+             return campanella.poll(player, frame, self.route.idle_frames, self.route.guarded_body_last_group.unwrap_or(1));
+@@ -1504,7 +1569,7 @@
+                         }
+                         self.daydream_case_press = Some(DaydreamCasePress {
+                             started: frame, title, region,
+-                            receipt: None, loads: Vec::new(), unexpected: false,
++                            receipt: None, loads: Vec::new(), unexpected: false, turn: None,
+                         });
+                         return Ok(Decision::Input(Action::Pointer { x, y, button: Some(0) }));
+                     }

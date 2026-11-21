@@ -67,7 +67,7 @@ impl LoggingHost<'_> {
         let from = request_rect(args, 24)?;
         let result = match self.image_sampling_profile() {
             Some(profile) => copy::copy_wrapper(&target, &source, to, from, source_id == target_id, profile),
-            None => crate::plane_native::copy_wrapper(&target, &source, to, from, source_id == target_id),
+            None => crate::plane_native::copy_wrapper(&target, &source, to, from, source_id == target_id, [false; 2]),
         };
         let Some(frame) = result? else { return Ok(NativeReturn::Continue); };
         self.image_resources.get_mut(&target_id).unwrap().image = frame.clone();

@@ -1,0 +1,11 @@
+{
+  "10": {
+    "frames": 1100,
+    "inputs": [
+      "story-events", "capture-every:0",
+      "move:708:183,338", "require-hit:710:41", "710:183,338",
+      "capture:930", "require-hit:950:79", "950:973,534", "tap:950",
+      "inspect:1050"
+    ]
+  }
+}

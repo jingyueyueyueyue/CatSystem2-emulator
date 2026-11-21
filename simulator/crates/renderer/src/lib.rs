@@ -18,6 +18,8 @@ mod text_layout;
 mod capture;
 mod image_surface;
 mod raster;
+mod row_pool;
+pub use raster::draw_pixel_rows;
 mod text_cache;
 pub use capture::encode_capture_bmp;
 
@@ -39,6 +41,7 @@ pub enum RendererError {
         expected: usize,
         actual: usize,
     },
+    DeviceReadbackFailed,
     CoordinateOutOfBounds {
         x: i64,
         y: i64,
@@ -147,6 +150,7 @@ impl fmt::Display for RendererError {
             Self::BufferLength { expected, actual } => {
                 write!(f, "RGBA buffer length is {actual}, expected {expected}")
             }
+            Self::DeviceReadbackFailed => write!(f, "could not read the completed device frame"),
             Self::CoordinateOutOfBounds {
                 x,
                 y,
@@ -1084,6 +1088,16 @@ impl BlendMode {
         matches!(self, Self::ListAlphaFromBlue | Self::ListAlphaFromGreen
             | Self::ListAlphaFromRed | Self::ListAlphaFromAlpha)
     }
+
+    const fn list_alpha_mask_channel(self) -> Option<usize> {
+        match self {
+            Self::ListAlphaFromBlue => Some(2),
+            Self::ListAlphaFromGreen => Some(1),
+            Self::ListAlphaFromRed => Some(0),
+            Self::ListAlphaFromAlpha => Some(3),
+            _ => None,
+        }
+    }
 }
 
 /// A CatSystem2-style two-dimensional object transform. `position` is where
@@ -1172,30 +1186,28 @@ pub trait CanvasReadback: std::any::Any + std::fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CanvasPixels {
     Cpu(Vec<u8>),
     Device {
-        previous: Vec<u8>,
+        pixels: Arc<Vec<u8>>,
         source: Arc<dyn CanvasReadback>,
-        readback: OnceLock<Vec<u8>>,
     },
 }
 
 impl CanvasPixels {
-    fn discard_device(&mut self) -> &mut Vec<u8> {
-        if let Self::Device { previous, readback, .. } = self {
-            *self = Self::Cpu(readback.take().unwrap_or_else(|| std::mem::take(previous)));
+    fn make_cpu(&mut self) -> &mut Vec<u8> {
+        if let Self::Device { pixels, .. } = self {
+            *self = Self::Cpu(Arc::unwrap_or_clone(std::mem::take(pixels)));
         }
         let Self::Cpu(pixels) = self else { unreachable!() };
         pixels
     }
 
-    fn into_vec(mut self) -> Vec<u8> {
-        let _ = &mut *self;
+    fn into_vec(self) -> Vec<u8> {
         match self {
             Self::Cpu(pixels) => pixels,
-            Self::Device { .. } => unreachable!(),
+            Self::Device { pixels, .. } => Arc::unwrap_or_clone(pixels),
         }
     }
 }
@@ -1206,28 +1218,15 @@ impl Deref for CanvasPixels {
     fn deref(&self) -> &[u8] {
         match self {
             Self::Cpu(pixels) => pixels,
-            Self::Device { previous, source, readback } => readback.get_or_init(|| {
-                let mut pixels = vec![0; previous.len()];
-                if !source.read_rgba(&mut pixels) { pixels.copy_from_slice(previous); }
-                pixels
-            }),
+            Self::Device { pixels, .. } => pixels,
         }
     }
 }
 
 impl std::ops::DerefMut for CanvasPixels {
     fn deref_mut(&mut self) -> &mut [u8] {
-        if let Self::Device { previous, source, readback } = self
-            && readback.get().is_none() {
-            let mut output = vec![0; previous.len()];
-            if source.read_rgba(&mut output) { let _ = readback.set(output); }
-        }
-        self.discard_device()
+        self.make_cpu()
     }
-}
-
-impl Clone for CanvasPixels {
-    fn clone(&self) -> Self { Self::Cpu(self.to_vec()) }
 }
 
 impl PartialEq for CanvasPixels {
@@ -1286,9 +1285,35 @@ impl Canvas {
         &mut self.pixels
     }
 
-    pub fn set_device_pixels(&mut self, source: Arc<dyn CanvasReadback>) {
-        let previous = std::mem::take(self.pixels.discard_device());
-        self.pixels = CanvasPixels::Device { previous, source, readback: OnceLock::new() };
+    /// Commit only a recoverable frame. On failure the caller can redraw the
+    /// same operations on the complete input, including any earlier GPU layers.
+    pub fn set_device_pixels(&mut self, source: Arc<dyn CanvasReadback>) -> Result<()> {
+        let bytes = self.pixels.len();
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(bytes).map_err(|_| RendererError::AllocationFailed { bytes })?;
+        pixels.resize(bytes, 0);
+        if !source.read_rgba(&mut pixels) {
+            return Err(RendererError::DeviceReadbackFailed);
+        }
+        self.pixels = CanvasPixels::Device { pixels: Arc::new(pixels), source };
+        Ok(())
+    }
+
+    /// Publish a device frame with recovery pixels from a completed submission.
+    pub fn set_verified_device_pixels(
+        &mut self,
+        source: Arc<dyn CanvasReadback>,
+        pixels: &[u8],
+    ) -> Result<()> {
+        let bytes = self.pixels.len();
+        if pixels.len() != bytes {
+            return Err(RendererError::BufferLength { expected: bytes, actual: pixels.len() });
+        }
+        let mut verified = Vec::new();
+        verified.try_reserve_exact(bytes).map_err(|_| RendererError::AllocationFailed { bytes })?;
+        verified.extend_from_slice(pixels);
+        self.pixels = CanvasPixels::Device { pixels: Arc::new(verified), source };
+        Ok(())
     }
 
     pub fn device_pixels(&self) -> Option<&dyn CanvasReadback> {
@@ -1310,7 +1335,7 @@ impl Canvas {
     }
 
     pub fn clear(&mut self, color: Color) {
-        self.pixels.discard_device().as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
+        self.pixels.as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> Result<Color> {
@@ -1360,6 +1385,55 @@ impl Canvas {
         let blended = blend_with_mode(dst, color, blend_mode);
         self.pixels[index..index + 4]
             .copy_from_slice(&[blended.r, blended.g, blended.b, blended.a]);
+        Ok(())
+    }
+
+    /// Blends tightly packed RGBA rows without scaling. The destination
+    /// rectangle must already be clipped to the canvas.
+    pub fn blend_rgba_rows(
+        &mut self,
+        rect: Rect,
+        rows: &[u8],
+        stride: usize,
+        mode: BlendMode,
+    ) -> Result<()> {
+        if rect.width == 0 || rect.height == 0 {
+            return Ok(());
+        }
+        self.pixel_index(rect.x, rect.y)?;
+        if rect.right() > i64::from(self.width) || rect.bottom() > i64::from(self.height) {
+            return Err(RendererError::InvalidEffectParameter { name: "RGBA row destination" });
+        }
+        let row_bytes = rect.width as usize * 4;
+        let height = rect.height as usize;
+        if rows.len() < row_bytes || stride < row_bytes
+            || height - 1 > (rows.len() - row_bytes) / stride
+        {
+            return Err(RendererError::InvalidEffectParameter { name: "RGBA row source" });
+        }
+        let target_stride = self.width as usize * 4;
+        let target_offset = rect.y as usize * target_stride + rect.x as usize * 4;
+        let pixels = &mut self.pixels[target_offset..];
+        for row in 0..height {
+            let target_start = row * target_stride;
+            let source_start = row * stride;
+            let target = &mut pixels[target_start..target_start + row_bytes];
+            let source = &rows[source_start..source_start + row_bytes];
+            let pairs = target.as_chunks_mut::<4>().0.iter_mut().zip(source.as_chunks::<4>().0);
+            if mode == BlendMode::SourceOver {
+                for (destination, source) in pairs {
+                    blend_source_over(destination, source);
+                }
+            } else if let Some(channel) = mode.list_alpha_mask_channel() {
+                for (destination, source) in pairs {
+                    apply_list_alpha_mask(destination, source[channel]);
+                }
+            } else {
+                for (destination, source) in pairs {
+                    blend_special(destination, source, mode);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2200,8 +2274,23 @@ pub struct RgbaFrame {
 }
 
 #[derive(Debug)]
+enum FramePixelBytes {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
+impl FramePixelBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct FramePixels {
-    bytes: Vec<u8>,
+    bytes: FramePixelBytes,
     opaque: OnceLock<bool>,
     patch: Option<(FramePixelIdentity, Rect)>,
     asset: OnceLock<FrameAsset>,
@@ -2232,6 +2321,10 @@ impl FramePixelIdentity {
 
 impl FramePixels {
     fn new(bytes: Vec<u8>) -> Self {
+        Self::from_bytes(FramePixelBytes::Owned(bytes))
+    }
+
+    fn from_bytes(bytes: FramePixelBytes) -> Self {
         Self {
             bytes,
             opaque: OnceLock::new(),
@@ -2243,14 +2336,14 @@ impl FramePixels {
 
     fn is_opaque(&self) -> bool {
         *self.opaque.get_or_init(|| {
-            self.bytes.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255)
+            self.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255)
         })
     }
 }
 
 impl PartialEq for FramePixels {
     fn eq(&self, other: &Self) -> bool {
-        self.bytes == other.bytes
+        self.bytes.as_slice() == other.bytes.as_slice()
     }
 }
 
@@ -2260,7 +2353,7 @@ impl Deref for FramePixels {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 }
 
@@ -2282,7 +2375,7 @@ impl RgbaFrame {
         *self.pixels.asset_revision.get_or_init(|| {
             use std::hash::{DefaultHasher, Hash, Hasher};
             let mut hasher = DefaultHasher::new();
-            self.pixels.bytes.hash(&mut hasher);
+            self.pixels.bytes.as_slice().hash(&mut hasher);
             hasher.finish()
         })
     }
@@ -2324,11 +2417,20 @@ impl RgbaFrame {
     }
 
     /// Recover the allocation only when nobody else can still observe the frame.
-    /// The canvas has no image metadata. Empty images remain frames.
+    /// The canvas has no image metadata. Empty or shared-buffer images remain frames.
     pub fn try_into_canvas(self) -> std::result::Result<Canvas, Self> {
-        if self.is_empty() { return Err(self); }
+        if self.is_empty() || matches!(self.pixels.bytes, FramePixelBytes::Shared(_)) {
+            return Err(self);
+        }
         match Arc::try_unwrap(self.pixels) {
-            Ok(pixels) => Ok(Canvas { width: self.width, height: self.height, pixels: CanvasPixels::Cpu(pixels.bytes) }),
+            Ok(pixels) => match pixels.bytes {
+                FramePixelBytes::Owned(bytes) => Ok(Canvas {
+                    width: self.width,
+                    height: self.height,
+                    pixels: CanvasPixels::Cpu(bytes),
+                }),
+                FramePixelBytes::Shared(_) => unreachable!("shared pixels cannot be converted in place"),
+            },
             Err(pixels) => Err(Self { pixels, ..self }),
         }
     }
@@ -2346,13 +2448,33 @@ impl RgbaFrame {
         width: u32,
         height: u32,
         pixels: Vec<u8>,
+        metadata: FrameMetadata,
+    ) -> Result<Self> {
+        Self::from_pixel_bytes(width, height, FramePixelBytes::Owned(pixels), metadata)
+    }
+
+    /// Wrap tightly packed, immutable RGBA without copying its bytes.
+    pub fn from_shared_rgba8(width: u32, height: u32, pixels: Arc<[u8]>) -> Result<Self> {
+        Self::from_pixel_bytes(
+            width,
+            height,
+            FramePixelBytes::Shared(pixels),
+            FrameMetadata::raster([width, height]),
+        )
+    }
+
+    fn from_pixel_bytes(
+        width: u32,
+        height: u32,
+        pixels: FramePixelBytes,
         mut metadata: FrameMetadata,
     ) -> Result<Self> {
         let expected = rgba_len(width, height)?;
-        if pixels.len() != expected {
+        let actual = pixels.as_slice().len();
+        if actual != expected {
             return Err(RendererError::BufferLength {
                 expected,
-                actual: pixels.len(),
+                actual,
             });
         }
         if metadata.canvas_size == [0, 0] {
@@ -2361,7 +2483,7 @@ impl RgbaFrame {
         Ok(Self {
             width,
             height,
-            pixels: Arc::new(FramePixels::new(pixels)),
+            pixels: Arc::new(FramePixels::from_bytes(pixels)),
             metadata,
             attributes: HgFrameAttributes::default(),
         })
@@ -2573,22 +2695,7 @@ impl RgbaFrame {
                 count: file.frames.len(),
             });
         }
-        let inspection = inspect_hg(encoded)?;
-        let info = inspection
-            .frames
-            .get(frame_index)
-            .ok_or(RendererError::InvalidHgStructure {
-                message: "HG frame metadata and format frame count differ".into(),
-            })?;
-        let pixels = file
-            .decode_frame_rgba8(encoded, frame_index)
-            .map_err(|error| RendererError::Decode {
-                message: error.to_string(),
-            })?;
-        let metadata = FrameMetadata::from_hg_frame(inspection.container, info);
-        let mut frame = Self::from_rgba8_with_metadata(info.width, info.height, pixels, metadata)?;
-        frame.attributes = info.attributes_view();
-        Ok(frame)
+        HgFrameDecoder::new(encoded, file)?.decode(frame_index)
     }
 
     pub fn width(&self) -> u32 {
@@ -3060,6 +3167,41 @@ impl RgbaFrame {
             self.pixels[index + 2],
             self.pixels[index + 3],
         )
+    }
+}
+
+/// Borrows one encoded HG file and reuses its checked renderer metadata for
+/// every requested frame. The format directory must come from these same bytes.
+pub struct HgFrameDecoder<'a> {
+    encoded: &'a [u8],
+    file: &'a HgFile,
+    inspection: HgInspection,
+}
+
+impl<'a> HgFrameDecoder<'a> {
+    pub fn new(encoded: &'a [u8], file: &'a HgFile) -> Result<Self> {
+        let inspection = inspect_hg(encoded)?;
+        Ok(Self { encoded, file, inspection })
+    }
+
+    pub fn decode(&self, frame_index: usize) -> Result<RgbaFrame> {
+        if frame_index >= self.file.frames.len() {
+            return Err(RendererError::FrameIndexOutOfBounds {
+                index: frame_index,
+                count: self.file.frames.len(),
+            });
+        }
+        let info = self.inspection.frames.get(frame_index).ok_or_else(||
+            RendererError::InvalidHgStructure {
+                message: "HG frame metadata and format frame count differ".into(),
+            },
+        )?;
+        let pixels = self.file.decode_frame_rgba8(self.encoded, frame_index)
+            .map_err(|error| RendererError::Decode { message: error.to_string() })?;
+        let metadata = FrameMetadata::from_hg_frame(self.inspection.container, info);
+        let mut frame = RgbaFrame::from_rgba8_with_metadata(info.width, info.height, pixels, metadata)?;
+        frame.attributes = info.attributes_view();
+        Ok(frame)
     }
 }
 
@@ -4756,6 +4898,8 @@ pub struct FontRasterizer {
 }
 
 impl FontRasterizer {
+    pub const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+
     pub fn from_bytes(bytes: &[u8], collection_index: u32) -> Result<Self> {
         Self::validate_font_size(bytes.len())?;
         Self::from_font(fontdue::Font::from_bytes(
@@ -4782,7 +4926,7 @@ impl FontRasterizer {
     }
 
     fn validate_font_size(length: usize) -> Result<()> {
-        if length > 64 * 1024 * 1024 {
+        if length > Self::MAX_FONT_BYTES {
             return Err(RendererError::Decode { message: "font data exceeds the 64 MiB limit".into() });
         }
         Ok(())
@@ -6208,24 +6352,22 @@ fn blend_with_mode(dst: Color, src: Color, mode: BlendMode) -> Color {
 }
 
 #[inline]
-fn blend_into(target: &mut [u8; 4], src: Color, mode: BlendMode) {
-    let mask = match mode {
-        BlendMode::ListAlphaFromBlue => Some(src.b),
-        BlendMode::ListAlphaFromGreen => Some(src.g),
-        BlendMode::ListAlphaFromRed => Some(src.r),
-        BlendMode::ListAlphaFromAlpha => Some(src.a),
-        _ => None,
-    };
-    if let Some(mask) = mask {
-        target[3] = (((u32::from(target[3]) + 1) * (u32::from(mask) + 1) - 1) >> 8) as u8;
+pub fn blend_into(target: &mut [u8; 4], src: Color, mode: BlendMode) {
+    let source = [src.r, src.g, src.b, src.a];
+    if let Some(channel) = mode.list_alpha_mask_channel() {
+        apply_list_alpha_mask(target, source[channel]);
         return;
     }
-    let source = [src.r, src.g, src.b, src.a];
     if mode == BlendMode::SourceOver {
         blend_source_over(target, &source);
     } else {
         blend_special(target, &source, mode);
     }
+}
+
+#[inline]
+fn apply_list_alpha_mask(target: &mut [u8; 4], mask: u8) {
+    target[3] = (((u32::from(target[3]) + 1) * (u32::from(mask) + 1) - 1) >> 8) as u8;
 }
 
 #[inline]

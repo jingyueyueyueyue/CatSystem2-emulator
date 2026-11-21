@@ -1,0 +1,33 @@
+{
+  "18": {
+    "frames": 6200,
+    "route": {
+      "label": "18 0001_00: guarded New Game and nine verified Enter presses",
+      "idle_frames": 1400,
+      "page_scenes": [],
+      "campanella_18_first_advance": true,
+      "guarded_body_last_group": 9,
+      "steps": []
+    },
+    "diagnostics": [
+      "trace-native:69", "trace-native:71", "trace-native:104", "trace-native:110",
+      "trace-native:325", "trace-native:326", "trace-native:327", "trace-native:520",
+      "trace-native:527", "trace-native:528", "trace-native:612", "trace-native:614",
+      "trace-native:615", "trace-native:616", "trace-native:618", "trace-native:619"
+    ]
+  },
+  "review": {
+    "jp": {
+      "inventory": "scripts/analysis/pc_story_18_jp_inventory.json",
+      "member": "scene.int::0001_00.cst",
+      "sha256": "22d8aef073b8d125bad43817274c77765d0665bfd3224598f1f5fb0ae3905e62",
+      "wait_records": [90, 95, 98, 100, 112, 115, 118, 121, 124, 126]
+    },
+    "cn": {
+      "inventory": "scripts/analysis/pc_story_18_cn_inventory.json",
+      "member": "update00.int::0001_00.cst",
+      "sha256": "a46748a49c7970fc13a19f0b3522b59523a3be78a51bb19ee0ba0932e7d86b27",
+      "wait_records": [94, 99, 102, 104, 116, 119, 122, 125, 128, 130]
+    }
+  }
+}

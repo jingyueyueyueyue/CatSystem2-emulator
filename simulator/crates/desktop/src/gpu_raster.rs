@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}, mpsc};
 use std::time::Duration;
-use super::perf_detail::{GpuDecision, list_gpu_decision};
+use super::perf_detail::{GpuDecision, ReadbackKind, ReadbackTimer, list_gpu_decision};
 use super::canvas_native::VramOverflow;
 use super::native_tasks::WipeStep;
 
@@ -18,6 +18,9 @@ use super::native_tasks::WipeStep;
 mod present;
 #[cfg(target_os = "android")]
 pub(super) use present::{candidate as surface_candidate, detach, display_stats, present_canvas, set_display_stats_enabled};
+
+#[path = "gpu_emote.rs"]
+mod emote_raster;
 
 thread_local! {
     static RASTER: RefCell<Option<Raster>> = const { RefCell::new(None) };
@@ -35,8 +38,40 @@ pub(super) fn enable() {
     });
 }
 
+#[cfg(windows)]
+pub(super) fn disable() {
+    let raster = RASTER.with_borrow_mut(Option::take);
+    drop(raster);
+}
+
 pub(super) fn available() -> bool {
     RASTER.with_borrow(|slot| slot.is_some())
+}
+
+pub(super) use emote_raster::draw_emote;
+
+#[cfg(windows)]
+pub(super) fn emote_requested() -> bool {
+    !std::env::var_os("CS2_EMOTE_GPU").is_some_and(|value| value == "0")
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn emote_requested() -> bool {
+    !android_property(c"debug.cs2.emote_gpu", |value| value == b"0").unwrap_or(false)
+}
+
+#[cfg(target_os = "android")]
+fn android_property<T>(name: &std::ffi::CStr, parse: impl FnOnce(&[u8]) -> T) -> Option<T> {
+    use std::ffi::c_char;
+    unsafe extern "C" {
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
+    }
+    // Bionic's PROP_VALUE_MAX includes room for the terminal NUL.
+    let mut value = [0_u8; 92];
+    let length = unsafe {
+        __system_property_get(name.as_ptr(), value.as_mut_ptr().cast())
+    };
+    value.get(..usize::try_from(length).ok()?).map(parse)
 }
 
 pub(super) fn latest_gpu_timing() -> Option<(u64, u64)> {
@@ -444,6 +479,9 @@ struct Raster {
     args_buffer: wgpu::Buffer,
     readback: wgpu::Buffer,
     timing: Option<GpuTiming>,
+    emote: Option<emote_raster::EmoteRaster>,
+    reported_emote_result: Option<bool>,
+    emote_initialization_failed: bool,
     scratch: Vec<u8>,
     previous_planes: Option<CompletedPlanes>,
     failed: Arc<AtomicBool>,
@@ -452,6 +490,8 @@ struct Raster {
     reported_batch: bool,
     reported_plane_group: bool,
     reported_atlas_fallback: bool,
+    #[cfg(all(test, windows))]
+    test_direct_output: bool,
     #[cfg(target_os = "android")]
     presenter: Option<present::Presenter>,
     #[cfg(target_os = "android")]
@@ -496,7 +536,7 @@ struct CompletedPlanes {
 
 enum CompletedOutput {
     Cpu(Vec<u8>),
-    Device(Arc<DeviceFrame>),
+    Device(Canvas),
 }
 
 #[derive(Debug)]
@@ -514,6 +554,7 @@ impl CanvasReadback for DeviceFrame {
         if self.failed.load(Ordering::Relaxed) { return false; }
         let size = self.size.into_iter().map(u64::from).product::<u64>() * 4;
         if output.len() as u64 != size { return false; }
+        let measurement = ReadbackTimer::start(ReadbackKind::Device, size);
         let readback = buffer(&self.device, size, DOWNLOAD);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&self.buffer, 0, &readback, 0, size);
@@ -530,6 +571,7 @@ impl CanvasReadback for DeviceFrame {
         }
         output.copy_from_slice(&slice.get_mapped_range());
         readback.unmap();
+        if let Some(measurement) = measurement { measurement.complete(); }
         true
     }
 
@@ -643,8 +685,11 @@ impl Raster {
             device, queue, pipeline, layout, empty_source: source, empty_atlas, empty_page_table,
             sources: VecDeque::new(), source_bytes: 0,
             target, args_buffer, readback, timing, atlas: None, full_target: None,
+            emote: None, reported_emote_result: None, emote_initialization_failed: false,
             scratch: Vec::new(), previous_planes: None, failed, backend: info.backend, reported: [false; 8],
             spares: Vec::new(), reported_atlas_fallback: false,
+            #[cfg(all(test, windows))]
+            test_direct_output: false,
             #[cfg(target_os = "android")]
             instance,
             #[cfg(target_os = "android")]
@@ -658,6 +703,8 @@ impl Raster {
     }
 
     fn direct_output_enabled(&self) -> bool {
+        #[cfg(all(test, windows))]
+        if self.test_direct_output { return true; }
         #[cfg(target_os = "android")]
         if self.presenter.is_some() { return true; }
         false
@@ -907,7 +954,8 @@ impl Raster {
         let direct = regions == [bounds] && self.direct_output_enabled()
             && (retain_result || draws.iter().all(|job| matches!(job.operation, Draw::DiffuseFrame { .. } | Draw::Wipe { .. })));
         let previous_device = direct.then(|| device_frame(canvas))
-            .flatten().map(|frame| (frame.revision, frame.buffer.clone()));
+            .flatten().filter(|frame| Arc::ptr_eq(&frame.failed, &self.failed))
+            .map(|frame| (frame.revision, frame.buffer.clone()));
         let before_revision = previous_device.as_ref().map(|(revision, _)| *revision);
         self.ensure_target_size(target_size);
         let input = if previous_device.is_some() {
@@ -934,7 +982,8 @@ impl Raster {
         {
             match &previous.after {
                 CompletedOutput::Cpu(pixels) => replace_rows(canvas, first, stride, row_size, pixels),
-                CompletedOutput::Device(pixels) => canvas.set_device_pixels(pixels.clone()),
+                CompletedOutput::Device(verified) if direct => *canvas = verified.clone(),
+                CompletedOutput::Device(verified) => replace_rows(canvas, first, stride, row_size, verified.pixels()),
             }
             return Ok(true);
         }
@@ -1026,43 +1075,57 @@ impl Raster {
             pass.dispatch_workgroups(groups_x, groups_y, jobs);
             first_job = end_job;
         }
-        if direct {
-            static NEXT_FRAME: AtomicU64 = AtomicU64::new(1);
-            self.queue.submit(Some(encoder.finish()));
-            let frame = Arc::new(DeviceFrame {
-                revision: NEXT_FRAME.fetch_add(1, Ordering::Relaxed), size: bounds.size,
-                buffer: self.target.clone(), device: self.device.clone(), queue: self.queue.clone(),
-                failed: self.failed.clone(),
-            });
-            canvas.set_device_pixels(frame.clone());
-            if let Some((before, seed)) = seed {
-                self.previous_planes = Some(CompletedPlanes {
-                    area: target_rect, before, before_revision, seed, parameters, after: CompletedOutput::Device(frame),
-                    inputs: draws.iter().zip(atlas_versions).map(|(job, version)| (job.source.cloned(), version)).collect(),
-                });
-            }
-            return Ok(true);
-        }
         encoder.copy_buffer_to_buffer(&self.target, 0, &self.readback, 0, target_size);
-        let map_size = if let Some(timing) = &self.timing {
+        let map_size = if let Some(timing) = self.timing.as_ref().filter(|_| !direct) {
             encoder.resolve_query_set(&timing.queries, 0..2, &timing.resolve, 0);
             encoder.copy_buffer_to_buffer(&timing.resolve, 0, &self.readback, target_size, TIMING_BYTES);
             target_size + TIMING_BYTES
         } else {
             target_size
         };
+        let kind = if direct { ReadbackKind::Device } else { ReadbackKind::Packed };
+        let measurement = ReadbackTimer::start(kind, map_size);
         let submission = self.queue.submit(Some(encoder.finish()));
         let slice = self.readback.slice(..map_size);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
-        self.device.poll(wgpu::PollType::Wait {
+        let ready = self.device.poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
             timeout: Some(Duration::from_millis(250)),
-        }).context("wait for raster readback")?;
-        receiver.try_recv().context("receive raster readback")?.context("map raster readback")?;
-        if self.failed.load(Ordering::Relaxed) {
+        }).context("wait for raster readback")
+            .and_then(|_| receiver.try_recv().context("receive raster readback")?.context("map raster readback"))
+            .and_then(|_| {
+                if self.failed.load(Ordering::Relaxed) {
+                    bail!("raster device failed during dispatch");
+                }
+                Ok(())
+            });
+        if let Err(error) = ready {
             self.readback.unmap();
-            bail!("raster device failed during dispatch");
+            if direct {
+                self.failed.store(true, Ordering::Relaxed);
+                report("device_frame_readback_failed");
+            }
+            return Err(error);
+        }
+        if direct {
+            static NEXT_FRAME: AtomicU64 = AtomicU64::new(1);
+            let frame = Arc::new(DeviceFrame {
+                revision: NEXT_FRAME.fetch_add(1, Ordering::Relaxed), size: bounds.size,
+                buffer: self.target.clone(), device: self.device.clone(), queue: self.queue.clone(),
+                failed: self.failed.clone(),
+            });
+            let attached = canvas.set_verified_device_pixels(frame, &slice.get_mapped_range());
+            self.readback.unmap();
+            attached?;
+            if let Some(measurement) = measurement { measurement.complete(); }
+            if let Some((before, seed)) = seed {
+                self.previous_planes = Some(CompletedPlanes {
+                    area: target_rect, before, before_revision, seed, parameters, after: CompletedOutput::Device(canvas.clone()),
+                    inputs: draws.iter().zip(atlas_versions).map(|(job, version)| (job.source.cloned(), version)).collect(),
+                });
+            }
+            return Ok(true);
         }
         {
             let output = slice.get_mapped_range();
@@ -1089,6 +1152,7 @@ impl Raster {
             }
         }
         self.readback.unmap();
+        if let Some(measurement) = measurement { measurement.complete(); }
         if regions == [bounds] {
             self.full_target = Some((bounds.size, canvas.pixels().as_ptr() as usize));
         }
@@ -1238,5 +1302,37 @@ fn replace_rows(canvas: &mut Canvas, first: usize, stride: usize, row_size: usiz
             let start = first + row * stride;
             pixels[start..start + row_size].copy_from_slice(source);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn direct_draw_keeps_verified_pixels_across_layers() -> Result<()> {
+        let mut raster = Raster::new()?;
+        let mut packed = Canvas::new(1280, 720)?;
+        let mut direct = packed.clone();
+        let rect = RasterRect { origin: [0; 2], size: [1280, 720] };
+        let source = RgbaFrame::from_rgba8(1280, 720, [26, 91, 153, 211].repeat(1280 * 720))?;
+        let mut previous = None;
+        for alpha in [179, 223] {
+            let jobs = [RasterJob { rect, source: Some(&source), atlas: None,
+                operation: Draw::DiffuseFrame { alpha } }];
+            raster.test_direct_output = false;
+            assert!(raster.draw_jobs(&mut packed, &[rect], &jobs, false)?);
+            raster.test_direct_output = true;
+            assert!(raster.draw_jobs(&mut direct, &[rect], &jobs, false)?);
+            assert_eq!(packed.pixels(), direct.pixels());
+            let frame = device_frame(&direct).context("missing direct output")?;
+            assert_ne!(previous, Some(frame.revision));
+            previous = Some(frame.revision);
+            let mut pixels = vec![0; 1280 * 720 * 4];
+            assert!(frame.read_rgba(&mut pixels));
+            assert_eq!(pixels, direct.pixels());
+        }
+        Ok(())
     }
 }

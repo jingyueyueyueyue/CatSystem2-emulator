@@ -1,0 +1,79 @@
+{
+  "14": {
+    "frames": 2400,
+    "diagnostics": [
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:110",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327"
+    ],
+    "route": {
+      "label": "14 OP: guarded New Game and three body presses through settled g3/80",
+      "idle_frames": 900,
+      "page_scenes": [],
+      "grisaia_14_first_advance": true,
+      "steps": [],
+      "guarded_body_last_group": 3
+    }
+  },
+  "review": {
+    "runtime_patch": "archive/2026-11/20261120_pc_story_14_18_live_routes.patch",
+    "checker": "scripts/analysis/check_pc_story_14_18_continuous.py",
+    "member": "UPDATE01.INT::op.cst",
+    "name_seed": 0,
+    "sha256": "2596c7c430dabed8e1e3144c50c4b8672b59b1d452e4b92b7e18cf0c9f409817",
+    "title_owner": 11,
+    "title_resume": "[2, 512, 354, 0]",
+    "loads": [
+      "start",
+      "OP"
+    ],
+    "pages": [
+      {
+        "wait": 6,
+        "wait_ordinal": 6,
+        "body": [
+          5
+        ],
+        "body_ordinals": [
+          5
+        ]
+      },
+      {
+        "wait": 8,
+        "wait_ordinal": 1,
+        "body": [
+          7
+        ],
+        "body_ordinals": [
+          0
+        ]
+      },
+      {
+        "wait": 78,
+        "wait_ordinal": 69,
+        "body": [
+          77
+        ],
+        "body_ordinals": [
+          68
+        ]
+      },
+      {
+        "wait": 80,
+        "wait_ordinal": 1,
+        "body": [
+          79
+        ],
+        "body_ordinals": [
+          0
+        ]
+      }
+    ],
+    "runtime_followup": "archive/2026-11/20261120_pc_story_14_18_body_readiness.patch",
+    "byte_match_increment": "archive/2026-11/20261120_pc_story_14_live_body_gate_followup.patch",
+    "latest_increment": "archive/2026-11/20261120_pc_story_14_op_g2_marker_order.patch"
+  }
+}

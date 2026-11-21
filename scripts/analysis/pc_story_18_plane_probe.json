@@ -1,0 +1,28 @@
+{
+  "18": {
+    "frames": 1800,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:69",
+      "trace-native:70",
+      "trace-native:72",
+      "trace-native:84",
+      "trace-native:85",
+      "trace-native:88",
+      "trace-native:90",
+      "trace-native:92",
+      "trace-native:93",
+      "trace-native:101",
+      "trace-native:344",
+      "875:183,434",
+      "require-hit:875:11",
+      "inspect-log:1005",
+      "inspect-log:1040",
+      "inspect-log:1300",
+      "inspect-log:1800"
+    ]
+  }
+}

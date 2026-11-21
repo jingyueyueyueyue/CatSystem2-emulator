@@ -1,0 +1,222 @@
+--- a/simulator/crates/desktop/examples/story_route/mod.rs
++++ b/simulator/crates/desktop/examples/story_route/mod.rs
+@@ -9,11 +9,14 @@
+ 
+ type StoryWindow = (&'static str, u32);
+ type IslandCstAnchor = (u32, u64, u32);
++type DaydreamBodyAnchor = (u32, u64, u32, u64, u64);
+ 
+ const ISLAND_MESWND_POINTS: [[i32; 2]; 2] = [[557, 530], [557, 324]];
+ 
+-const DAYDREAM_PROLOGUE_WAITS: [i32; 20] = [
++const DAYDREAM_PROLOGUE_WAITS: [i32; 41] = [
+     18, 22, 25, 28, 31, 33, 35, 37, 40, 44, 47, 55, 57, 62, 64, 75, 77, 79, 81, 83,
++    96, 107, 113, 117, 120, 122, 124, 129, 131, 145, 151, 153, 158, 163, 174, 179, 183,
++    186, 199, 205, 221,
+ ];
+ 
+ fn is_neko_runtime(player: &HeadlessPlayer) -> bool {
+@@ -98,11 +101,14 @@
+     }
+ 
+     fn daydream_opening_page(&self) -> Option<usize> {
++        if self.is_daydream_r96_probe() {
++            return Some(20);
++        }
+         if self.state != "page" || self.scene.as_deref() != Some("prologue") || self.window.as_deref() != Some("cinema") {
+             return None;
+         }
+         let group = usize::try_from(self.group?).ok()?;
+-        (DAYDREAM_PROLOGUE_WAITS.get(group).copied()? == self.record?).then_some(group)
++        (group != 20 && DAYDREAM_PROLOGUE_WAITS.get(group).copied()? == self.record?).then_some(group)
+     }
+ 
+     fn is_daydream_r96_probe(&self) -> bool {
+@@ -182,8 +188,7 @@
+         };
+         self.key == Some(13) && self.click.is_none() && self.mouse_press.is_none()
+             && self.wait.hit.is_none() && after.hit.is_none()
+-            && (after.daydream_opening_page() == Some(page + 1)
+-                || page == 19 && after.is_daydream_r96_probe())
++            && after.daydream_opening_page() == Some(page + 1)
+             && (press.region, press.receiver, press.key, press.group, press.response) == (62, 8, 2, 0, 0)
+     }
+ 
+@@ -471,6 +476,7 @@
+     keyboard_press: KeyboardPressReceipt,
+     island_meswnd: Option<IslandMeswndPress>,
+     kanmi_body: Option<KanmiBodyPress>,
++    daydream_body: Option<DaydreamBodyAnchor>,
+ }
+ 
+ struct KanmiBodyPress {
+@@ -712,27 +718,24 @@
+                 ensure!(step.wait.hit.as_ref().is_some_and(|hit| hit.point == point),
+                     "route click needs a matching hit region");
+             }
++            let daydream_enter = step.is_daydream_enter();
+             if step.wait.state == "page_probe" && input {
+-                ensure!(step.mouse_press.is_some(), "page probe input requires a verified mouse press");
++                ensure!(step.mouse_press.is_some() || step.wait.is_daydream_r96_probe() && daydream_enter,
++                    "page probe input requires a verified mouse press or the exact Daydream r96 Enter");
+             }
+             if step.wait.window.as_deref() == Some("meswnd") && input {
+                 ensure!(step.is_neko_body_press() || step.island_meswnd_edge().is_some() || step.is_island_opmovie_exit(),
+                     "a meswnd input requires an exact guarded NEKO or ISLAND route");
+             }
+-            ensure!(!input || !step.wait.is_daydream_r96_probe(), "Daydream r96 is an input-free observation");
+             if step.keyboard_press.is_some() || input && step.wait.daydream_opening_page().is_some() {
+-                ensure!(step.is_daydream_enter() && route.page_scenes.is_empty()
++                ensure!(daydream_enter && route.page_scenes.is_empty()
+                     && step.continuous_window().is_none() && !step.continue_same_record_prompt
+                     && step.neko_startup_language.is_none(),
+                     "Daydream Enter requires its exact opening step and keyboard receipt, with no fallback");
+                 let after = step.after.as_ref().unwrap();
+                 let next = &route.steps[index + 1];
+-                let valid_next = if after.is_daydream_r96_probe() {
+-                    index + 1 == last && next.wait.is_daydream_r96_probe()
+-                } else {
+-                    next.wait.daydream_opening_page() == after.daydream_opening_page()
+-                        && next.wait.hit.is_none() && (index + 1 == last || next.is_daydream_enter())
+-                };
++                let valid_next = next.wait.daydream_opening_page() == after.daydream_opening_page()
++                    && next.wait.hit.is_none() && (index + 1 == last || next.is_daydream_enter());
+                 ensure!(valid_next,
+                     "Daydream Enter requires an exact next guarded page or input-free checkpoint");
+             }
+@@ -978,6 +981,15 @@
+                                 (owner, context, load, record) == (body.owner, body.context, body.load, 42)
+                                     && epoch != body.epoch && source_frame > pending.started
+                             }))
++                } else if let Some((context, load, before_owner, epoch, _)) = pending.daydream_body {
++                    !step.after.as_ref().unwrap().matches_position(&position, window)
++                        || window.and_then(|(_, owner)| player.host_replay_body_route_anchor(
++                            &position.scene, (position.group, position.record), None, owner,
++                        )).is_some_and(|(after_context, after_load, owner, after_epoch, source_frame)| {
++                            (after_context, after_load) == (context, load)
++                                && (owner != before_owner || after_epoch != epoch)
++                                && source_frame > pending.started
++                        })
+                 } else if let Some(island) = &pending.island_meswnd {
+                     if let Some((_, target)) = step.island_meswnd_edge() {
+                         island.root_lifetime == NovelWindowLifetime::Continuous
+@@ -1049,12 +1061,14 @@
+         let daydream_body = is_daydream_runtime(player) && matches!(position.state, "page" | "page_probe")
+             && window.is_some_and(|(name, _)| name == "cinema");
+         if step.wait.matches(&position, window, player)? {
+-            if daydream_body && (step.click.is_some() || step.key.is_some()) && !step.is_daydream_enter()
+-                || step.keyboard_press.is_some() && !kanmi && !(daydream_body && position.state == "page")
++            let daydream_enter = step.is_daydream_enter();
++            if daydream_body && (step.click.is_some() || step.key.is_some()) && !daydream_enter
++                || step.keyboard_press.is_some() && !kanmi && !(daydream_body && daydream_enter)
+             {
+                 return Ok(Decision::Stop("checkpoint_mismatch", "Daydream input requires an exact cinema page and guarded Enter route".into()));
+             }
+             let mut kanmi_body = None;
++            let mut daydream_anchor = None;
+             if let Some(press) = &step.keyboard_press && kanmi {
+                 let actual = player.host_kanmi_exact_body();
+                 let Some((owner, region, receiver, context, load, 40, epoch, _)) = actual else {
+@@ -1068,6 +1082,17 @@
+                 kanmi_body = Some(KanmiBodyPress { owner, context, load, epoch,
+                     lifetime: NovelWindowLifetime::Armed { first_event: player.events().len() } });
+             } else if let Some(press) = &step.keyboard_press {
++                if step.wait.daydream_opening_page().is_some_and(|group| group >= 20) {
++                    let after = step.after.as_ref().unwrap();
++                    daydream_anchor = window.and_then(|(_, owner)| player.host_replay_body_route_anchor(
++                        &position.scene, (position.group, position.record), after.group.zip(after.record), owner,
++                    ));
++                    if daydream_anchor.is_none() {
++                        return Ok(Decision::Stop("checkpoint_mismatch", format!(
++                            "Enter withheld at {:?}: current composed body or adjacent CST wait did not match", step.label,
++                        )));
++                    }
++                }
+                 let button = player.input_button_state(press.region);
+                 eprintln!("frame {frame}: guarded Enter window={window:?} region={} receiver={:?}",
+                     press.region, button.and_then(|button| button.receiver));
+@@ -1181,7 +1206,8 @@
+                 .or_else(|| step.key.map(|key| Action::Key(InputKey::Keyboard(key))));
+             if let Some(action) = action {
+                 self.pending = Some(Pending { origin: position, started: frame, step: Some(step_index),
+-                    mouse_press: pending_mouse_press, keyboard_press: KeyboardPressReceipt::Awaiting, island_meswnd, kanmi_body });
++                    mouse_press: pending_mouse_press, keyboard_press: KeyboardPressReceipt::Awaiting,
++                    island_meswnd, kanmi_body, daydream_body: daydream_anchor });
+                 return Ok(Decision::Input(action));
+             }
+             return Ok(if self.next == self.route.steps.len() { Decision::Done } else { Decision::Wait });
+@@ -1205,7 +1231,8 @@
+                     Action::Key(InputKey::Keyboard(13))
+                 };
+                 self.pending = Some(Pending { origin: position, started: frame, step: None, mouse_press: None,
+-                    keyboard_press: KeyboardPressReceipt::Awaiting, island_meswnd: None, kanmi_body: None });
++                    keyboard_press: KeyboardPressReceipt::Awaiting, island_meswnd: None,
++                    kanmi_body: None, daydream_body: None });
+                 Ok(Decision::Input(action))
+             }
+             "menu" | "choice" | "page" | "page_prompt" | "page_probe" | "language_select" => Ok(Decision::Stop("unknown_state", format!("{position:?} window={window:?}"))),
+@@ -1259,7 +1286,7 @@
+     }
+ 
+     #[test]
+-    fn daydream_prologue_chain_can_observe_r96_and_must_stop_there() {
++    fn daydream_prologue_chain_can_observe_r96_or_continue_to_r221() {
+         let gate = |group, record| json!({"state":"page","scene":"prologue","group":group,"record":record,"window":"cinema"});
+         let page = |group: usize| gate(group, super::DAYDREAM_PROLOGUE_WAITS[group]);
+         let step = |wait, after| json!({"label":"one guarded Enter", "wait":wait, "after":after,
+@@ -1288,8 +1315,27 @@
+             assert!(validate(invalid).is_err());
+         }
+         let probe = route["steps"][20]["wait"].clone();
+-        route["steps"][20] = step(probe, gate(21, 107));
+-        route["steps"].as_array_mut().unwrap().push(json!({"label":"observe r107","wait":gate(21, 107)}));
++        route["steps"][20] = step(probe, page(21));
++        route["steps"].as_array_mut().unwrap().push(json!({"label":"observe r107","wait":page(21)}));
++        assert!(validate(route.clone()).is_ok());
++
++        let mut wrong_receiver = route.clone();
++        wrong_receiver["steps"][20]["keyboard_press"]["receiver"] = json!(65);
++        assert!(validate(wrong_receiver).is_err());
++
++        let mut skipped = route.clone();
++        skipped["steps"][20]["after"] = page(22);
++        skipped["steps"][21]["wait"] = page(22);
++        assert!(validate(skipped).is_err());
++
++        let steps = route["steps"].as_array_mut().unwrap();
++        steps.pop();
++        steps.extend((21..40).map(|group| step(page(group), page(group + 1))));
++        steps.push(json!({"label":"observe r221","wait":page(40)}));
++        assert!(validate(route.clone()).is_ok());
++
++        route["steps"][40] = step(page(40), gate(41, 222));
++        route["steps"].as_array_mut().unwrap().push(json!({"label":"observe r222","wait":gate(41, 222)}));
+         assert!(validate(route).is_err());
+     }
+ 
+--- a/simulator/crates/desktop/src/story_trace.rs
++++ b/simulator/crates/desktop/src/story_trace.rs
+@@ -707,7 +707,22 @@
+         if !composited {
+             return None;
+         }
+-        let load = sources?.first()?.load_id;
++        let sources = sources?;
++        if shell.window == "cinema" && scene == "prologue" {
++            let empty_case = match anchor {
++                (20, 96) => Some((90, 95, [38, 48])),
++                (40, 221) => Some((215, 220, [36, 42])),
++                _ => None,
++            };
++            if let Some((body, empty, lengths)) = empty_case
++                && (!matches!(sources, [source] if source.absolute_record == body)
++                    || !daydream_empty_body_lengths(document, anchor, body, empty)
++                        .is_some_and(|[body_bytes, empty_bytes]| lengths.contains(&body_bytes) && empty_bytes == 0))
++            {
++                return None;
++            }
++        }
++        let load = sources.first()?.load_id;
+         let generation = self.data_services.fes_text.story_body_generation(owner)?;
+         Some((shell.context, load, owner, generation.source_epoch, generation.source_frame))
+     }

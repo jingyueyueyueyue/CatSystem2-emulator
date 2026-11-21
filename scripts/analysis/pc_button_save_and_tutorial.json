@@ -1,0 +1,20 @@
+{
+  "0": {
+    "frames": 520,
+    "inputs": ["story-events", "capture-every:0", "inspect:195", "move:197:399,328",
+      "require-hit:198:13", "198:399,328", "inspect:310", "inspect:500"]
+  },
+  "6": {
+    "frames": 650,
+    "inputs": ["story-events", "capture-every:0", "inspect:495", "move:497:84,308",
+      "require-hit:498:19", "498:84,308", "inspect:603"]
+  },
+  "10": {
+    "frames": 1510,
+    "inputs": ["story-events", "capture-every:0", "move:708:190,222", "require-hit:710:39",
+      "710:190,222", "right:900:515,301", "move:1038:277,203", "require-hit:1040:83",
+      "1040:277,203", "inspect:1200", "move:1208:385,32", "require-hit:1210:38",
+      "1210:385,32", "inspect:1320", "move:1338:279,135", "require-hit:1340:53",
+      "1340:279,135", "inspect:1500"]
+  }
+}

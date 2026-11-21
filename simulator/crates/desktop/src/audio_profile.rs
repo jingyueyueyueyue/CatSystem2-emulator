@@ -2,14 +2,15 @@
 use std::{
     cell::RefCell,
     fmt::Write,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
     time::{Duration, Instant},
 };
 
 const MAX_ROWS: usize = 3;
-const STAGES: [&str; Stage::Standby as usize + 1] = [
+const STAGES: [&str; Stage::StateWait as usize + 1] = [
     "read", "prepare", "sidecars", "register", "spawn", "ack",
     "reader", "open", "prime", "activate", "request", "confirm", "close", "standby",
+    "confirm_pump", "confirm_expand", "state_wait",
 ];
 
 #[derive(Clone, Copy)]
@@ -28,10 +29,31 @@ pub(crate) enum Stage {
     Confirm,
     Close,
     Standby,
+    ConfirmPump,
+    ConfirmExpand,
+    StateWait,
 }
 
 type Times = [Duration; STAGES.len()];
-pub(crate) type Shared = Arc<Mutex<Times>>;
+static NEXT_COMMAND: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct CommandTiming {
+    pub(crate) id: u64,
+    pub(crate) channel: u32,
+    name: [u8; 40],
+    name_len: usize,
+    started: Instant,
+    times: Mutex<Times>,
+}
+impl CommandTiming {
+    #[cfg(target_os = "android")]
+    pub(crate) fn name(&self) -> &str {
+        std::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?")
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn elapsed(&self) -> Duration { self.started.elapsed() }
+}
+pub(crate) type Shared = Arc<CommandTiming>;
 
 thread_local! {
     static ACTIVE: RefCell<Option<Shared>> = const { RefCell::new(None) };
@@ -76,12 +98,13 @@ impl Drop for Phase {
     fn drop(&mut self) {
         if let Some((times, start, stage)) = self.0.take() {
             let elapsed = start.elapsed();
-            times.lock().unwrap_or_else(|error| error.into_inner())[stage as usize] += elapsed;
+            times.times.lock().unwrap_or_else(|error| error.into_inner())[stage as usize] += elapsed;
         }
     }
 }
 
 pub(super) struct Sample {
+    id: u64,
     task: u32,
     channel: u32,
     operation: &'static str,
@@ -106,19 +129,24 @@ impl Profile {
             return Self(None);
         }
         let (name, name_len) = super::detail_name(resource.as_bytes());
-        let times = Arc::new(Mutex::new(Times::default()));
+        let times = Arc::new(CommandTiming {
+            id: NEXT_COMMAND.fetch_add(1, Ordering::Relaxed),
+            channel, name, name_len, started: Instant::now(), times: Mutex::new(Times::default()),
+        });
         let activation = Activation::replace(Some(times.clone()));
         let sample = Sample {
+            id: times.id,
             task,
-            channel,
+            channel: times.channel,
             operation,
             code,
-            name,
-            name_len,
+            name: times.name,
+            name_len: times.name_len,
             elapsed: Duration::ZERO,
             times: Times::default(),
         };
-        Self(Some((activation, times, Instant::now(), sample)))
+        let started = times.started;
+        Self(Some((activation, times, started, sample)))
     }
 }
 
@@ -129,7 +157,7 @@ impl Drop for Profile {
         };
         drop(activation);
         sample.elapsed = start.elapsed();
-        sample.times = *times.lock().unwrap_or_else(|error| error.into_inner());
+        sample.times = *times.times.lock().unwrap_or_else(|error| error.into_inner());
         if sample.elapsed.as_micros() < u128::from(super::SLOW_US) {
             return;
         }
@@ -148,8 +176,8 @@ pub(super) fn write_rows(rows: &mut String, mut audio: Vec<Sample>, session: u64
     for sample in audio {
         let name = std::str::from_utf8(&sample.name[..sample.name_len]).unwrap_or("?");
         let mut row = format!(
-            "audio_detail session={session} frame={frame} call={call} task={} channel={} operation={} elapsed_us={}",
-            sample.task, sample.channel, sample.operation, sample.elapsed.as_micros(),
+            "audio_detail session={session} frame={frame} call={call} task={} channel={} operation={} elapsed_us={} audio_id={}",
+            sample.task, sample.channel, sample.operation, sample.elapsed.as_micros(), sample.id,
         );
         if let Some(code) = sample.code {
             let _ = write!(row, " code={code}");

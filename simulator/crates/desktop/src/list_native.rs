@@ -330,6 +330,14 @@ struct AnimationUpdate {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn is_list_output_wrapper(&self, handle: u32) -> bool {
+        let pixels = &self.data_services.image_wrapper_pixels;
+        self.data_services.tasks.fes.platform.lists.values().any(|list| {
+            list.output == handle || pixels.get(&handle)
+                .is_some_and(|pixel| pixels.get(&list.output) == Some(pixel))
+        })
+    }
+
     pub(crate) fn synchronize_list_resource_pixels_only(&mut self, handle: u32, frame: &RgbaFrame) -> Result<()> {
         let mut wrappers = std::collections::BTreeSet::new();
         for entry in self.data_services.list_native.entries.0.values()
@@ -2874,6 +2882,16 @@ fn blend_pixel(canvas: &mut Canvas, x: i32, y: i32, source: [u8; 4], opacity: u3
     Ok(())
 }
 
+const LIST_ALPHA_RECIPROCAL: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut alpha = 1;
+    while alpha < table.len() {
+        table[alpha] = 65536 / alpha as u32;
+        alpha += 1;
+    }
+    table
+};
+
 pub(super) fn blend_list_pixel(out: &mut [u8], source: [u8; 4], opacity: u32) {
     let alpha = (((opacity & 0xffff) * (u32::from(source[3]) + 1)) >> 8) & 255;
     if alpha == 255 || out[3] == 0 {
@@ -2891,7 +2909,7 @@ pub(super) fn blend_list_pixel(out: &mut [u8], source: [u8; 4], opacity: u32) {
         let dw = ((256 - alpha) * destination) >> 8;
         let sw = (((256 - destination) * alpha) >> 8) + overlap;
         let oa = (sw + dw) | 1;
-        let reciprocal = 65536 / oa;
+        let reciprocal = LIST_ALPHA_RECIPROCAL[oa as usize];
         for axis in 0..3 {
             out[axis] = ((u32::from(source[axis]) * sw + u32::from(out[axis]) * dw) * reciprocal
                 >> 16) as u8;

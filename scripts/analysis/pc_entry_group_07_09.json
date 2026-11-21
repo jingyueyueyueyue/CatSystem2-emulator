@@ -1,0 +1,61 @@
+{
+  "7": {
+    "frames": 6680,
+    "inputs": [
+      "story-events",
+      "story-trace",
+      "capture-every:0",
+      "move:805:176,256",
+      "capture:830",
+      "840:176,256",
+      "capture:970",
+      "capture:1150",
+      "capture:1602",
+      "capture:6200",
+      "capture:6310",
+      "capture:6470",
+      "inspect:6680"
+    ]
+  },
+  "8": {
+    "frames": 3020,
+    "inputs": [
+      "story-events",
+      "story-trace",
+      "capture-every:0",
+      "move:2458:634,90",
+      "2460:634,90",
+      "capture:2468",
+      "capture:2527",
+      "capture:2541",
+      "capture:2912",
+      "move:2914:720,150",
+      "capture:2919",
+      "2920:720,150",
+      "capture:2921",
+      "capture:2985",
+      "move:3006:120,185",
+      "move:3016:120,185",
+      "inspect:3020"
+    ]
+  },
+  "9": {
+    "frames": 735,
+    "inputs": [
+      "story-events",
+      "story-trace",
+      "capture-every:0",
+      "move:360:140,354",
+      "capture:380",
+      "380:140,354",
+      "capture:447",
+      "capture:457",
+      "capture:461",
+      "capture:480",
+      "capture:560",
+      "capture:685",
+      "685:13",
+      "capture:710"
+    ]
+  }
+}

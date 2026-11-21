@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use cs2_renderer::{BlendMode, Canvas, Color};
+use cs2_renderer::{BlendMode, Canvas, Rect};
 use cs2_runtime::ResourceIndex;
 use cs2_runtime::emote::{
     CpuEmoteBackend, CpuEmoteResources, CpuM2ActionConfig, CpuM2Config, CpuM2ControllerConfig,
@@ -22,6 +22,7 @@ use cs2_runtime::emote::{
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
 use super::{LoggingHost, expand_kcs_format};
+use super::perf_detail::SlowTask;
 
 const MAX_FORMAT_BYTES: usize = 4095;
 const MAX_BATCH_ENTRIES: usize = 1_000_000;
@@ -222,6 +223,7 @@ pub(super) fn load_m2_resource_plan(
         startup_config_name,
         formatted_spec,
         None,
+        None,
     )
 }
 
@@ -231,6 +233,7 @@ fn load_m2_resource_plan_impl(
     startup_config_name: &[u8],
     formatted_spec: &[u8],
     reusable_resource_name: Option<&[u8]>,
+    task: Option<u32>,
 ) -> std::result::Result<EmoteM2ResourcePlan, EmoteError> {
     fn read(
         resources: &ResourceIndex,
@@ -257,6 +260,7 @@ fn load_m2_resource_plan_impl(
         }
         Ok(rows[0][0].clone())
     }
+    let config_timer = task.map(|id| SlowTask::new(id, || 54, "emote_m2_config"));
     let view = CpuM2Config::parse_cp932(&read(
         resources,
         startup_config_category,
@@ -338,16 +342,18 @@ fn load_m2_resource_plan_impl(
     let mut resource_name = selection.resource_stem_cp932.clone();
     resource_name.push(b'.');
     resource_name.extend_from_slice(&extension);
+    drop(config_timer);
     //17a990 preserves an already loaded resource with the same name. Avoid
     //reading/inflating a68MiB PSB for every script pattern/timeline change.
     let resource = if reusable_resource_name == Some(resource_name.as_slice()) {
         None
     } else {
-        Some(EmoteResource::decode(&read(
-            resources,
-            archive_category,
-            &resource_name,
-        )?)?)
+        let packed = {
+            let _timing = task.map(|id| SlowTask::new(id, || 54, "emote_psz_read").named(&resource_name, None));
+            read(resources, archive_category, &resource_name)?
+        };
+        let _timing = task.map(|id| SlowTask::new(id, || 54, "emote_psz_decode").named(&resource_name, None));
+        Some(EmoteResource::decode(&packed)?)
     };
     Ok(EmoteM2ResourcePlan {
         load_spec,
@@ -683,6 +689,30 @@ impl LoggingHost<'_> {
         if index == 906 {
             let spec = formatted(vm, word(args, 1)?)?;
             let mode = word(args, 2)?;
+            // LOAD_LoadObj replays the saved plane's fixed string even when
+            // it is empty. For that input the original receiver returns 0
+            // (RVA 0x2389ac) and the newly created plane stays unloaded.
+            if spec == [0]
+                && vm.instruction_pointer == 790_654
+                && vm.frames().last().map(|frame| frame.return_pc) == Some(721_011)
+                && vm.program_code_sha256()
+                    == Some("bf9933a33675e5e44d34f7486d54aa6b53bb3f32a74c2fe0393b5a43efc6f4ad")
+                && self
+                    .data_services
+                    .emote
+                    .state
+                    .state(target)
+                    .is_some_and(|state| state.successful_resource_imports == 0)
+            {
+                if self.trace_neko_cstl() {
+                    self.events.push(super::LogicEvent {
+                        frame: self.frame,
+                        kind: "neko-m2-restore-empty".into(),
+                        detail: format!("native=906 target={target} mode={mode}"),
+                    });
+                }
+                return Ok(NativeReturn::Continue);
+            }
             let result = self
                 .data_services
                 .emote
@@ -765,7 +795,11 @@ impl EmoteNativeServices {
         };
         let size = [dimension(&rows[0][0])?, dimension(&rows[0][1])?];
         let viewport = CpuViewport::original_neko_target(size[0], size[1]).map_err(error)?;
-        let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
+        let mut backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if crate::gpu_raster::emote_requested() {
+            backend.set_rasterizer(crate::gpu_raster::draw_emote);
+        }
         self.state.set_backend(Box::new(backend)).map_err(error)?;
         self.target_size = Some(size);
         let mut fade = 30;
@@ -792,6 +826,7 @@ impl EmoteNativeServices {
             b"m2view.cnf",
             spec,
             current_name.as_deref(),
+            Some(task),
         )
         .map_err(error)?;
         let mut secondary_variables = plan.secondary_config.default_variables().map_err(error)?;
@@ -841,9 +876,11 @@ impl EmoteNativeServices {
             root_affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             transition_raw: mode,
         };
-        self.state
-            .import_m2_resource(task, &plan.resource_name, plan.resource.as_ref(), load)
-            .map_err(error)?;
+        {
+            let _timing = SlowTask::new(task, || 54, "emote_m2_import").named(&plan.resource_name, None);
+            self.state.import_m2_resource(task, &plan.resource_name, plan.resource.as_ref(), load)
+                .map_err(error)?;
+        }
         let placement = self.placements.entry(task).or_default();
         placement.profile_position = position.map(|value| value as f32);
         placement.profile_scale = scale[0];
@@ -1104,9 +1141,21 @@ impl EmoteNativeServices {
         resolved_target: u32,
         canvas: &mut Canvas,
     ) -> std::result::Result<usize, EmoteError> {
-        let frame = self.state.render_rgba(resolved_target)?;
+        let frame = {
+            let _timing = SlowTask::new(resolved_target, || 54, "emote_render_rgba");
+            self.state.render_rgba(resolved_target)?
+        };
         let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
-        let submitted = submit_rgba(canvas, &frame, blend)?;
+        let frame = if blend == BlendMode::SourceOver {
+            frame
+        } else {
+            // Other blend modes can depend on transparent pixels outside the pose bounds.
+            frame.into_viewport([canvas.width(), canvas.height()])?
+        };
+        let submitted = {
+            let _timing = SlowTask::new(resolved_target, || 54, "emote_blend");
+            submit_rgba(canvas, &frame, blend)?
+        };
         if submitted != 0 {
             self.state.record_pixel_submission(resolved_target)?;
         }
@@ -1293,28 +1342,28 @@ pub(super) fn submit_rgba(
     } else {
         (left, top, right, bottom)
     };
-    for y in top..bottom {
-        for x in left..right {
-            let source_x = (x - i64::from(origin_x)) as usize;
-            let source_y = (y - i64::from(origin_y)) as usize;
-            let offset = (source_y * frame.width() as usize + source_x) * 4;
-            let p = &frame.rgba()[offset..offset + 4];
-            if source_over && p[3] == 0 {
-                continue;
-            }
-            let x = i32::try_from(x).map_err(|_| EmoteError::InvalidFrame)?;
-            let y = i32::try_from(y).map_err(|_| EmoteError::InvalidFrame)?;
-            canvas
-                .blend_pixel_with_mode(x, y, Color::rgba(p[0], p[1], p[2], p[3]), blend)
-                .map_err(|error| EmoteError::Backend(error.to_string()))?;
-        }
+    if right <= left || bottom <= top {
+        return Ok(submitted);
     }
+    let target = Rect::new(
+        i32::try_from(left).map_err(|_| EmoteError::InvalidFrame)?,
+        i32::try_from(top).map_err(|_| EmoteError::InvalidFrame)?,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    );
+    let stride = frame.width() as usize * 4;
+    let source_x = (left - i64::from(origin_x)) as usize;
+    let source_y = (top - i64::from(origin_y)) as usize;
+    let offset = source_y * stride + source_x * 4;
+    canvas.blend_rgba_rows(target, &frame.rgba()[offset..], stride, blend)
+        .map_err(|error| EmoteError::Backend(error.to_string()))?;
     Ok(submitted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cs2_renderer::Color;
 
     #[test]
     fn sidecar_emote_submission_preserves_clipping_and_mask_modes() {
@@ -1325,7 +1374,12 @@ mod tests {
             transparent, opaque, transparent, half, transparent, transparent, transparent, transparent];
         let frame = EmoteRasterFrame::new(4, 3, [-1, -1], pixels.concat()).unwrap();
         assert_eq!(frame.alpha_bounds(), Some([1, 1, 4, 2]));
-        for blend in [BlendMode::SourceOver, BlendMode::ListAlphaFromAlpha, BlendMode::ListAlphaFromRed] {
+        for blend in [
+            BlendMode::SourceOver, BlendMode::AddSource, BlendMode::AddDestination,
+            BlendMode::Multiply, BlendMode::InvertDestination, BlendMode::AddMultiply,
+            BlendMode::ListAlphaFromBlue, BlendMode::ListAlphaFromGreen,
+            BlendMode::ListAlphaFromRed, BlendMode::ListAlphaFromAlpha,
+        ] {
             let mut fast = Canvas::new(3, 2).unwrap();
             fast.clear(Color::rgba(20, 30, 40, 200));
             let mut reference = fast.clone();

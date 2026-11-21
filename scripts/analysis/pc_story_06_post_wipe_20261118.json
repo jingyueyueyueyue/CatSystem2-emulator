@@ -1,0 +1,13 @@
+{
+  "6": {
+    "frames": 1490,
+    "inputs": [
+      "capture:450", "move:500:98,208", "capture:520", "530:98,208",
+      "capture:531", "capture:600", "move:640:98,104", "capture:655",
+      "660:98,104", "capture:661", "capture:760", "capture:820", "capture:850",
+      "887:13", "capture:907", "957:13", "capture:977", "capture:1195",
+      "capture:1220", "capture:1275", "capture:1350", "capture:1400",
+      "1420:13", "capture:1440", "capture:1485"
+    ]
+  }
+}

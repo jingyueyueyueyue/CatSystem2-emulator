@@ -101,10 +101,12 @@ class PlayerActivity : PlayerEngineActivity() {
         if (monitorEnabled) {
             showOverlay()
         } else {
+            val view = overlay
+            overlay = null
+            stopGameSampling()
             samplingJob?.cancel()
             samplingJob = null
-            overlay?.let(playerRoot::removeView)
-            overlay = null
+            view?.let(playerRoot::removeView)
             snapshot = PerformanceSnapshot()
         }
     }
@@ -138,11 +140,16 @@ class PlayerActivity : PlayerEngineActivity() {
                         logSample(snapshot)
                     }
                 } finally {
-                    resetGameSampling()
-                    setGameHudCollection(false)
+                    // A cancelled sampler may finish after a new overlay starts.
+                    if (overlay === view) stopGameSampling()
                 }
             }
         }
+    }
+
+    private fun stopGameSampling() {
+        resetGameSampling()
+        setGameHudCollection(false)
     }
 
     private fun resetGameSampling() {
@@ -253,6 +260,7 @@ class PlayerActivity : PlayerEngineActivity() {
         @JvmStatic external fun nativeDialog(handle: Long): ByteArray?
         @JvmStatic external fun nativeDialogResult(handle: Long, request: Long, shown: Int): Int
         @JvmStatic external fun nativeInput(handle: Long, kind: Int, a: Int, b: Int): Int
+        @JvmStatic external fun nativeTimedPrimaryDown(handle: Long, eventToUiMs: Long, uiToWorkerUs: Long): Int
         @JvmStatic external fun nativeText(handle: Long, kind: Int, text: ByteArray, start: Int, end: Int): Int
         @JvmStatic external fun nativePresent(handle: Long, surface: Surface): Int
         @JvmStatic external fun nativeDetachSurface(): Int

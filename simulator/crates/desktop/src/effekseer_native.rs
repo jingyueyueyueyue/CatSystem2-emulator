@@ -59,7 +59,7 @@ pub(super) fn receive(
     output: &mut u32,
     _budget: usize,
 ) -> Result<Option<TaskCommandOutcome>> {
-    if !matches!(command.code, 51 | 55 | 59 | 66 | 578..=582) {
+    if !matches!(command.code, 49 | 51 | 55 | 59 | 61 | 66 | 81 | 578..=582) {
         return Ok(None);
     }
     let id = command.target as u32;
@@ -73,6 +73,24 @@ pub(super) fn receive(
         host.data_services.effekseer.sync(node).map_err(error)?;
     }
     match command.code {
+        49 | 61 => {
+            if command.data[0] != 0 {
+                return Err(error("unsupported Effekseer plane base selector"));
+            }
+            let manager = &mut host.data_services.effekseer.manager;
+            if command.code == 49 {
+                let bytes = buffers.data1().and_then(|bytes| bytes.get(..12))
+                    .ok_or_else(|| error("plane base setter needs three owned floats"))?;
+                let base = std::array::from_fn(|axis| {
+                    f32::from_le_bytes(bytes[axis * 4..axis * 4 + 4].try_into().unwrap())
+                });
+                manager.set_plane_base(id, base).map_err(error)?;
+            } else {
+                let base = manager.plane_base(id).map_err(error)?;
+                let bytes: Vec<_> = base.into_iter().flat_map(f32::to_le_bytes).collect();
+                buffers.write_data1(&bytes)?;
+            }
+        }
         51 | 66 => {
             let bytes = buffers
                 .data1()
@@ -134,6 +152,13 @@ pub(super) fn receive(
                 .ok_or_else(|| error(Error::Task(id)))?;
             node.color = command.data[1];
             host.data_services.effekseer.sync(node).map_err(error)?;
+        }
+        81 => {
+            // Base receiver 1398c5 maps values outside 0..=5 to the
+            // default renderer mode. The CPU callback supports that mode.
+            if (1..=5).contains(&command.data[1]) {
+                return Err(error("nondefault Effekseer plane blend mode"));
+            }
         }
         578 => {
             // Failure leaves the old state released, matching18c444.
@@ -251,6 +276,50 @@ fn read_resource(resources: &ResourceIndex, name: &[u8]) -> Result<Resource> {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn effekseer_base_native(
+        &mut self,
+        index: u32,
+        args: &[u8],
+    ) -> Result<Option<NativeReturn>> {
+        if !matches!(index, 85 | 88 | 402) {
+            return Ok(None);
+        }
+        let id = read_u32(args, 0)?;
+        if !self.scene_nodes.get(&id).is_some_and(|node| node.kind == 61) {
+            return Ok(None);
+        }
+        if index == 402 {
+            let command = TaskCommand {
+                target: id as i32,
+                sender: self.current_task_id as i32,
+                code: 81,
+                data: [0, read_u32(args, 4)?, 0],
+            };
+            receive(self, command, &mut OwnedTaskBuffers::default(), &mut 0, 4096)?;
+            return Ok(Some(NativeReturn::Continue));
+        }
+        let (selector, range, value) = if index == 85 {
+            (read_u32(args, 12)?, 0..8, &args[4..12])
+        } else {
+            (0, 8..12, args.get(4..8).ok_or_else(|| error("native88 needs a depth"))?)
+        };
+        // PE 195340/195560 query the renderer base, replace the requested
+        // components, and send it back without moving the particle root.
+        let query = TaskCommand {
+            target: id as i32,
+            sender: self.current_task_id as i32,
+            code: 61,
+            data: [selector, 0, 1],
+        };
+        let mut buffers = OwnedTaskBuffers::new(None, Some(vec![0; 12]))?;
+        receive(self, query, &mut buffers, &mut 0, 4096)?;
+        let mut base = buffers.data1().unwrap().to_vec();
+        base[range].copy_from_slice(value);
+        let mut buffers = OwnedTaskBuffers::new(None, Some(base))?;
+        receive(self, TaskCommand { code: 49, ..query }, &mut buffers, &mut 0, 4096)?;
+        Ok(Some(NativeReturn::Continue))
+    }
+
     pub(super) fn receive_effekseer_transform(
         &mut self,
         command: TaskCommand,

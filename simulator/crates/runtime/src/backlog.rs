@@ -22,6 +22,8 @@ pub enum BacklogError {
     InvalidTables,
     #[error("backlog text has an incomplete two-byte character")]
     TruncatedCharacter,
+    #[error("backlog Unicode text is not valid UTF-8")]
+    InvalidUtf8,
 }
 
 pub type Result<T> = std::result::Result<T, BacklogError>;
@@ -234,16 +236,33 @@ impl Backlog {
         &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
         mark: u32, space: u32, extra: u32,
     ) -> Result<bool> {
+        self.append_with_encoding(source, input, name, text, mark, space, extra, TextEncoding::Legacy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_utf8(
+        &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
+        mark: u32, space: u32, extra: u32,
+    ) -> Result<bool> {
+        self.append_with_encoding(source, input, name, text, mark, space, extra, TextEncoding::Utf8)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_with_encoding(
+        &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
+        mark: u32, space: u32, extra: u32, encoding: TextEncoding,
+    ) -> Result<bool> {
         let source = nul(source);
         if self.segments.back().is_some_and(|last| last.input == input
             && self.sources.get(last.source as usize).is_some_and(|last| last == source)) {
             return Ok(false);
         }
-        let name = preprocess(nul(name), self.settings.escape != 0)?;
-        let text = preprocess(nul(text), self.settings.escape != 0)?;
+        let name = preprocess(nul(name), self.settings.escape != 0, encoding)?;
+        let text = preprocess(nul(text), self.settings.escape != 0, encoding)?;
         let formatted_name = if name.is_empty() { Vec::new() } else {
             [nul(&self.settings.name_first), &name, nul(&self.settings.name_last)].concat()
         };
+        encoding.columns(&formatted_name)?;
         let mut rows = Vec::new();
         if self.settings.space != 0 && space != 0 && !self.lines.is_empty() {
             rows.push(Line { segment: u32::MAX, text: Vec::new() });
@@ -261,7 +280,7 @@ impl Backlog {
             let prefix = if self.settings.name_line == 0 && self.settings.display_name != 0 {
                 formatted_name.as_slice()
             } else { &[] };
-            let wrapped = layout(&text, prefix, &self.settings)?;
+            let wrapped = layout(&text, prefix, &self.settings, encoding)?;
             if !wrapped.is_empty() {
                 first = self.line_start.wrapping_add((self.lines.len() + rows.len()) as u32);
                 last = first.wrapping_add(wrapped.len() as u32 - 1);
@@ -458,6 +477,52 @@ fn unit(data: &[u8], offset: usize) -> Result<usize> {
     } else { Ok(1) }
 }
 
+#[derive(Clone, Copy)]
+enum TextEncoding {
+    Legacy,
+    Utf8,
+}
+
+impl TextEncoding {
+    fn unit(self, data: &[u8], offset: usize) -> Result<(usize, usize)> {
+        match self {
+            Self::Utf8 => match data.get(offset) {
+                Some(0xc2..=0xdf) => Ok((2, 2)),
+                Some(0xe0..=0xef) => Ok((3, 2)),
+                Some(0xf0..=0xf4) => Ok((4, 2)),
+                _ => unit(data, offset).map(|length| (length, length)),
+            },
+            Self::Legacy => unit(data, offset).map(|length| (length, length)),
+        }
+    }
+
+    fn columns(self, data: &[u8]) -> Result<usize> {
+        match self {
+            Self::Legacy => Ok(data.len()),
+            Self::Utf8 => std::str::from_utf8(data)
+                .map(|text| text.chars().map(|character| if character.is_ascii() { 1 } else { 2 }).sum())
+                .map_err(|_| BacklogError::InvalidUtf8),
+        }
+    }
+
+    fn wide_space(self) -> &'static [u8] {
+        match self {
+            Self::Legacy => b"\x81\x40",
+            Self::Utf8 => "\u{3000}".as_bytes(),
+        }
+    }
+
+    fn opening_indent(self, text: &[u8]) -> usize {
+        let opening = match self {
+            Self::Legacy => matches!(text.get(..2),
+                Some(b"\x81\x69" | b"\x81\x6d" | b"\x81\x6f" | b"\x81\x75" | b"\x81\x77")),
+            Self::Utf8 => ["\u{ff08}", "\u{ff3b}", "\u{ff5b}", "\u{300c}", "\u{300e}"]
+                .iter().any(|opening| text.starts_with(opening.as_bytes())),
+        };
+        if opening { 2 } else { 0 }
+    }
+}
+
 fn numeric_span(data: &[u8]) -> usize {
     let mut offset = usize::from(matches!(data.first(), Some(b'+' | b'-')));
     let hexadecimal = data.get(offset..).is_some_and(|tail| tail.starts_with(b"0x") || tail.starts_with(b"0X"));
@@ -470,8 +535,9 @@ fn numeric_span(data: &[u8]) -> usize {
     offset + usize::from(data.get(offset) == Some(&b';'))
 }
 
-fn preprocess(data: &[u8], escape: bool) -> Result<Vec<u8>> {
+fn preprocess(data: &[u8], escape: bool, encoding: TextEncoding) -> Result<Vec<u8>> {
     if data.len() > MAX_BYTES { return Err(BacklogError::TooLarge); }
+    encoding.columns(data)?;
     let mut output = Vec::with_capacity(data.len());
     let mut offset = 0;
     while offset < data.len() {
@@ -513,11 +579,15 @@ fn preprocess(data: &[u8], escape: bool) -> Result<Vec<u8>> {
                     }
                     _ => 1, // Unsupported control removes only its slash.
                 };
-                offset += consumed.min(tail.len());
+                let mut consumed = consumed.min(tail.len());
+                if matches!(encoding, TextEncoding::Utf8) {
+                    while matches!(tail.get(consumed), Some(0x80..=0xbf)) { consumed += 1; }
+                }
+                offset += consumed;
                 continue;
             }
         }
-        let width = unit(data, offset)?;
+        let (width, _) = encoding.unit(data, offset)?;
         output.extend_from_slice(&data[offset..offset + width]);
         offset += width;
     }
@@ -543,11 +613,35 @@ mod tests {
         assert_eq!(restored_text, text);
         Ok(())
     }
+
+    #[test]
+    fn utf8_backlog_wraps_full_characters_and_preserves_name_on_restore() -> Result<()> {
+        let settings = Settings { columns: 9, ..Settings::default() };
+        let mut backlog = Backlog::new(settings)?;
+        let name = "\u{6d77}\u{6597}";
+        let body = "\u{300c}\u{4e2d}\u{6587}\u{6587}\u{5b57}\u{1f642}\u{300d}";
+        backlog.append_utf8(b"prologue", 0, name.as_bytes(), body.as_bytes(), 0, 0, 0)?;
+        let snapshot = backlog.snapshot()?;
+        let restored = Backlog::from_snapshot(&snapshot)?;
+        assert_eq!(restored.name_for_row(0), Some(name.as_bytes()));
+        let rows = restored.lines().iter().skip(1)
+            .map(|row| std::str::from_utf8(&row.text).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rows.len() > 1);
+        assert!(rows[1].starts_with('\u{3000}'));
+        assert_eq!(rows.iter().map(|row| row.trim_start()).collect::<String>(), body);
+        assert_eq!(
+            backlog.append_utf8(b"prologue", 1, b"", b"\x81", 0, 0, 0),
+            Err(BacklogError::InvalidUtf8),
+        );
+        assert_eq!(backlog, restored);
+        Ok(())
+    }
 }
 
-fn layout(text: &[u8], prefix: &[u8], settings: &Settings) -> Result<Vec<Vec<u8>>> {
-    let opening_indent = if text.len() >= 2 && matches!(&text[..2],
-        b"\x81\x69" | b"\x81\x6d" | b"\x81\x6f" | b"\x81\x75" | b"\x81\x77") { 2 } else { 0 };
+fn layout(text: &[u8], prefix: &[u8], settings: &Settings, encoding: TextEncoding) -> Result<Vec<Vec<u8>>> {
+    let opening_indent = encoding.opening_indent(text);
+    let prefix_columns = encoding.columns(prefix)?;
     let mut output = Vec::new();
     let mut offset = 0usize;
     while offset < text.len() {
@@ -555,10 +649,10 @@ fn layout(text: &[u8], prefix: &[u8], settings: &Settings) -> Result<Vec<Vec<u8>
         let first = output.is_empty();
         let indent = settings.name_indent as usize + if first { 0 } else { opening_indent };
         let mut row = if first { prefix.to_vec() } else { Vec::new() };
-        let spaces = if first { indent.saturating_sub(prefix.len()) } else { indent };
-        for _ in 0..spaces / 2 { row.extend_from_slice(b"\x81\x40"); }
+        let spaces = if first { indent.saturating_sub(prefix_columns) } else { indent };
+        for _ in 0..spaces / 2 { row.extend_from_slice(encoding.wide_space()); }
         if spaces % 2 != 0 { row.push(b' '); }
-        let mut width = row.len();
+        let mut width = if first { prefix_columns + spaces } else { spaces };
         while offset < text.len() {
             if text[offset] == b'[' {
                 let mut end = offset + 1;
@@ -566,18 +660,18 @@ fn layout(text: &[u8], prefix: &[u8], settings: &Settings) -> Result<Vec<Vec<u8>
                 while end < text.len() {
                     if text[end] == b'/' && body_end.is_none() { body_end = Some(end); }
                     if text[end] == b']' { end += 1; break; }
-                    end += unit(text, end)?;
+                    end += encoding.unit(text, end)?.0;
                 }
                 let body = body_end.unwrap_or_else(|| end - usize::from(text.get(end.wrapping_sub(1)) == Some(&b']')));
-                let visible = body.saturating_sub(offset + 1);
+                let visible = encoding.columns(&text[offset + 1..body])?;
                 if width.saturating_add(visible) > (settings.columns + settings.extra_columns) as usize { break; }
                 width += visible;
                 offset = end;
                 if width >= settings.columns as usize { break; }
             } else {
-                let count = unit(text, offset)?;
-                if width.saturating_add(count) >= settings.columns as usize { break; }
-                width += count;
+                let (count, columns) = encoding.unit(text, offset)?;
+                if width.saturating_add(columns) >= settings.columns as usize { break; }
+                width += columns;
                 offset += count;
             }
         }

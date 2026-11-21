@@ -1721,10 +1721,18 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             pointerButton = (event.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0 ? 1 : 0;
         }
         int button = pointerButton;
+        boolean primaryDown = action == MotionEvent.ACTION_DOWN && button == 0;
+        long uiSampleNs = primaryDown ? System.nanoTime() : 0;
+        long eventToUiMs = primaryDown ? Math.max(0, SystemClock.uptimeMillis() - event.getEventTime()) : 0;
         worker.post(() -> {
             if (session != handle || paused) return;
             nativeInput(session, 0, x, y);
-            if (action == MotionEvent.ACTION_DOWN) nativeInput(session, 1, button, 0);
+            if (primaryDown) {
+                long uiToWorkerUs = (System.nanoTime() - uiSampleNs) / 1000;
+                nativeTimedPrimaryDown(session, eventToUiMs, uiToWorkerUs);
+            } else if (action == MotionEvent.ACTION_DOWN) {
+                nativeInput(session, 1, button, 0);
+            }
             if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) nativeInput(session, 2, button, 0);
         });
         return true;

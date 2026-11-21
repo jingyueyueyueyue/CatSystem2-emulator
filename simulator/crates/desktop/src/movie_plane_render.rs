@@ -49,13 +49,14 @@ impl MpegMovieHost {
         let crate::movie_plane::MovieDrawSnapshot {
             surface,
             playback,
+            sequence,
             frame,
             rectangle,
         } = snapshot;
         let [x, y, width, height] =
             rectangle.unwrap_or([0, 0, canvas.width() as i32, canvas.height() as i32]);
         if width > 0 && height > 0 {
-            let source = RgbaFrame::from_rgba8(frame.width, frame.height, frame.rgba.to_vec())?;
+            let source = RgbaFrame::from_shared_rgba8(frame.width, frame.height, frame.rgba.clone())?;
             let mut options = ImageDrawOptions::new(Point::new(x, y));
             options.scale_x = width as f32 / frame.width as f32;
             options.scale_y = height as f32 / frame.height as f32;
@@ -66,6 +67,7 @@ impl MpegMovieHost {
             self.record_movie_presentation(MoviePresentation {
                 surface,
                 playback,
+                sequence,
                 time: frame.presentation_time,
             });
         }
@@ -129,6 +131,7 @@ impl MpegMovieHost {
         let crate::movie_plane::MovieDrawSnapshot {
             surface,
             playback,
+            sequence,
             frame,
             rectangle,
         } = snapshot;
@@ -175,7 +178,7 @@ impl MpegMovieHost {
             }
             None => (movie.at, movie.size),
         };
-        let image = RgbaFrame::from_rgba8(frame.width, frame.height, frame.rgba.to_vec())?;
+        let image = RgbaFrame::from_shared_rgba8(frame.width, frame.height, frame.rgba.clone())?;
         if draw_movie(
             canvas,
             &image,
@@ -189,6 +192,7 @@ impl MpegMovieHost {
             self.record_movie_presentation(MoviePresentation {
                 surface,
                 playback,
+                sequence,
                 time: frame.presentation_time,
             });
         }
@@ -223,13 +227,24 @@ impl HeadlessPlayer {
         }).collect()
     }
 
-    /// Call only after the app's real pixel surface/texture was presented.
-    /// Merely requesting a report or composing a Canvas is not presentation.
+    /// A new composed movie PTS needs submission even if its pixels
+    /// match the last posted frame (for example a held intro image).
+    pub fn has_unsubmitted_movie_frame(&self) -> Result<bool> {
+        for receipt in &self.movie_host.planes.presentations {
+            if receipt.surface.needs_submission(receipt.playback, receipt.sequence)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Call on the composing thread after the backend accepts the frame for
+    /// submission. This receipt does not measure physical display time.
     pub fn acknowledge_movie_frame(&self) -> Result<()> {
-        for receipt in self.movie_host.scene_movie_presentations() {
+        for receipt in &self.movie_host.planes.presentations {
             receipt
                 .surface
-                .mark_presented(receipt.playback, receipt.time)?;
+                .mark_submitted(receipt.playback, receipt.sequence, receipt.time)?;
         }
         Ok(())
     }
@@ -301,6 +316,7 @@ fn render_nodes(
             let crate::movie_plane::MovieDrawSnapshot {
                 surface,
                 playback,
+                sequence,
                 frame,
                 rectangle,
             } = snapshot;
@@ -351,7 +367,7 @@ fn render_nodes(
                 depth: properties.base[2],
                 sequence: properties.sequence,
                 draw: Draw::Movie {
-                    frame: RgbaFrame::from_rgba8(frame.width, frame.height, frame.rgba.to_vec())?,
+                    frame: RgbaFrame::from_shared_rgba8(frame.width, frame.height, frame.rgba.clone())?,
                     at,
                     size,
                     node,
@@ -360,6 +376,7 @@ fn render_nodes(
                     receipt: MoviePresentation {
                         surface,
                         playback,
+                        sequence,
                         time: frame.presentation_time,
                     },
                 },

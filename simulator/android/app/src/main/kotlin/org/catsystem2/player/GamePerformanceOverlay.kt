@@ -53,7 +53,12 @@ internal fun GamePerformanceOverlay(
         snapshot.powerWatts != null -> String.format(Locale.ROOT, "%4.1fW", snapshot.powerWatts)
         else -> "  — W"
     }
-    val fps = snapshot.game.displayedFps ?: snapshot.game.submittedFps
+    val fps = snapshot.game.displayedFps
+    val gpu = when (snapshot.gpu.status) {
+        GpuUsageStatus.AVAILABLE -> percent(snapshot.gpu.percent)
+        GpuUsageStatus.STALE -> "~" + percent(snapshot.gpu.percent).trimStart()
+        else -> percent(null)
+    }
 
     FlowRow(
         modifier = Modifier
@@ -75,7 +80,7 @@ internal fun GamePerformanceOverlay(
     ) {
         Metric("FPS", fps?.roundToInt()?.toString()?.padStart(3) ?: "  —",
             Color(0xFFFFFF50), stringResource(R.string.performance_frames))
-        Metric("GPU", percent(snapshot.gpu.percent), Color(0xFF64FF64))
+        Metric("GPU", gpu, Color(0xFF64FF64))
         Metric("CPU", percent(snapshot.cpuPercent), Color(0xFFFFB400),
             stringResource(R.string.performance_cpu))
         Metric("RAM", percent(snapshot.ramPercent), Color(0xFF50C8FF),

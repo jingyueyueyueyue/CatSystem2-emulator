@@ -417,6 +417,7 @@ struct Task {
     handle: Option<u32>,
     active: bool,
     repeat: u32,
+    plane_base: [f32; 3],
     position: [f32; 3],
     scale: [f32; 3],
     color: [u8; 4],
@@ -429,6 +430,7 @@ impl Default for Task {
             handle: None,
             active: false,
             repeat: 0,
+            plane_base: [0.0; 3],
             position: [0.0; 3],
             scale: [1.0; 3],
             color: [255; 4],
@@ -471,6 +473,16 @@ impl Manager {
     }
     pub fn contains(&self, id: u32) -> bool {
         self.tasks.contains_key(&id)
+    }
+    pub fn plane_base(&self, id: u32) -> Result<[f32; 3], Error> {
+        Ok(self.tasks.get(&id).ok_or(Error::Task(id))?.plane_base)
+    }
+    pub fn set_plane_base(&mut self, id: u32, base: [f32; 3]) -> Result<(), Error> {
+        if !base.into_iter().all(f32::is_finite) {
+            return Err(Error::Host("invalid plane base"));
+        }
+        self.tasks.get_mut(&id).ok_or(Error::Task(id))?.plane_base = base;
+        Ok(())
     }
     pub fn task_count(&self) -> usize {
         self.tasks.len()

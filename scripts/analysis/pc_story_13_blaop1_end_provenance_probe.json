@@ -1,0 +1,79 @@
+{
+  "13": {
+    "frames": 4400,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:325", "trace-native:326", "trace-native:327", "trace-native:276",
+      "require-hit:241:20", "241:640,441", "require-hit:361:55", "361:640,549",
+      "inspect-log:3950", "inspect-log:4400"
+    ],
+    "review": {
+      "scope": "Reuse only the two verified startup clicks. Send no dialogue input after entry. Frame caps and layer alpha are not acceptance on their own.",
+      "baseline_error": "2026-11/20261120_060957_411669_uom5538o_playthrough/13.events.log:11437",
+      "fixed_read": "2026-11/20261120_063250_205860_uzy48vvq_playthrough/13.events.log:11689",
+      "fixed_wait": "2026-11/20261120_070036_972128_2k91_4nv_playthrough/13.host.log:243",
+      "member": {
+        "source": "scene.int::BLAOP1_END.cst",
+        "sha256": "c09bcb90152977cd9d21b68ec019d627ccc80136036503a5ce376a2ae6020561",
+        "archive_name_seed": "0x69dfd7a6",
+        "codec": "Gbk",
+        "group": 4,
+        "speaker": {"ordinal": 10, "absolute_record": 101, "shared_string": 1001, "bytes": 4, "utf8_bytes": 6},
+        "body": {"ordinal": 11, "absolute_record": 102, "shared_string": 1000, "bytes": 97, "utf8_bytes": 144, "cp932_first_invalid_byte": 27},
+        "wait": {"absolute_record": 103, "opcode": "0x02"}
+      },
+      "fes": {
+        "resource": "meswnd.fes",
+        "sha256": "24d7b9d39471a48939c6ad5329e5f21d2431d8cc4b2168992c1e9cf0ee9ee205",
+        "matching_archive_members": ["UPDATE00.INT::meswnd.fes", "fes.int::meswnd.fes"],
+        "body": {"block": "MES_SETSTRING", "statement_offset": "0x640f", "shared_string": 1000},
+        "speaker": {"block": "MES_SETNAME", "statement_offset": "0x6571", "shared_string": 1001},
+        "ready_block": "MES_SHOW",
+        "vm_wait_address": "0xad0"
+      },
+      "runtime_observation": {
+        "run": "20261120_074717_962322_u6tvk97k_playthrough",
+        "op_movie_load": {"frame": 472, "events_line": 1926},
+        "scene_loaded": {"frame": 2343, "events_line": 7561},
+        "pre_body_controls": [
+          {"frame": 3151, "events_line": 11316, "command": "auto off"},
+          {"frame": 3151, "events_line": 11320, "command": "wait 30"},
+          {"frame": 3181, "events_line": 11428, "command": "wipe wipe19 30 0"},
+          {"frame": 3181, "events_line": 11431, "command": "wait"}
+        ],
+        "shared_publication": {
+          "frame": 3151,
+          "context_handle": 174,
+          "scratch": "0x4ec27",
+          "speaker_read_line": 11307,
+          "speaker_publish_line": 11308,
+          "body_read_line": 11309,
+          "body_publish_line": 11310
+        },
+        "legacy_debug": {"frame": 3212, "speaker_line": 11537, "body_line": 11542, "input_line": 11543},
+        "settled": {"frames": [3950, 4400], "host_lines": [72, 132], "owner": 25, "movies": 0, "body_nonzero_alpha": 25036},
+        "result": "The name and body debug strings match the CST bytes after the logger's lossy UTF-8 conversion. The runtime 327 and 276 call pairs identify the two shared strings. Strict GBK decoding succeeds for both records. The observed layer and wait still lack a source receipt tied to the current FES body generation."
+      },
+      "next_body": {
+        "status": "frozen pending the source and commit receipt for group 4 record 103",
+        "group": 5,
+        "body_record": 106,
+        "wait_record": 107,
+        "wait_opcode": "0x02",
+        "body_bytes": 38,
+        "body_utf8_bytes": 57,
+        "cp932_first_invalid_byte": 33
+      },
+      "following_waits": [
+        {"group": 5, "wait_record": 107, "body_records": [106]},
+        {"group": 6, "wait_record": 109, "body_records": [108]},
+        {"group": 7, "wait_record": 111, "body_records": [110]}
+      ],
+      "acceptance": [
+        "Require natural movie completion and a successful CST load. Correlate the live context, group and ordinals across native 327 and 276; the scratch destination is reused, so bind each publication to its immediately preceding read, not the address alone.",
+        "At the stable wait require movies=0, meswnd.fes in MES_SHOW with WAIT_KEY=true, and nonempty composed body. Record which evidence is missing rather than advancing the page.",
+        "The archived builds report trace_enabled=false for this game. The observation still needs a receipt that binds record 102 to the exact FES statement, natural reveal completion and commit of the same generation. The next page requires that receipt and a single accepted Enter at the verified first wait."
+      ]
+    }
+  }
+}

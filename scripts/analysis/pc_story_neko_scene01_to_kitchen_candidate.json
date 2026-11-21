@@ -1,0 +1,407 @@
+{
+  "schema": "cs2-neko-route-data/v1",
+  "contract_only": true,
+  "scene": "01",
+  "entry": "Normal cold start, isolated profile, no imported save",
+  "prefix_contract": "scripts/analysis/pc_story_neko_startup_segments_candidate.json",
+  "join": {
+    "state": "page",
+    "scene": "01",
+    "group": 11,
+    "record": 146,
+    "window": "meswnd"
+  },
+  "extension": {
+    "added_waits": 20,
+    "presses_after_join": 20,
+    "terminal": [
+      31,
+      461
+    ],
+    "terminal_input": false
+  },
+  "evidence": {
+    "extension": "Offline CST/CSTL evidence; no fresh replay or menu receipt",
+    "to_117": {
+      "run": "F:/CS2-build-cache/playthrough/2026-11/20261120_075232_393843_u0a1c66r_neko_language_stage",
+      "page": [
+        6,
+        117
+      ],
+      "jp_frame": 1497,
+      "cn_frame": 1353
+    },
+    "to_146": {
+      "run": "F:/CS2-build-cache/playthrough/2026-11/20261120_075631_453179_b105vzyu_neko_language_stage",
+      "page": [11, 146],
+      "jp_frame": 2002,
+      "cn_frame": 1730,
+      "physical_presses_per_language": 13,
+      "jp_probe_host_line": 7111,
+      "cn_probe_host_line": 5402,
+      "jp_primary_queue_events_line": 21193,
+      "cn_primary_queue_events_line": 17382,
+      "live_1038_receipt_groups": [0, 1, 2]
+    },
+    "to_146_1756_integration": {
+      "run": "F:/CS2-build-cache/playthrough/2026-11/20261120_180844_499944_ps_6fn9l_neko_language_stage",
+      "player_sha256": "cf2ac89ef4e9d6e16ac188e76e8ad9d1c33cfd1bc1747f8cb616166f1d62b24a",
+      "page": [11, 146],
+      "jp_frame": 2002,
+      "cn_frame": 1730,
+      "physical_presses_per_language": 13,
+      "cstl_receipt_scope": "first_three_pages"
+    }
+  },
+  "runtime_handoff": {
+    "first_batch": "to-200",
+    "example": {
+      "path": "simulator/crates/desktop/examples/story_route/mod.rs",
+      "allowlist_function": "Condition::neko_opening_page",
+      "append_waits": [151, 156, 160, 165, 170, 175, 180, 185, 190, 195, 200],
+      "keep": "Step::is_neko_body_press exact adjacent route and physical receipt, continuous meswnd owner, no fallback, input-free terminal.",
+      "regression": "Reject a skipped or changed wait, a foreign receiver and any press at r200. The next cutoff is r213 in a dedicated probe."
+    },
+    "receipt": {
+      "path": "simulator/crates/desktop/src/cst_context_native.rs",
+      "function": "read_cst_record",
+      "scene_01_source_trace_through_group": 22,
+      "next_probe_trace_caps": {"to-213": 23, "to-218": 24, "to-337": 25},
+      "keep": "Extend the NEKO story-trace diagnostic gate for native 1038; retain 0x20/0x21 and the existing receipt shape. Preserve the localization, provenance and buffer paths.",
+      "expected_r200": { "group": 22, "ordinal": 2, "absolute_record": 198, "control_only_absolute_record": 199 }
+    },
+    "r213_and_r218": {
+      "append_waits_in_order": [213, 218],
+      "required_1038": [
+        {"wait": [23, 213], "ordinal": 9, "body_absolute": 210, "control_only_absolute": 212},
+        {"wait": [24, 218], "ordinal": 2, "body_absolute": 216, "control_only_absolute": 217}
+      ],
+      "policy": "Use each exact terminal in order. Keep the continuous meswnd guard for 200 to 213 and 213 to 218; a changed owner or unexpected ready state stops the segment. The fade and audio waits run on the existing clock."
+    },
+    "kitchen_edge": {
+      "path": "simulator/crates/desktop/examples/story_route/mod.rs",
+      "input_edge": [[24, 218], [25, 337]],
+      "current_guard": "All NEKO turns require PendingMousePress::confirms_window_instance at the successor. This will reject a rebuilt meswnd.",
+      "probe": "For this exact terminal edge, arm from host_replay_body_route_anchor(scene 01, (24,218), Some((25,337)), old owner). Confirm the click on the old owner, observe release, and accept only the settled r337 live meswnd using the successor anchor with the same context and load and a source frame after the press. Use task-create to distinguish a rebuilt window, including numeric owner reuse. Preserve the ordinary continuous guard when the instance survives and on all other edges.",
+      "acceptance": "Verify r316 as the composited source, the current r337 prompt and the expected loaded background/model. Inspect the kitchen pose separately if face13 traces are available."
+    }
+  },
+  "guard": {
+    "wait_kind": "0x02",
+    "point": [
+      625,
+      478
+    ],
+    "hit_region": 77,
+    "candidates": [
+      3,
+      77,
+      52,
+      57,
+      7
+    ],
+    "receipt_region": 52,
+    "key": 0,
+    "group": 0,
+    "response": 1,
+    "require": "Exact before/after page, natural reveal, current composited body and prompt, enabled hit, exact candidate order, physical left-press receipt from the current meswnd owner. Re-probe after a window rebuild; do not assume the same owner or region map.",
+    "stop": "No input during transitions, at terminal probes, or at unknown waits. No fixed-frame clicks, Enter fallback, auto, or skip."
+  },
+  "language_gate": {
+    "native": 1038,
+    "kind": "0x20",
+    "primary_destination": "0x00062c6b",
+    "excluded_english_destination": "0x00063c6b",
+    "jp": {
+      "main_index": 1,
+      "column": 2
+    },
+    "cn": {
+      "main_index": 2,
+      "column": 0
+    },
+    "require": "Match scene-01 CSTL identity, load, group, local ordinal, column, byte length, full SHA-256, and exact composited body provenance. Exclude control-only records from visible sources."
+  },
+  "page_fields": [
+    "group",
+    "wait_record",
+    "body_absolute",
+    "body_ordinal",
+    "cstl_fragment",
+    "control_only_body_absolute",
+    "jp_utf8_bytes",
+    "jp_sha256",
+    "cn_utf8_bytes",
+    "cn_sha256"
+  ],
+  "pages": [
+    [11, 146, 144, 2, 0, [145], 81, "8a100a22895de06c066d91587abba2bca926070a55939af6ae121365eb00b79d", 56, "00e0691c88c98e67b4ad666ea9dfdd193c54ab0bba490b92c20510a76b583d7e"],
+    [12, 151, 149, 2, 0, [150], 93, "1c6829786189bfa5b249e4c67ad3dd70f6354a40da90f9ba43d4d79a3b6202d7", 84, "f161419e0be2e33febe22d4fe01e0fba28a4be3ca431e9529177266f7b7560ad"],
+    [13, 156, 154, 2, 0, [155], 81, "f244bba9a99549d50dc9cf5328b9910a765c3cb3283c651f1023c54b1dc234d0", 75, "1142c5a50b596ab4668983ea2cb2b3caa2b3a0b078b45a44495696b2c20640bd"],
+    [14, 160, 159, 2, 0, [], 63, "312cc2a3772bc784932812d9f5d2fca5cc3995c5034c7ccb225ce73c4152952f", 48, "2a04a9558838f920fdd089f7727c2d59d79a5ea533216a54ae881655025316ab"],
+    [15, 165, 163, 2, 0, [164], 54, "9c73c2b0be716ae7894424029195cdfaa10768f75315dded72b4fadc6d5f002e", 33, "82ea43f377c91a033f906919f55ce280cf5955d9cdd026e6c40f38dbc82b4ac1"],
+    [16, 170, 168, 2, 0, [169], 72, "c246ab5918497b26b46ac6df341fb8162d23638cd4c5f0cfd1ebee1cacaf1f87", 42, "7df371e681ba6151940991d3e35f916e135415b6bc3b880ee00d554337c01bb9"],
+    [17, 175, 173, 2, 0, [174], 81, "20df2593de2867138eb22baada525f2759a69be36175f18e655ff17950d2c525", 54, "434e3ba5bd4f035a1fdadeaa1c9829d1a417563c1261fe5fef4e43eb7d065310"],
+    [18, 180, 178, 2, 0, [179], 87, "1d51e9b40d657c24d21694b4f420fddaf4d857246983617ff464fa9b236496de", 96, "877f5f945fde3c85caaaec1e02fa73b48a1afd10c58043dccf70b4c0dda000f8"],
+    [19, 185, 183, 2, 0, [184], 84, "01ab56e7babba92f63e7e2840a708e0e99b60f259d5fe79e23bebc24090e9f10", 84, "f54c6b79d5845676861075fe20c105a69791e30a8703bd48b90f6cce6d2e1394"],
+    [20, 190, 188, 2, 0, [189], 75, "5e351c92687fac6c55b231a44421e61ba4defb2eef9757b43c7928a8ff981f22", 60, "9f9f04686518d84aef5a2c6a8b86036f9bba839d21001ad5207d39ec266e647e"],
+    [21, 195, 193, 2, 0, [194], 72, "af4c9142d30fd9529bd1f91cd0f672bd6ab6225926c700ca0c92af277794d996", 63, "b602a432b647f899b7a71fd1313a3d6ce1f4ef4147d52d929fa9b8ea983d2429"],
+    [22, 200, 198, 2, 0, [199], 90, "601eba493902f8e2104dee910058feeb6ee5a2147a574c1b5309c91b11f1525a", 66, "9a0ffdc1974ae1f11cc1988ea4eef01a90a1e07d084ad7766ff10033a2af75cd"],
+    [23, 213, 210, 9, 0, [212], 75, "635afef4fcbd59fede88101ea12673792b1ec222cdc672a2d5871ebd7b6f851c", 57, "2b29e0d2a50b48ab6b3dfd596bce17ec0ad8e6752c87081d2b102e268b805a93"],
+    [24, 218, 216, 2, 0, [217], 84, "2cdc860b83ba917e916fe5aa792403aab74ae562c12d2149c054ca7398b10b3d", 81, "05069e65781812e7f9bc80f95ba3470b5267fd92d9e8d89d916ed81c3979ebc7"],
+    [25, 337, 316, 97, 0, [336], 27, "d7baa17d20b9c90d00c10de8ed630978387e55e44ce464fcd002dff9dcb1951b", 18, "edb84678be7ad6b97fb7c7f368e09707d554e169634f6f57887ddfb5cd3f21f7"],
+    [26, 368, 342, 4, 0, [367], 180, "c28ed82e864dc6849a7c9f71dc64a14e89233d0aee30e43e974cf318119fdc07", 84, "830d1fec074c71c0e39ab231ff49fc001c4fa07c5010273efa80894cd7a6706d"],
+    [27, 381, 374, 5, 0, [380], 63, "1a0f96bdeadc98ec95cf4cf282e65dd743776d34aa4c91c31c3da68c46b43167", 51, "5700dc9ad00346ef8b4b769e7cfd3d94127c3bd0bdae7fd0fcd28c5b138ca151"],
+    [28, 399, 384, 2, 0, [398], 72, "75e0887f4705f9f66a3f8b0768f289206eadb4bf003767e0722dfe0df187c4f4", 60, "6852f6a390950c37709cc202d0fe6370cab4c5d29ede99fd73b3c9b735f867ac"],
+    [29, 405, 404, 4, 0, [], 45, "605c3678cadbf3ab3c17f79eadacf8962a57615da73baa07e11b62029afd12c8", 42, "27b882c4305f2f48b4504064c3b9ee66ac3d499550d6a0fd67115c22f52a8bf3"],
+    [30, 410, 409, 3, 0, [], 33, "9878c336ff8f4a3ad7b9ed76f08f7220bfa1d81fb97bb462a86fce72d528bdd4", 42, "29b942a6736c73c33198a73073e876d45b0c6b66364da0e1662ddc4422dcd7c6"],
+    [31, 461, 428, 17, 0, [460], 117, "7c5e2a7c01f446b6aa1aa3ec4728bbe78220d898adc31f154fb7e3372f533620", 93, "be575f3ab41498f557ccbb6b654d8b50dfdf0c60e6d43e361e157ed8fb523929"]
+  ],
+  "segments": [
+    {
+      "from": [
+        11,
+        146
+      ],
+      "to": [
+        22,
+        200
+      ],
+      "presses": 11,
+      "kind": "ordinary_pages"
+    },
+    {
+      "from": [
+        22,
+        200
+      ],
+      "to": [
+        23,
+        213
+      ],
+      "presses": 1,
+      "kind": "fade_and_sound_wait"
+    },
+    {
+      "from": [
+        23,
+        213
+      ],
+      "to": [
+        24,
+        218
+      ],
+      "presses": 1,
+      "kind": "last_pre_kitchen_page"
+    },
+    {
+      "from": [
+        24,
+        218
+      ],
+      "to": [
+        25,
+        337
+      ],
+      "presses": 1,
+      "kind": "kitchen_transition"
+    },
+    {
+      "from": [
+        25,
+        337
+      ],
+      "to": [
+        26,
+        368
+      ],
+      "presses": 1,
+      "kind": "kitchen_motion_wait"
+    },
+    {
+      "from": [
+        26,
+        368
+      ],
+      "to": [
+        31,
+        461
+      ],
+      "presses": 5,
+      "kind": "kitchen_pages_with_motion_and_voice_waits"
+    }
+  ],
+  "transitions": [
+    {
+      "from": [
+        22,
+        200
+      ],
+      "to": [
+        23,
+        213
+      ],
+      "command_records": [
+        201,
+        203,
+        207
+      ],
+      "policy": "Preserve frameoff fade 30, wait mpl, and wait 120. No input during these waits."
+    },
+    {
+      "from": [
+        24,
+        218
+      ],
+      "to": [
+        25,
+        337
+      ],
+      "command_records": [
+        219,
+        221,
+        222,
+        251,
+        254,
+        259,
+        304,
+        308,
+        312,
+        330,
+        335
+      ],
+      "policy": "Preserve fades, motion and audio waits, rdraw, initialize_header, model/background setup and final motion. Same CST scene, rebuilt message window; probe new receiver at the exact ready page."
+    }
+  ],
+  "kitchen": {
+    "first_background_command": 304,
+    "first_model_command": 308,
+    "first_readable_body": 316,
+    "first_ready_page": [
+      25,
+      337
+    ],
+    "background": {
+      "source": "image_bg.int::bg03a_19.hg3",
+      "sha256": "dae41b27ce4530ee3cbb21506c8604f981e030f69f2af3fbd59645c550491c0e"
+    },
+    "model": {
+      "source": "psz.int::ca01_l_body_1.psz",
+      "object": "all_parts",
+      "model_clocks": [
+        77,
+        279
+      ],
+      "sha256": "7050ef92fb8ee44c0ce81c992d37fe3ba3627ff2165b570c18063d83751071b0"
+    },
+    "visual_probe": {
+      "checker": "scripts/analysis/check_neko_kitchen_face.py",
+      "historical_log": "archive/2026-11/20261119_neko_sidecar13_123612_2032/20261119_ascending.host.log",
+      "historical_log_lines": [
+        632,
+        1335
+      ],
+      "policy": "The historical trace is a model/clock oracle, not an exact CST wait or input schedule. Probe only the same waiting loop at a stable kitchen hold, with no input or forced clocks during the samples."
+    }
+  },
+  "ordinary_save_probe": {
+    "status": "ready_page_probe_only_no_save_or_reopen_entry",
+    "staging_mode": "to-218",
+    "needs": "Observed title/scene/menu/confirmation hit and receiver receipts plus dedicated NEKO save/load/menu state guards. Approve an ordinary save only after an independent same-slot reopen and exact successor.",
+    "save_page": [
+      24,
+      218
+    ],
+    "restored_page": [
+      24,
+      218
+    ],
+    "next_page_after_reopen": [
+      25,
+      337
+    ],
+    "entry_validation": {
+      "hover": "Both to-218 terminals probe the body point and Save candidate point at the exact settled r218 frame. Record the enabled mask, ordered press candidates and each live receiver. The probe alone is a candidate observation.",
+      "one_press": "On a separate private run, allow only the exact r218 Save edge after proving the enabled Save control and its routing. Log the physical left press, region, key, group, response and live receiver using InputRouteReceipt. Match the observed tuple, keeping the source r218 context/load and the existing mouse release gate. Leave the slot untouched in this entry run.",
+      "panel_terminal": "Observe the live saveload/WAIT owner and mode flags with a pending-free current-frame driver and the same retained r218 source. Stop at this panel and probe btdata[0] without clicking. Log controller completion, the panel snapshot and slot probe. An unrecognized modal or route tuple stops the run.",
+      "runtime_scope": "Use a dedicated NEKO ready state carrying the live window owner; the current host_replay_menu_ready is ISLAND-only. Keep generic page fallback disabled and disallow the Save edge outside this page and dedicated route."
+    },
+    "save": {
+      "control": "meswnd btn[4]",
+      "command": 19,
+      "button_local_ltrb": [
+        1124,
+        124,
+        1170,
+        180
+      ],
+      "button_probe_point": [1147, 612],
+      "button_probe_evidence": "Probe only: local center projected with default bottom-aligned 1280x260 window on 1280x720 canvas. The live hit and receiver are unverified.",
+      "panel": "saveload/WAIT",
+      "globals": {
+        "800": 0,
+        "801": 1,
+        "860": 0
+      },
+      "locals": {
+        "100": 0,
+        "110": 0
+      },
+      "slot": 0,
+      "slot_control": "btdata[0]",
+      "slot_probe_point": [
+        285,
+        184
+      ],
+      "write_receipt": "fes-datasave slot=0 ... written=true",
+      "private_file": "save0000.dat"
+    },
+    "reopen": {
+      "profile": "Same private profile and identical EXE/resources; change log names, not the output prefix.",
+      "title": "flow/WAIT_TITLE + ttlflow/FES_WAIT + title/WAIT",
+      "title_control": "title btn1[1]",
+      "title_probe_point": [
+        1155,
+        325
+      ],
+      "panel": "ttlflow/LOAD_WAIT + saveload/WAIT",
+      "globals": {
+        "800": 1,
+        "801": 0,
+        "860": 1
+      },
+      "locals": {
+        "100": 0,
+        "110": 1
+      },
+      "slot_control": "btdata[0]",
+      "confirm": "saveload/CONFIRM_WAIT + confirm2/WAIT",
+      "confirm_control": "confirm2 btn[0]",
+      "confirm_probe_point": [
+        559,
+        377
+      ],
+      "expected_panel_exit": 0
+    },
+    "roundtrip_validation": {
+      "write": "Fresh private profile, verify empty ordinary slot 0, use the normal Save panel and confirm any observed modal through its live control. Require one successful fes-datasave slot=0 receipt and one complete save0000.dat; record size and SHA-256 after the write process exits.",
+      "same_profile": "Reopen using a different process and the same output prefix so story_replay uses the same .profile. Keep separate logs, identify the executable and resource tree, and match the title, Load panel, slot 0 and any confirmation receipts. Require actual slot consumption and the naturally composited restored r218 body, followed by one guarded press to fresh r337. Compare the slot hash before and after.",
+      "read_receipt": "Record the successful private slot open after selection and confirmation. If the live path uses native 247, record filename save0000.dat and its nonzero CSS handle at that call site. Record saveload preview and saveexist as panel observations.",
+      "single_slot": "For promotion to the shared ordinary-save manifest, independently reopen in a fresh private profile seeded with only the exact reviewed slot file and the normal cold-start language settings as needed. Do not copy auxiliary save state. Reuse the same resource hash, producer/consumer binary and source hashes, slot size and hash, and write/reopen/resume evidence fields expected by run_playthrough_batch.py."
+    },
+    "policy": "Separate from the uninterrupted bilingual pair. Probe each enabled control and live owner before clicking; numeric regions are unverified. Require a real write, process exit, same-slot reopen and exact restored body before the guarded kitchen edge. No quick save, manual injection or user save."
+  },
+  "cst": {
+    "source": "scene.int::01.cst",
+    "sha256": "47ea1f3d6ba0de16736f5f574bda9297544d220d4998dd3061bb96689ad1c37e"
+  },
+  "cstl": {
+    "source": "scene.int::01.cstl",
+    "sha256": "8085d37fd751947577579ff0ac6eea7a58f5f6863e5df0f4d9561666a6065ae6",
+    "columns": [
+      "cn",
+      "en",
+      "jp"
+    ]
+  }
+}

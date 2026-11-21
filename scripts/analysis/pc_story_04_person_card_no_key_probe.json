@@ -1,0 +1,20 @@
+{
+  "4": {
+    "frames": 1080,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "215:638,446",
+      "require-hit:215:19",
+      "move:372:165,386",
+      "390:165,386",
+      "require-hit:390:15",
+      "inspect-log:585",
+      "inspect-log:610",
+      "inspect-log:820",
+      "inspect-log:1080"
+    ]
+  }
+}

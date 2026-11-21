@@ -461,7 +461,8 @@ pub(crate) fn prepare_navigation(host: &mut LoggingHost<'_>, owner: u32, key: u3
         let button = &buttons[index];
         let layer = &runtime.media[&button.key];
         let mut point = [0, 1].map(|axis| button.position[axis].wrapping_add(layer.navigation.offset[axis]));
-        if let Some(plane) = layer.plane.as_ref().filter(|name| runtime.planes.get(*name).is_some_and(|plane| plane.expose != 0)) {
+        if let Some(plane) = layer.plane.as_deref().and_then(|name| runtime.driver_plane_key(name))
+            .filter(|name| runtime.planes[*name].expose != 0) {
             let view = FesTaskView { id: owner, parent: 0, context: Vec::new(), list: None, now: 0, paused: 0 };
             let words = crate::fes_motion::plane_render_properties(host, &view, runtime, plane)?;
             for axis in 0..2 { point[axis] = point[axis].wrapping_add(x86_integer(f32::from_bits(words[6 + axis]))); }
@@ -493,11 +494,7 @@ pub(crate) fn advance_navigation(host: &mut LoggingHost<'_>, owner: u32,
     }
     if pending.stage == 1 {
         if let Some(point) = pending.pointer {
-            let input = host.input_task.owner_id.context("navigation has no input task")?;
-            let packed = (point[0] as u32 & 0xffff) | (point[1] as u32).wrapping_shl(16);
-            host.receive_device_input_buffers(TaskCommand { target: input as i32, sender: owner as i32,
-                code: 139, data: [1, packed, 0] }, &mut Default::default(), &mut 0)?
-                .context("navigation input receiver is absent")?;
+            host.move_fes_navigation_pointer(owner, point)?;
         }
         pending.stage = 2;
     }

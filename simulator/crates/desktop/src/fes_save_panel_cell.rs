@@ -184,8 +184,6 @@ pub(super) fn apply_sources(panel: &mut bank::Bank, host: &mut LoggingHost<'_>) 
                 let image = if bytes.starts_with(b"HG-3") || bytes.starts_with(b"HG-2") {
                     host.decode_managed_image_frame(bytes, 0)?
                 } else { None };
-                // CSS image content preserves the decoder's row order. The
-                // separate HG-resource path reverses rows during composition.
                 if let Some(image) = image {
                     let content = panel.contents.entry(id).or_default();
                     content.record.put(0, kind); content.record.put(0x28, 0);

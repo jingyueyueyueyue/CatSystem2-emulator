@@ -1,0 +1,31 @@
+{
+  "9": {
+    "frames": 920,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:450",
+      "trace-native:630",
+      "move:360:140,354",
+      "require-hit:380:14",
+      "380:140,354",
+      "inspect-log:448",
+      "inspect-log:449",
+      "inspect-log:450",
+      "inspect-log:617",
+      "inspect-log:618",
+      "inspect-log:619",
+      "inspect-log:662",
+      "inspect-log:663",
+      "inspect-log:900"
+    ]
+  },
+  "review": {
+    "purpose": "Compare the MES_SETSTATE and MES_SHOW notification returns on old and new players from a fresh start.",
+    "input": "Only the previously observed New Game click. No body keys, saved state, or captures.",
+    "acceptance": "Use native calls, the live driver and committed body generation as anchors. Frame numbers are checkpoints from the old run, not permission to advance. An unknown or shifted title hit stops the scenario."
+  }
+}

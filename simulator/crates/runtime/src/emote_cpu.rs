@@ -1,4 +1,4 @@
-//! Independent PSB motion sampling and CPU texture/mesh rasterization.
+//! Independent PSB motion sampling and reference f64 texture/mesh rasterization.
 //!
 //! Strict mode rejects unsupported stencil/skin/controller features. Explicit
 //! diagnostic previews return their warnings beside the pixels and never count
@@ -357,6 +357,11 @@ impl CpuPlayer {
             reference_timelines: super::timeline::CpuReferenceTimelines::default(),
         }
     }
+
+    pub fn shared_motion_model(&self) -> &Arc<CpuMotionModel> {
+        &self.model
+    }
+
     pub fn select_motion(&mut self, object: &str, motion: &str, frame: f64) -> Result<()> {
         self.model.motion(object, motion)?;
         if !frame.is_finite() {
@@ -510,12 +515,13 @@ impl CpuPlayer {
         let variables = self.effective_variables()?;
         let mut references = self.reference_timelines.clone();
         references.begin(&self.object, &self.motion);
+        let mut target = CpuDrawTarget::default();
         let mut context = RenderContext {
             player: self, variables: &variables,
             viewport: CpuViewport { width: 1, height: 1, origin_x: 0.0, origin_y: 0.0,
                                     scale: 1.0, time_units_per_frame: 1.0 },
-            pixels: Vec::new(), warnings: BTreeSet::new(), layers: 0, triangles: 0,
-            sampled_pixels: 0, active: BTreeSet::new(), references,
+            target: &mut target, warnings: BTreeSet::new(), layers: 0, triangles: 0,
+            active: BTreeSet::new(), references,
             reference_path: Vec::new(), reference_update: true,
             reference_raw_time: self.frame,
         };
@@ -545,21 +551,54 @@ impl CpuPlayer {
     fn render_resolved(
         &self, viewport: CpuViewport, variables: &BTreeMap<String, f64>, mut pixels: Vec<u8>,
     ) -> Result<DiagnosticFrame> {
-        let mut references = self.reference_timelines.clone();
-        references.begin(&self.object, &self.motion);
         let byte_count = viewport.width as usize * viewport.height as usize * 4;
         pixels.clear();
         pixels.reserve_exact(byte_count);
         pixels.resize(byte_count, 0);
+        let mut target = CpuDrawTarget {
+            pixels,
+            sampled_pixels: 0,
+            columns: None,
+        };
+        let draws = self.draw_primitives_resolved(viewport, variables, &mut target)?;
+        let frame = EmoteRasterFrame::new(viewport.width, viewport.height, [0, 0], target.pixels)?;
+        Ok(DiagnosticFrame {
+            frame,
+            warnings: draws.warnings,
+            layers: draws.layers,
+            triangles: draws.triangles,
+            sampled_pixels: target.sampled_pixels,
+        })
+    }
+
+    /// Submit one pose in model draw order, using the current effective variables.
+    /// Commit a target's output only after checking the returned diagnostics.
+    pub fn draw_primitives<T: EmoteDrawTarget>(
+        &self,
+        viewport: CpuViewport,
+        target: &mut T,
+    ) -> Result<EmoteDrawDiagnostics> {
+        viewport.check()?;
+        let variables = self.effective_variables()?;
+        self.draw_primitives_resolved(viewport, &variables, target)
+    }
+
+    pub fn draw_primitives_resolved<T: EmoteDrawTarget>(
+        &self,
+        viewport: CpuViewport,
+        variables: &BTreeMap<String, f64>,
+        target: &mut T,
+    ) -> Result<EmoteDrawDiagnostics> {
+        let mut references = self.reference_timelines.clone();
+        references.begin(&self.object, &self.motion);
         let mut context = RenderContext {
             player: self,
             variables,
             viewport,
-            pixels,
+            target,
             warnings: BTreeSet::new(),
             layers: 0,
             triangles: 0,
-            sampled_pixels: 0,
             active: BTreeSet::new(),
             references,
             reference_path: Vec::new(),
@@ -612,19 +651,23 @@ impl CpuPlayer {
         //Draws sample a private copy. Only the explicit per-tick update hook
         //commits visibility/release, so a second color/mask/render pass cannot
         //consume time or destroy holders absent from its primitive schedule.
-        let frame = EmoteRasterFrame::new(viewport.width, viewport.height, [0, 0], context.pixels)?;
-        Ok(DiagnosticFrame {
-            frame,
+        Ok(EmoteDrawDiagnostics {
             warnings: context.warnings.into_iter().collect(),
             layers: context.layers,
             triangles: context.triangles,
-            sampled_pixels: context.sampled_pixels,
         })
     }
 
     pub fn render_strict(&self, viewport: CpuViewport) -> Result<EmoteRasterFrame> {
         self.render_preview(viewport)?.into_strict()
     }
+}
+
+pub struct EmoteDrawDiagnostics {
+    /// Nonempty warnings forbid treating this pose as successful native draw.
+    pub warnings: Vec<String>,
+    pub layers: usize,
+    pub triangles: usize,
 }
 
 pub struct DiagnosticFrame {
@@ -777,15 +820,14 @@ fn mesh_raster_plan(
     Ok((geometry, delta))
 }
 
-struct RenderContext<'a> {
+struct RenderContext<'a, T> {
     player: &'a CpuPlayer,
     variables: &'a BTreeMap<String, f64>,
     viewport: CpuViewport,
-    pixels: Vec<u8>,
+    target: &'a mut T,
     warnings: BTreeSet<String>,
     layers: usize,
     triangles: usize,
-    sampled_pixels: usize,
     active: BTreeSet<(String, String)>,
     references: super::timeline::CpuReferenceTimelines,
     reference_path: Vec<usize>,
@@ -846,7 +888,7 @@ struct ColorPrimitive {
     stencils: Vec<OwnedStencilScope>,
 }
 
-impl RenderContext<'_> {
+impl<T: EmoteDrawTarget> RenderContext<'_, T> {
     ///35124 binds a motion's own parameter record to player+2d0;
     ///3abf1..3ac2a consumes that cursor instead of advancing ordinary time.
     ///This is independent of the referencing layer's parameter selection.
@@ -940,7 +982,7 @@ impl RenderContext<'_> {
         //A frame's owner/source samples are immutable. Reuse the actual
         //linked plane for the same complete chain, instead of resampling
         //every captured motion for every color sprite in that chain.
-        let mut planes: BTreeMap<Vec<(usize, usize)>, Arc<(CpuStencilBuffer, u8)>> = BTreeMap::new();
+        let mut planes: BTreeMap<Vec<(usize, usize)>, Arc<(T::Stencil, u8)>> = BTreeMap::new();
         for primitive in primitives {
             let draw = primitive.motion.pending[primitive.index].as_ref().unwrap();
             let scopes: Vec<_> = primitive.stencils.iter().map(|scope| StencilScope {
@@ -962,12 +1004,12 @@ impl RenderContext<'_> {
             } else {
                 None
             };
-            let mut pass = SpritePass::Color(
+            let pass = EmoteSpritePass::Color(
                 clip.as_deref().map(|(buffer, reference)| (buffer, *reference)),
             );
             self.sprite(
                 &draw.content, draw.transform, &draw.warps, draw.mesh_grid,
-                draw.mesh_owner, &mut pass,
+                draw.mesh_owner, pass,
             )?;
         }
         Ok(())
@@ -987,9 +1029,10 @@ impl RenderContext<'_> {
         if depth > 64 || !self.active.insert((object.to_owned(), name.to_owned())) {
             return Err(unsupported("recursive/cyclic PSB motion reference"));
         }
-        let motion = self.player.model.motion(object, name)?.clone();
-        let frame = self.motion_frame(&motion, time)?;
-        let layers = field(&motion, "layer")?
+        let player = self.player;
+        let motion = player.model.motion(object, name)?;
+        let frame = self.motion_frame(motion, time)?;
+        let layers = field(motion, "layer")?
             .list()
             .ok_or_else(|| unsupported("motion layer list"))?;
         let params = motion
@@ -999,7 +1042,7 @@ impl RenderContext<'_> {
         //For a parameter-driven motion both+100/+104 equal that cursor;
         //ordinary owners retain the raw clock from the captured reference.
         let previous_raw = self.reference_raw_time;
-        self.reference_raw_time = self.bound_parameter_clock(&motion, params)?.unwrap_or(previous_raw);
+        self.reference_raw_time = self.bound_parameter_clock(motion, params)?.unwrap_or(previous_raw);
         // PSB priority indexes the entire preorder layer tree, not only the
         // roots in motion.layer. Transform collection and draw ordering are
         // separate; otherwise sprites may be omitted or children drawn twice.
@@ -1019,13 +1062,13 @@ impl RenderContext<'_> {
             )?;
         }
         self.bind_references(&mut pending)?;
-        let bindings = super::resolve_emote_stencil_bindings(&motion)?;
+        let bindings = super::resolve_emote_stencil_bindings(motion)?;
         let order = if self.reference_update {
             //Native player update visits physical references even if their
             //motion currently emits no primitive in the priority schedule.
             (0..pending.len()).collect()
         } else {
-            priority_order(&motion, frame, pending.len())?
+            priority_order(motion, frame, pending.len())?
         };
         let scope = Arc::new(MotionPrimitives {
             pending: pending.into_iter().map(|draw| draw.map(Arc::new)).collect(),
@@ -1434,7 +1477,7 @@ impl RenderContext<'_> {
     fn stencil_source_range(
         &mut self,
         draws: &[Arc<DrawLayer>],
-        plane: &mut CpuStencilBuffer,
+        plane: &mut T::Stencil,
         reference: u8,
         operation: CpuStencilWrite,
     ) -> Result<()> {
@@ -1445,8 +1488,8 @@ impl RenderContext<'_> {
             if !matches!(draw.kind, 0 | 12) || string(&draw.content, "src") == Some("blank") {
                 continue;
             }
-            let mut pass = SpritePass::Mask {
-                buffer: &mut *plane,
+            let pass = EmoteSpritePass::Mask {
+                buffer: plane,
                 reference,
                 operation,
             };
@@ -1456,7 +1499,7 @@ impl RenderContext<'_> {
                 &draw.warps,
                 draw.mesh_grid,
                 draw.mesh_owner,
-                &mut pass,
+                pass,
             )?;
         }
         Ok(())
@@ -1467,7 +1510,7 @@ impl RenderContext<'_> {
     fn literal_stencil_clip(
         &mut self,
         scopes: &[StencilScope<'_>],
-    ) -> Result<Option<(CpuStencilBuffer, u8)>> {
+    ) -> Result<Option<(T::Stencil, u8)>> {
         let mut selected = Vec::new();
         for scope in scopes {
             for owner in scope.owners.iter().rev() {
@@ -1487,8 +1530,7 @@ impl RenderContext<'_> {
             .map(|(binding, _)| binding.stencil_type)
             .collect();
         let plan = super::stencil::linked_stencil_plan(&kinds)?;
-        let mut plane = CpuStencilBuffer::new(self.viewport.width, self.viewport.height)?;
-        plane.clear(plan.clear);
+        let mut plane = self.target.new_stencil(self.viewport, plan.clear)?;
         for (owner, reference, operation) in plan.passes {
             let (binding, scope) = selected[owner];
             if binding.stencil_type & 4 != 0 {
@@ -1512,7 +1554,7 @@ impl RenderContext<'_> {
                     // must still reject color; it must not remove the clip.
                     continue;
                 }
-                let mut pass = SpritePass::Mask {
+                let pass = EmoteSpritePass::Mask {
                     buffer: &mut plane,
                     reference,
                     operation,
@@ -1523,7 +1565,7 @@ impl RenderContext<'_> {
                     &draw.warps,
                     draw.mesh_grid,
                     draw.mesh_owner,
-                    &mut pass,
+                    pass,
                 )?;
             }
         }
@@ -1581,7 +1623,7 @@ impl RenderContext<'_> {
         warps: &[MeshAncestor],
         mesh_grid: Option<CpuMeshGrid>,
         mesh_owner: usize,
-        pass: &mut SpritePass<'_>,
+        pass: EmoteSpritePass<'_, T::Stencil>,
     ) -> Result<()> {
         let source = string(content, "src").ok_or_else(|| unsupported("sprite source"))?;
         let name = string(content, "icon").ok_or_else(|| unsupported("sprite icon"))?;
@@ -1597,11 +1639,11 @@ impl RenderContext<'_> {
             .get("icon")
             .and_then(|v| v.get(name))
             .ok_or_else(|| unsupported(format!("missing texture icon {source}/{name}")))?;
-        let texture = self
+        let (source, texture) = self
             .player
             .model
             .textures
-            .get(source)
+            .get_key_value(source)
             .ok_or_else(|| unsupported("missing decoded texture"))?;
         let width = num(icon, "width", 0.0)?;
         let height = num(icon, "height", 0.0)?;
@@ -1618,7 +1660,7 @@ impl RenderContext<'_> {
         {
             return Err(unsupported("icon texture rectangle"));
         }
-        let is_mask = matches!(&*pass, SpritePass::Mask { .. });
+        let is_mask = matches!(&pass, EmoteSpritePass::Mask { .. });
         if !is_mask && num(content, "bm", 0.0)? != 0.0 {
             self.warnings.insert("sprite blend mode unsupported".into());
         }
@@ -1650,11 +1692,10 @@ impl RenderContext<'_> {
             .and_then(|n| self.triangles.checked_add(n))
             .filter(|&n| n <= MAX_DRAW_TRIANGLES)
             .ok_or(EmoteError::Capacity)?;
-        let _ = count;
         //Native58720/2f080 materializes one shared node grid before emitting
         //row strips. Sample each ancestor warp once per node, then reuse the
         //same XY/UV for adjacent cells in both real color and mask passes.
-        let (stride, vertex_count) = grid.raster_layout()?;
+        let (_, vertex_count) = grid.raster_layout()?;
         let mut vertices = Vec::with_capacity(vertex_count);
         for y in 0..=grid.rows {
             for x in 0..=grid.columns {
@@ -1674,34 +1715,15 @@ impl RenderContext<'_> {
                 ]);
             }
         }
-        for y in 0..grid.rows {
-            for x in 0..grid.columns {
-                let first = y as usize * stride + x as usize;
-                let v = [vertices[first], vertices[first + 1],
-                         vertices[first + stride], vertices[first + stride + 1]];
-                raster(
-                    &mut self.pixels,
-                    self.viewport.width,
-                    self.viewport.height,
-                    [v[0], v[1], v[2]],
-                    texture,
-                    raster_opacity,
-                    &mut self.sampled_pixels,
-                    pass.raster_pass(),
-                )?;
-                raster(
-                    &mut self.pixels,
-                    self.viewport.width,
-                    self.viewport.height,
-                    [v[2], v[1], v[3]],
-                    texture,
-                    raster_opacity,
-                    &mut self.sampled_pixels,
-                    pass.raster_pass(),
-                )?;
-                self.triangles += 2;
-            }
-        }
+        let mesh = EmoteSpriteMesh {
+            source,
+            texture,
+            opacity: raster_opacity,
+            vertices,
+            grid,
+        };
+        self.target.draw_sprite(self.viewport, mesh, pass)?;
+        self.triangles = count;
         Ok(())
     }
 }
@@ -1779,16 +1801,66 @@ enum StencilRaster<'a> {
     },
 }
 
-enum SpritePass<'a> {
-    Color(Option<(&'a CpuStencilBuffer, u8)>),
+/// One model sprite. XY is in viewport pixels, UV in atlas pixels.
+pub struct EmoteSpriteMesh<'a> {
+    /// Texture identity within the player's shared model. The model instance
+    /// owns the decoded pixels, including its selected texture filter.
+    pub source: &'a str,
+    pub texture: &'a CpuTexture,
+    pub opacity: f64,
+    pub vertices: Vec<[f64; 4]>,
+    grid: CpuMeshGrid,
+}
+
+impl EmoteSpriteMesh<'_> {
+    /// Keep evaluated geometry and borrow its texture from the shared model.
+    pub fn retain<'a>(self, model: &'a CpuMotionModel) -> Result<EmoteSpriteMesh<'a>> {
+        let (source, texture) = model.textures.get_key_value(self.source)
+            .filter(|(_, texture)| std::ptr::eq(*texture, self.texture))
+            .ok_or_else(|| unsupported("E-mote draw texture does not belong to model"))?;
+        Ok(EmoteSpriteMesh { source, texture, opacity: self.opacity, vertices: self.vertices, grid: self.grid })
+    }
+
+    pub fn triangle_indices(&self) -> impl Iterator<Item = [usize; 3]> + '_ {
+        let columns = self.grid.columns as usize;
+        let stride = columns + 1;
+        (0..self.grid.rows as usize).flat_map(move |y| {
+            (0..columns).flat_map(move |x| {
+                let first = y * stride + x;
+                let next_row = first + stride;
+                [[first, first + 1, next_row], [next_row, first + 1, next_row + 1]]
+            })
+        })
+    }
+}
+
+pub enum EmoteSpritePass<'a, Stencil> {
+    /// Straight RGBA source-over with an optional stencil equality test.
+    Color(Option<(&'a Stencil, u8)>),
+    /// Test round(sampled alpha) > 64 and stencil equality, then write.
     Mask {
-        buffer: &'a mut CpuStencilBuffer,
+        buffer: &'a mut Stencil,
         reference: u8,
         operation: CpuStencilWrite,
     },
 }
 
-impl SpritePass<'_> {
+/// Receives clear, mask and color operations in their required order.
+/// Clip all operations to the viewport. An error may leave a partial pose
+/// in the target, so callers must discard any output from a failed draw.
+pub trait EmoteDrawTarget {
+    type Stencil;
+
+    fn new_stencil(&mut self, viewport: CpuViewport, clear: u8) -> Result<Self::Stencil>;
+    fn draw_sprite(
+        &mut self,
+        viewport: CpuViewport,
+        mesh: EmoteSpriteMesh<'_>,
+        pass: EmoteSpritePass<'_, Self::Stencil>,
+    ) -> Result<()>;
+}
+
+impl EmoteSpritePass<'_, CpuStencilBuffer> {
     fn raster_pass(&mut self) -> Option<StencilRaster<'_>> {
         match self {
             Self::Color(None) => None,
@@ -1806,6 +1878,68 @@ impl SpritePass<'_> {
                 operation: *operation,
             }),
         }
+    }
+}
+
+#[derive(Default)]
+pub struct CpuDrawTarget<'a> {
+    pixels: Vec<u8>,
+    sampled_pixels: usize,
+    columns: Option<&'a [Vec<usize>]>,
+}
+
+/// Apply the reference rasterizer to selected pixels of an evaluated pose.
+/// Each row contains sorted, unique viewport X coordinates.
+pub fn repair_emote_raster(
+    viewport: CpuViewport,
+    rows: &[Vec<usize>],
+    draw: impl FnOnce(&mut CpuDrawTarget<'_>) -> Result<()>,
+) -> Result<EmoteRasterFrame> {
+    viewport.check()?;
+    if rows.len() != viewport.height as usize || rows.iter().any(|row|
+        row.last().is_some_and(|&last| last >= viewport.width as usize)
+            || row.windows(2).any(|pair| pair[0] >= pair[1]))
+    {
+        return Err(unsupported("invalid E-mote raster repair coordinates"));
+    }
+    let mut target = CpuDrawTarget {
+        pixels: vec![0; viewport.width as usize * viewport.height as usize * 4],
+        sampled_pixels: 0,
+        columns: Some(rows),
+    };
+    draw(&mut target)?;
+    EmoteRasterFrame::new(viewport.width, viewport.height, [0, 0], target.pixels)
+}
+
+impl EmoteDrawTarget for CpuDrawTarget<'_> {
+    type Stencil = CpuStencilBuffer;
+
+    fn new_stencil(&mut self, viewport: CpuViewport, clear: u8) -> Result<Self::Stencil> {
+        let mut plane = CpuStencilBuffer::new(viewport.width, viewport.height)?;
+        plane.clear(clear);
+        Ok(plane)
+    }
+
+    fn draw_sprite(
+        &mut self,
+        viewport: CpuViewport,
+        mesh: EmoteSpriteMesh<'_>,
+        mut pass: EmoteSpritePass<'_, Self::Stencil>,
+    ) -> Result<()> {
+        for indices in mesh.triangle_indices() {
+            raster(
+                &mut self.pixels,
+                viewport.width,
+                viewport.height,
+                indices.map(|index| mesh.vertices[index]),
+                mesh.texture,
+                mesh.opacity,
+                &mut self.sampled_pixels,
+                pass.raster_pass(),
+                self.columns,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1837,8 +1971,156 @@ pub fn rasterize_emote_stencil_triangle(
             reference,
             operation,
         }),
+        None,
     )?;
     Ok(written)
+}
+
+fn scanline_boundary(mut start: usize, mut end: usize, before: impl Fn(usize) -> bool) -> usize {
+    while start < end {
+        let mid = start + (end - start) / 2;
+        if before(mid) {
+            start = mid + 1;
+        } else {
+            end = mid;
+        }
+    }
+    start
+}
+
+fn raster_scanline(
+    mut start: usize,
+    mut end: usize,
+    row_edges: [(f64, f64, f64); 3],
+    inclusive: [bool; 3],
+) -> std::ops::Range<usize> {
+    for ((row, origin_x, dy), inclusive) in row_edges.into_iter().zip(inclusive) {
+        if start == end {
+            break;
+        }
+        let inside = |x: usize| {
+            let edge = row - dy * (x as f64 - origin_x);
+            edge > 0.0 || (edge == 0.0 && inclusive)
+        };
+        let left_inside = inside(start);
+        let right_inside = inside(end - 1);
+        match (left_inside, right_inside) {
+            (false, false) => return start..start,
+            (true, true) => {}
+            (false, true) => start = scanline_boundary(start + 1, end, |x| !inside(x)),
+            (true, false) => end = scanline_boundary(start + 1, end, inside),
+        }
+    }
+    start..end
+}
+
+fn accelerated_scanline(
+    mut start: usize,
+    mut end: usize,
+    row_edges: [(f64, f64, f64); 3],
+    reciprocal_dy: [f64; 3],
+    inclusive: [bool; 3],
+) -> std::ops::Range<usize> {
+    for (((row, origin, dy), reciprocal), inclusive) in
+        row_edges.into_iter().zip(reciprocal_dy).zip(inclusive)
+    {
+        if start == end {
+            break;
+        }
+        let inside = |x: usize| {
+            let edge = row - dy * (x as f64 - origin);
+            edge > 0.0 || (edge == 0.0 && inclusive)
+        };
+        let left_inside = inside(start);
+        let right_inside = inside(end - 1);
+        if left_inside == right_inside {
+            if !left_inside {
+                return start..start;
+            }
+            continue;
+        }
+        let before = |x| inside(x) == left_inside;
+        let boundary = if end - start >= 12 {
+            // Locate the crossing, then recheck both sides with the original
+            // predicate. Near ties and extreme coordinates retain bisection.
+            let estimate = ((row * reciprocal + origin) as usize).clamp(start, end - 1);
+            if before(estimate) && estimate + 1 < end && !before(estimate + 1) {
+                estimate + 1
+            } else if !before(estimate) && estimate > start && before(estimate - 1) {
+                estimate
+            } else {
+                scanline_boundary(start + 1, end, before)
+            }
+        } else {
+            scanline_boundary(start + 1, end, before)
+        };
+        if left_inside {
+            end = boundary;
+        } else {
+            start = boundary;
+        }
+    }
+    start..end
+}
+
+/// Covered horizontal run of a textured triangle. UV starts at the first
+/// covered pixel, and advances by the given amount for each subsequent pixel.
+pub struct EmoteTextureSpan {
+    pub y: u32,
+    pub x: std::ops::Range<u32>,
+    pub uv: [f64; 2],
+    pub step: [f64; 2],
+}
+
+/// Uses the CPU rasterizer's integer sample positions and top-left rule.
+/// Hardware triangle setup can change coverage when an edge lies near an
+/// integer pixel center, even when vertex conversion has a tiny error.
+pub fn visit_emote_texture_spans(
+    mut vertices: [[f64; 4]; 3],
+    size: [u32; 2],
+    mut visit: impl FnMut(EmoteTextureSpan),
+) -> Result<()> {
+    if !vertices.iter().flatten().all(|value| value.is_finite())
+        || vertices.iter().any(|v| v[0].abs().max(v[1].abs()) > 1e12)
+    {
+        return Err(unsupported("invalid accelerated E-mote triangle"));
+    }
+    let mut area = edge(vertices[0], vertices[1], vertices[2][0], vertices[2][1]);
+    if area.abs() < 1e-12 {
+        return Ok(());
+    }
+    if area < 0.0 {
+        vertices.swap(1, 2);
+        area = -area;
+    }
+    let bounds = [0, 1].map(|axis| {
+        let lo = vertices.iter().map(|v| v[axis]).fold(f64::INFINITY, f64::min);
+        let hi = vertices.iter().map(|v| v[axis]).fold(f64::NEG_INFINITY, f64::max);
+        let clip = |n: f64| n.ceil().clamp(0.0, f64::from(size[axis])) as usize;
+        clip(lo)..clip(hi)
+    });
+    let edges = [(vertices[1], vertices[2]), (vertices[2], vertices[0]), (vertices[0], vertices[1])];
+    let inclusive = edges.map(|(a, b)| b[1] < a[1] || (b[1] == a[1] && b[0] > a[0]));
+    let reciprocal_dy =
+        (size[0] >= 640).then(|| edges.map(|(a, b)| (b[1] - a[1]).recip()));
+    let step = [2, 3].map(|axis| (0..3).map(|i| {
+        (edges[i].0[1] - edges[i].1[1]) / area * vertices[i][axis]
+    }).sum());
+    for y in bounds[1].clone() {
+        let row_edges = edges.map(|(a, b)| ((b[0] - a[0]) * (y as f64 - a[1]), a[0], b[1] - a[1]));
+        let run = if let Some(reciprocal_dy) = reciprocal_dy {
+            accelerated_scanline(bounds[0].start, bounds[0].end, row_edges, reciprocal_dy, inclusive)
+        } else {
+            raster_scanline(bounds[0].start, bounds[0].end, row_edges, inclusive)
+        };
+        if run.is_empty() {
+            continue;
+        }
+        let weights = row_edges.map(|(row, origin, dy)| (row - dy * (run.start as f64 - origin)) / area);
+        let uv = [2, 3].map(|axis| (0..3).map(|i| weights[i] * vertices[i][axis]).sum());
+        visit(EmoteTextureSpan { y: y as u32, x: run.start as u32..run.end as u32, uv, step });
+    }
+    Ok(())
 }
 
 fn raster(
@@ -1850,6 +2132,7 @@ fn raster(
     opacity: f64,
     samples: &mut usize,
     mut stencil: Option<StencilRaster<'_>>,
+    columns: Option<&[Vec<usize>]>,
 ) -> Result<()> {
     texture.check()?;
     if !opacity.is_finite() {
@@ -1896,50 +2179,80 @@ fn raster(
         top_left(v[2], v[0]),
         top_left(v[0], v[1]),
     ];
+    // The width cutoff avoids searching short ranges. Bounded XY ensures
+    // intermediate f64 operations are finite and the edge predicate is
+    // monotonic across each scanline, including ties at shared edges.
+    let clip_scanlines = xmax - xmin >= 32
+        && v.iter().all(|point| point[0].abs().max(point[1].abs()) <= 1e12);
+    let edges = [(v[1], v[2]), (v[2], v[0]), (v[0], v[1])].map(|(a, b)| {
+        (a[0], a[1], b[0] - a[0], b[1] - a[1])
+    });
+    let texels = texture.rgba.as_chunks::<4>().0;
     for y in ymin..ymax {
-        for x in xmin..xmax {
-            let es = [
-                edge(v[1], v[2], x as f64, y as f64),
-                edge(v[2], v[0], x as f64, y as f64),
-                edge(v[0], v[1], x as f64, y as f64),
-            ];
-            if (0..3).any(|i| es[i] < 0.0 || (es[i] == 0.0 && !inclusive[i])) {
+        let selected = if let Some(rows) = columns {
+            let row = &rows[y];
+            if row.is_empty() || row[row.len() - 1] < xmin || row[0] >= xmax {
                 continue;
+            }
+            let start = row.partition_point(|&x| x < xmin);
+            let end = start + row[start..].partition_point(|&x| x < xmax);
+            if start == end {
+                continue;
+            }
+            Some(&row[start..end])
+        } else {
+            None
+        };
+        let row_edges = edges.map(|(origin_x, origin_y, dx, dy)| {
+            (dx * (y as f64 - origin_y), origin_x, dy)
+        });
+        let mut draw = |x: usize| {
+            let es = row_edges.map(|(row, origin_x, dy)| row - dy * (x as f64 - origin_x));
+            if (0..3).any(|i| es[i] < 0.0 || (es[i] == 0.0 && !inclusive[i])) {
+                return;
+            }
+            if let Some(StencilRaster::Test { buffer, reference }) = stencil.as_ref()
+                && !buffer.test_equal(x as u32, y as u32, *reference)
+            {
+                return;
             }
             let w = es.map(|n| n / area);
             let tx = (0..3).map(|i| w[i] * v[i][2]).sum::<f64>();
             let ty = (0..3).map(|i| w[i] * v[i][3]).sum::<f64>();
-            let color = sample_texture(texture, tx, ty);
+            let color = sample_texture(texels, texture.width, texture.height, tx, ty);
             let alpha = (color[3] / 255.0 * opacity).clamp(0.0, 1.0);
-            match stencil.as_mut() {
-                Some(StencilRaster::Write {
-                    buffer,
-                    reference,
-                    operation,
-                }) => {
-                    if buffer.write_fragment(
-                        x as u32,
-                        y as u32,
-                        (alpha * 255.0).round() as u8,
-                        *reference,
-                        *operation,
-                    ) {
-                        *samples += 1;
-                    }
-                    continue;
+            if let Some(StencilRaster::Write { buffer, reference, operation }) = stencil.as_mut() {
+                if buffer.write_fragment(
+                    x as u32,
+                    y as u32,
+                    (alpha * 255.0).round() as u8,
+                    *reference,
+                    *operation,
+                ) {
+                    *samples += 1;
                 }
-                Some(StencilRaster::Test { buffer, reference }) => {
-                    if !buffer.test_equal(x as u32, y as u32, *reference) {
-                        continue;
-                    }
-                }
-                None => {}
+                return;
             }
             let offset = (y * width as usize + x) * 4;
+            if alpha == 0.0 {
+                // Source-over preserves the destination bytes. Keep counting
+                // fragments whose destination was already nontransparent.
+                *samples += usize::from(pixels[offset + 3] != 0);
+                return;
+            }
+            if alpha == 1.0 {
+                let destination = &mut pixels[offset..offset + 4];
+                for channel in 0..3 {
+                    destination[channel] = color[channel].round().clamp(0.0, 255.0) as u8;
+                }
+                destination[3] = 255;
+                *samples += 1;
+                return;
+            }
             let destination_alpha = f64::from(pixels[offset + 3]) / 255.0;
             let combined_alpha = alpha + destination_alpha * (1.0 - alpha);
             if combined_alpha == 0.0 {
-                continue;
+                return;
             }
             // EmoteRasterFrame/Canvas exchange straight RGBA. Retaining a
             // premultiplied RGB here would apply alpha twice at submission.
@@ -1952,13 +2265,40 @@ fn raster(
             }
             pixels[offset + 3] = (combined_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
             *samples += 1;
+        };
+        if let Some(selected) = selected {
+            // Exact fragment tests are cheaper than finding both edges for
+            // rows with only a few uncertain pixels.
+            if clip_scanlines && selected.len() >= 16 {
+                let scanline = raster_scanline(
+                    selected[0], selected[selected.len() - 1] + 1, row_edges, inclusive,
+                );
+                let start = selected.partition_point(|&x| x < scanline.start);
+                for &x in &selected[start..] {
+                    if x >= scanline.end {
+                        break;
+                    }
+                    draw(x);
+                }
+            } else {
+                for &x in selected {
+                    draw(x);
+                }
+            }
+        } else {
+            let scanline = if clip_scanlines {
+                raster_scanline(xmin, xmax, row_edges, inclusive)
+            } else {
+                xmin..xmax
+            };
+            for x in scanline { draw(x); }
         }
     }
     Ok(())
 }
-fn sample_texture(texture: &CpuTexture, x: f64, y: f64) -> [f64; 4] {
-    let x = (x - 0.5).clamp(0.0, (texture.width - 1) as f64);
-    let y = (y - 0.5).clamp(0.0, (texture.height - 1) as f64);
+fn sample_texture(texels: &[[u8; 4]], width: usize, height: usize, x: f64, y: f64) -> [f64; 4] {
+    let x = (x - 0.5).clamp(0.0, (width - 1) as f64);
+    let y = (y - 0.5).clamp(0.0, (height - 1) as f64);
     let x0 = x.floor() as usize;
     let y0 = y.floor() as usize;
     let fx = x - x0 as f64;
@@ -1966,17 +2306,17 @@ fn sample_texture(texture: &CpuTexture, x: f64, y: f64) -> [f64; 4] {
     let mut out = [0.0; 4];
     for (px, py, w) in [
         (x0, y0, (1.0 - fx) * (1.0 - fy)),
-        ((x0 + 1).min(texture.width - 1), y0, fx * (1.0 - fy)),
-        (x0, (y0 + 1).min(texture.height - 1), (1.0 - fx) * fy),
+        ((x0 + 1).min(width - 1), y0, fx * (1.0 - fy)),
+        (x0, (y0 + 1).min(height - 1), (1.0 - fx) * fy),
         (
-            (x0 + 1).min(texture.width - 1),
-            (y0 + 1).min(texture.height - 1),
+            (x0 + 1).min(width - 1),
+            (y0 + 1).min(height - 1),
             fx * fy,
         ),
     ] {
-        let off = (py * texture.width + px) * 4;
+        let texel = texels[py * width + px];
         for c in 0..4 {
-            out[c] += f64::from(texture.rgba[off + c]) * w;
+            out[c] += f64::from(texel[c]) * w;
         }
     }
     out
@@ -2132,7 +2472,9 @@ impl CpuTask {
         }
     }
 
-    fn render_model(&mut self, viewport: CpuViewport, scratch: &mut Vec<u8>) -> Result<EmoteRasterFrame> {
+    fn render_model(
+        &mut self, viewport: CpuViewport, scratch: &mut Vec<u8>, rasterizer: Option<HostRasterizer>,
+    ) -> Result<EmoteRasterFrame> {
         if let Some(frame) = self.surface.frame() {
             return Ok(frame.clone());
         }
@@ -2147,9 +2489,22 @@ impl CpuTask {
             return Ok(cached.frame.clone());
         }
         self.raster_cache = None;
-        let mut preview = player.render_resolved(viewport, &variables, std::mem::take(scratch))?;
-        self.append_owner_warnings(&mut preview.warnings);
-        let frame = preview.into_strict()?;
+        let accelerated = if let Some(rasterizer) = rasterizer {
+            let mut warnings = Vec::new();
+            self.append_owner_warnings(&mut warnings);
+            check_strict_warnings(&warnings)?;
+            rasterizer(player, viewport, &variables)
+        } else {
+            None
+        };
+        let frame = match accelerated {
+            Some(frame) => frame,
+            None => {
+                let mut preview = player.render_resolved(viewport, &variables, std::mem::take(scratch))?;
+                self.append_owner_warnings(&mut preview.warnings);
+                preview.into_strict()?
+            }
+        };
         self.raster_cache = Some(CachedRaster {
             model: Arc::downgrade(&player.model),
             object: player.object.clone(),
@@ -2172,14 +2527,18 @@ impl CpuTask {
     }
 }
 
+/// Host raster fallback returns None without committing any partial image.
+type HostRasterizer = fn(&CpuPlayer, CpuViewport, &BTreeMap<String, f64>) -> Option<EmoteRasterFrame>;
+
 pub struct CpuEmoteBackend {
     pub viewport: CpuViewport,
     players: BTreeMap<u32, CpuTask>,
     resources: Option<Box<dyn CpuEmoteResources>>,
     mesh_quality_scale: f32,
     original_task_clock: bool,
-    models: BTreeMap<(Vec<u8>, String, u32), Weak<CpuMotionModel>>,
+    models: BTreeMap<(Vec<u8>, u32), Vec<Weak<CpuMotionModel>>>,
     raster_scratch: Vec<u8>,
+    rasterizer: Option<HostRasterizer>,
 }
 impl CpuEmoteBackend {
     pub fn new(viewport: CpuViewport) -> Result<Self> {
@@ -2192,6 +2551,7 @@ impl CpuEmoteBackend {
             original_task_clock: false,
             models: BTreeMap::new(),
             raster_scratch: Vec::new(),
+            rasterizer: None,
         })
     }
     /// Byte-proven174040->driver3540->12bb0 clock path. The host passes
@@ -2203,6 +2563,13 @@ impl CpuEmoteBackend {
         backend.original_task_clock = true;
         Ok(backend)
     }
+
+    pub fn set_rasterizer(
+        &mut self, rasterizer: fn(&CpuPlayer, CpuViewport, &BTreeMap<String, f64>) -> Option<EmoteRasterFrame>,
+    ) {
+        self.rasterizer = Some(rasterizer);
+    }
+
     pub fn set_resources(&mut self, resources: Box<dyn CpuEmoteResources>) {
         self.resources = Some(resources);
     }
@@ -2212,20 +2579,26 @@ impl CpuEmoteBackend {
         resource: &EmoteResource,
         texture_filter_raw: u32,
     ) -> Result<Arc<CpuMotionModel>> {
-        let mut digest = crate::sha256::Sha256::default();
-        digest.update(resource.bytes());
         let filter = if matches!(texture_filter_raw, 1..=3) { texture_filter_raw } else { 0 };
-        let key = (name.to_vec(), digest.finish(), filter);
-        if let Some(model) = self.models.get(&key).and_then(Weak::upgrade) {
+        let key = (name.to_vec(), filter);
+        // Compare the source only for live candidates with this name and filter.
+        // The parsed model already owns the bytes needed for the comparison.
+        if let Some(model) = self.models.get(&key).into_iter().flatten()
+            .filter_map(Weak::upgrade)
+            .find(|model| model.document.matches_resource(resource))
+        {
             return Ok(model);
         }
-        self.models.retain(|_, model| model.strong_count() != 0);
+        self.models.retain(|_, models| {
+            models.retain(|model| model.strong_count() != 0);
+            !models.is_empty()
+        });
         let mut model = CpuMotionModel::load(resource)?;
         for texture in model.textures.values_mut() {
             super::texture::apply_m2_texture_filter(&mut texture.rgba, filter);
         }
         let model = Arc::new(model);
-        self.models.insert(key, Arc::downgrade(&model));
+        self.models.entry(key).or_default().push(Arc::downgrade(&model));
         Ok(model)
     }
     /// Mirrors the actual driver quality control; default is the byte-proven1.
@@ -2283,7 +2656,10 @@ impl CpuEmoteBackend {
 
     fn capture_surface(&self, task: u32) -> Result<EmoteRasterFrame> {
         let state = self.players.get(&task).ok_or(EmoteError::UnknownTask(task))?;
-        if let Some(frame) = state.surface.capture() { return Ok(frame.clone()); }
+        if let Some(frame) = state.surface.capture() {
+            // Blend endpoints share the logical viewport; steady presented frames may stay cropped.
+            return frame.clone().into_viewport([self.viewport.width, self.viewport.height]);
+        }
         self.model_preview(task)?.into_strict()
     }
 
@@ -2462,7 +2838,9 @@ impl EmoteBackend for CpuEmoteBackend {
         if name.is_empty() || name.len() > 4095 || name.contains(&0) {
             return Err(unsupported("invalid M2 resource identity"));
         }
-        let same_resource = state.player.is_some() && state.resource_name == name;
+        let same_resource = state.resource_name == name && state.player.as_ref().is_some_and(|player| {
+            resource.is_none_or(|source| player.model.document.matches_resource(source))
+        });
         let same_profile = state.m2_profile == load.profile_alias_cp932
             && state.m2_player_name == load.player_name_cp932;
         let selection = load
@@ -3225,7 +3603,7 @@ impl EmoteBackend for CpuEmoteBackend {
     }
     fn render_rgba(&mut self, task: u32) -> Result<EmoteRasterFrame> {
         let state = self.players.get_mut(&task).ok_or_else(|| unsupported("E-mote player resource is not loaded"))?;
-        let mut captured = state.render_model(self.viewport, &mut self.raster_scratch)?;
+        let mut captured = state.render_model(self.viewport, &mut self.raster_scratch, self.rasterizer)?;
         // Keep the untinted manager surface; quad color must be applied only
         // once, after old/new surface composition, on every actual draw.
         if let Some(bytes) = state.surface.remember(captured.clone()).and_then(EmoteRasterFrame::try_recycle) {
@@ -3406,6 +3784,54 @@ mod tests {
         owner.pending_effects.push("live test warning".into());
         backend.players.get_mut(&1).unwrap().m2_owner = Some(owner);
         assert!(backend.render_rgba(1).unwrap_err().to_string().contains("live test warning"));
+        Ok(())
+    }
+
+    #[test]
+    fn host_rasterizer_falls_back_without_hiding_strict_warnings() -> Result<()> {
+        let mut backend = backend()?;
+        let expected = backend.render_preview(1)?.frame;
+        backend.set_rasterizer(|_, _, _| None);
+        let fallback = backend.render_rgba(1)?;
+        assert_eq!(fallback.rgba(), expected.rgba());
+        assert_eq!(fallback.origin(), [0, 0]);
+
+        let mut owner = CpuM2LiveOwner::new(Default::default(), &[], &mut BTreeMap::new(), &BTreeMap::new())?;
+        owner.pending_effects.push("live test warning".into());
+        backend.players.get_mut(&1).unwrap().m2_owner = Some(owner);
+        backend.viewport.origin_x = 1.0;
+        assert!(backend.render_rgba(1).unwrap_err().to_string().contains("live test warning"));
+        Ok(())
+    }
+
+    #[test]
+    fn cropped_presented_surface_is_materialized_for_blend_capture() -> Result<()> {
+        let mut backend = backend()?;
+        backend.set_rasterizer(|_, _, _| {
+            Some(EmoteRasterFrame::new(1, 1, [1, 0], vec![200, 100, 50, 255]).unwrap())
+        });
+        let presented = backend.render_rgba(1)?;
+        assert_eq!(presented.origin(), [1, 0]);
+        let captured = backend.capture_surface(1)?;
+        assert_eq!((captured.width(), captured.height(), captured.origin()), (3, 2, [0, 0]));
+        for (index, pixel) in captured.rgba().chunks_exact(4).enumerate() {
+            if index == 1 {
+                assert_eq!(pixel, presented.rgba());
+            } else {
+                assert_eq!(pixel, &[0u8; 4]);
+            }
+        }
+
+        let mut surface = backend.players.get(&1).unwrap().surface.clone();
+        surface.request(Some(30), captured, false);
+        let next = EmoteRasterFrame::new(3, 2, [0, 0], vec![0; 24])?;
+        surface.begin(next, true)?;
+        assert!(surface.hold(0));
+        assert_eq!(surface.frame().unwrap().origin(), [0, 0]);
+        assert!(Arc::ptr_eq(
+            &presented.pixels,
+            &backend.players.get(&1).unwrap().surface.capture().unwrap().pixels,
+        ));
         Ok(())
     }
 

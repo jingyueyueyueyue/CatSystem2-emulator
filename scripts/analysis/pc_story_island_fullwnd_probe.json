@@ -1,0 +1,47 @@
+{
+  "3": {
+    "frames": 24000,
+    "route": {
+      "label": "ISLAND: observe the first fullwnd wait without clicking it",
+      "idle_frames": 3600,
+      "page_click": {"point": [557, 530], "region": 73},
+      "page_scenes": [
+        "com01", "OPMOVIE_END", "com01_selA_1", "com01_flowA_1",
+        "com01_flowA", "com01_flowB_1", "com01_selB_1"
+      ],
+      "steps": [
+        {
+          "label": "\u70b9\u51fb\u65b0\u6e38\u620f",
+          "wait": {"state": "title", "hit": {"point": [138, 362], "region": 15}},
+          "shared_flags": [{"slot": 722, "mask": 2, "expected": 0}],
+          "click": [138, 362],
+          "after": {"state": "page", "scene": "com01", "group": 0, "record": 54},
+          "capture": true
+        },
+        {
+          "label": "\u9996\u9875\u7ffb\u9875",
+          "wait": {"state": "page", "scene": "com01", "group": 0, "record": 54},
+          "key": 13,
+          "after": {"state": "page", "scene": "com01", "group": 1, "record": 62},
+          "capture": true
+        },
+        {
+          "label": "\u7b2c\u4e8c\u9875",
+          "wait": {"state": "page", "scene": "com01", "group": 1, "record": 62},
+          "capture": true
+        },
+        {
+          "label": "com01 28/182: keep the existing page-prompt action",
+          "wait": {"state": "page_prompt", "scene": "com01", "group": 28, "record": 182, "hit": {"point": [557, 530], "region": 73}},
+          "click": [557, 530],
+          "after": {"state": "page_probe", "scene": "com01", "group": 29, "record": 209}
+        },
+        {
+          "label": "com01 29/209: observe fullwnd hit regions and stop",
+          "wait": {"state": "page_probe", "scene": "com01", "group": 29, "record": 209},
+          "probe_points": [[557, 530], [557, 324]]
+        }
+      ]
+    }
+  }
+}

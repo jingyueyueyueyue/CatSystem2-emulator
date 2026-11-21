@@ -1,0 +1,17 @@
+{
+  "6": {
+    "frames": 690,
+    "inputs": ["story-events", "capture-every:0", "inspect:495", "move:497:111,411",
+      "require-hit:498:20", "498:111,411", "inspect:608", "inspect:685"]
+  },
+  "7": {
+    "frames": 1120,
+    "inputs": ["story-events", "capture-every:0", "inspect:950", "move:952:176,435",
+      "require-hit:953:22", "953:176,435", "inspect:1058", "inspect:1115"]
+  },
+  "9": {
+    "frames": 550,
+    "inputs": ["story-events", "capture-every:0", "inspect:379", "move:381:195,459",
+      "require-hit:382:16", "382:195,459", "inspect:487", "inspect:545"]
+  }
+}

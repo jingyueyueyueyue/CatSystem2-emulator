@@ -139,6 +139,10 @@ mod css_model_shader;
 mod backlog_native;
 mod cst_context_native;
 mod story_trace;
+pub use story_trace::story_trace_08::Eye08Body;
+pub use story_trace::story_trace_14::Grisaia14Body;
+pub use story_trace::story_trace_18::CampanellaWait;
+pub use story_trace::story_trace_12::HatsumiraPage;
 mod cst_window_native;
 mod cst_state;
 mod system_open_native;
@@ -3846,6 +3850,40 @@ impl Host for LoggingHost<'_> {
         });
         // Keep native event construction visible as a separate profiling cost.
         detail_timer.native_log_finished();
+        let next_pc = vm.instruction_pointer;
+        let radio_gate = match (index, next_pc) {
+            (21, 0x44be9) => Some("plane_token"),
+            (213, 0x44c68) => Some("plane_index"),
+            (311, 0x44ce4) => Some("plane_motion_state"),
+            (514, 0x44d28) => Some("plane_motion_kind"),
+            (19, 0x468b9) => Some("stop_case"),
+            _ => None,
+        }.filter(|_| self.data_services.story_trace
+            && self.css_task_sha() == Some("4ccb48ad4bb6bfb5a15a45b8e1f2c2e62072cfad9f1487f869561a473770ed94")
+            && vm.program_code_sha256() == Some("3024880f72c31051d071f6cfb6c1b4125086de3b355691a903293e4dfb826fa6")
+            && self.cst_contexts.values().any(|context| context.story.is_scene("00_001")));
+        let result = self.dispatch_kcs_native(index, arguments, vm);
+        if let Some(gate) = radio_gate {
+            let first_word = arguments.get(..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+            self.events.push(LogicEvent {
+                frame: self.frame,
+                kind: "radio-plane-command-gate".into(),
+                detail: format!("task={} gate={gate} native={index} next_pc={next_pc:#x} result={result:?} first_word={first_word:?}",
+                    self.current_task_id),
+            });
+        }
+        result
+    }
+}
+
+impl LoggingHost<'_> {
+    fn dispatch_kcs_native(
+        &mut self,
+        index: u32,
+        arguments: &[u8],
+        vm: &mut Vm,
+    ) -> cs2_script::Result<NativeReturn> {
         let word = |offset: usize| -> Option<u32> {
             arguments
                 .get(offset..offset + 4)
@@ -3996,6 +4034,9 @@ impl Host for LoggingHost<'_> {
         if let Some(result) = self.effekseer_rotation_native(index, arguments)? {
             return Ok(result);
         }
+        if let Some(result) = self.effekseer_base_native(index, arguments)? {
+            return Ok(result);
+        }
         if let Some(result) = self.movie_plane_native(index, arguments, vm)? {
             return Ok(result);
         }
@@ -4067,6 +4108,19 @@ impl Host for LoggingHost<'_> {
             9 => Err(native_state_error(
                 "native 9 requires exactly 4 argument bytes",
             )),
+            // The packed Kanmi producer uses the reserved slot as a statement
+            // with an owner ID and a Boolean. Bind only the verified producer.
+            439 if self.data_services.particle_message_pe_sha256 == Some(
+                "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26",
+            ) && vm.program_code_sha256() == Some(
+                "7a068090a8d37c7a446a74e98448458e3d6ed75d94bb1a00022eaeb07d7a3921",
+            ) && arguments.len() == 8 && read_u32(arguments, 4)? <= 1 =>
+                Ok(NativeReturn::Continue),
+            // Slot 439 in Djibril5.exe (RVA 0x80980) and Grisaia.exe
+            // (RVA 0x79660) returns status 2 without touching the result slot.
+            439 if matches!(self.css_task_sha(),
+                Some(story_trace::story_trace_10::PE | story_trace::story_trace_14::PE)) =>
+                Ok(NativeReturn::Continue),
             429 | 439 | 543..=548 | 550..=556 | 559..=563 | 573 | 575
             | 578..=581 | 626 | 627 | 642..=644 | 652 | 660 | 661
             | 670..=673 | 686 | 687 => reserved_native::call(
@@ -4927,7 +4981,7 @@ impl Host for LoggingHost<'_> {
                     restored.entry(index).or_insert_with(|| data[cursor..end].to_vec());
                     cursor = end + 1;
                 }
-                self.data_services.cst_text_origins = Default::default();
+                self.data_services.cst_text_origins.clear_after_shared_strings_restore();
                 *self.string_values = restored;
                 Ok(NativeReturn::Value(1))
             }
@@ -5046,10 +5100,30 @@ impl Host for LoggingHost<'_> {
                 let filename_source = vm.read_string(word(0).unwrap())?;
                 let filename = expand_kcs_format(vm, &filename_source, 0)?;
                 let filename = self.text_encoding.decode(trim_nul(&filename));
-                let file = match read_save_css(self.save_root, &filename) {
-                    Ok(bytes) => CssFile::from_css(&bytes)
-                        .map_err(|_| audio_script_error("CSS file structure or capacity is invalid"))?,
-                    Err(_) => None,
+                let daydream_trace = self.data_services.story_trace
+                    && self.css_task_sha() == Some(story_trace::DAYDREAM_PE);
+                let slot_event = if filename != "save0000.dat" {
+                    None
+                } else if daydream_trace {
+                    Some("daydream-slot-open")
+                } else if self.trace_neko_cstl() {
+                    Some("neko-slot-open")
+                } else if self.data_services.story_trace
+                    && vm.program().is_some_and(HeadlessPlayer::verified_rebellions_sscript)
+                {
+                    Some("rebellions-slot-open")
+                } else {
+                    None
+                };
+                let (file, digest) = match read_save_css(self.save_root, &filename) {
+                    Ok(bytes) => {
+                        let file = CssFile::from_css(&bytes)
+                            .map_err(|_| audio_script_error("CSS file structure or capacity is invalid"))?;
+                        let digest = (file.is_some() && slot_event.is_some())
+                            .then(|| particle_plugin_digest::sha256(&bytes));
+                        (file, digest)
+                    }
+                    Err(_) => (None, None),
                 };
                 let handle = file
                     .map(|file| {
@@ -5058,6 +5132,10 @@ impl Host for LoggingHost<'_> {
                         handle
                     })
                     .unwrap_or(0);
+                if let (Some(kind), Some(digest)) = (slot_event, digest) {
+                    self.events.push(LogicEvent { frame: self.frame, kind: kind.into(),
+                        detail: format!("native=247 slot=0 file={filename:?} handle={handle} sha256={digest}") });
+                }
                 Ok(NativeReturn::Value(handle))
             }
             244 if arguments.len() >= 16 => {
@@ -6397,6 +6475,14 @@ impl LoggingHost<'_> {
         Ok(offset)
     }
 
+    fn ordinary_motion_layout(&self) -> motion_vm::ExternalLayout {
+        if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA) {
+            motion_vm::ExternalLayout::Campanella
+        } else {
+            motion_vm::ExternalLayout::Default
+        }
+    }
+
     fn motion_start_native(
         &mut self,
         index: u32,
@@ -6472,8 +6558,14 @@ impl LoggingHost<'_> {
             .get(&controller_handle)
             .map_or(0, |controller| controller.external_value);
         let properties = self.motion_controllers[&controller_handle].properties;
-        let runner = create_motion_runner(program, &name, &parameters, &saved_data,
-            external_value, properties, flags)?;
+        let runner = motion_vm::MotionRunner::with_external_layout(
+            motion_vm::MotionProgram::from_program(program)?,
+            motion_vm::MotionStart {
+                name: &name, parameters, external_value, properties,
+                base_time: 0, saved_data: &saved_data, snapshot_flags: flags,
+            },
+            self.ordinary_motion_layout(),
+        )?;
         let controller = self
             .motion_controllers
             .get_mut(&controller_handle)
@@ -6559,6 +6651,7 @@ impl LoggingHost<'_> {
             },
         );
 
+        let layout = self.ordinary_motion_layout();
         let mut offset = 8usize;
         for _ in 0..count {
             let record_size = snapshot_word(&bytes, offset)? as usize;
@@ -6614,8 +6707,15 @@ impl LoggingHost<'_> {
                             self.motion_controllers.get_mut(&controller_handle).unwrap();
                         let external_value = controller.external_value;
                         let saved_data = bytes[saved_start..saved_end].to_vec();
-                        let runner = create_motion_runner(program, &basename, &parameters,
-                            &saved_data, external_value, controller.properties, snapshot_flags)?;
+                        let runner = motion_vm::MotionRunner::with_external_layout(
+                            motion_vm::MotionProgram::from_program(program)?,
+                            motion_vm::MotionStart {
+                                name: &basename, parameters, external_value,
+                                properties: controller.properties, base_time: 0,
+                                saved_data: &saved_data, snapshot_flags,
+                            },
+                            layout,
+                        )?;
                         let id = controller.next_task_id;
                         controller.next_task_id = controller.next_task_id.saturating_add(1).max(1);
                         controller.tasks.insert(
@@ -7904,8 +8004,11 @@ impl HeadlessPlayer {
                 state.paused = false;
                 if state.repeat_remaining > 0 {
                     if let Some(resource) = state.resource.clone() {
+                        let category = self.with_host(|host| {
+                            Ok(host.configured_sound_channel(&resource, state.task.is_speech))
+                        })?;
                         match audio::play_loaded_audio(&mut self.audio_host, AudioRequest {
-                            channel: sound_audio_channel(&resource),
+                            channel: category.unwrap_or_else(|| sound_audio_channel(&resource)),
                             resource,
                             volume: state.request_volume(),
                             pan: state.request_pan(),
@@ -8058,7 +8161,7 @@ impl HeadlessPlayer {
             let static_prefix = prefix_cached
                 && self.scene_nodes.is_empty()
                 && (self.cst.is_none() || self.font.is_empty())
-                && fes_text::novel_projections(&self.data_services, f32::NEG_INFINITY, f32::INFINITY).is_empty();
+                && fes_text::scene_projections(&self.data_services, f32::NEG_INFINITY, f32::INFINITY).is_empty();
             let unchanged = if prefix_cached {
                 let _timing = measure_host_phase(HostPhase::ComposeLayers);
                 let layers = self.scene_image_prefix();
@@ -8200,8 +8303,13 @@ impl HeadlessPlayer {
             let (speaker, text) = cst.display_text();
             draw_message_text(&mut self.canvas, &self.font, &speaker, &text, cst.display_encoding())?;
         }
-        let mut movie_depths = BTreeMap::new();
+        let mut drawable_depths = BTreeMap::new();
         for node in self.scene_nodes.values() {
+            if node.kind == 61 {
+                let base = self.data_services.effekseer.manager.plane_base(node.id)?;
+                drawable_depths.insert(node.id, base[2]);
+                continue;
+            }
             if self.movie_host.plane_target_handle(node.id).is_none() {
                 continue;
             }
@@ -8221,14 +8329,14 @@ impl HeadlessPlayer {
                     .map_or(5000., |properties| properties.base[2]);
                 depth = parent_base + offset[2];
             }
-            movie_depths.insert(node.id, depth);
+            drawable_depths.insert(node.id, depth);
         }
         let nodes = self
             .data_services
             .planes
-            .draw_order_with_depths(&self.scene_nodes, &movie_depths);
-        let mut novel = measure_host_operation(HostPhase::ComposeText, || {
-            fes_text::novel_projections(&self.data_services, lower, upper)
+            .draw_order_with_depths(&self.scene_nodes, &drawable_depths);
+        let mut scene_text = measure_host_operation(HostPhase::ComposeText, || {
+            fes_text::scene_projections(&self.data_services, lower, upper)
         }).into_iter().peekable();
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         let (gpu_planes, mut pending_planes) = (gpu_raster::available(), Vec::new());
@@ -8240,22 +8348,25 @@ impl HeadlessPlayer {
                 continue;
             }
             if matches!(node.kind, 35..=39) { continue; }
-            let depth = movie_depths.get(&id).copied().unwrap_or_else(|| {
+            let depth = drawable_depths.get(&id).copied().unwrap_or_else(|| {
                 if node.kind == 2 { plane_native::plane_depth(node, &self.data_services.planes) }
                 else { node.position[2] }
             });
             if !(lower <= depth && depth < upper) { continue; }
-            while novel.peek().is_some_and(|layer| (layer.priority as f32) < depth) {
+            while scene_text.peek().is_some_and(|layer| (layer.priority as f32) < depth) {
                 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
                 self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
                 let _timing = measure_host_phase(HostPhase::ComposeText);
-                let layer = novel.next().unwrap();
+                let layer = scene_text.next().unwrap();
                 layer.draw(&mut self.canvas)?;
+                if self.data_services.story_trace {
+                    self.data_services.fes_text.note_rebellions_novel_composed(&layer, self.state.clock.frame);
+                }
             }
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
             if gpu_planes {
                 let node = &self.scene_nodes[&id];
-                let independent = !movie_depths.contains_key(&id)
+                let independent = !drawable_depths.contains_key(&id)
                     && !self.particles.contains_key(&id)
                     && !self.data_services.css_models.owners.contains_key(&id)
                     && !self.data_services.css_models.utate_models.contains_key(&id)
@@ -8341,8 +8452,11 @@ impl HeadlessPlayer {
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
         let _timing = measure_host_phase(HostPhase::ComposeText);
-        for layer in novel {
+        for layer in scene_text {
             layer.draw(&mut self.canvas)?;
+            if self.data_services.story_trace {
+                self.data_services.fes_text.note_rebellions_novel_composed(&layer, self.state.clock.frame);
+            }
         }
         self.render_message_objects_range(lower, upper).context("compose message object depth range")?;
         Ok(())

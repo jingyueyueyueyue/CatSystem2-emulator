@@ -1,0 +1,53 @@
+{
+  "1": {
+    "frames": 1250,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "400:784,405", "move:665:1155,235", "680:1155,235", "inspect-log:1250"
+    ]
+  },
+  "2": {
+    "frames": 2320,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "move:695:105,64", "move:730:400,144", "745:400,144", "805:400,144",
+      "850:13", "905:13", "inspect-log:2320"
+    ]
+  },
+  "5": {
+    "frames": 1720,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "215:13", "260:400,300", "310:32", "380:400,300", "435:13", "510:13",
+      "move:860:235,509", "885:235,509", "985:13"
+    ]
+  },
+  "9": {
+    "frames": 900,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace", "move:360:140,354", "380:140,354",
+      "inspect-log:900"
+    ]
+  },
+  "11": {
+    "frames": 4700,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "215:13", "385:13", "550:13", "move:605:1154,473", "612:1154,473",
+      "810:640,360", "890:640,360", "970:640,360", "inspect-log:4700"
+    ]
+  },
+  "12": {
+    "frames": 900,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace", "move:208:640,443", "234:640,443",
+      "inspect-log:900"
+    ]
+  },
+  "17": {
+    "frames": 840,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace", "inspect-log:840"
+    ]
+  }
+}

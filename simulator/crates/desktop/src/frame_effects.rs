@@ -380,7 +380,12 @@ impl RenderTaskStore {
                 Some(YUKIKOI) => Some(true),
                 _ => None,
             },
-            scale_profile: profile.and_then(|profile| resample::Profile::from_sha(profile.pe_sha256)),
+            scale_profile: profile.and_then(|profile| match (kind, profile.pe_sha256) {
+                // Hatsumira WMosaic uses the V401 format4 kernels (0x534880,
+                // 0x534e20) and format32 hard expansion (0x4c2cee).
+                (50, super::HATSUMIRA) => Some(resample::Profile::V401),
+                (_, sha) => resample::Profile::from_sha(sha),
+            }),
             flag: false,
         };
         // FMosaic owns a constructor-time copy; WMosaic captures at prepare.

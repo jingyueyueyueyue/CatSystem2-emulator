@@ -1,0 +1,46 @@
+{
+  "12": {
+    "menu-save": {
+      "before": 2490, "click": 2493, "after": 2700, "region": 43,
+      "inputs": ["move:1612:641,443", "require-hit:1613:15", "1613:641,443",
+        "right:2353:640,360", "move:2492:325,245", "require-hit:2493:43", "2493:325,245"]
+    },
+    "menu-load": {
+      "before": 2490, "click": 2493, "after": 2700, "region": 44,
+      "inputs": ["move:1612:641,443", "require-hit:1613:15", "1613:641,443",
+        "right:2353:640,360", "move:2492:533,245", "require-hit:2493:44", "2493:533,245"]
+    },
+    "menu-text": {
+      "before": 2490, "click": 2493, "after": 2700, "region": 46,
+      "inputs": ["move:1612:641,443", "require-hit:1613:15", "1613:641,443",
+        "right:2353:640,360", "move:2492:948,245", "require-hit:2493:46", "2493:948,245"]
+    },
+    "menu-back": {
+      "before": 2490, "click": 2493, "after": 2700, "region": 52,
+      "inputs": ["move:1612:641,443", "require-hit:1613:15", "1613:641,443",
+        "right:2353:640,360", "move:2492:1028,670", "require-hit:2493:52", "2493:1028,670"]
+    }
+  },
+  "15": {
+    "menu-save": {
+      "before": 6360, "click": 6363, "after": 6580, "region": 45,
+      "inputs": ["move:691:512,353", "require-hit:692:20", "692:512,353",
+        "move:820:400,130", "require-hit:821:67", "821:400,130", "right:6203:512,280", "move:6362:251,230", "require-hit:6363:45", "6363:251,230"]
+    },
+    "menu-load": {
+      "before": 6360, "click": 6363, "after": 6580, "region": 46,
+      "inputs": ["move:691:512,353", "require-hit:692:20", "692:512,353",
+        "move:820:400,130", "require-hit:821:67", "821:400,130", "right:6203:512,280", "move:6362:425,230", "require-hit:6363:46", "6363:425,230"]
+    },
+    "menu-text": {
+      "before": 6360, "click": 6363, "after": 6580, "region": 48,
+      "inputs": ["move:691:512,353", "require-hit:692:20", "692:512,353",
+        "move:820:400,130", "require-hit:821:67", "821:400,130", "right:6203:512,280", "move:6362:777,230", "require-hit:6363:48", "6363:777,230"]
+    },
+    "menu-back": {
+      "before": 6360, "click": 6363, "after": 6580, "region": 53,
+      "inputs": ["move:691:512,353", "require-hit:692:20", "692:512,353",
+        "move:820:400,130", "require-hit:821:67", "821:400,130", "right:6203:512,280", "move:6362:825,538", "require-hit:6363:53", "6363:825,538"]
+    }
+  }
+}

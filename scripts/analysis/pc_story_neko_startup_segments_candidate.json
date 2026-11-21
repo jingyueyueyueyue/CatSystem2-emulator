@@ -1,0 +1,135 @@
+{
+  "schema": "cs2-neko-startup-segments-candidate/v1",
+  "status": "contract_only_not_a_runner_manifest",
+  "sample": 1,
+  "profile": {
+    "pe_sha256": "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc",
+    "startup": "kcs.int/main.kcs",
+    "scene_sha256": "47ea1f3d6ba0de16736f5f574bda9297544d220d4998dd3061bb96689ad1c37e",
+    "cstl_sha256": "8085d37fd751947577579ff0ac6eea7a58f5f6863e5df0f4d9561666a6065ae6",
+    "fresh_isolated_profile": true
+  },
+  "startup": {
+    "shared_preconditions": ["completed frame", "focused and unpaused", "empty CST contexts", "VM waiting for host message", "no pending handler, pending message, or movie", "exactly the registered live FES drivers, each waiting for the observed frame"],
+    "modal": {
+      "state": "language_select",
+      "scene": "langselect",
+      "window": "langselect",
+      "drivers": {"flow": "WAIT_TITLE", "ttlflow": "WAIT_SELLANG", "langselect": "WAIT"},
+      "locals": {"ui_display_index": 55, "main_display_index": 56, "subtitle_display_index": 57},
+      "options_menu_state_not_approved": "SYSTEM_LANG_WAIT",
+      "languages": {
+        "en": {"ui_index": 0, "main_index": 0, "subtitle_index": -1, "expected_ui_main_sub_locals": [1, 1, 3], "main_cstl_column": 1},
+        "jp": {"ui_index": 0, "main_index": 1, "subtitle_index": -1, "expected_ui_main_sub_locals": [1, 0, 3], "main_cstl_column": 2},
+        "cn": {"ui_index": 0, "main_index": 2, "subtitle_index": -1, "expected_ui_main_sub_locals": [1, 2, 3], "main_cstl_column": 0}
+      },
+      "press": {"object": "decide", "point": [784, 405], "hit_region": 27, "hit_rect_ltrb": [738, 390, 830, 420], "ordered_candidates": [3, 27, 28, 11, 7], "receipt_region": 27, "receiver": "live langselect owner", "key": 0, "group": 0, "raw_mask": 2, "pressed": 1, "repeated": false, "physical": "left mouse", "response": 0},
+      "after": "title",
+      "requires": "Match the requested preconfigured language before confirming. Confirm a single receipt from the live langselect owner, observe release and replacement by title even when the numeric owner is reused, and verify the same language is still configured. Do not select a language or dismiss a different modal."
+    },
+    "title": {
+      "state": "title",
+      "scene": "-",
+      "window": "title",
+      "drivers": {"flow": "WAIT_TITLE", "ttlflow": "FES_WAIT", "title": "WAIT"},
+      "drivers_evidence": "shipped_fes_static_pending_live_dump",
+      "press": {"object": "btn1[0]", "point": [1155, 235], "hit_region": 14, "hit_rect_ltrb": [1067, 193, 1247, 283], "ordered_candidates": [3, 14, 19, 11, 7], "receipt_region": 14, "receiver": "live title owner", "key": 0, "group": 0, "raw_mask": 2, "pressed": 1, "repeated": false, "physical": "left mouse", "response": 0},
+      "new_game_step_without_language": {
+        "label": "Settled NEKO title: New Game only",
+        "wait": {"state": "title", "scene": "-", "window": "title", "hit": {"point": [1155, 235], "region": 14}},
+        "click": [1155, 235],
+        "mouse_press": {"candidates": [3, 14, 19, 11, 7], "region": 14, "key": 0, "group": 0, "response": 0},
+        "after": {"state": "page", "scene": "01", "group": 0, "record": 59, "window": "meswnd"}
+      },
+      "requires": "Do not arm New Game until the input-free title probe confirms the exact live drivers and title-owner receipt target. Region words[7] is selection, not enabled (words[8]); do not require a preexisting hover.",
+      "after": "01/0/59"
+    }
+  },
+  "startup_title_probe": {
+    "status": "offline_route_fragments_pending_typed_startup_candidate",
+    "frames": 3600,
+    "expected_presses": {"language_confirm": 1, "new_game": 0, "body": 0},
+    "routes": {
+      "jp": {
+        "label": "NEKO JP: confirm the preset, probe title without input",
+        "idle_frames": 1800,
+        "page_scenes": [],
+        "page_fallback_before": 0,
+        "steps": [
+          {
+            "label": "Confirm cold-start JP with UI EN and subtitles off",
+            "wait": {"state": "language_select", "scene": "langselect", "window": "langselect", "hit": {"point": [784, 405], "region": 27}},
+            "click": [784, 405],
+            "mouse_press": {"candidates": [3, 27, 28, 11, 7], "region": 27, "key": 0, "group": 0, "response": 0},
+            "neko_startup_language": "jp",
+            "after": {"state": "title", "scene": "-", "window": "title"}
+          },
+          {
+            "label": "Probe settled title and New Game target; do not click",
+            "wait": {"state": "title", "scene": "-", "window": "title"},
+            "probe_points": [[1155, 235]]
+          }
+        ]
+      },
+      "cn": {
+        "label": "NEKO CN: confirm the preset, probe title without input",
+        "idle_frames": 1800,
+        "page_scenes": [],
+        "page_fallback_before": 0,
+        "steps": [
+          {
+            "label": "Confirm cold-start CN with UI EN and subtitles off",
+            "wait": {"state": "language_select", "scene": "langselect", "window": "langselect", "hit": {"point": [784, 405], "region": 27}},
+            "click": [784, 405],
+            "mouse_press": {"candidates": [3, 27, 28, 11, 7], "region": 27, "key": 0, "group": 0, "response": 0},
+            "neko_startup_language": "cn",
+            "after": {"state": "title", "scene": "-", "window": "title"}
+          },
+          {
+            "label": "Probe settled title and New Game target; do not click",
+            "wait": {"state": "title", "scene": "-", "window": "title"},
+            "probe_points": [[1155, 235]]
+          }
+        ]
+      }
+    },
+    "require_title_evidence": "No live langselect, no CST context, exact three title drivers with current frame waits, no pending handler/message or active movie, mask 14 and candidate order [3,14,19,11,7] with region 14 owned by the live title. One physical language-confirm receipt and no other press."
+  },
+  "pages": [
+    {"group": 0, "wait_record": 59, "absolute_body_records": [58]},
+    {"group": 1, "wait_record": 87, "absolute_body_records": [85, 86]},
+    {"group": 2, "wait_record": 92, "absolute_body_records": [90, 91]},
+    {"group": 3, "wait_record": 98, "absolute_body_records": [96, 97]},
+    {"group": 4, "wait_record": 103, "absolute_body_records": [101, 102]},
+    {"group": 5, "wait_record": 112, "absolute_body_records": [110, 111]},
+    {"group": 6, "wait_record": 117, "absolute_body_records": [115, 116]},
+    {"group": 7, "wait_record": 122, "absolute_body_records": [120, 121]},
+    {"group": 8, "wait_record": 127, "absolute_body_records": [125, 126]},
+    {"group": 9, "wait_record": 136, "absolute_body_records": [134, 135]},
+    {"group": 10, "wait_record": 141, "absolute_body_records": [139, 140]},
+    {"group": 11, "wait_record": 146, "absolute_body_records": [144, 145]}
+  ],
+  "segments": [
+    {"name": "first_press", "prior_ready": "01/0/59", "stop": "01/1/87", "body_presses_from_cold_start": 1, "languages": ["jp", "cn"]},
+    {"name": "bilingual_opening", "prior_ready": "01/1/87", "stop": "01/2/92", "body_presses_from_cold_start": 2, "languages": ["jp", "cn"]},
+    {"name": "first_extended_successor", "prior_ready": "01/2/92", "stop": "01/3/98", "body_presses_from_cold_start": 3},
+    {"name": "extended_midpoint", "prior_ready": "01/3/98", "stop": "01/6/117", "body_presses_from_cold_start": 6},
+    {"name": "extended_stop", "prior_ready": "01/6/117", "stop": "01/11/146", "body_presses_from_cold_start": 11}
+  ],
+  "evidence": {
+    "cold_english_unrecognized_modal": "F:/CS2-build-cache/playthrough/2026-11/20261120_070036_972128_2k91_4nv_playthrough/01/01.host.log:3",
+    "english_confirmation_receipt": "F:/CS2-build-cache/playthrough/2026-11/20261120_065651_455401_lje78j6x_playthrough/01.host.log:3",
+    "english_new_game_receipt": "F:/CS2-build-cache/playthrough/2026-11/20261120_065651_455401_lje78j6x_playthrough/01.host.log:11",
+    "english_first_ready_page": "F:/CS2-build-cache/playthrough/2026-11/20261120_065651_455401_lje78j6x_playthrough/01.host.log:141",
+    "jp_cn_private_setup_only": "F:/CS2-build-cache/playthrough/2026-11/20261120_064230_168636_wmh3_fwb_neko_language_stage/stage.json"
+  },
+  "policy": {
+    "first_press_manifest": "scripts/analysis/pc_story_neko_first_press_once.json",
+    "body_route_manifest": "scripts/analysis/pc_story_neko_state_route_candidate.json",
+    "execution": "First extract only startup_title_probe.routes[language] for fresh isolated title evidence. After title evidence passes, replace its terminal with new_game_step_without_language and assign it the same neko_startup_language as the confirmation. Use the existing exact body steps and stop without input at the requested page. Do not use the extended suffix before its allowlist is implemented. Each prefix is a new cold run; prior_ready is evidence required to schedule a larger prefix, not a save or resume token.",
+    "source_records": "These are packed candidate kind 0x20 records. Runtime must bind the actual consumed and composited current-page sources. Do not manufacture a source receipt for an empty fragment or accept a single first fragment as proof of a complete page.",
+    "no_fallback": true,
+    "no_scheduled_story_input": true,
+    "no_input_at_terminal": true
+  }
+}

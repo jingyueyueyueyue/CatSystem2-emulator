@@ -581,6 +581,8 @@ fn parse_object_definition(line: &FesLine) -> Result<FesObjectDefinition> {
     let target = words
         .get(1)
         .ok_or_else(|| scene_error(line.offset, "FES DEFINE 行缺少对象名称"))?;
+    // Some compiled save/load scenes retain the declaration's semicolon.
+    let target = target.strip_suffix(b";").unwrap_or(target);
     let (name, bank_expression) = split_object_target(target, line.offset)?;
     let banks = match bank_expression.as_deref() {
         None => -1,
@@ -1269,6 +1271,15 @@ fn fes_parameters(input: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(words)
 }
 
+fn fes_appended_string(input: &[u8]) -> bool {
+    let mut fields = input.split(|byte| *byte == b' ').filter(|field| !field.is_empty());
+    let (Some(_), Some(b"apend"), Some(operand), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next()) else { return false; };
+    operand.strip_prefix(b"$str").is_some_and(|digits| {
+        !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+    })
+}
+
 fn expand_strings(input: &[u8], strings: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0;
@@ -1534,6 +1545,7 @@ pub enum FesEvent {
 pub enum FesStep {
     Yield,
     Event,
+    SharedStringWrite { destination: u32, source: Option<u32> },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1763,6 +1775,18 @@ impl FesInterpreter {
     }
 
     pub fn run(&mut self, state: &mut ExpressionState, budget: usize) -> Result<FesStep> {
+        self.run_inner(state, budget, false)
+    }
+
+    pub fn run_observing_shared_strings(
+        &mut self, state: &mut ExpressionState, budget: usize,
+    ) -> Result<FesStep> {
+        self.run_inner(state, budget, true)
+    }
+
+    fn run_inner(
+        &mut self, state: &mut ExpressionState, budget: usize, observe_shared_strings: bool,
+    ) -> Result<FesStep> {
         if self.pending.is_some() {
             return Ok(FesStep::Event);
         }
@@ -1810,7 +1834,13 @@ impl FesInterpreter {
             {
                 return Err(error.clone());
             }
-            let expanded_strings = expand_strings(&line.bytes, &state.strings);
+            // An append from a string slot inserts message bytes verbatim.
+            // Parse the placeholder first so prose punctuation stays literal.
+            let expanded_strings = if fes_appended_string(&line.bytes) {
+                line.bytes.clone()
+            } else {
+                expand_strings(&line.bytes, &state.strings)
+            };
             let macro_expanded = expand_fes_macros(&expanded_strings, &self.program.macros)?;
             let mut bytes = macro_expanded.as_slice();
             if let Some((condition, tail)) = split_fes_condition(bytes)? {
@@ -1942,7 +1972,11 @@ impl FesInterpreter {
                     return Ok(FesStep::Event);
                 }
                 b"strvar" => {
-                    self.execute_strvar(&arguments, state)?;
+                    if let Some((destination, source)) = self.execute_strvar(&arguments, state)?
+                        && observe_shared_strings
+                    {
+                        return Ok(FesStep::SharedStringWrite { destination, source });
+                    }
                     continue;
                 }
                 b"strcmp" => {
@@ -2125,23 +2159,25 @@ impl FesInterpreter {
         }
     }
 
-    fn execute_strvar(&mut self, arguments: &[Vec<u8>], state: &mut ExpressionState) -> Result<()> {
+    fn execute_strvar(
+        &mut self, arguments: &[Vec<u8>], state: &mut ExpressionState,
+    ) -> Result<Option<(u32, Option<u32>)>> {
         if arguments.len() < 2 {
-            return Ok(());
+            return Ok(None);
         }
         if arguments.get(1).is_some_and(|word| word.eq_ignore_ascii_case(b"get")) {
             if arguments.len() < 3 {
-                return Ok(());
+                return Ok(None);
             }
             let destination = self.eval(&arguments[2], state)? as u32;
             let Some(source) = arguments.get(3) else {
-                return Ok(());
+                return Ok(None);
             };
             let source = self.eval(source, state)? as u32;
             let value = state.strings.get(&source)
                 .map(|value| string_prefix(value).to_vec()).unwrap_or_default();
             state.strings.insert(destination, value);
-            return Ok(());
+            return Ok(Some((destination, Some(source))));
         }
         let destination = self.eval(&arguments[1], state)? as u32;
         let value = arguments.get(2).cloned().unwrap_or_default();
@@ -2158,7 +2194,7 @@ impl FesInterpreter {
         state
             .strings
             .insert(destination, string_prefix(&formatted).to_vec());
-        Ok(())
+        Ok(Some((destination, None)))
     }
 
     fn eval(&mut self, source: &[u8], state: &mut ExpressionState) -> Result<i32> {
@@ -3331,6 +3367,21 @@ mod tests {
             Some(FesEvent::Command(line)) => assert_eq!(line.bytes, b"hello"),
             other => panic!("unexpected FES event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fes_append_keeps_unbalanced_parentheses_in_message_text() {
+        let program = FesProgram::from_text(b"#START\nstr apend $str1000\n").unwrap();
+        let mut interpreter = FesInterpreter::new(program).unwrap();
+        let mut state = ExpressionState::default();
+        let message = b"CatSystem2(introduction\x81\x6a";
+        state.strings.insert(1000, message.to_vec());
+        assert!(matches!(interpreter.run(&mut state, 8).unwrap(), super::FesStep::Event));
+        let Some(FesEvent::Command(line)) = interpreter.pending() else {
+            panic!("expected append command");
+        };
+        assert_eq!(line.bytes, [b"str apend ".as_slice(), message].concat());
+        assert_eq!(interpreter.pending_command_parameters().unwrap()[2], message);
     }
 
     #[test]

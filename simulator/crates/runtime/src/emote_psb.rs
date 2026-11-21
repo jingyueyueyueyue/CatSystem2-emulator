@@ -70,7 +70,8 @@ pub struct PsbDocument {
     pub recovered_header_key: Option<u32>,
     pub value_count: usize,
     pub root: PsbValue,
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
+    encrypted_header: Option<([u8; 48], usize)>,
     chunks: Vec<(usize, usize)>,
     extra_chunks: Vec<(usize, usize)>,
 }
@@ -79,11 +80,26 @@ impl PsbDocument {
     #[cfg(test)]
     pub(super) fn from_test_root(root: PsbValue) -> Self {
         Self { version: 2, recovered_header_key: None, value_count: 0, root,
-            bytes: Arc::from([]), chunks: Vec::new(), extra_chunks: Vec::new() }
+            bytes: Arc::new(Vec::new()), encrypted_header: None,
+            chunks: Vec::new(), extra_chunks: Vec::new() }
     }
 
     pub fn from_resource(resource: &EmoteResource) -> Result<Self> {
         Self::parse(resource.bytes())
+    }
+
+    pub(super) fn matches_resource(&self, resource: &EmoteResource) -> bool {
+        let source = resource.bytes();
+        if source.len() != self.bytes.len() {
+            return false;
+        }
+        if let Some((original, end)) = &self.encrypted_header {
+            source[..8] == self.bytes[..8]
+                && source[8..*end] == original[..*end - 8]
+                && source[*end..] == self.bytes[*end..]
+        } else {
+            source == self.bytes.as_slice()
+        }
     }
 
     pub fn parse(input: &[u8]) -> Result<Self> {
@@ -102,6 +118,7 @@ impl PsbDocument {
         }
         let mut bytes = input.to_vec();
         let original_length = u32_at(&bytes, 8)?;
+        let mut encrypted_header = None;
         let key = if original_length != header_size as u32 {
             // First encrypted DWORD is the known canonical header length.
             // Invert y = seed XOR seed>>19, then validate every structural
@@ -110,6 +127,11 @@ impl PsbDocument {
             let y = original_length ^ header_size as u32 ^ a ^ (a >> 8);
             let seed = y ^ (y >> 19);
             let mut cipher = HeaderCipher::new(seed);
+            // Keep the original header for exact source comparisons without
+            // retaining a second copy of the PSB.
+            let mut original = [0; 48];
+            original[..header_size - 8].copy_from_slice(&bytes[8..header_size]);
+            encrypted_header = Some((original, header_size));
             for byte in &mut bytes[8..header_size] {
                 *byte ^= cipher.byte();
             }
@@ -204,7 +226,8 @@ impl PsbDocument {
             recovered_header_key: key,
             value_count,
             root,
-            bytes: Arc::from(bytes),
+            bytes: Arc::new(bytes),
+            encrypted_header,
             chunks,
             extra_chunks,
         })

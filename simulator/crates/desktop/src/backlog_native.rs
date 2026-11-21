@@ -5,6 +5,7 @@ use cs2_runtime::{resource_router::ResourceMode, backlog::{Backlog, Settings}};
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, LogicEvent, cp932_to_utf8,
     expand_kcs_format, native_state_error, read_u32, trim_nul};
+use super::cst_context_native::decode_cst_dialogue;
 use super::string_native::expand_shared_strings;
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -125,8 +126,10 @@ impl LoggingHost<'_> {
         let mut is_continuous = 0i32;
         let mut imported = 0usize;
         for (history_index, (name, count)) in history.iter().enumerate().skip(first) {
-            let Some((resolved, bytes)) = self.backlog_resource(b"scene", name, false)? else { continue; };
+            let Some((resolved, resource)) = self.cst_resource_with_source(b"scene", name)? else { continue; };
+            let bytes = &resource.bytes;
             if bytes.is_empty() { continue; }
+            let source_codec = self.cst_scene_encoding_override(&resource).unwrap_or(self.text_encoding);
             // Both wrappers use the same temporary scene loader. After any
             // nonempty CST read it also attempts the adjacent language file,
             // even though no languages are registered into this scene.
@@ -152,7 +155,7 @@ impl LoggingHost<'_> {
                     continue;
                 }
             }
-            let document = CstFile::parse(&bytes)
+            let document = CstFile::parse(bytes)
                 .map_err(|_| native_state_error("backlog CST resource is malformed"))?;
             if *count as i32 <= 0 { continue; }
             let count = *count as usize;
@@ -168,8 +171,13 @@ impl LoggingHost<'_> {
                     for record in &document.records[range.clone()] {
                         match record.kind {
                             0x20 | 0x21 => {
-                                scratch = if language.is_some() { cp932_to_utf8(&record.text) } else { record.text.clone() };
-                                scratch.truncate(scratch.iter().position(|&byte| byte == 0).unwrap_or(scratch.len()));
+                                scratch = if language.is_some() {
+                                    decode_cst_dialogue(&record.text, source_codec).map_err(|cause|
+                                        super::native_state_error_owned(format!(
+                                            "native 1034 history={history_index} input={input} source={:?}: {cause}",
+                                            resource.source,
+                                        )))?.into_owned().into_bytes()
+                                } else { trim_nul(&record.text).to_vec() };
                                 if scratch.len() >= 4096 { return Err(native_state_error("backlog CST text exceeds read buffer")); }
                                 if record.kind == 0x20 {
                                     append_bounded(&mut text, &scratch, 4096)?;
@@ -206,9 +214,15 @@ impl LoggingHost<'_> {
                 if text.len() >= 4096 || speaker.len() >= 256 {
                     return Err(native_state_error("backlog substituted text exceeds import buffers"));
                 }
-                self.backlogs.get_mut(&handle).unwrap().append(name, input as u32,
-                    &speaker, &text, mark, space, history_index as u32)
-                    .map_err(|_| native_state_error("backlog history byte layout is invalid"))?;
+                let backlog = self.backlogs.get_mut(&handle).unwrap();
+                let result = if language.is_some() {
+                    backlog.append_utf8(name, input as u32, &speaker, &text, mark, space, history_index as u32)
+                } else {
+                    backlog.append(name, input as u32, &speaker, &text, mark, space, history_index as u32)
+                };
+                result.map_err(|cause| super::native_state_error_owned(format!(
+                    "backlog history={history_index} input={input} byte layout: {cause}"
+                )))?;
             }
         }
         Ok(NativeReturn::Continue)
@@ -235,23 +249,6 @@ impl LoggingHost<'_> {
             }
         }
         Ok(false)
-    }
-
-    pub(super) fn backlog_resource(
-        &self, category: &[u8], bytes: &[u8], existence: bool,
-    ) -> Result<Option<(String, Vec<u8>)>> {
-        // History sources and native 699 command parameters remain CP932.
-        // For 1034 commands the baseline passes its UTF-8 buffer through the
-        // same legacy category resolver, without an implicit conversion.
-        let name = String::from_utf8(cp932_to_utf8(bytes)).expect("CP932 conversion emits UTF-8");
-        let names = self.resources.category_names(category, &name)
-            .map_err(|cause| super::native_state_error_owned(format!(
-                "backlog resource {category:?}/{name:?} category resolution failed: {cause}"
-            )))?;
-        for name in names {
-            if let Some(bytes) = self.backlog_read(&name, existence)? { return Ok(Some((name, bytes))); }
-        }
-        Ok(None)
     }
 
     pub(super) fn backlog_read(&self, name: &str, existence: bool) -> Result<Option<Vec<u8>>> {
@@ -306,6 +303,50 @@ fn append_bounded(target: &mut Vec<u8>, source: &[u8], capacity: usize) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use cs2_script::Host;
+
+    #[test]
+    #[ignore = "requires the installed Daydream translation and an isolated profile"]
+    fn daydream_body_speaker_and_imported_history_use_the_winning_cst_codec() -> anyhow::Result<()> {
+        let root = std::env::var_os("CS2_DAYDREAM_TEXT_TEST_ROOT").expect("installed game root required");
+        let profile = std::env::var_os("CS2_DAYDREAM_TEXT_TEST_PROFILE").expect("isolated profile required");
+        let mut player = crate::HeadlessPlayer::open_with_save_root(root, profile)?;
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0; 4096])?;
+        let args = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+        let scene = 0x8000_0100;
+        let result = 0x8000_0400;
+        let empty = 0x8000_0800;
+        vm.write(scene, b"prologue.cst\0")?;
+        let speaker = "\u{6d77}\u{6597}";
+        let body = "\u{300c}\u{2014}\u{2014}\u{80fd}\u{6539}\u{53d8}\u{4eba}\u{7684}\u{ff0c}\u{53ea}\u{6709}\u{4eba}\u{300d}";
+        player.with_host(|host| {
+            let (_, resource) = host.cst_resource_with_source(b"scene", b"prologue.cst")?.unwrap();
+            assert_eq!(host.cst_scene_encoding_override(&resource), Some(crate::ScriptTextEncoding::Gbk));
+            let NativeReturn::Value(context) = host.call(323, &[], &mut vm)? else {
+                anyhow::bail!("missing CST context handle");
+            };
+            assert_eq!(host.call(325, &args(&[context, scene]), &mut vm)?, NativeReturn::Value(1));
+            for (ordinal, expected) in [(16, speaker), (17, body)] {
+                host.call(1037, &args(&[context, result, 0, ordinal]), &mut vm)?;
+                assert_eq!(vm.read_string(result)?, expected.as_bytes());
+            }
+            assert_eq!(host.call(329, &args(&[context, scene, 1]), &mut vm)?, NativeReturn::Value(0));
+            let NativeReturn::Value(backlog) = host.call(696, &[], &mut vm)? else {
+                anyhow::bail!("missing backlog handle");
+            };
+            host.call(1034, &args(&[backlog, context, empty, empty, empty]), &mut vm)?;
+            let history = &host.backlogs[&backlog];
+            let name = std::str::from_utf8(history.name_for_row(0).expect("missing history speaker"))?;
+            assert!(name.contains(speaker));
+            let rows = history.lines().iter().map(|line| std::str::from_utf8(&line.text))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert!(rows.concat().contains(body));
+            Ok(())
+        })
+    }
+
     #[test]
     fn backlog_resolves_voice_by_its_configured_archive() -> anyhow::Result<()> {
         let serial = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();

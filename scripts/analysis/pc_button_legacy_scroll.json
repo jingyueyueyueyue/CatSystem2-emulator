@@ -1,0 +1,19 @@
+{
+  "3": {
+    "frames": 2790,
+    "inputs": [
+      "story-events", "capture-every:0",
+      "230:557,324", "465:557,324", "525:557,324", "549:557,324", "573:557,324",
+      "move:2380:138,362", "2450:138,362", "inspect:2640", "2670:9",
+      "inspect:2700", "inspect:2770"
+    ]
+  },
+  "18": {
+    "frames": 1080,
+    "inputs": [
+      "story-events", "capture-every:0", "settings-apply",
+      "inspect:855", "move:857:327,433", "require-hit:858:12", "858:327,433",
+      "inspect:963", "inspect:1050"
+    ]
+  }
+}

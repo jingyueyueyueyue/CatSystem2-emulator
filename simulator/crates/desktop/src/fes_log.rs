@@ -86,6 +86,22 @@ fn row_info(log: &Backlog, index: u32) -> Option<(u32, &Segment)> {
     Some((group, log.segments().get(group as usize)?))
 }
 
+pub(crate) fn is_island_gbk_scene(resources: &cs2_runtime::ResourceIndex, source: &[u8]) -> Result<bool> {
+    use cs2_runtime::{ResourceLocation, resource_router::ResourceMode};
+
+    let Some(router) = resources.resource_router() else { return Ok(false) };
+    let source = ScriptTextEncoding::Cp932.decode(source);
+    for name in resources.category_names(b"scene", &source)? {
+        if let Some(found) = resources.resolve_mode_utf16(
+            &name.encode_utf16().collect::<Vec<_>>(), ResourceMode::LooseFirst,
+        )? {
+            return Ok(matches!(&found.value.location, ResourceLocation::Archive { path, .. }
+                if router.is_island_chinese_scene(resources, path)));
+        }
+    }
+    Ok(false)
+}
+
 /// Called before ordinary text verbs, whose pos/getpos/draw have a different ABI.
 pub(super) fn command(
     store: &mut FesTextStore, keys: &[Key], command: &FesDriverCommand,
@@ -226,7 +242,7 @@ pub(super) fn geometry(host: &mut LoggingHost<'_>, key: &Key) -> Result<()> {
 pub(super) fn update(
     bank: &mut TextBank, next_surface: &mut i32, device: &mut DesktopMessageDevice,
     view: &FesTaskView, runtime: &FesRuntime, name: &[u8], index: i32,
-    backlogs: &BTreeMap<u32, Backlog>, legacy_gbk: bool,
+    backlogs: &BTreeMap<u32, Backlog>, resources: &cs2_runtime::ResourceIndex, legacy_gbk: bool,
 ) -> Result<()> {
     let mut state = bank.log.take().unwrap();
     let result = (|| -> Result<()> {
@@ -247,6 +263,7 @@ pub(super) fn update(
         }
         let redraw = state.redraw || bank.dirty || bank.shift_dirty;
         let height = word(&bank.configuration, 12) as i32;
+        let mut scene_codecs = BTreeMap::new();
         for (i, row) in state.rows.iter_mut().enumerate() {
             let initial = !row.configured;
             if bank.dirty || initial {
@@ -281,12 +298,26 @@ pub(super) fn update(
             }
             if (redraw || initial) && state.drawing && log.is_some() {
                 let line_index = state.position.wrapping_add(i as i32) as u32;
-                let voice = log.and_then(|log| row_info(log, line_index)).is_some_and(|(_, info)| info.flags & 4 != 0);
+                let info = log.and_then(|log| row_info(log, line_index));
+                let voice = info.is_some_and(|(_, info)| info.flags & 4 != 0);
                 let colors = state.line_colors.get(&i).copied().unwrap_or(state.colors[state.row_colors[i] * 2 + usize::from(voice)]);
                 for (offset, color) in [0x10, 0x14, 0x18].into_iter().zip(colors) { set(&mut row.configuration, offset, color); }
                 row.restore_colors = colors; row.dirty = true;
                 let text = log.and_then(|log| log.lines().get(line_index as usize)).map_or(&[][..], |line| line.text.as_slice());
-                row.replace_with_codec(text, legacy_gbk)?;
+                let mut row_gbk = legacy_gbk;
+                if !row_gbk && row.message.encoding() == MessageEncoding::Cp932 {
+                    if let Some(source) = info.and_then(|(_, segment)| {
+                        log?.sources().get(segment.source as usize)
+                    }) {
+                        row_gbk = *match scene_codecs.entry(source) {
+                            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(is_island_gbk_scene(resources, source)?)
+                            }
+                        };
+                    }
+                }
+                row.replace_with_codec(text, row_gbk)?;
                 row.draw = Some(u32::MAX);
             }
         }

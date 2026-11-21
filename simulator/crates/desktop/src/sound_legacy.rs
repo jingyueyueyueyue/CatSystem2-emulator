@@ -149,6 +149,29 @@ impl LoggingHost<'_> {
         ))
     }
 
+    pub(super) fn legacy_file_audio_channel(&self, path: &[u8], qualified: bool) -> Option<cs2_runtime::AudioChannel> {
+        let block = &self.system_config_blocks[0];
+        if block.len() != BLOCK_BYTES {
+            return None;
+        }
+        let channel = if qualified { directory_index(block, path) } else { prefix_index(block, path) }?;
+        let id = word(block, RECORD_START + channel * RECORD + 80);
+        if qualified {
+            let start = RECORD_START + channel * RECORD + 84;
+            let directory = trim_nul(&block[start..start + 32]);
+            // One archive can serve several groups. Only a unique group
+            // provides enough information to exempt a qualified resource.
+            for index in channel + 1..CHANNELS {
+                let base = RECORD_START + index * RECORD;
+                if trim_nul(&block[base + 84..base + 116]) == directory && word(block, base + 80) != id {
+                    return None;
+                }
+            }
+        }
+        let group = self.sound_groups.iter().find(|group| group.id == id)?;
+        super::sound_control::audio_channel_for_type(&group.label)
+    }
+
     /// 605 is the cached category volume, 606 play, 607 per-file mastervol,
     /// 844 definition index. Names are original declared script bytes.
     pub(super) fn legacy_sound_file_value(&mut self, index: u32, name: &[u8]) -> Result<u32> {

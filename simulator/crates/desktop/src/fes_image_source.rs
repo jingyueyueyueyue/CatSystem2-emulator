@@ -399,7 +399,17 @@ pub(crate) fn update_image_sources(
                         .unwrap_or([image.width() as i32, image.height() as i32]);
                     layer.navigation.set_size(size);
                 }
-                install_ordinary_frame(layer, image);
+                if layer.source.btype == 0
+                    && layer.kind == "IMAGE"
+                    && matches!(first, Some("title_btn" | "title_btn2"))
+                    && host.css_task_sha() == Some(crate::css_model::SHA)
+                {
+                    // The title POS2 references supply the anchors of these
+                    // sprites. Keep their HG3 pivots so they line up with btn[].
+                    install_frame_with_btype(layer, image, 1);
+                } else {
+                    install_ordinary_frame(layer, image);
+                }
             }
         }
         // Publish each completed bank before trying the next resource, so a
@@ -422,8 +432,12 @@ pub(crate) fn update_image_sources(
 }
 
 pub(super) fn install_ordinary_frame(layer: &mut FesMediaLayer, image: RgbaFrame) {
+    install_frame_with_btype(layer, image, layer.source.btype);
+}
+
+fn install_frame_with_btype(layer: &mut FesMediaLayer, image: RgbaFrame, btype: i32) {
     let mut metadata = image.metadata();
-    match layer.source.btype {
+    match btype {
         0 => {
             layer.image_offset = metadata.base;
             layer.image_base = std::array::from_fn(|axis| {

@@ -250,7 +250,7 @@ impl FesTaskStore {
         let matches = |effect: &FesDriverEffect| matches!(effect,
             FesDriverEffect::Initialize { event: FesEvent::CreateObject(definition), .. }
                 if definition.name == name && (crate::fes_text::is_text_kind(&definition.kind)
-                    || !text_only && matches!(definition.kind.as_slice(), b"VIEWPORT" | b"IMGWND" | b"SLIDER" | b"SCROLL2")));
+                    || !text_only && matches!(definition.kind.as_slice(), b"VIEWPORT" | b"IMGWND" | b"SLIDER" | b"SCROLL2" | b"SCROLL")));
         object.pending_effect.iter().chain(&object.boundary)
             .chain(object.button_refresh.iter().filter_map(|r| r.pending_effect.as_ref()))
             .chain(object.lower_notification.iter().filter_map(|r| r.pending_effect.as_ref()))
@@ -383,7 +383,7 @@ impl FesTask {
                 !crate::fes_task_platform::checkpoint::supported_object(&object.definition.kind_name)
                     && !crate::fes_text::is_text_kind(&object.definition.kind_name)
                     && !matches!(object.definition.kind_name.as_slice(),
-                        b"VIEWPORT" | b"IMGWND" | b"SLIDER" | b"SCROLL2" | b"DRAW" | b"SOUND" | b"SNDTABLE" | b"PARTICLE" | b"SAVEPANEL")) {
+                        b"VIEWPORT" | b"IMGWND" | b"SLIDER" | b"SCROLL2" | b"SCROLL" | b"DRAW" | b"SOUND" | b"SNDTABLE" | b"PARTICLE" | b"SAVEPANEL")) {
                 bail!("FES checkpoint object kind needs its matching extension owner/physical-task adapter");
             }
             if let Some(scope) = self.button_refresh.as_ref().and_then(|refresh| refresh.notifications.as_ref()) {

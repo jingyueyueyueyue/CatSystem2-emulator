@@ -1,0 +1,541 @@
+{
+  "schema": "daydream-prologue-exit-evidence/v1",
+  "runtime_status": "r221 verified on the 19:06 player; title transition awaits replay",
+  "r221": {
+    "receipt": "archive/2026-11/20261120_daydream_r221_receipt.json",
+    "batch_result": "F:\\CS2-build-cache\\playthrough\\2026-11\\20261120_190801_610883_287t7_2w_playthrough\\17.json",
+    "verified_page": {
+      "group": 40,
+      "wait_record": 221,
+      "frame": 5687,
+      "host_line": 363,
+      "owner": 65,
+      "context": 159,
+      "load_id": 1,
+      "loaded_frame": 644,
+      "wait_marked_frame": 5685,
+      "body_records": [
+        215
+      ],
+      "source_frame": 5243,
+      "epoch": 174,
+      "natural_complete_frame": 5336,
+      "empty_body": {
+        "record": 220,
+        "raw_bytes": 0,
+        "preceding_body_raw_bytes": 36,
+        "fes_queue_operation": "unobserved"
+      }
+    },
+    "incoming_enter": {
+      "from": 205,
+      "to": 221,
+      "down_frame": 5242,
+      "receipt_frame": 5243,
+      "resume_event_line": 68902,
+      "region": 62,
+      "receiver": 8
+    }
+  },
+  "prologue_tail_group": 41,
+  "prologue_tail_commands": [
+    [
+      222,
+      "frameoff"
+    ],
+    [
+      223,
+      "wait"
+    ],
+    [
+      224,
+      "eg 5"
+    ],
+    [
+      225,
+      "rdraw 60"
+    ],
+    [
+      226,
+      "wait"
+    ],
+    [
+      227,
+      "eg 5 c_white"
+    ],
+    [
+      228,
+      "rdraw 120"
+    ],
+    [
+      229,
+      "wait"
+    ],
+    [
+      230,
+      "wait 120"
+    ],
+    [
+      231,
+      "eg"
+    ],
+    [
+      232,
+      "rdraw 120"
+    ],
+    [
+      233,
+      "wait"
+    ],
+    [
+      234,
+      "wait 60"
+    ],
+    [
+      235,
+      "frameoff fade "
+    ],
+    [
+      236,
+      "wait"
+    ],
+    [
+      237,
+      "initialize_header"
+    ],
+    [
+      238,
+      "view 0 default"
+    ],
+    [
+      239,
+      "particle stop"
+    ],
+    [
+      240,
+      "particle2 stop"
+    ],
+    [
+      241,
+      "particle3 stop"
+    ],
+    [
+      242,
+      "fesds"
+    ],
+    [
+      243,
+      "bgm"
+    ],
+    [
+      244,
+      "se"
+    ],
+    [
+      245,
+      "bg stop"
+    ],
+    [
+      246,
+      "cg stop"
+    ],
+    [
+      247,
+      "fg stop"
+    ],
+    [
+      248,
+      "eg stop"
+    ],
+    [
+      249,
+      "fw stop"
+    ],
+    [
+      250,
+      "pl stop"
+    ],
+    [
+      251,
+      "particle stop"
+    ],
+    [
+      252,
+      "place"
+    ],
+    [
+      253,
+      "wait"
+    ],
+    [
+      254,
+      "bg"
+    ],
+    [
+      255,
+      "cg"
+    ],
+    [
+      256,
+      "fg"
+    ],
+    [
+      257,
+      "eg"
+    ],
+    [
+      258,
+      "fw"
+    ],
+    [
+      259,
+      "pl"
+    ],
+    [
+      260,
+      "wait"
+    ],
+    [
+      261,
+      "bg tone"
+    ],
+    [
+      262,
+      "cg tone"
+    ],
+    [
+      263,
+      "fg tone"
+    ],
+    [
+      264,
+      "eg tone"
+    ],
+    [
+      265,
+      "bg attr_def 401 402 403 404 405"
+    ],
+    [
+      266,
+      "cg attr_def 401 402 403 404 405"
+    ],
+    [
+      267,
+      "fg attr_def 401 402 403 404 405"
+    ],
+    [
+      268,
+      "eg attr_def 401 402 403 404 405"
+    ],
+    [
+      269,
+      "pl attr_def 401 402 403 404 405"
+    ],
+    [
+      270,
+      "wait"
+    ],
+    [
+      271,
+      "wait"
+    ],
+    [
+      272,
+      "drawdef"
+    ],
+    [
+      273,
+      "wipedef"
+    ],
+    [
+      274,
+      "wait"
+    ]
+  ],
+  "prologue_tail_log_checkpoints": [
+    [
+      222,
+      "frameoff"
+    ],
+    [
+      225,
+      "rdraw 60"
+    ],
+    [
+      228,
+      "rdraw 120"
+    ],
+    [
+      232,
+      "rdraw 120"
+    ],
+    [
+      237,
+      "initialize_header"
+    ],
+    [
+      242,
+      "fesds"
+    ],
+    [
+      272,
+      "drawdef"
+    ],
+    [
+      273,
+      "wipedef"
+    ],
+    [
+      274,
+      "wait"
+    ]
+  ],
+  "first_post_prologue_wait": {
+    "position": {
+      "state": "title",
+      "scene": "-",
+      "group": -1,
+      "record": -1,
+      "window": "title"
+    },
+    "flow": "TITLE_WAIT",
+    "ttlflow": "FES_WAIT",
+    "title": "WAIT",
+    "button": "btn1[0]",
+    "region": "resolve live",
+    "inputs": 0
+  },
+  "fes_sources": [
+    {
+      "member": "fes.int::flow.fes",
+      "sha256": "c32e18f118e9e0542633a0bd3283c4a9643af0667c732648d10d0a06b889a7f2",
+      "lines": {
+        "30": "execfes ttlflow",
+        "31": "next TITLE_WAIT",
+        "67": "#GAME_WAIT",
+        "68": "if (_EXITCODE_!=-1)",
+        "69": "next START_TITLE"
+      }
+    },
+    {
+      "member": "fes.int::ttlflow.fes",
+      "sha256": "45f85f51b1123b0cde8d5a83b9b7702b2e5e530118763b4f91ba6a159d4c3f7f",
+      "lines": {
+        "35": "execfes title",
+        "36": "next FES_WAIT"
+      }
+    },
+    {
+      "member": "fes.int::title.fes",
+      "sha256": "5cce82a9ff5418872b440b3c9dc3bbb775e2f05e7f29a83c4155df4cb914a0d8",
+      "lines": {
+        "69": "btn1[0] sys_title 100 110 120 130 100 0 0",
+        "120": "if ($542==1)",
+        "121": "next IN2",
+        "127": "strvar 200 prologue",
+        "129": "$542 = 1",
+        "207": "btn1[0] noact 0",
+        "214": "btn1[0] disp 1",
+        "256": "btn1 enable 1",
+        "284": "next WAIT",
+        "383": "#WAIT",
+        "405": "#GO_STORY",
+        "406": "strvar 200 start",
+        "602": "#btn1.PUSH_L",
+        "605": "if (@==0)",
+        "606": "next GO_STORY"
+      }
+    }
+  ],
+  "later_dispatch_after_title_input": {
+    "brunch.cst": {
+      "member": "update02.int::brunch.cst",
+      "sha256": "4eae85e1f7d45b532b88e3b0956eedf18e30c4e15e81ef45f5815af4940c5846",
+      "commands": [
+        [
+          0,
+          "if (#399 == 0) next brunch_A"
+        ],
+        [
+          1,
+          "if (#399 == 1) next brunch_B"
+        ],
+        [
+          2,
+          "if (#399 == 2) next brunch_C"
+        ],
+        [
+          3,
+          "if (#399 == 3) next brunch_2"
+        ],
+        [
+          4,
+          "if (#399 == 4) next brunch_2"
+        ],
+        [
+          5,
+          "if (#399 == 5) next brunch_2"
+        ]
+      ]
+    },
+    "brunch_a.cst": {
+      "member": "update02.int::brunch_A.cst",
+      "sha256": "3a3ae5f2ddab9358f03fc12d1e388cbacb6c90f10a9167c5a9743306fbb0a79d",
+      "commands": [
+        [
+          0,
+          "rand 299 1 3"
+        ],
+        [
+          1,
+          "if (#299 == 1) next c01_01"
+        ],
+        [
+          2,
+          "if (#299 == 2) next c02_01"
+        ],
+        [
+          3,
+          "if (#299 == 3) next c03_01"
+        ]
+      ]
+    },
+    "c00_00.cst": {
+      "member": "update02.int::c00_00.cst",
+      "sha256": "0877411837488ed01a8ad4c00f575d6a632da834c5e44b223f051adcad0c1307",
+      "commands": [
+        [
+          0,
+          "next brunch"
+        ]
+      ]
+    },
+    "c01_01.cst": {
+      "member": "update02.int::c01_01.cst",
+      "sha256": "8ebfff8abe5bce475217ab1832e4a657b73f9e99befce2d19a63338126a7f530",
+      "commands": [
+        [
+          0,
+          "next c01_01_01"
+        ]
+      ]
+    },
+    "c02_01.cst": {
+      "member": "update02.int::c02_01.cst",
+      "sha256": "52b17c1d2ff43b800eb81fd69f9f368336f230132010734654ee44230803bf8d",
+      "commands": [
+        [
+          0,
+          "next c02_01_01"
+        ]
+      ]
+    },
+    "c03_01.cst": {
+      "member": "update02.int::c03_01.cst",
+      "sha256": "5b906204f1be3b3bebd5e3f7d6640281b550018f5184f59853c1ae87d2548d08",
+      "commands": [
+        [
+          0,
+          "next c03_01_01"
+        ]
+      ]
+    },
+    "start.cst": {
+      "member": "update02.int::start.cst",
+      "sha256": "67ba76a533c574f9165270b0d059bfc0badedbaa1562ea2dab44f1eccef41ab9",
+      "commands": [
+        [
+          0,
+          "next c00_00"
+        ]
+      ]
+    }
+  },
+  "first_body_waits_for_branch_399_eq_0": [
+    {
+      "scene": "c01_01_01",
+      "assets": {
+        "cn": {
+          "member": "update03.int::c01_01_01.cst",
+          "sha256": "f030ee9c61e938c805bd53f5795577b380ce7408a920c81585e047a966a77937",
+          "group": 0,
+          "record": 66,
+          "kind": 2,
+          "body_records": [
+            65
+          ],
+          "view_mode": "cinema"
+        },
+        "jp": {
+          "member": "update02.int::c01_01_01.cst",
+          "sha256": "3e4589544c62ae4c2a78d8c8a3f222dd6ce1d02360e7d0ceba38fabd5474dcc3",
+          "group": 0,
+          "record": 66,
+          "kind": 2,
+          "body_records": [
+            65
+          ],
+          "view_mode": "cinema"
+        }
+      }
+    },
+    {
+      "scene": "c02_01_01",
+      "assets": {
+        "cn": {
+          "member": "update03.int::c02_01_01.cst",
+          "sha256": "b1f048287cd45dc398508f7a1db36dfbd26d31a4560768643049a86152d861b2",
+          "group": 0,
+          "record": 66,
+          "kind": 2,
+          "body_records": [
+            64,
+            65
+          ],
+          "view_mode": "case02"
+        },
+        "jp": {
+          "member": "update02.int::c02_01_01.cst",
+          "sha256": "d307614cf74f7e521e7d2d1b725b6fb49b8c369bae4ce7f76e09d932551752f6",
+          "group": 0,
+          "record": 66,
+          "kind": 2,
+          "body_records": [
+            64,
+            65
+          ],
+          "view_mode": "case02"
+        }
+      }
+    },
+    {
+      "scene": "c03_01_01",
+      "assets": {
+        "cn": {
+          "member": "update03.int::c03_01_01.cst",
+          "sha256": "0fab60189396d735e9d42729c8323bb8baf4c344ccd3b500e7569c96070b1fdf",
+          "group": 0,
+          "record": 62,
+          "kind": 2,
+          "body_records": [
+            60,
+            61
+          ],
+          "view_mode": "cinema"
+        },
+        "jp": {
+          "member": "update02.int::c03_01_01.cst",
+          "sha256": "c314d75b989f700f2ed13cca770e35868b2264c0b5c26544131a9269a57db72b",
+          "group": 0,
+          "record": 62,
+          "kind": 2,
+          "body_records": [
+            60,
+            61
+          ],
+          "view_mode": "cinema"
+        }
+      }
+    }
+  ]
+}

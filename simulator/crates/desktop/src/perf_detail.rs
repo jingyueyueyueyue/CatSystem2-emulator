@@ -23,12 +23,15 @@ pub struct HostPerfDetails {
     tasks: Vec<TaskSample>,
     lists: Vec<ListSample>,
     text: Vec<TextSample>,
+    text_summary: TextSummary,
     kcs: Vec<KcsSample>,
     audio: Vec<audio::Sample>,
     active_list: Option<ListSample>,
     image_source: Option<ImageSourceSample>,
     active_image_source: Option<ImageSourceSample>,
     sample_lists: bool,
+    gpu_output: GpuOutputSample,
+    emote_gpu: EmoteGpuSample,
 }
 
 struct Capture(Option<HostPerfDetails>);
@@ -50,6 +53,25 @@ impl HostPerfDetails {
 
     pub fn rows(mut self, session: u64, frame: u64, call: u64) -> String {
         let mut rows = String::new();
+        if let Some(row) = self.gpu_output.row(session, frame, call) {
+            let _ = append_row(&mut rows, &row);
+        }
+        if self.emote_gpu.poses != 0 {
+            let sample = self.emote_gpu;
+            let [evaluate, prepare, encode, readback, repair] = sample.elapsed.map(|time| time.as_micros());
+            let collect = evaluate + prepare;
+            let [scanlines, pack] = sample.collect_phases.map(|time| time.as_micros());
+            let row = format!(
+                "emote_gpu session={session} frame={frame} call={call} poses={} draws={} pixels={} repaired={} collect_us={collect} evaluate_us={evaluate} prepare_us={prepare} scanlines_cpu_us={scanlines} pack_cpu_us={pack} encode_us={encode} readback_us={readback} repair_us={repair}",
+                sample.poses, sample.draws, sample.pixels, sample.repaired,
+            );
+            append_row(&mut rows, &row);
+        }
+        let mut text_summary = self.text_summary.row(session, frame, call, self.text.len());
+        // Preserve the aggregate and coverage counters even if detailed rows fill the batch.
+        let text_reserve = text_summary.as_ref().map_or(0, |row| {
+            row.len() + " detail_wire_dropped=\n".len() + MAX_TEXT.ilog10() as usize + 1
+        });
         self.tasks.sort_by_key(|sample| std::cmp::Reverse(sample.us));
         self.lists.sort_by_key(|sample| std::cmp::Reverse(sample.us));
         for task in &self.tasks {
@@ -63,7 +85,7 @@ impl HostPerfDetails {
                 let name = std::str::from_utf8(&task.name[..task.name_len]).unwrap_or("?");
                 let _ = write!(row, " name={name}");
             }
-            append_row(&mut rows, &row);
+            append_row_reserving(&mut rows, &row, text_reserve);
         }
         self.kcs.sort_by_key(|sample| std::cmp::Reverse(sample.elapsed));
         for sample in &self.kcs {
@@ -81,7 +103,7 @@ impl HostPerfDetails {
                 let _ = write!(row, " n{index}={}/{}/{}", code.calls,
                     code.elapsed.as_micros(), code.log_time.as_micros());
             }
-            append_row(&mut rows, &row);
+            append_row_reserving(&mut rows, &row, text_reserve);
         }
         if let Some(sample) = &self.image_source {
             let mut row = format!(
@@ -91,9 +113,10 @@ impl HostPerfDetails {
             for (stage, (calls, us)) in IMAGE_SOURCE_STAGES.iter().zip(sample.stages) {
                 if calls != 0 { let _ = write!(row, " {stage}={calls}/{us}"); }
             }
-            append_row(&mut rows, &row);
+            append_row_reserving(&mut rows, &row, text_reserve);
         }
         self.text.sort_by_key(|sample| std::cmp::Reverse(sample.elapsed));
+        let mut detail_wire_dropped = 0;
         for sample in &self.text {
             let name = std::str::from_utf8(&sample.name[..sample.name_len]).unwrap_or("?");
             let mut row = format!(
@@ -106,16 +129,20 @@ impl HostPerfDetails {
                         measurement.elapsed.as_micros(), measurement.calls);
                 }
             }
-            for (name, count) in ["font_cache_hits", "font_rank_hits", "font_rank_builds"]
-                .into_iter().zip(sample.fallback)
-            {
+            for (name, count) in TEXT_FALLBACK.into_iter().zip(sample.fallback) {
                 if count != 0 { let _ = write!(row, " {name}={count}"); }
             }
             if let Some((_, index, name, length)) = sample.cold_face.as_ref() {
                 let name = std::str::from_utf8(&name[..*length]).unwrap_or("?");
                 let _ = write!(row, " slowest_face={name}:{index}");
             }
-            append_row(&mut rows, &row);
+            if !append_row_reserving(&mut rows, &row, text_reserve) {
+                detail_wire_dropped += 1;
+            }
+        }
+        if let Some(row) = &mut text_summary {
+            let _ = writeln!(row, " detail_wire_dropped={detail_wire_dropped}");
+            rows.insert_str(0, row);
         }
         audio::write_rows(&mut rows, self.audio, session, frame, call);
         for list in &self.lists {
@@ -136,11 +163,146 @@ impl HostPerfDetails {
     }
 }
 
-fn append_row(rows: &mut String, row: &str) {
-    if rows.len() + row.len() < MAX_WIRE_BYTES {
-        rows.push_str(row);
-        rows.push('\n');
+// Report issued transfer bytes, including failed submissions, with elapsed
+// CPU wall time for the synchronous wait and copy.
+#[derive(Default)]
+struct ReadbackSample {
+    calls: u64,
+    failures: u64,
+    bytes: u64,
+    elapsed: Duration,
+}
+
+#[derive(Default)]
+struct GpuOutputSample {
+    device: ReadbackSample,
+    packed: ReadbackSample,
+    textured_group_rejects: u64,
+    textured_single_rejects: u64,
+}
+
+#[derive(Default)]
+struct EmoteGpuSample {
+    poses: usize,
+    draws: usize,
+    pixels: u64,
+    repaired: usize,
+    elapsed: [Duration; 5],
+    collect_phases: [Duration; 2],
+}
+
+impl GpuOutputSample {
+    fn row(&self, session: u64, frame: u64, call: u64) -> Option<String> {
+        if self.device.calls == 0 && self.packed.calls == 0
+            && self.textured_group_rejects == 0 && self.textured_single_rejects == 0
+        {
+            return None;
+        }
+        Some(format!(
+            "gpu_output session={session} frame={frame} call={call} device_calls={} device_failed={} device_bytes={} device_us={} packed_calls={} packed_failed={} packed_bytes={} packed_us={} textured_group_rejects={} textured_single_rejects={}",
+            self.device.calls, self.device.failures, self.device.bytes, self.device.elapsed.as_micros(),
+            self.packed.calls, self.packed.failures, self.packed.bytes, self.packed.elapsed.as_micros(),
+            self.textured_group_rejects, self.textured_single_rejects,
+        ))
     }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+#[derive(Clone, Copy)]
+pub(super) enum ReadbackKind {
+    Device,
+    Packed,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) struct ReadbackTimer {
+    kind: ReadbackKind,
+    bytes: u64,
+    started: Instant,
+    success: bool,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+impl ReadbackTimer {
+    pub(super) fn start(kind: ReadbackKind, bytes: u64) -> Option<Self> {
+        DETAIL.with_borrow(Option::is_some)
+            .then(|| Self { kind, bytes, started: Instant::now(), success: false })
+    }
+
+    pub(super) fn complete(mut self) {
+        self.success = true;
+    }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+impl Drop for ReadbackTimer {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        DETAIL.with_borrow_mut(|slot| {
+            let Some(detail) = slot else { return };
+            let sample = match self.kind {
+                ReadbackKind::Device => &mut detail.gpu_output.device,
+                ReadbackKind::Packed => &mut detail.gpu_output.packed,
+            };
+            sample.calls += 1;
+            sample.failures += u64::from(!self.success);
+            sample.bytes += self.bytes;
+            sample.elapsed += elapsed;
+        });
+    }
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_gpu_start() -> Option<Instant> {
+    DETAIL.with_borrow(Option::is_some).then(Instant::now)
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_gpu_pose(
+    milestones: [Instant; 5], collect_phases: [Duration; 2], draws: usize, pixels: u64, repaired: usize,
+) {
+    let [start, evaluated, collected, encoded, downloaded] = milestones;
+    let elapsed = [evaluated - start, collected - evaluated, encoded - collected, downloaded - encoded, downloaded.elapsed()];
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            let sample = &mut detail.emote_gpu;
+            sample.poses += 1;
+            sample.draws += draws;
+            sample.pixels += pixels;
+            sample.repaired += repaired;
+            for (total, phase) in sample.collect_phases.iter_mut().zip(collect_phases) {
+                *total += phase;
+            }
+            for (total, elapsed) in sample.elapsed.iter_mut().zip(elapsed) {
+                *total += elapsed;
+            }
+        }
+    });
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn textured_triangle_rejected(group: bool) {
+    DETAIL.with_borrow_mut(|slot| {
+        let Some(detail) = slot else { return };
+        if group {
+            detail.gpu_output.textured_group_rejects += 1;
+        } else {
+            detail.gpu_output.textured_single_rejects += 1;
+        }
+    });
+}
+
+fn append_row(rows: &mut String, row: &str) {
+    append_row_reserving(rows, row, 0);
+}
+
+fn append_row_reserving(rows: &mut String, row: &str, reserve: usize) -> bool {
+    if rows.len() + row.len() + reserve >= MAX_WIRE_BYTES {
+        return false;
+    }
+    rows.push_str(row);
+    rows.push('\n');
+    true
 }
 
 fn keep_slowest<T>(records: &mut Vec<T>, limit: usize, record: T, elapsed: impl Fn(&T) -> u64) {
@@ -157,18 +319,112 @@ fn keep_slowest<T>(records: &mut Vec<T>, limit: usize, record: T, elapsed: impl 
 pub(super) enum TextStage {
     Configure, UserMaps, DecodeUser, Clear, Prepare, Layout, FontSelect, FontFallback,
     FaceLoad, FaceRead, FaceDecode, GlyphMeasure, GlyphRaster, GlyphEffects, DecodeInline,
+    Metadata, FontCatalog, Playback, SurfaceSync, Projection, NovelProjection, History,
 }
 
-const TEXT_STAGES: [&str; TextStage::DecodeInline as usize + 1] = [
+const TEXT_STAGES: [&str; TextStage::History as usize + 1] = [
     "configure", "user_maps", "decode_user", "clear", "prepare", "layout", "font_select",
     "font_fallback", "face_load", "face_read", "face_decode", "glyph_measure",
-    "glyph_raster", "glyph_effects", "decode_inline",
+    "glyph_raster", "glyph_effects", "decode_inline", "metadata", "font_catalog", "playback",
+    "surface_sync", "projection", "novel_projection", "history",
 ];
+const TEXT_FALLBACK: [&str; 3] = ["font_cache_hits", "font_rank_hits", "font_rank_builds"];
 
 #[derive(Clone, Copy, Default)]
 struct TextMeasurement {
     elapsed: Duration,
     calls: u32,
+}
+
+impl TextMeasurement {
+    fn record(&mut self, elapsed: Duration) {
+        self.elapsed += elapsed;
+        self.calls = self.calls.saturating_add(1);
+    }
+}
+
+#[derive(Default)]
+struct TextSummary {
+    bank_work: TextMeasurement,
+    bank_below_threshold: u32,
+    projections: TextProjections,
+    stages: [TextMeasurement; TEXT_STAGES.len()],
+    fallback: [u32; TEXT_FALLBACK.len()],
+}
+
+impl TextSummary {
+    fn record_bank(&mut self, sample: &TextSample) {
+        self.bank_work.record(sample.elapsed);
+        if sample.elapsed.as_micros() < u128::from(SLOW_US) {
+            self.bank_below_threshold = self.bank_below_threshold.saturating_add(1);
+        }
+        self.projections.add(&sample.projections);
+        for (total, stage) in self.stages.iter_mut().zip(sample.stages) {
+            total.elapsed += stage.elapsed;
+            total.calls = total.calls.saturating_add(stage.calls);
+        }
+        for (total, count) in self.fallback.iter_mut().zip(sample.fallback) {
+            *total = total.saturating_add(count);
+        }
+    }
+
+    fn row(&self, session: u64, frame: u64, call: u64, kept: usize) -> Option<String> {
+        if self.bank_work.calls == 0 && self.stages.iter().all(|stage| stage.calls == 0) {
+            return None;
+        }
+        let bank_calls = self.bank_work.calls;
+        let bank_us = self.bank_work.elapsed.as_micros();
+        let below = self.bank_below_threshold;
+        let detail_limit_dropped = bank_calls.saturating_sub(below).saturating_sub(kept as u32);
+        let mut row = format!(
+            "text_summary session={session} frame={frame} call={call} bank_calls={bank_calls} bank_us={bank_us} detail_below_threshold={below} detail_kept={kept} detail_limit_dropped={detail_limit_dropped}"
+        );
+        for (stage, measurement) in TEXT_STAGES.iter().zip(self.stages) {
+            if measurement.calls != 0 {
+                let _ = write!(row, " {stage}={}/{}", measurement.calls, measurement.elapsed.as_micros());
+            }
+        }
+        for (name, count) in TEXT_FALLBACK.into_iter().zip(self.fallback) {
+            if count != 0 {
+                let _ = write!(row, " {name}={count}");
+            }
+        }
+        self.projections.write(&mut row);
+        Some(row)
+    }
+}
+
+#[derive(Default)]
+struct TextProjections {
+    reused: u32,
+    patched: u32,
+    replaced: u32,
+    patch_pixels: u64,
+    eligible_updates: u32,
+}
+
+impl TextProjections {
+    fn add(&mut self, other: &Self) {
+        self.reused = self.reused.saturating_add(other.reused);
+        self.patched = self.patched.saturating_add(other.patched);
+        self.replaced = self.replaced.saturating_add(other.replaced);
+        self.patch_pixels = self.patch_pixels.saturating_add(other.patch_pixels);
+        self.eligible_updates = self.eligible_updates.saturating_add(other.eligible_updates);
+    }
+
+    fn write(&self, row: &mut String) {
+        if self.reused != 0 || self.patched != 0 || self.replaced != 0 {
+            let _ = write!(row,
+                " projections_reused={} projections_patched={} projections_replaced={} projection_patch_pixels={} eligible_projection_updates={}",
+                self.reused, self.patched, self.replaced, self.patch_pixels, self.eligible_updates);
+        }
+    }
+}
+
+pub(super) enum TextProjection {
+    Reused,
+    Patched(u64),
+    Replaced,
 }
 
 struct TextSample {
@@ -180,6 +436,7 @@ struct TextSample {
     stages: [TextMeasurement; TEXT_STAGES.len()],
     fallback: [u32; 3],
     cold_face: Option<(Duration, u32, [u8; 40], usize)>,
+    projections: TextProjections,
 }
 
 fn detail_name(name: &[u8]) -> ([u8; 40], usize) {
@@ -199,8 +456,31 @@ impl TextWork {
             (Instant::now(), TEXT.with_borrow_mut(|slot| slot.replace(TextSample {
                 owner, bank, name, name_len, elapsed: Duration::ZERO,
                 stages: Default::default(), fallback: [0; 3], cold_face: None,
+                projections: TextProjections::default(),
             })))
         }))
+    }
+
+    pub(super) fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(super) fn projection(&self, projection: TextProjection, eligible: bool) {
+        TEXT.with_borrow_mut(|slot| {
+            let Some(sample) = slot.as_mut() else { return };
+            let counts = &mut sample.projections;
+            match projection {
+                TextProjection::Reused => counts.reused += 1,
+                TextProjection::Patched(pixels) => {
+                    counts.patched += 1;
+                    counts.patch_pixels += pixels;
+                }
+                TextProjection::Replaced => counts.replaced += 1,
+            }
+            if eligible && !matches!(projection, TextProjection::Reused) {
+                counts.eligible_updates += 1;
+            }
+        });
     }
 }
 
@@ -209,14 +489,15 @@ impl Drop for TextWork {
         let Some((start, previous)) = self.0.take() else { return };
         let elapsed = start.elapsed();
         let sample = TEXT.with_borrow_mut(|slot| std::mem::replace(slot, previous));
-        if let Some(mut sample) = sample && elapsed.as_micros() >= u128::from(SLOW_US) {
-            sample.elapsed = elapsed;
-            DETAIL.with_borrow_mut(|slot| {
-                if let Some(detail) = slot {
-                    keep_slowest(&mut detail.text, MAX_TEXT, sample, |sample| sample.elapsed.as_micros() as u64);
-                }
-            });
-        }
+        let Some(mut sample) = sample else { return };
+        sample.elapsed = elapsed;
+        DETAIL.with_borrow_mut(|slot| {
+            let Some(detail) = slot else { return };
+            detail.text_summary.record_bank(&sample);
+            if elapsed.as_micros() >= u128::from(SLOW_US) {
+                keep_slowest(&mut detail.text, MAX_TEXT, sample, |sample| sample.elapsed.as_micros() as u64);
+            }
+        });
     }
 }
 
@@ -233,6 +514,27 @@ pub(super) fn text_fallback_event(event: TextFallbackEvent) {
             *counter = counter.saturating_add(1);
         }
     });
+}
+
+/// Text work outside an individual message bank.
+pub(super) struct TextHostTimer(Option<Instant>, TextStage);
+
+impl TextHostTimer {
+    pub(super) fn new(stage: TextStage) -> Self {
+        Self(DETAIL.with_borrow(|slot| slot.is_some()).then(Instant::now), stage)
+    }
+}
+
+impl Drop for TextHostTimer {
+    fn drop(&mut self) {
+        let Some(start) = self.0 else { return };
+        let elapsed = start.elapsed();
+        DETAIL.with_borrow_mut(|slot| {
+            if let Some(detail) = slot {
+                detail.text_summary.stages[self.1 as usize].record(elapsed);
+            }
+        });
+    }
 }
 
 pub(super) struct TextTimer(Option<Instant>, TextStage, Option<(u32, [u8; 40], usize)>);
@@ -258,8 +560,7 @@ impl Drop for TextTimer {
         TEXT.with_borrow_mut(|slot| {
             if let Some(text) = slot {
                 let measurement = &mut text.stages[self.1 as usize];
-                measurement.elapsed += elapsed;
-                measurement.calls = measurement.calls.saturating_add(1);
+                measurement.record(elapsed);
                 if let Some((index, name, len)) = self.2
                     && text.cold_face.as_ref().is_none_or(|(longest, ..)| elapsed > *longest)
                 {
@@ -417,7 +718,11 @@ impl Drop for SlowTask {
             });
         }
         sample.us = elapsed.as_micros() as u64;
-        if sample.us >= SLOW_US {
+        let threshold = match sample.scope {
+            "emote_render_rgba" | "emote_blend" => 1_000,
+            _ => SLOW_US,
+        };
+        if sample.us >= threshold {
             DETAIL.with_borrow_mut(|slot| {
                 if let Some(detail) = slot {
                     keep_slowest(&mut detail.tasks, MAX_TASKS, sample, |sample| sample.us);

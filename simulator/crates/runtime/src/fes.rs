@@ -37,6 +37,7 @@ pub enum FesObjectKind {
     Wipe,
     NovelString,
     NovelString8,
+    Scroll,
 }
 
 impl FesObjectKind {
@@ -63,6 +64,8 @@ impl FesObjectKind {
             Some(Self::Slider)
         } else if name.eq_ignore_ascii_case(b"SCROLL2") {
             Some(Self::Scroll2)
+        } else if name.eq_ignore_ascii_case(b"SCROLL") {
+            Some(Self::Scroll)
         } else if name.eq_ignore_ascii_case(b"STRING") {
             Some(Self::String)
         } else if name.eq_ignore_ascii_case(b"STRING8") {

@@ -1,0 +1,22 @@
+{
+  "3": {
+    "frames": 425,
+    "inputs": [
+      "story-events",
+      "story-trace",
+      "capture-every:0",
+      "101:138,362",
+      "capture:169",
+      "right:181:640,540",
+      "capture:230",
+      "move:241:1070,421",
+      "245:1070,421",
+      "capture:250",
+      "move:298:1060,672",
+      "300:1060,672",
+      "capture:347",
+      "365:13",
+      "capture:414"
+    ]
+  }
+}

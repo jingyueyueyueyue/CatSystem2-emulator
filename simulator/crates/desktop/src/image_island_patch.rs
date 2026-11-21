@@ -1,6 +1,7 @@
 //! ISLAND's identified translation DLL HG-3 receiver, independently expressed
 //! from its fixed byte evidence. No DLL loading, PNG/CRC name aliases, global
 //! filename overrides, or retained replacement pixel store.
+use cs2_formats::{HgFile, HgFrame};
 use cs2_renderer::RgbaFrame;
 use cs2_runtime::{ResourceIndex, RuntimeError};
 use cs2_script::Result;
@@ -53,12 +54,18 @@ fn plain_file(resources: &ResourceIndex, name: &str) -> Result<Option<Vec<u8>>> 
 /// Original 548f0b invokes the receiver once for each imgNNNN slice, after
 /// inverse predictors, before metadata publication/cache insertion. The native
 /// image uses bottom-up BGR(A); renderer storage is top-down RGBA.
-pub(super) fn apply(resources: &ResourceIndex, encoded: &[u8], id: u32, frame: RgbaFrame,
-    warning: &mut impl FnMut(String)) -> Result<RgbaFrame> {
-    let file = cs2_formats::HgFile::parse(encoded)
-        .map_err(|_| native_state_error("ISLAND HG-3 directory changed after decoding"))?;
-    let source = file.frames.iter().find(|source| source.id == id)
-        .ok_or_else(|| native_state_error("ISLAND selected HG-3 frame is absent"))?;
+pub(super) fn apply(resources: &ResourceIndex, encoded: &[u8], id: u32, source: Option<&HgFrame>,
+    frame: RgbaFrame, warning: &mut impl FnMut(String)) -> Result<RgbaFrame> {
+    let file;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            file = HgFile::parse(encoded)
+                .map_err(|_| native_state_error("ISLAND HG-3 directory changed after decoding"))?;
+            file.frames.iter().find(|source| source.id == id)
+                .ok_or_else(|| native_state_error("ISLAND selected HG-3 frame is absent"))?
+        }
+    };
     // The patched instruction is in the native imgNNNN branch, not img_jpg,
     // img_al or a generic bitmap decoder. Do not apply it to other encodings.
     if source.encoded_image.is_some() { return Ok(frame); }

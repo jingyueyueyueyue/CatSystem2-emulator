@@ -1,0 +1,52 @@
+{
+  "8": {
+    "frames": 9800,
+    "route": {
+      "label": "08 guarded eye exit and two Enter presses through settled c01_01 g2/150",
+      "idle_frames": 5500,
+      "page_scenes": [],
+      "eyecatch_08_exit": true,
+      "eyecatch_08_first_body": true,
+      "eyecatch_08_next_body": true,
+      "steps": [],
+      "guarded_body_last_group": 2
+    },
+    "diagnostics": [
+      "trace-native:69",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:614",
+      "trace-native:616",
+      "trace-native:619",
+      "inspect-log:4000",
+      "inspect-log:5400"
+    ]
+  },
+  "review": {
+    "member": "scene/c01_01.cst",
+    "entry_increment": "archive/2026-11/20261120_pc_story_08_card_bank.patch",
+    "runtime_increment": "archive/2026-11/20261120_pc_story_08_ordinary_body_route.patch",
+    "checker": "scripts/analysis/check_pc_story_08_eyecatch.py --through-g2",
+    "static_checker": "scripts/analysis/check_pc_story_08_eyecatch.py --static-successor",
+    "waits": [
+      144,
+      148,
+      150
+    ],
+    "body_records": [
+      143,
+      147,
+      149
+    ],
+    "between": [
+      "se 9 vol 100",
+      "se 9 loop se078"
+    ],
+    "budget": "The 9800-frame cap adds a 600-frame successor readiness window to the g1 run. The title deadline is 5500 frames.",
+    "expected_inputs": "One left click each for title, card and eye, then one Enter each at g0/144 and g1/148. Stop at settled g2/150.",
+    "eyecatch_increment": "archive/2026-11/20261120_pc_story_08_eye_mouse_alias.patch",
+    "next_pages_increment": "archive/2026-11/20261120_pc_story_08_14_18_next_pages.patch"
+  }
+}

@@ -91,9 +91,19 @@ pub trait MovieFramePresenter: Send + Sync {
     fn present(&self, handle: u64, frame: Arc<MovieFrame>) -> RuntimeResult<()>;
 }
 
+struct PublishedMovieFrame {
+    handle: u64,
+    first_sequence: u64,
+    sequence: u64,
+    frame: Arc<MovieFrame>,
+}
+
 pub struct MovieFrameSurface {
-    latest: Mutex<Option<(u64, Arc<MovieFrame>)>>,
-    presented: Mutex<HashMap<u64, f64>>,
+    latest: Mutex<Option<PublishedMovieFrame>>,
+    sequence: AtomicU64,
+    presented: Mutex<HashMap<u64, (u64, f64)>>,
+    #[cfg(target_os = "android")]
+    trace: Mutex<Option<Arc<crate::movie_android::MovieTrace>>>,
     visible: AtomicBool,
     game_drawing: AtomicBool,
     rectangle: Mutex<Option<[i32; 4]>>,
@@ -103,7 +113,10 @@ impl Default for MovieFrameSurface {
     fn default() -> Self {
         Self {
             latest: Mutex::new(None),
+            sequence: AtomicU64::new(0),
             presented: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "android")]
+            trace: Mutex::new(None),
             visible: AtomicBool::new(false),
             game_drawing: AtomicBool::new(false),
             rectangle: Mutex::new(None),
@@ -133,14 +146,14 @@ impl MovieFrameSurface {
     fn retained_frame(&self) -> RuntimeResult<Option<(u64, Arc<MovieFrame>)>> {
         self.latest
             .lock()
-            .map(|frame| frame.clone())
+            .map(|frame| frame.as_ref().map(|p| (p.handle, p.frame.clone())))
             .map_err(|_| error("movie frame surface was poisoned"))
     }
 
     pub fn take_latest(&self) -> RuntimeResult<Option<(u64, Arc<MovieFrame>)>> {
         self.latest
             .lock()
-            .map(|mut frame| frame.take())
+            .map(|mut frame| frame.take().map(|p| (p.handle, p.frame)))
             .map_err(|_| error("movie frame surface was poisoned"))
     }
 
@@ -153,7 +166,7 @@ impl MovieFrameSurface {
             .latest
             .lock()
             .map_err(|_| error("movie frame surface was poisoned"))?;
-        if latest.as_ref().is_none_or(|(owner, _)| *owner != handle) {
+        if latest.as_ref().is_none_or(|frame| frame.handle != handle) {
             // A queued UI frame may finish after synchronous source release.
             // Its receipt must not resurrect a released presentation clock.
             return Ok(());
@@ -162,9 +175,59 @@ impl MovieFrameSurface {
             .lock()
             .map_err(|_| error("movie presentation clock was poisoned"))?
             .entry(handle)
-            .and_modify(|last| *last = (*last).max(time))
-            .or_insert(time);
+            .and_modify(|(_, last)| *last = (*last).max(time))
+            .or_insert((0, time));
         Ok(())
+    }
+
+    pub(super) fn frame_for_composition(&self) -> RuntimeResult<Option<(u64, u64, Arc<MovieFrame>)>> {
+        if !self.visible.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.latest.lock()
+            .map(|latest| latest.as_ref().map(|p| (p.handle, p.sequence, p.frame.clone())))
+            .map_err(|_| error("movie frame surface was poisoned"))
+    }
+
+    pub(super) fn needs_submission(&self, handle: u64, sequence: u64) -> RuntimeResult<bool> {
+        let latest = self.latest.lock().map_err(|_| error("movie frame surface was poisoned"))?;
+        if !Self::matches_receipt(&latest, handle, sequence) {
+            return Ok(false);
+        }
+        let submitted = self.presented.lock().map_err(|_| error("movie presentation clock was poisoned"))?;
+        Ok(submitted.get(&handle).is_none_or(|(previous, _)| *previous < sequence))
+    }
+
+    pub(super) fn mark_submitted(&self, handle: u64, sequence: u64, time: f64) -> RuntimeResult<()> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(error("invalid submitted movie timestamp"));
+        }
+        let latest = self.latest.lock().map_err(|_| error("movie frame surface was poisoned"))?;
+        if Self::matches_receipt(&latest, handle, sequence) {
+            let mut submitted = self.presented.lock().map_err(|_| error("movie presentation clock was poisoned"))?;
+            let previous = submitted.entry(handle).or_insert((0, time));
+            if sequence > previous.0 {
+                *previous = (sequence, time);
+                #[cfg(target_os = "android")]
+                self.trace_frame(handle, 4, "first_submitted", time);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn trace_frame(&self, handle: u64, bit: u8, stage: &str, time: f64) {
+        if let Ok(trace) = self.trace.lock()
+            && let Some(trace) = trace.as_ref().filter(|trace| trace.playback == handle)
+        {
+            trace.first(bit, stage, format_args!("pts={time:.6}"));
+        }
+    }
+
+    fn matches_receipt(latest: &Option<PublishedMovieFrame>, handle: u64, sequence: u64) -> bool {
+        latest.as_ref().is_some_and(|frame| {
+            frame.handle == handle && (frame.first_sequence..=frame.sequence).contains(&sequence)
+        })
     }
 
     fn presented_time(&self, handle: u64) -> RuntimeResult<Option<f64>> {
@@ -173,7 +236,7 @@ impl MovieFrameSurface {
             .lock()
             .map_err(|_| error("movie presentation clock was poisoned"))?
             .get(&handle)
-            .copied())
+            .map(|(_, time)| *time))
     }
 
     fn clear(&self, handle: u64) -> RuntimeResult<()> {
@@ -181,7 +244,7 @@ impl MovieFrameSurface {
             .latest
             .lock()
             .map_err(|_| error("movie frame surface was poisoned"))?;
-        if latest.as_ref().is_some_and(|(owner, _)| *owner == handle) {
+        if latest.as_ref().is_some_and(|frame| frame.handle == handle) {
             *latest = None;
         }
         self.presented
@@ -194,10 +257,14 @@ impl MovieFrameSurface {
 
 impl MovieFramePresenter for MovieFrameSurface {
     fn present(&self, handle: u64, frame: Arc<MovieFrame>) -> RuntimeResult<()> {
-        *self
-            .latest
-            .lock()
-            .map_err(|_| error("movie frame surface was poisoned"))? = Some((handle, frame));
+        let mut latest = self.latest.lock().map_err(|_| error("movie frame surface was poisoned"))?;
+        if latest.as_ref().is_some_and(|p| p.handle == handle && Arc::ptr_eq(&p.frame, &frame)) {
+            return Ok(());
+        }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let first_sequence = latest.as_ref().filter(|previous| previous.handle == handle)
+            .map_or(sequence, |previous| previous.first_sequence);
+        *latest = Some(PublishedMovieFrame { handle, first_sequence, sequence, frame });
         Ok(())
     }
 }
@@ -233,9 +300,9 @@ struct LoadedMovie {
     #[cfg(not(target_os = "android"))]
     input: Arc<MediaInput>,
     #[cfg(target_os = "android")]
-    resolve: crate::movie_android::Resolver,
+    source: crate::movie_android::MovieSource,
     #[cfg(target_os = "android")]
-    length: Option<u64>,
+    trace: Arc<crate::movie_android::MovieTrace>,
     format: MovieFormat,
     metadata: MovieMetadata,
     width: u32,
@@ -302,6 +369,7 @@ impl Drop for ActiveMovie {
 struct Completion {
     result: Result<(), String>,
     last_time: Option<f64>,
+    natural: bool,
 }
 
 pub struct MpegMovieHost {
@@ -524,9 +592,14 @@ impl MpegMovieHost {
             Completion {
                 result: result.as_ref().map(|_| ()).map_err(ToString::to_string),
                 last_time: time,
+                natural: false,
             },
         );
         result
+    }
+
+    pub(super) fn replay_finished_naturally(&self, handle: u64) -> bool {
+        self.completed.get(&handle).is_some_and(|entry| entry.natural && entry.result.is_ok())
     }
 
     pub fn frame_surface(&self) -> Arc<MovieFrameSurface> {
@@ -605,6 +678,7 @@ impl MpegMovieHost {
                 Completion {
                     result: result.map_err(|cause| cause.to_string()),
                     last_time,
+                    natural: true,
                 },
             );
         }
@@ -747,6 +821,8 @@ impl MpegMovieHost {
             self.release(handle)?;
         }
         let movie = self.loaded.clone().expect("loaded above");
+        #[cfg(target_os = "android")]
+        let mut movie = movie;
         self.show_on_window();
         let handle = self.next_handle;
         self.next_handle = self
@@ -768,6 +844,13 @@ impl MpegMovieHost {
         let host_paused = self.host_paused.clone();
         let looped = count == 0 || count == u32::MAX;
         let muted = request.muted;
+        #[cfg(target_os = "android")]
+        {
+            let trace = Arc::new(crate::movie_android::MovieTrace::new(movie.trace.load, handle));
+            trace.event("play", format_args!("resource={:?} count={count} muted={muted}", movie.resource));
+            *surface.trace.lock().map_err(|_| error("movie trace lock was poisoned"))? = Some(trace.clone());
+            movie.trace = trace;
+        }
         let worker = thread::Builder::new()
             .name(format!("cs2-movie-{handle}"))
             .spawn(move || {
@@ -791,12 +874,12 @@ impl MpegMovieHost {
                             &mut started,
                         )?;
                         if !keep_playing {
-                            return Ok(());
+                            return Ok("stopped");
                         }
                         if !looped {
                             remaining = remaining.saturating_sub(1);
                             if remaining == 0 {
-                                return Ok(());
+                                return Ok("completed");
                             }
                         }
                     }
@@ -809,7 +892,12 @@ impl MpegMovieHost {
                         .unwrap_or_else(|| "movie ended before decoding its first frame".into());
                     let _ = started.send(Err(error(message)));
                 }
-                let _ = finished_sender.send(result);
+                #[cfg(target_os = "android")]
+                match &result {
+                    Ok(reason) => movie.trace.event("end", format_args!("reason={reason}")),
+                    Err(cause) => movie.trace.event("end", format_args!("reason=error error={cause:?}")),
+                }
+                let _ = finished_sender.send(result.map(|_| ()));
             })
             .map_err(|cause| error(format!("start movie worker: {cause}")))?;
         let playback = ActiveMovie {
@@ -857,7 +945,13 @@ impl MovieHost for MpegMovieHost {
     fn load(&mut self, request: MovieRequest) -> RuntimeResult<MovieLoadResult> {
         // Never reuse the previous asset after a failed load.
         self.loaded = None;
+        #[cfg(target_os = "android")]
+        let trace = Arc::new(crate::movie_android::MovieTrace::begin());
+        #[cfg(target_os = "android")]
+        trace.event("request", format_args!("resource={:?}", request.resource));
         if !self.enabled {
+            #[cfg(target_os = "android")]
+            trace.event("disabled", format_args!("reason=playback_setting"));
             return Ok(MovieLoadResult::Disabled);
         }
         #[cfg(not(target_os = "android"))]
@@ -873,25 +967,47 @@ impl MovieHost for MpegMovieHost {
         #[cfg(not(target_os = "android"))]
         let (metadata, has_audio) = probe_metadata(input.clone(), format, &self.ffmpeg)?;
         #[cfg(target_os = "android")]
-        let format = match crate::movie_android::signature(&self.resolve, &request.resource) {
-            Ok(prefix) => MovieFormat::detect(&prefix)?,
-            Err(RuntimeError::ResourceNotFound(_)) => return Ok(MovieLoadResult::Missing),
-            Err(cause) => return Err(cause),
-        };
-        #[cfg(target_os = "android")]
-        let source_length = match &self.android_resources {
-            Some(resources) => resources.resolve_mode_utf16(
+        let source = if let Some(resources) = &self.android_resources {
+            let candidate = resources.resolve_mode_utf16(
                 &request.resource.encode_utf16().collect::<Vec<_>>(), ResourceMode::LooseFirst,
-            )?.map(|candidate| candidate.value.size),
-            None => None,
+            ).inspect_err(|cause| trace.event("resolve_error", format_args!("{cause:?}")))?;
+            let Some(candidate) = candidate else {
+                trace.event("missing", format_args!("source=indexed"));
+                return Ok(MovieLoadResult::Missing);
+            };
+            let value = candidate.value;
+            let source = match &value.location {
+                cs2_runtime::ResourceLocation::File { .. } => "loose",
+                cs2_runtime::ResourceLocation::Archive { payload_key: Some(_), .. } => "encrypted_archive",
+                cs2_runtime::ResourceLocation::Archive { .. } => "archive",
+            };
+            trace.event("resolved", format_args!("source={source} bytes={}", value.size));
+            crate::movie_android::MovieSource::Indexed(resources.clone(), value.clone())
+        } else {
+            trace.event("resolved", format_args!("source=stream"));
+            crate::movie_android::MovieSource::Streaming(self.resolve.clone(), request.resource.clone())
         };
         #[cfg(target_os = "android")]
-        let (metadata, has_audio) = crate::movie_android::probe(
-            self.resolve.clone(),
-            &request.resource,
-            source_length,
-            format,
-        )?;
+        let format = match crate::movie_android::signature(&source) {
+            Ok(prefix) => MovieFormat::detect(&prefix)
+                .inspect_err(|cause| trace.event("signature_error", format_args!("{cause:?}")))?,
+            Err(RuntimeError::ResourceNotFound(_)) => {
+                trace.event("missing", format_args!("source=open"));
+                return Ok(MovieLoadResult::Missing);
+            }
+            Err(cause) => {
+                trace.event("open_error", format_args!("{cause:?}"));
+                return Err(cause);
+            }
+        };
+        #[cfg(target_os = "android")]
+        trace.event("probe_begin", format_args!("container={format:?} demuxer={}", format.demuxer()));
+        #[cfg(target_os = "android")]
+        let (metadata, has_audio) = crate::movie_android::probe(source.clone(), format)
+            .inspect_err(|cause| trace.event("probe_error", format_args!("{cause:?}")))?;
+        #[cfg(target_os = "android")]
+        trace.event("probe_ready", format_args!("width={:?} height={:?} has_audio={has_audio} duration={:?}",
+            metadata.width, metadata.height, metadata.duration_seconds));
         let (Some(width), Some(height)) = (metadata.width, metadata.height) else {
             return Err(error(
                 "movie metadata probe has no supported frame dimensions",
@@ -907,9 +1023,9 @@ impl MovieHost for MpegMovieHost {
             #[cfg(not(target_os = "android"))]
             input,
             #[cfg(target_os = "android")]
-            resolve: self.resolve.clone(),
+            source,
             #[cfg(target_os = "android")]
-            length: source_length,
+            trace,
             format,
             metadata: metadata.clone(),
             width: width.into(),
@@ -1060,9 +1176,7 @@ fn video_stream(
         .spawn(move || {
             let result = (|| {
                 let (mut decoder, _, _) = crate::movie_android::Decoder::open(
-                    movie.resolve.clone(),
-                    &movie.resource,
-                    movie.length,
+                    movie.source.clone(),
                     movie.format.demuxer(),
                     1,
                     cancel.clone(),
@@ -1086,6 +1200,9 @@ fn video_stream(
                             }
                             previous = time;
                             count += 1;
+                            if count == 1 {
+                                movie.trace.first(1, "first_decoded", format_args!("pts={time:.6} width={width} height={height}"));
+                            }
                             if !send_bounded(
                                 &sender,
                                 Ok(Some(DecodedVideo {
@@ -1093,7 +1210,7 @@ fn video_stream(
                                         width,
                                         height,
                                         presentation_time: time,
-                                        rgba: rgba.into(),
+                                        rgba,
                                     }),
                                     duration,
                                 })),
@@ -1145,9 +1262,7 @@ fn audio_stream(
         .spawn(move || {
             let result = (|| {
                 let (mut decoder, _, _) = crate::movie_android::Decoder::open(
-                    movie.resolve.clone(),
-                    &movie.resource,
-                    movie.length,
+                    movie.source.clone(),
                     movie.format.demuxer(),
                     2,
                     cancel.clone(),

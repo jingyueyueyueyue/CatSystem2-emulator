@@ -1,0 +1,32 @@
+{
+  "1": {
+    "frames": 4500,
+    "route": {
+      "label": "NEKOPARA Vol.3: one guarded opening press, then observe 01/1/87",
+      "idle_frames": 1800,
+      "page_scenes": [],
+      "page_fallback_before": 0,
+      "steps": [
+        {
+          "label": "Settled New Game only; no startup modal confirmation",
+          "wait": {"state": "title", "hit": {"point": [1155, 235], "region": 14}},
+          "click": [1155, 235],
+          "after": {"state": "page", "scene": "01", "group": 0, "record": 59, "window": "meswnd"}
+        },
+        {
+          "label": "01/0/59: one guarded physical press to the exact next page",
+          "wait": {"state": "page", "scene": "01", "group": 0, "record": 59, "window": "meswnd", "hit": {"point": [625, 478], "region": 77}},
+          "probe_points": [[625, 478]],
+          "click": [625, 478],
+          "mouse_press": {"candidates": [3, 77, 52, 57, 7], "region": 52, "key": 0, "group": 0, "response": 1},
+          "after": {"state": "page", "scene": "01", "group": 1, "record": 87, "window": "meswnd"}
+        },
+        {
+          "label": "01/1/87: log the proven successor without input",
+          "wait": {"state": "page", "scene": "01", "group": 1, "record": 87, "window": "meswnd"},
+          "probe_points": [[625, 478]]
+        }
+      ]
+    }
+  }
+}

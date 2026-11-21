@@ -374,9 +374,10 @@ impl FesRuntime {
             .unwrap_or(layer.opacity);
         options.clip = layer.clip;
         if let Some(name) = &layer.plane {
-            let Some(plane) = self.planes.get(name) else {
+            let Some(name) = self.driver_plane_key(name) else {
                 return Ok(None);
             };
+            let plane = &self.planes[name];
             let canvas_plane = !self.media.contains_key(name);
             let animation = layer
                 .animation_display
@@ -415,6 +416,14 @@ impl FesRuntime {
             options.position = Point::new(point[0], point[1]);
         }
         Ok(Some(options))
+    }
+
+    pub(super) fn driver_plane_key(&self, name: &str) -> Option<&str> {
+        // A single bank is allocated under its base name even if the FES
+        // refers to it explicitly as name[0].
+        self.planes.get_key_value(name)
+            .or_else(|| self.planes.get_key_value(name.strip_suffix("[0]")?))
+            .map(|(key, _)| key.as_str())
     }
 
     pub(super) fn driver_plane_clip(&self, name: &str) -> Option<Rect> {

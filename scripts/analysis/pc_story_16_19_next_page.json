@@ -1,0 +1,20 @@
+{
+  "16": {
+    "frames": 1920,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "require-hit:425:14", "425:640,480",
+      "require-hit:661:15", "661:66,72",
+      "require-hit:1041:62", "1041:640,420", "1280:13",
+      "inspect-log:1700", "1700:13", "inspect-log:1920"
+    ]
+  },
+  "19": {
+    "frames": 3100,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "require-hit:2270:17", "2270:335,488", "move:2304:40,32",
+      "inspect-log:2900", "2900:13", "inspect-log:3100"
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "20": {
+    "frames": 3000,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:66",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:530",
+      "trace-native:531",
+      "trace-native:630",
+      "trace-native:905",
+      "require-hit:2032:16",
+      "2032:480,667",
+      "require-hit:2192:14",
+      "2192:353,308",
+      "move:2410:559,418",
+      "move:2411:723,418",
+      "require-hit:2413:15",
+      "2413:723,418",
+      "inspect-log:2441",
+      "inspect-log:2500",
+      "inspect-log:3000"
+    ]
+  }
+}

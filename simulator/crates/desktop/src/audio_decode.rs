@@ -14,10 +14,20 @@ mod vorbis_stream;
 pub(super) const MAX_ENCODED: usize = 64 * 1024 * 1024;
 const MAX_PCM: usize = 80 * 1024 * 1024;
 const MAX_CACHE: usize = 128 * 1024 * 1024;
+const MAX_SAMPLE_RATE: u32 = 384_000;
+const PCM_READ_FRAMES: usize = MAX_SAMPLE_RATE as usize / 100;
 const MIN_STREAM_BYTES: usize = 256 * 1024;
 const MIN_VOICE_STREAM_BYTES: usize = 32 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    cs2_runtime::graph_serde::Serialize,
+    cs2_runtime::graph_serde::Deserialize,
+)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub enum AudioCodec {
     OggVorbis,
@@ -27,7 +37,15 @@ pub enum AudioCodec {
     SpeechPcm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    cs2_runtime::graph_serde::Serialize,
+    cs2_runtime::graph_serde::Deserialize,
+)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub struct AudioProbe {
     pub codec: AudioCodec,
@@ -50,9 +68,6 @@ enum AudioSource {
 pub(crate) struct PreparedAudio {
     pub probe: AudioProbe,
     source: AudioSource,
-    // Checkpoints retain the existing exact PCM wire representation. Only
-    // explicit checkpoint operations need to materialize an indexed source.
-    checkpoint_pcm: OnceLock<Arc<[i16]>>,
 }
 
 impl std::fmt::Debug for PreparedAudio {
@@ -75,7 +90,6 @@ impl PreparedAudio {
         Self {
             probe: audio.probe,
             source: AudioSource::Pcm(audio.samples),
-            checkpoint_pcm: OnceLock::new(),
         }
     }
 
@@ -88,25 +102,13 @@ impl PreparedAudio {
                 frames: source.frames() as u64,
             },
             source: AudioSource::Vorbis(source),
-            checkpoint_pcm: OnceLock::new(),
         }
     }
 
-    pub(super) fn materialize(&self) -> RuntimeResult<Arc<[i16]>> {
+    pub(super) fn checkpoint_samples(&self) -> RuntimeResult<Vec<i16>> {
         match &self.source {
-            AudioSource::Pcm(samples) => Ok(samples.clone()),
-            AudioSource::Vorbis(vorbis) => {
-                if let Some(samples) = self.checkpoint_pcm.get() {
-                    return Ok(samples.clone());
-                }
-                let (_, samples) = vorbis::decode(&vorbis.encoded)?;
-                if samples.len() != self.sample_count() {
-                    return Err(error("materialized Vorbis PCM differs from its indexed length"));
-                }
-                let samples: Arc<[i16]> = samples.into();
-                let _ = self.checkpoint_pcm.set(samples);
-                Ok(self.checkpoint_pcm.get().expect("initialized checkpoint PCM").clone())
-            }
+            AudioSource::Pcm(samples) => Ok(samples.to_vec()),
+            AudioSource::Vorbis(vorbis) => vorbis.checkpoint_samples(),
         }
     }
 
@@ -117,52 +119,73 @@ impl PreparedAudio {
         if self.probe != other.probe {
             return Ok(false);
         }
-        if let (AudioSource::Vorbis(left), AudioSource::Vorbis(right)) = (&self.source, &other.source)
+        if let (AudioSource::Vorbis(left), AudioSource::Vorbis(right)) =
+            (&self.source, &other.source)
             && left.encoded == right.encoded
         {
             return Ok(true);
         }
-        Ok(self.materialize()? == other.materialize()?)
+        match (&self.source, &other.source) {
+            (AudioSource::Pcm(samples), _) => other.matches_samples(samples),
+            (_, AudioSource::Pcm(samples)) => self.matches_samples(samples),
+            (AudioSource::Vorbis(_), AudioSource::Vorbis(_)) => {
+                let mut left = self.reader()?;
+                let mut right = other.reader()?;
+                for start in (0..self.probe.frames as usize).step_by(PCM_READ_FRAMES) {
+                    let end = (start + PCM_READ_FRAMES).min(self.probe.frames as usize);
+                    if left.read(start, end)? != right.read(start, end)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    pub(super) fn matches_samples(&self, samples: &[i16]) -> RuntimeResult<bool> {
+        if samples.len() != self.sample_count() {
+            return Ok(false);
+        }
+        if let AudioSource::Pcm(actual) = &self.source {
+            return Ok(actual.as_ref() == samples);
+        }
+        let mut reader = self.reader()?;
+        let channels = usize::from(self.probe.channels);
+        for start in (0..self.probe.frames as usize).step_by(PCM_READ_FRAMES) {
+            let end = (start + PCM_READ_FRAMES).min(self.probe.frames as usize);
+            if reader.read(start, end)? != &samples[start * channels..end * channels] {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn sample_count(&self) -> usize {
         self.probe.frames as usize * usize::from(self.probe.channels)
     }
 
-    #[cfg(any(test, windows, target_os = "android"))]
     pub(super) fn reader(&self) -> RuntimeResult<AudioReader<'_>> {
         let source = match &self.source {
             AudioSource::Pcm(samples) => PcmReader::Slice(samples),
-            AudioSource::Vorbis(vorbis) => match self.checkpoint_pcm.get() {
-                Some(samples) => PcmReader::Slice(samples),
-                None => PcmReader::Stream(vorbis.reader()?),
-            },
+            AudioSource::Vorbis(vorbis) => PcmReader::Stream(vorbis.reader()?),
         };
-        Ok(AudioReader { source, channels: usize::from(self.probe.channels) })
-    }
-
-    fn unshared_samples(&self) -> bool {
-        match &self.source {
-            AudioSource::Pcm(samples) => Arc::strong_count(samples) == 1,
-            AudioSource::Vorbis(_) => self.checkpoint_pcm.get()
-                .is_none_or(|samples| Arc::strong_count(samples) == 1),
-        }
+        Ok(AudioReader {
+            source,
+            channels: usize::from(self.probe.channels),
+        })
     }
 }
 
-#[cfg(any(test, windows, target_os = "android"))]
 enum PcmReader<'a> {
     Slice(&'a [i16]),
     Stream(vorbis_stream::VorbisReader<'a>),
 }
 
-#[cfg(any(test, windows, target_os = "android"))]
 pub(super) struct AudioReader<'a> {
     source: PcmReader<'a>,
     channels: usize,
 }
 
-#[cfg(any(test, windows, target_os = "android"))]
 impl AudioReader<'_> {
     pub(super) fn read(&mut self, start: usize, end: usize) -> RuntimeResult<&[i16]> {
         match &mut self.source {
@@ -176,6 +199,7 @@ struct Entry {
     hash: u64,
     encoded: Arc<[u8]>,
     audio: Arc<PreparedAudio>,
+    // The original encoded-plus-PCM charge bounds either resident source.
     bytes: usize,
 }
 
@@ -185,7 +209,50 @@ struct Cache {
     bytes: usize,
 }
 
+impl Cache {
+    fn find(&mut self, hash: u64, encoded: &[u8]) -> Option<Arc<PreparedAudio>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.hash == hash && entry.encoded.as_ref() == encoded)?;
+        let entry = self.entries.remove(index).expect("selected cache entry");
+        let audio = entry.audio.clone();
+        self.entries.push_back(entry);
+        Some(audio)
+    }
+}
+
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+// Bound concurrent cold preparations without growing per-resource lock state.
+static PREPARATION: [Mutex<()>; 2] = [Mutex::new(()), Mutex::new(())];
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparationEvent {
+    CacheMiss,
+    PreparationStart,
+}
+
+#[cfg(test)]
+static PREPARATION_TEST_HOOK: Mutex<Option<Arc<dyn Fn(PreparationEvent) + Send + Sync>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn notify_preparation_test(event: PreparationEvent) {
+    let hook = PREPARATION_TEST_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(event);
+    }
+}
+
+fn content_hash(encoded: &[u8]) -> u64 {
+    encoded.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
 
 /// Cache hits require byte equality in addition to the hash; unrelated roots
 /// and intentional hash collisions can never select another resource's PCM.
@@ -193,73 +260,95 @@ pub(super) fn prepare_audio(encoded: Vec<u8>) -> RuntimeResult<Arc<PreparedAudio
     prepare_audio_with_minimum(encoded, MIN_STREAM_BYTES)
 }
 
-pub(super) fn prepare_named_audio(encoded: Vec<u8>, resource: &str) -> RuntimeResult<Arc<PreparedAudio>> {
+pub(super) fn prepare_named_audio(
+    encoded: Vec<u8>,
+    resource: &str,
+) -> RuntimeResult<Arc<PreparedAudio>> {
     // Traditional dialogue resides in pcm_* archives. This classification
     // controls only preparation, leaving script channel routing untouched.
     let voice = resource.split(['/', '\\']).any(|part| {
         part.eq_ignore_ascii_case("voice")
-            || part.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("pcm_"))
+            || part
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pcm_"))
     });
-    prepare_audio_with_minimum(encoded, if voice { MIN_VOICE_STREAM_BYTES } else { MIN_STREAM_BYTES })
+    prepare_audio_with_minimum(
+        encoded,
+        if voice {
+            MIN_VOICE_STREAM_BYTES
+        } else {
+            MIN_STREAM_BYTES
+        },
+    )
 }
 
-fn prepare_audio_with_minimum(encoded: Vec<u8>, min_stream_bytes: usize) -> RuntimeResult<Arc<PreparedAudio>> {
+fn prepare_audio_with_minimum(
+    encoded: Vec<u8>,
+    min_stream_bytes: usize,
+) -> RuntimeResult<Arc<PreparedAudio>> {
     if encoded.is_empty() || encoded.len() > MAX_ENCODED {
         return Err(error("encoded sound must contain 1 byte to 64 MiB"));
     }
-    let hash = encoded.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    });
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(Cache::default()))
-        .lock()
-        .map_err(|_| error("decoded audio cache was poisoned"))?;
-    if let Some(index) = cache
-        .entries
-        .iter()
-        .position(|entry| entry.hash == hash && entry.encoded.as_ref() == encoded.as_slice())
-    {
-        let entry = cache.entries.remove(index).expect("selected cache entry");
-        let audio = entry.audio.clone();
-        cache.entries.push_back(entry);
+    let hash = content_hash(&encoded);
+    let shared_cache = CACHE.get_or_init(|| Mutex::new(Cache::default()));
+    let lock_cache = || {
+        shared_cache
+            .lock()
+            .map_err(|_| error("decoded audio cache was poisoned"))
+    };
+    if let Some(audio) = lock_cache()?.find(hash, &encoded) {
         return Ok(audio);
     }
+    #[cfg(test)]
+    notify_preparation_test(PreparationEvent::CacheMiss);
+    let _preparation = PREPARATION[(hash >> 63) as usize]
+        .lock()
+        .map_err(|_| error("audio preparation lock was poisoned"))?;
+    if let Some(audio) = lock_cache()?.find(hash, &encoded) {
+        return Ok(audio);
+    }
+    #[cfg(test)]
+    notify_preparation_test(PreparationEvent::PreparationStart);
     let encoded: Arc<[u8]> = encoded.into();
-    let pinned_bytes = || cache.entries.iter()
-        .filter(|entry| !entry.evictable())
-        .map(|entry| entry.bytes)
-        .sum::<usize>();
     let indexed = if encoded.len() >= min_stream_bytes && encoded.starts_with(b"OggS") {
-        vorbis_stream::IndexedVorbis::new(encoded.clone())?.filter(|source| {
-            // Reserve the optional checkpoint PCM and fall back to ordinary
-            // PCM when the index would prevent a previously admissible load.
-            pinned_bytes() + encoded.len() + source.retained_bytes()
-                + source.frames() * usize::from(source.metadata.channels) * size_of::<i16>()
-                <= MAX_CACHE
-        })
+        let index_limit = (MAX_CACHE - encoded.len()).min(MAX_PCM);
+        vorbis_stream::IndexedVorbis::new(encoded.clone(), index_limit)?
     } else {
         None
     };
-    let (audio, retained) = if let Some(source) = indexed {
-        let retained = source.retained_bytes();
-        (PreparedAudio::from_indexed_vorbis(source), retained)
+    let audio = if let Some(source) = indexed {
+        PreparedAudio::from_indexed_vorbis(source)
     } else {
-        (decode_pcm(&encoded)?, 0)
+        decode_pcm(&encoded)?
     };
-    let AudioProbe { sample_rate, channels, frames, .. } = audio.probe;
-    if !matches!(channels, 1 | 2) || !(1..=384_000).contains(&sample_rate) || frames == 0 {
+    let AudioProbe {
+        sample_rate,
+        channels,
+        frames,
+        ..
+    } = audio.probe;
+    if !matches!(channels, 1 | 2) || !(1..=MAX_SAMPLE_RATE).contains(&sample_rate) || frames == 0 {
         return Err(error(
             "decoded sound has an unsupported rate, channel count or sample alignment",
         ));
     }
-    let bytes = encoded.len() + retained + audio.sample_count() * size_of::<i16>();
+    let bytes = encoded.len() + audio.sample_count() * size_of::<i16>();
     if bytes > MAX_CACHE {
         return Err(error("sound cache entry exceeds 128 MiB"));
     }
+    let mut cache = lock_cache()?;
     while cache.bytes + bytes > MAX_CACHE || cache.entries.len() >= 128 {
-        let index = cache.entries.iter().position(Entry::evictable)
-            .ok_or_else(|| error("128 MiB decoded sound cache is pinned by loaded/playing channels"))?;
-        let evicted = cache.entries.remove(index).expect("selected unpinned cache entry");
+        let index = cache
+            .entries
+            .iter()
+            .position(Entry::evictable)
+            .ok_or_else(|| {
+                error("128 MiB decoded sound cache is pinned by loaded/playing channels")
+            })?;
+        let evicted = cache
+            .entries
+            .remove(index)
+            .expect("selected unpinned cache entry");
         cache.bytes -= evicted.bytes;
     }
     let audio = Arc::new(audio);
@@ -275,14 +364,19 @@ fn prepare_audio_with_minimum(encoded: Vec<u8>, min_stream_bytes: usize) -> Runt
 
 impl Entry {
     fn evictable(&self) -> bool {
-        Arc::strong_count(&self.audio) == 1 && self.audio.unshared_samples()
+        Arc::strong_count(&self.audio) == 1
     }
 }
 
 fn decode_pcm(encoded: &[u8]) -> RuntimeResult<PreparedAudio> {
     let (codec, sample_rate, channels, samples) = if encoded.starts_with(b"OggS") {
         let (metadata, samples) = vorbis::decode(encoded)?;
-        (AudioCodec::OggVorbis, metadata.sample_rate, metadata.channels, samples)
+        (
+            AudioCodec::OggVorbis,
+            metadata.sample_rate,
+            metadata.channels,
+            samples,
+        )
     } else if encoded.starts_with(b"RIFF") && encoded.get(8..12) == Some(b"WAVE") {
         crate::wav_decode::decode(encoded)?
     } else {
@@ -291,7 +385,7 @@ fn decode_pcm(encoded: &[u8]) -> RuntimeResult<PreparedAudio> {
         ));
     };
     if !matches!(channels, 1 | 2)
-        || !(1..=384_000).contains(&sample_rate)
+        || !(1..=MAX_SAMPLE_RATE).contains(&sample_rate)
         || samples.is_empty()
         || samples.len() % usize::from(channels) != 0
     {
@@ -316,6 +410,262 @@ mod tests {
     use cs2_formats::OggVorbis;
     use cs2_runtime::GameRoot;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Condvar, MutexGuard, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct TestState {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl TestState {
+        fn new() -> Self {
+            let serial = TEST_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::reset_cache();
+            *PREPARATION_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            Self { _serial: serial }
+        }
+
+        fn reset_cache() {
+            let mut cache = CACHE
+                .get_or_init(|| Mutex::new(Cache::default()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *cache = Cache::default();
+        }
+
+        fn set_hook(&self, hook: impl Fn(PreparationEvent) + Send + Sync + 'static) {
+            *PREPARATION_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(hook));
+        }
+    }
+
+    impl Drop for TestState {
+        fn drop(&mut self) {
+            *PREPARATION_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            Self::reset_cache();
+        }
+    }
+
+    struct ColdPreparations {
+        events: mpsc::Receiver<PreparationEvent>,
+        starts: Arc<AtomicUsize>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ColdPreparations {
+        fn install(state: &TestState) -> Self {
+            let (event_sender, events) = mpsc::channel();
+            let starts = Arc::new(AtomicUsize::new(0));
+            let released = Arc::new((Mutex::new(false), Condvar::new()));
+            let hook_starts = starts.clone();
+            let hook_released = released.clone();
+            state.set_hook(move |event| {
+                let _ = event_sender.send(event);
+                if event == PreparationEvent::PreparationStart {
+                    hook_starts.fetch_add(1, Ordering::SeqCst);
+                    let (lock, condition) = &*hook_released;
+                    let mut released = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while !*released {
+                        released = condition
+                            .wait(released)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+            });
+            Self {
+                events,
+                starts,
+                released,
+            }
+        }
+
+        fn receive(&self) -> Option<PreparationEvent> {
+            self.events.recv_timeout(Duration::from_secs(10)).ok()
+        }
+
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            let (lock, condition) = &*self.released;
+            *lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            condition.notify_all();
+        }
+    }
+
+    impl Drop for ColdPreparations {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn pcm_wav(samples: &[i16]) -> Vec<u8> {
+        let data_bytes = (samples.len() * size_of::<i16>()) as u32;
+        let mut encoded = Vec::with_capacity(44 + data_bytes as usize);
+        encoded.extend_from_slice(b"RIFF");
+        encoded.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        encoded.extend_from_slice(b"WAVEfmt ");
+        encoded.extend_from_slice(&16_u32.to_le_bytes());
+        encoded.extend_from_slice(&1_u16.to_le_bytes());
+        encoded.extend_from_slice(&1_u16.to_le_bytes());
+        encoded.extend_from_slice(&8_000_u32.to_le_bytes());
+        encoded.extend_from_slice(&16_000_u32.to_le_bytes());
+        encoded.extend_from_slice(&2_u16.to_le_bytes());
+        encoded.extend_from_slice(&16_u16.to_le_bytes());
+        encoded.extend_from_slice(b"data");
+        encoded.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            encoded.extend_from_slice(&sample.to_le_bytes());
+        }
+        encoded
+    }
+
+    fn spawn_preparation(
+        start: Arc<Barrier>,
+        encoded: Vec<u8>,
+    ) -> thread::JoinHandle<RuntimeResult<Arc<PreparedAudio>>> {
+        thread::spawn(move || {
+            start.wait();
+            prepare_audio(encoded)
+        })
+    }
+
+    #[test]
+    fn same_resource_cold_preparation_is_singleflight() {
+        let state = TestState::new();
+        let encoded = pcm_wav(&[0]);
+        let cold = ColdPreparations::install(&state);
+        let start = Arc::new(Barrier::new(3));
+        let first = spawn_preparation(start.clone(), encoded.clone());
+        let second = spawn_preparation(start.clone(), encoded);
+        start.wait();
+
+        let events = [cold.receive(), cold.receive(), cold.receive()];
+        cold.release();
+        let first = first
+            .join()
+            .expect("first preparation thread")
+            .expect("first audio");
+        let second = second
+            .join()
+            .expect("second preparation thread")
+            .expect("second audio");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cold.starts(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|&&event| event == Some(PreparationEvent::CacheMiss))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|&&event| event == Some(PreparationEvent::PreparationStart))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn different_resources_on_different_shards_prepare_in_parallel() {
+        let state = TestState::new();
+        let first = pcm_wav(&[0]);
+        let second = pcm_wav(&[0, 1, 2, 3, 4, 5]);
+        assert_ne!(content_hash(&first) >> 63, content_hash(&second) >> 63);
+        let cold = ColdPreparations::install(&state);
+        let start = Arc::new(Barrier::new(3));
+        let first_thread = spawn_preparation(start.clone(), first);
+        let second_thread = spawn_preparation(start.clone(), second);
+        start.wait();
+
+        let events = [
+            cold.receive(),
+            cold.receive(),
+            cold.receive(),
+            cold.receive(),
+        ];
+        cold.release();
+        first_thread
+            .join()
+            .expect("first preparation thread")
+            .expect("first audio");
+        second_thread
+            .join()
+            .expect("second preparation thread")
+            .expect("second audio");
+
+        assert_eq!(cold.starts(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|&&event| event == Some(PreparationEvent::CacheMiss))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|&&event| event == Some(PreparationEvent::PreparationStart))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn cache_hit_completes_while_cold_preparation_is_blocked() {
+        let state = TestState::new();
+        let warm = pcm_wav(&[0]);
+        let cold_encoded = pcm_wav(&[0, 1, 2, 3, 4, 5]);
+        let cached = prepare_audio(warm.clone()).expect("warm audio");
+        let cold = ColdPreparations::install(&state);
+        let start = Arc::new(Barrier::new(2));
+        let cold_thread = spawn_preparation(start.clone(), cold_encoded);
+        start.wait();
+        let events = [cold.receive(), cold.receive()];
+
+        let (hit_sender, hit_receiver) = mpsc::channel();
+        let hit_thread = thread::spawn(move || {
+            let _ = hit_sender.send(prepare_audio(warm));
+        });
+        let hit = hit_receiver.recv_timeout(Duration::from_secs(10)).ok();
+        cold.release();
+        cold_thread
+            .join()
+            .expect("cold preparation thread")
+            .expect("cold audio");
+        hit_thread.join().expect("cache hit thread");
+
+        assert_eq!(
+            events,
+            [
+                Some(PreparationEvent::CacheMiss),
+                Some(PreparationEvent::PreparationStart)
+            ]
+        );
+        let hit = hit
+            .expect("cache hit while cold preparation was blocked")
+            .expect("cached audio");
+        assert!(Arc::ptr_eq(&cached, &hit));
+    }
 
     #[test]
     #[ignore = "requires the local sample 05 archives"]
@@ -331,20 +681,45 @@ mod tests {
         let scan = GameRoot::open(sample)?.scan()?;
         let music = scan.resources.read("bgm.int/BGM50.ogg")?;
         assert_eq!(music.len(), 9_942_144);
-        assert!(matches!(OggVorbis::metadata(&music), Err(cs2_formats::OggVorbisError::Truncated)));
+        assert!(matches!(
+            OggVorbis::metadata(&music),
+            Err(cs2_formats::OggVorbisError::Truncated)
+        ));
         let title = prepare_audio(music)?;
-        assert_eq!(title.probe, AudioProbe {
-            codec: AudioCodec::OggVorbis, sample_rate: 44_100, channels: 2, frames: 18_598_464,
-        });
-        assert!(title.materialize()?.iter().any(|&sample| sample != 0));
+        assert_eq!(
+            title.probe,
+            AudioProbe {
+                codec: AudioCodec::OggVorbis,
+                sample_rate: 44_100,
+                channels: 2,
+                frames: 18_598_464,
+            }
+        );
+        assert!(
+            title
+                .checkpoint_samples()?
+                .iter()
+                .any(|&sample| sample != 0)
+        );
 
         let voice = scan.resources.read("pcm_a.int/A_00_01_001.ogg")?;
         assert!(OggVorbis::metadata(&voice).is_ok());
         let spoken = prepare_audio(voice)?;
-        assert_eq!(spoken.probe, AudioProbe {
-            codec: AudioCodec::OggVorbis, sample_rate: 44_100, channels: 1, frames: 189_954,
-        });
-        assert!(spoken.materialize()?.iter().any(|&sample| sample != 0));
+        assert_eq!(
+            spoken.probe,
+            AudioProbe {
+                codec: AudioCodec::OggVorbis,
+                sample_rate: 44_100,
+                channels: 1,
+                frames: 189_954,
+            }
+        );
+        assert!(
+            spoken
+                .checkpoint_samples()?
+                .iter()
+                .any(|&sample| sample != 0)
+        );
         Ok(())
     }
 }

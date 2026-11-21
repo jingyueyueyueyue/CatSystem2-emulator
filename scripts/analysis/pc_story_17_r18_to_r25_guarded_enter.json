@@ -1,0 +1,33 @@
+{
+  "17": {
+    "frames": 3000,
+    "route": {
+      "label": "Daydream: guarded Enter at r18 and r22, then observe r25",
+      "idle_frames": 720,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "r18: verify the physical Enter and VM resume before accepting r22",
+          "wait": {"state":"page","scene":"prologue","group":0,"record":18,"window":"cinema"},
+          "probe_points": [[640,395]],
+          "key": 13,
+          "keyboard_press": {"region":62,"receiver":8,"key":2,"group":0,"response":0},
+          "after": {"state":"page","scene":"prologue","group":1,"record":22,"window":"cinema"}
+        },
+        {
+          "label": "r22: one additional guarded Enter toward r25",
+          "wait": {"state":"page","scene":"prologue","group":1,"record":22,"window":"cinema"},
+          "probe_points": [[640,395]],
+          "key": 13,
+          "keyboard_press": {"region":62,"receiver":8,"key":2,"group":0,"response":0},
+          "after": {"state":"page","scene":"prologue","group":2,"record":25,"window":"cinema"}
+        },
+        {
+          "label": "r25: observe current composed source record 24 and stop without input",
+          "wait": {"state":"page","scene":"prologue","group":2,"record":25,"window":"cinema"},
+          "probe_points": [[640,395]]
+        }
+      ]
+    }
+  }
+}

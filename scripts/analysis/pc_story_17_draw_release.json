@@ -1,0 +1,32 @@
+{
+  "17": {
+    "frames": 1060,
+    "inputs": [
+      "story-trace",
+      "capture-every:0",
+      "no-final-capture",
+      "inspect-log:900",
+      "inspect-log:1043",
+      "inspect-log:1044",
+      "inspect-log:1060"
+    ]
+  },
+  "probe_anchors": {
+    "baseline": {
+      "run": "2026-11/20261120_042038_312745_npe2w_7n_playthrough",
+      "source_tree_sha256": "780c479f9bc7d1c85d383b435d5cc0fedf54029e5a17db38ae817f04536bf8f7",
+      "last_frame": 900,
+      "wipe_stop_frame": 687,
+      "draw": {"task": 13, "configure_frame": 744, "enable_frame": 745, "duration_ticks": 298, "mode": 0, "depth": 45000}
+    },
+    "scene": "update03.int::prologue.cst",
+    "records": {"draw": 13, "bare_wait": 14, "timed_wait": 15, "first_page": 18},
+    "expected_draw_release_frame": 1044,
+    "acceptance": [
+      "Follow the task ID from the Draw creation, through 527/528 and 520. The baseline ID and frames are not input gates.",
+      "At the endpoint, require natural release and continuation to wait 60; a 520 invocation alone does not prove the value returned.",
+      "Frame 1044 is the expected release near the baseline timing, not forced completion. Frame 1060 is a sampling cap, not first-page acceptance.",
+      "Use pc_story_17_first_two_pages.json separately for the first readable CST page at group 0, record 18. This probe sends no input and takes no screenshots."
+    ]
+  }
+}

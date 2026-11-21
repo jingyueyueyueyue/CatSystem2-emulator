@@ -16,6 +16,7 @@ struct DisplayTiming {
     generation: u64,
     next_id: u32,
     frames_since_poll: u8,
+    last_poll_ns: u64,
     pending: VecDeque<(u32, u64)>,
     displayed: u64,
     latest_ns: u64,
@@ -35,7 +36,8 @@ impl DisplayTiming {
             None
         };
         let mut timing = Self {
-            api, generation: 0, next_id: 1, frames_since_poll: 0, pending: VecDeque::new(),
+            api, generation: 0, next_id: 1, frames_since_poll: 0, last_poll_ns: 0,
+            pending: VecDeque::new(),
             displayed: 0, latest_ns: 0, queue_to_display_ns: 0, unresolved: 0, query_failed: false,
         };
         timing.reset();
@@ -47,6 +49,7 @@ impl DisplayTiming {
         self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         self.pending.clear();
         self.frames_since_poll = 0;
+        self.last_poll_ns = 0;
         self.displayed = 0;
         self.latest_ns = 0;
         self.queue_to_display_ns = 0;
@@ -61,9 +64,11 @@ impl DisplayTiming {
     fn on_submit(&mut self, surface: &wgpu::Surface<'_>) {
         if !self.supported() || !DISPLAY_STATS_ENABLED.with(Cell::get) { return; }
         self.frames_since_poll += 1;
-        // Query frequently while producing frames so a short driver history
-        // can cover all of them, even though the overlay refreshes at 1 Hz.
-        if self.frames_since_poll >= 4 { self.poll(surface); }
+        let now = monotonic_ns();
+        // Bound the interval at low submission rates as well as the frame count.
+        if self.frames_since_poll >= 4 || now.saturating_sub(self.last_poll_ns) >= 100_000_000 {
+            self.poll(surface);
+        }
         if self.query_failed { return; }
         let Some(hal) = (unsafe { surface.as_hal::<wgpu::hal::api::Vulkan>() }) else { return; };
         let id = self.next_id;
@@ -81,6 +86,7 @@ impl DisplayTiming {
     fn poll(&mut self, surface: &wgpu::Surface<'_>) {
         self.frames_since_poll = 0;
         if self.pending.is_empty() || !self.supported() { return; }
+        self.last_poll_ns = monotonic_ns();
         let Some(hal) = (unsafe { surface.as_hal::<wgpu::hal::api::Vulkan>() }) else { return; };
         let Some(swapchain) = hal.raw_swapchain() else { return; };
         // No other thread presents or reconfigures this surface.
@@ -89,11 +95,8 @@ impl DisplayTiming {
             Ok(rows) => {
                 for row in rows {
                     let Some(index) = self.pending.iter().position(|(id, _)| *id == row.present_id) else { continue; };
+                    if row.actual_present_time == 0 { continue; }
                     let (_, submitted_ns) = self.pending.remove(index).unwrap();
-                    if row.actual_present_time == 0 {
-                        self.unresolved += 1;
-                        continue;
-                    }
                     self.displayed += 1;
                     if row.actual_present_time > self.latest_ns {
                         self.latest_ns = row.actual_present_time;
@@ -109,7 +112,7 @@ impl DisplayTiming {
             }
         }
         let now = monotonic_ns();
-        while self.pending.front().is_some_and(|(_, submitted)| now.saturating_sub(*submitted) > 500_000_000) {
+        while self.pending.front().is_some_and(|(_, submitted)| now.saturating_sub(*submitted) > 2_500_000_000) {
             self.pending.pop_front();
             self.unresolved += 1;
         }
@@ -241,7 +244,8 @@ impl Presenter {
         if size > u64::from(raster.device.limits().max_storage_buffer_binding_size) {
             bail!("game frame exceeds Vulkan presentation storage limit");
         }
-        let frame_on_device = device_frame(canvas).filter(|frame| !frame.failed.load(Ordering::Relaxed));
+        let frame_on_device = device_frame(canvas).filter(|frame|
+            std::sync::Arc::ptr_eq(&frame.failed, &raster.failed) && !frame.failed.load(Ordering::Relaxed));
         let pixels = if let Some(frame) = frame_on_device {
             &*frame.buffer
         } else {

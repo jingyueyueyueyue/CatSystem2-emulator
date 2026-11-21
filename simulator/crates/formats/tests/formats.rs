@@ -266,7 +266,7 @@ fn accepts_zero_padding_after_hg3_tags_and_rejects_nonzero_padding() {
 }
 
 #[test]
-fn restricts_nine_byte_hg3_padding_to_aligned_cptype_followed_by_a_frame() {
+fn restricts_extended_hg3_padding_to_aligned_cptype() {
     let make_frame = |tag, padding_len: usize, alignment_shift| {
         let mut bytes = synthetic_hg3_with_tags(&[
             (*b"stdinfo\0", synthetic_stdinfo(1, 1)),
@@ -285,20 +285,25 @@ fn restricts_nine_byte_hg3_padding_to_aligned_cptype_followed_by_a_frame() {
     };
 
     let cptype = *b"cptype\0\0";
-    let mut bytes = make_frame(cptype, 9, 0);
-    let next_frame_offset = bytes.len();
-    append_frame(&mut bytes);
-    let file = HgFile::parse(&bytes).unwrap();
-    assert_eq!(file.frames.len(), 2);
-    assert_eq!(file.frames[1].frame_offset, next_frame_offset as u64);
+    let last_frame = make_frame(cptype, 9, 0);
+    assert_eq!(HgFile::parse(&last_frame).unwrap().frames.len(), 1);
+    for padding_len in 8..=15 {
+        let mut bytes = make_frame(cptype, padding_len, 0);
+        let next_frame_offset = bytes.len();
+        append_frame(&mut bytes);
+        let file = HgFile::parse(&bytes).unwrap();
+        assert_eq!(file.frames.len(), 2);
+        assert_eq!(file.frames[1].frame_offset, next_frame_offset as u64);
+    }
 
     for (case, tag, padding_len, alignment_shift, followed_by_frame, nonzero) in [
-        ("eight bytes", cptype, 8, 0, true, false),
-        ("ten bytes", cptype, 10, 0, true, false),
+        ("oversized inter-frame padding", cptype, 16, 0, true, false),
         ("different tag", *b"unknown\0", 9, 0, true, false),
         ("unaligned next frame", cptype, 9, 1, true, false),
-        ("last frame", cptype, 9, 0, false, false),
+        ("eight bytes at file end", cptype, 8, 0, false, false),
+        ("ten bytes at file end", cptype, 10, 0, false, false),
         ("nonzero padding", cptype, 9, 0, true, true),
+        ("nonzero file end", cptype, 9, 0, false, true),
     ] {
         let mut bytes = make_frame(tag, padding_len, alignment_shift);
         if nonzero {

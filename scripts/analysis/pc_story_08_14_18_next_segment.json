@@ -1,0 +1,564 @@
+{
+  "review": {
+    "runtime_increment": "archive/2026-11/20261120_pc_story_08_14_18_cst_segment.patch",
+    "08_prerequisite": "archive/2026-11/20261120_pc_story_08_eye_sleep.patch",
+    "08_render_increment": "archive/2026-11/20261121_pc_story_08_wipe_draw_abi.patch",
+    "14_prerequisite": "archive/2026-11/20261120_pc_story_14_op_g5_marker_order.patch",
+    "14_g6_increment": "archive/2026-11/20261121_pc_story_14_op_g6_marker_order.patch",
+    "14_g6_g7_input_increment": "archive/2026-11/20261121_pc_story_14_op_g6_g7_enter_binding.patch",
+    "18_prerequisite": "archive/2026-11/20261120_pc_story_18_rdraw527.patch",
+    "routes": {
+      "8": {
+        "member": "scene/c01_01.cst",
+        "sha256": "942ca2dbd98382b7196ba97f8b38709d672ce5d9c97d62068a9e3b423dafdee2",
+        "pages": [
+          {
+            "group": 0,
+            "kind": "input",
+            "wait": 144,
+            "wait_ordinal": 144,
+            "body": [
+              143
+            ],
+            "body_ordinals": [
+              143
+            ],
+            "body_sizes": [
+              20
+            ],
+            "name_records": []
+          },
+          {
+            "group": 1,
+            "kind": "input",
+            "wait": 148,
+            "wait_ordinal": 3,
+            "body": [
+              147
+            ],
+            "body_ordinals": [
+              2
+            ],
+            "body_sizes": [
+              28
+            ],
+            "name_records": []
+          },
+          {
+            "group": 2,
+            "kind": "input",
+            "wait": 150,
+            "wait_ordinal": 1,
+            "body": [
+              149
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              34
+            ],
+            "name_records": []
+          },
+          {
+            "group": 3,
+            "kind": "input",
+            "wait": 166,
+            "wait_ordinal": 15,
+            "body": [
+              165
+            ],
+            "body_ordinals": [
+              14
+            ],
+            "body_sizes": [
+              18
+            ],
+            "name_records": [
+              164
+            ]
+          },
+          {
+            "group": 4,
+            "kind": "input",
+            "wait": 170,
+            "wait_ordinal": 3,
+            "body": [
+              169
+            ],
+            "body_ordinals": [
+              2
+            ],
+            "body_sizes": [
+              64
+            ],
+            "name_records": [
+              168
+            ]
+          },
+          {
+            "group": 5,
+            "kind": "input",
+            "wait": 174,
+            "wait_ordinal": 3,
+            "body": [
+              173
+            ],
+            "body_ordinals": [
+              2
+            ],
+            "body_sizes": [
+              20
+            ],
+            "name_records": [
+              172
+            ]
+          }
+        ],
+        "previous_group": 2,
+        "readiness_frames_per_added_page": 600
+      },
+      "14": {
+        "member": "UPDATE01.INT::op.cst",
+        "sha256": "2596c7c430dabed8e1e3144c50c4b8672b59b1d452e4b92b7e18cf0c9f409817",
+        "pages": [
+          {
+            "group": 0,
+            "kind": "input",
+            "wait": 6,
+            "wait_ordinal": 6,
+            "body": [
+              5
+            ],
+            "body_ordinals": [
+              5
+            ],
+            "body_sizes": [
+              40
+            ],
+            "name_records": []
+          },
+          {
+            "group": 1,
+            "kind": "input",
+            "wait": 8,
+            "wait_ordinal": 1,
+            "body": [
+              7
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              56
+            ],
+            "name_records": []
+          },
+          {
+            "group": 2,
+            "kind": "input",
+            "wait": 78,
+            "wait_ordinal": 69,
+            "body": [
+              77
+            ],
+            "body_ordinals": [
+              68
+            ],
+            "body_sizes": [
+              54
+            ],
+            "name_records": []
+          },
+          {
+            "group": 3,
+            "kind": "input",
+            "wait": 80,
+            "wait_ordinal": 1,
+            "body": [
+              79
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              52
+            ],
+            "name_records": []
+          },
+          {
+            "group": 4,
+            "kind": "input",
+            "wait": 82,
+            "wait_ordinal": 1,
+            "body": [
+              81
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              42
+            ],
+            "name_records": []
+          },
+          {
+            "group": 5,
+            "kind": "input",
+            "wait": 115,
+            "wait_ordinal": 32,
+            "body": [
+              114
+            ],
+            "body_ordinals": [
+              31
+            ],
+            "body_sizes": [
+              74
+            ],
+            "name_records": []
+          },
+          {
+            "group": 6,
+            "kind": "input",
+            "wait": 124,
+            "wait_ordinal": 8,
+            "body": [
+              123
+            ],
+            "body_ordinals": [
+              7
+            ],
+            "body_sizes": [
+              42
+            ],
+            "name_records": [
+              122
+            ]
+          },
+          {
+            "group": 7,
+            "kind": "input",
+            "wait": 126,
+            "wait_ordinal": 1,
+            "body": [
+              125
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              88
+            ],
+            "name_records": []
+          },
+          {
+            "group": 8,
+            "kind": "input",
+            "wait": 130,
+            "wait_ordinal": 3,
+            "body": [
+              129
+            ],
+            "body_ordinals": [
+              2
+            ],
+            "body_sizes": [
+              22
+            ],
+            "name_records": [
+              128
+            ]
+          }
+        ],
+        "previous_group": 5,
+        "readiness_frames_per_added_page": 900,
+        "title_owner": 11,
+        "title_resume": "[2, 512, 354, 0]",
+        "loads": [
+          "start",
+          "OP"
+        ]
+      },
+      "18": {
+        "member": "scene.int::0001_00.cst",
+        "sha256": "22d8aef073b8d125bad43817274c77765d0665bfd3224598f1f5fb0ae3905e62",
+        "pages": [
+          {
+            "group": 0,
+            "kind": "input",
+            "wait": 90,
+            "wait_ordinal": 90,
+            "body": [
+              88,
+              89
+            ],
+            "body_ordinals": [
+              88,
+              89
+            ],
+            "body_sizes": [
+              30,
+              26
+            ],
+            "name_records": []
+          },
+          {
+            "group": 1,
+            "kind": "input",
+            "wait": 95,
+            "wait_ordinal": 4,
+            "body": [
+              92
+            ],
+            "body_ordinals": [
+              1
+            ],
+            "body_sizes": [
+              32
+            ],
+            "name_records": [
+              91
+            ],
+            "newline_only": [
+              94
+            ]
+          },
+          {
+            "group": 2,
+            "kind": "input",
+            "wait": 98,
+            "wait_ordinal": 2,
+            "body": [
+              96,
+              97
+            ],
+            "body_ordinals": [
+              0,
+              1
+            ],
+            "body_sizes": [
+              38,
+              26
+            ],
+            "name_records": []
+          },
+          {
+            "group": 3,
+            "kind": "input",
+            "wait": 100,
+            "wait_ordinal": 1,
+            "body": [
+              99
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              42
+            ],
+            "name_records": []
+          },
+          {
+            "group": 4,
+            "kind": "input",
+            "wait": 112,
+            "wait_ordinal": 11,
+            "body": [
+              102
+            ],
+            "body_ordinals": [
+              1
+            ],
+            "body_sizes": [
+              10
+            ],
+            "name_records": [
+              101
+            ],
+            "newline_only": [
+              111
+            ]
+          },
+          {
+            "group": 5,
+            "kind": "input",
+            "wait": 115,
+            "wait_ordinal": 2,
+            "body": [
+              113,
+              114
+            ],
+            "body_ordinals": [
+              0,
+              1
+            ],
+            "body_sizes": [
+              30,
+              36
+            ],
+            "name_records": []
+          },
+          {
+            "group": 6,
+            "kind": "input",
+            "wait": 118,
+            "wait_ordinal": 2,
+            "body": [
+              116,
+              117
+            ],
+            "body_ordinals": [
+              0,
+              1
+            ],
+            "body_sizes": [
+              38,
+              26
+            ],
+            "name_records": []
+          },
+          {
+            "group": 7,
+            "kind": "input",
+            "wait": 121,
+            "wait_ordinal": 2,
+            "body": [
+              119,
+              120
+            ],
+            "body_ordinals": [
+              0,
+              1
+            ],
+            "body_sizes": [
+              32,
+              36
+            ],
+            "name_records": []
+          },
+          {
+            "group": 8,
+            "kind": "input",
+            "wait": 124,
+            "wait_ordinal": 2,
+            "body": [
+              122,
+              123
+            ],
+            "body_ordinals": [
+              0,
+              1
+            ],
+            "body_sizes": [
+              48,
+              44
+            ],
+            "name_records": []
+          },
+          {
+            "group": 9,
+            "kind": "input",
+            "wait": 126,
+            "wait_ordinal": 1,
+            "body": [
+              125
+            ],
+            "body_ordinals": [
+              0
+            ],
+            "body_sizes": [
+              46
+            ],
+            "name_records": []
+          }
+        ],
+        "previous_group": 6,
+        "readiness_frames_per_added_page": 1400,
+        "title_owner": 7,
+        "title_resume": "[2, 183, 434, 0]",
+        "loads": [
+          "0001_00"
+        ]
+      }
+    }
+  },
+  "8": {
+    "frames": 11600,
+    "route": {
+      "label": "08 c01_01: 5 guarded Enter presses through g5/174",
+      "idle_frames": 5500,
+      "page_scenes": [],
+      "eyecatch_08_exit": true,
+      "eyecatch_08_first_body": true,
+      "eyecatch_08_next_body": true,
+      "steps": [],
+      "guarded_body_last_group": 5
+    },
+    "diagnostics": [
+      "trace-native:69",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:614",
+      "trace-native:616",
+      "trace-native:619",
+      "inspect-log:4000",
+      "inspect-log:5400",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:530",
+      "trace-native:531"
+    ]
+  },
+  "14": {
+    "frames": 5900,
+    "diagnostics": [
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:110",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327"
+    ],
+    "route": {
+      "label": "14 OP: 8 guarded Enter presses through g8/130",
+      "idle_frames": 900,
+      "page_scenes": [],
+      "grisaia_14_first_advance": true,
+      "steps": [],
+      "guarded_body_last_group": 8
+    }
+  },
+  "18": {
+    "frames": 10400,
+    "route": {
+      "label": "18 0001_00: 9 guarded Enter presses through g9/126",
+      "idle_frames": 1400,
+      "page_scenes": [],
+      "campanella_18_first_advance": true,
+      "steps": [],
+      "guarded_body_last_group": 9
+    },
+    "diagnostics": [
+      "trace-native:69",
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:110",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:612",
+      "trace-native:614",
+      "trace-native:615",
+      "trace-native:616",
+      "trace-native:618",
+      "trace-native:619"
+    ]
+  }
+}

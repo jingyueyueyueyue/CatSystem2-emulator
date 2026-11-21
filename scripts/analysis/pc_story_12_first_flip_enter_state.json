@@ -1,0 +1,37 @@
+{
+  "12": {
+    "frames": 1800,
+    "route": {
+      "label": "Hatsuru op001: one Enter from the first ready message page",
+      "idle_frames": 720,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "Open New Game only at the verified title hit region",
+          "wait": {"state": "title", "hit": {"point": [640, 443], "region": 15}},
+          "click": [640, 443],
+          "after": {"state": "page", "scene": "op001", "group": 0, "record": 69, "window": "meswnd"}
+        },
+        {
+          "label": "Press Enter once after op001 record 69 is ready",
+          "wait": {"state": "page", "scene": "op001", "group": 0, "record": 69, "window": "meswnd"},
+          "key": 13,
+          "after": {"state": "page", "scene": "op001", "group": 1, "record": 72, "window": "meswnd"}
+        },
+        {
+          "label": "Capture the settled second page without input",
+          "wait": {"state": "page", "scene": "op001", "group": 1, "record": 72, "window": "meswnd"},
+          "capture": true
+        }
+      ]
+    }
+  },
+  "probe_anchors": {
+    "baseline_host_log": "2026-11/20261120_043423_909610_d8r65g_j_playthrough/12.host.log",
+    "entry": {"enabled_hit_line": 3, "click_receipts_line": 5},
+    "cst": {"source": "scene.int::op001.cst", "sha256": "9911a9f8daecd80062fe4fcdf3f438845b5ecafdf55c1292a97ce18cd0233087", "body_records": [68, 71], "wait_kind": "0x02"},
+    "pages": {"first_wait_line": 199, "second_partial_body_line": 249, "second_stale_wait_key_line": 265, "second_settled_body_line": 380, "second_settled_wait_line": 396},
+    "requires": "A candidate that recognizes the title and the PE-bound meswnd gate for op001, with a confirmed CST wait and fully revealed, submitted body from the current page. The older frame probe is evidence only, not an input fallback.",
+    "acceptance": "One normal Enter after the first ready page, then group 1 record 72 with the new body fully displayed. The second page can temporarily have WAIT_KEY before reveal completes; do not capture that early state or send another key. Stop on unexpected state or timeout."
+  }
+}

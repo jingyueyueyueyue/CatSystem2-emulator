@@ -1,0 +1,26 @@
+{
+  "6": {
+    "frames": 1440,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:325", "trace-native:326", "trace-native:530",
+      "move:500:98,208", "require-hit:530:18", "530:98,208",
+      "move:640:98,104", "require-hit:660:10", "660:98,104",
+      "inspect-log:900", "inspect-log:1440"
+    ]
+  },
+  "7": {
+    "frames": 2100,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:325", "trace-native:326", "trace-native:530",
+      "move:805:176,256", "inspect-log:840", "inspect-log:1120",
+      "inspect-log:1600", "inspect-log:2100"
+    ]
+  },
+  "review": {
+    "mode": "06 guarded entry control; 07 observation only; no body advances",
+    "06": "Look for a coherent C01_01 wait or a distinct startup obstruction. Stop on a changed hit region.",
+    "07": "Wait for the opening movie or intro overlay to close naturally. Record its completion and a settled title with an enabled New Game receiver; do not click the old title position while full-screen region 31 is active."
+  }
+}

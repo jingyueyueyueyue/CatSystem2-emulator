@@ -1,0 +1,24 @@
+{
+  "6": {
+    "save-disabled": {
+      "before": 603, "click": 607, "after": 710, "region": 26, "expectation": "disabled",
+      "inputs": ["move:497:84,308", "require-hit:498:19", "498:84,308",
+        "move:606:227,59", "607:227,59"]
+    },
+    "next-page": {
+      "before": 603, "click": 607, "after": 710, "region": 20,
+      "inputs": ["move:497:84,308", "require-hit:498:19", "498:84,308",
+        "move:606:745,59", "require-hit:607:20", "607:745,59"]
+    },
+    "last-page": {
+      "before": 603, "click": 607, "after": 710, "region": 21,
+      "inputs": ["move:497:84,308", "require-hit:498:19", "498:84,308",
+        "move:606:806,59", "require-hit:607:21", "607:806,59"]
+    },
+    "return": {
+      "before": 603, "click": 607, "after": 800, "region": 22,
+      "inputs": ["move:497:84,308", "require-hit:498:19", "498:84,308",
+        "move:606:1142,660", "require-hit:607:22", "607:1142,660"]
+    }
+  }
+}

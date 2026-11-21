@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const MAX_SAMPLES: usize = MAX_PCM / size_of::<i16>();
-const MIN_PARALLEL_BYTES: usize = 256 * 1024;
+pub(super) const MIN_PARALLEL_BYTES: usize = 256 * 1024;
 const MAX_PARALLEL_PACKETS: usize = 65_536;
 
 pub(super) fn decode(encoded: &[u8]) -> RuntimeResult<(AudioMetadata, Vec<i16>)> {
@@ -21,7 +21,9 @@ pub(super) fn decode(encoded: &[u8]) -> RuntimeResult<(AudioMetadata, Vec<i16>)>
         .map_err(|cause| error(format!("probe Ogg/Vorbis: {cause}")))?;
     if encoded.len() >= MIN_PARALLEL_BYTES {
         let lanes = thread::available_parallelism().map_or(1, |threads| threads.get().min(3));
-        if lanes > 1 && let Some(samples) = decode_parallel(encoded, lanes)? {
+        if lanes > 1
+            && let Some(samples) = decode_parallel(encoded, lanes)?
+        {
             return Ok((metadata, samples));
         }
     }
@@ -91,7 +93,10 @@ pub(super) fn decode_parallel(encoded: &[u8], lanes: usize) -> RuntimeResult<Opt
                     .unwrap_or_else(|_| Err(error("Vorbis decoder worker panicked")))
             }))
             .collect::<Vec<_>>();
-        let mut pieces = pieces.into_iter().collect::<RuntimeResult<Vec<_>>>()?.into_iter();
+        let mut pieces = pieces
+            .into_iter()
+            .collect::<RuntimeResult<Vec<_>>>()?
+            .into_iter();
         let mut result = pieces.next().expect("first Vorbis lane");
         result
             .try_reserve_exact(total.load(Ordering::Relaxed) - result.len())

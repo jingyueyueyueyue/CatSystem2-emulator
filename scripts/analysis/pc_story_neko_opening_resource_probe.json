@@ -1,0 +1,29 @@
+{
+  "1": {
+    "frames": 2040,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:1033",
+      "trace-native:1037",
+      "trace-native:1038",
+      "400:784,405",
+      "move:665:1155,235",
+      "680:1155,235",
+      "inspect-log:1250",
+      "require-hit:1250:77",
+      "1250:625,478",
+      "inspect-log:1710",
+      "inspect-log:1840",
+      "require-hit:1840:77",
+      "1840:625,478",
+      "inspect-log:1841",
+      "inspect-log:2040"
+    ]
+  }
+}

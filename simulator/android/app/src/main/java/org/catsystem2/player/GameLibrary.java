@@ -163,11 +163,12 @@ final class GameLibrary {
     void adoptPreviousImport(SharedPreferences previous) {
         String game = previous.getString("game", null);
         String saves = previous.getString("saves", null);
-        if (game == null || saves == null || !new File(game).isDirectory()) return;
+        if (game == null || saves == null) return;
         File gameDir = new File(game);
         File saveDir = new File(saves);
         String key = saveDir.getName();
-        if (!key.matches("[0-9a-f]{64}")) return;
+        if (!gameDir.isAbsolute() || !saveDir.isAbsolute() || !key.matches("[0-9a-f]{64}")) return;
+        // Keep the import visible so refresh can report why its directory is unavailable.
         synchronized (LIBRARY_WRITE) {
             if (settings.contains("entry." + key) || settings.contains("alias." + key)) return;
             save(settings.edit(), new Entry(key, "已导入游戏", null, "", gameDir, saveDir, "", null)).apply();
@@ -353,8 +354,8 @@ final class GameLibrary {
             if (oldSystem == null && game.system != null) {
                 oldSystem = previousEntry(existing, grants, game.tree, systemId, systemKey);
             }
-            Entry previous = root != null && !root.systemDocument.isEmpty() ? root
-                : oldSystem != null ? oldSystem : root;
+            // If both records exist, each keeps its own save identity.
+            Entry previous = root != null ? root : oldSystem;
             String identity = previous == null ? rootKey : previous.key;
             File mirror = root != null ? root.game : mirror(identity, "current");
             File systemMirror = root == null ? null : root.systemMirror;
@@ -373,11 +374,6 @@ final class GameLibrary {
                     && game.root.id.equals(previous.document) ? previous.tree : game.tree;
             save(changes, new Entry(identity, game.root.title, tree, game.root.id, mirror, saves,
                 systemId, systemMirror));
-            for (Entry alias : new Entry[]{root, oldSystem}) {
-                if (alias != null && !identity.equals(alias.key)) {
-                    changes.remove("entry." + alias.key).putString("alias." + alias.key, identity);
-                }
-            }
             result.found++;
         }
         if (selected != null) changes.putString("last-folder", selected.toString());
@@ -449,7 +445,7 @@ final class GameLibrary {
                 throw new DirectoryFailure(DirectoryStatus.DENIED, "storage-permission", path, null);
             }
             String state = Environment.getExternalStorageState(volume);
-            if (!Environment.MEDIA_MOUNTED.equals(state) && !Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
+            if (!mounted(state)) {
                 throw new DirectoryFailure(DirectoryStatus.UNAVAILABLE, "volume-state:" + state, path, null);
             }
             File root = volume.getCanonicalFile();
@@ -493,25 +489,57 @@ final class GameLibrary {
     }
 
     private DirectoryStatus absenceStatus(File directory, File volume) {
-        if (volume == null) return DirectoryStatus.MISSING;
         try {
-            if (!Os.access(volume.getAbsolutePath(), OsConstants.R_OK | OsConstants.X_OK)) {
-                return DirectoryStatus.UNAVAILABLE;
-            }
-        } catch (ErrnoException | SecurityException error) {
-            return DirectoryStatus.UNAVAILABLE;
-        }
-        if (Build.VERSION.SDK_INT >= 30) {
-            String relative = volume.toPath().relativize(directory.toPath()).toString().toLowerCase(Locale.ROOT);
-            for (String restricted : new String[] {"android/data", "android/obb"}) {
-                if (relative.equals(restricted)) return DirectoryStatus.DENIED;
-                if (relative.startsWith(restricted + "/")) {
-                    String own = restricted + "/" + context.getPackageName().toLowerCase(Locale.ROOT);
-                    if (!relative.equals(own) && !relative.startsWith(own + "/")) return DirectoryStatus.DENIED;
+            if (volume == null && storage != null) {
+                StorageVolume external = storage.getStorageVolume(directory);
+                if (external != null) {
+                    if (!mounted(external.getState())) return DirectoryStatus.UNAVAILABLE;
+                    if (!hasStorageAccess()) return DirectoryStatus.DENIED;
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        volume = external.getDirectory();
+                        if (volume == null) return DirectoryStatus.UNAVAILABLE;
+                        volume = volume.getCanonicalFile();
+                        directory = directory.getCanonicalFile();
+                    }
                 }
             }
+            if (directory.equals(volume)) return DirectoryStatus.UNAVAILABLE;
+            if (Build.VERSION.SDK_INT >= 30 && volume != null) {
+                String relative = volume.toPath().relativize(directory.toPath()).toString().toLowerCase(Locale.ROOT);
+                for (String restricted : new String[] {"android/data", "android/obb"}) {
+                    if (relative.equals(restricted)) return DirectoryStatus.DENIED;
+                    if (relative.startsWith(restricted + "/")) {
+                        String own = restricted + "/" + context.getPackageName().toLowerCase(Locale.ROOT);
+                        if (!relative.equals(own) && !relative.startsWith(own + "/")) return DirectoryStatus.DENIED;
+                    }
+                }
+            }
+        } catch (SecurityException error) {
+            return DirectoryStatus.DENIED;
+        } catch (IOException error) {
+            return DirectoryStatus.UNAVAILABLE;
         }
-        return DirectoryStatus.MISSING;
+        // ENOENT may be returned for hidden paths. Check the nearest existing parent.
+        for (File parent = directory.getParentFile(); parent != null; parent = parent.getParentFile()) {
+            String path = parent.getAbsolutePath();
+            try {
+                if (!OsConstants.S_ISDIR(Os.stat(path).st_mode)) return DirectoryStatus.UNAVAILABLE;
+                return Os.access(path, OsConstants.R_OK | OsConstants.X_OK)
+                    ? DirectoryStatus.MISSING : DirectoryStatus.DENIED;
+            } catch (ErrnoException error) {
+                if (error.errno == OsConstants.EACCES || error.errno == OsConstants.EPERM) {
+                    return DirectoryStatus.DENIED;
+                }
+                if (error.errno != OsConstants.ENOENT || parent.equals(volume)) return DirectoryStatus.UNAVAILABLE;
+            } catch (SecurityException error) {
+                return DirectoryStatus.DENIED;
+            }
+        }
+        return DirectoryStatus.UNAVAILABLE;
+    }
+
+    private static boolean mounted(String state) {
+        return Environment.MEDIA_MOUNTED.equals(state) || Environment.MEDIA_MOUNTED_READ_ONLY.equals(state);
     }
 
     Uri lastFolder() {

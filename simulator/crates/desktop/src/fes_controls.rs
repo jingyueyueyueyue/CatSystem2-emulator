@@ -25,6 +25,8 @@ const MAX_IMAGE: u64 = 64 * 1024 * 1024;
 
 #[path = "fes_controls_state.rs"]
 mod state;
+#[path = "fes_controls_legacy_scroll.rs"]
+mod legacy_scroll;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
@@ -33,6 +35,7 @@ enum Kind {
     Window,
     Slider,
     Scroll2,
+    Scroll,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -86,7 +89,7 @@ struct Bank {
     direction: u32,
     state: usize,
     lower: Option<u32>,
-    buttons: [Option<u32>; 2],
+    buttons: legacy_scroll::Buttons,
     drag_origin: Option<[i32; 2]>,
     #[serde(with = "crate::fes_tasks::state::frame")]
     control_image: Option<RgbaFrame>,
@@ -117,7 +120,7 @@ impl Bank {
             size: [0; 2],
             size_source: None,
             position_source: None,
-            priority: if matches!(kind, Kind::Slider | Kind::Scroll2) {
+            priority: if matches!(kind, Kind::Slider | Kind::Scroll2 | Kind::Scroll) {
                 10
             } else {
                 20
@@ -142,7 +145,7 @@ impl Bank {
             direction: 0,
             state: 0,
             lower: None,
-            buttons: [None; 2],
+            buttons: legacy_scroll::Buttons::default(),
             drag_origin: None,
             control_image: None,
             initial_region: false,
@@ -157,20 +160,26 @@ impl Bank {
     }
 
     fn is_slider(&self) -> bool {
-        matches!(self.kind, Kind::Slider | Kind::Scroll2)
+        self.kind == Kind::Slider || self.kind.is_scroll()
+    }
+    fn button_regions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.buttons.primary.into_iter().chain(self.buttons.arrows).flatten()
+    }
+    fn has_region(&self, region: u32) -> bool {
+        self.button_regions().any(|id| id == region)
     }
     fn position_value(&self) -> i32 {
         self.requested_position
     }
     fn lower_value(&self) -> i32 {
-        if self.kind == Kind::Scroll2 {
+        if self.kind.is_scroll() {
             self.scroll.position
         } else {
             self.slider.position
         }
     }
     fn pixel(&self) -> i32 {
-        if self.kind == Kind::Scroll2 {
+        if self.kind.is_scroll() {
             self.scroll.pixel
         } else {
             self.slider.pixel
@@ -183,6 +192,12 @@ impl Bank {
             default_group: None,
             value: self.lower.map_or(-1, |id| id as i32),
         }
+    }
+}
+
+impl Kind {
+    fn is_scroll(self) -> bool {
+        matches!(self, Self::Scroll2 | Self::Scroll)
     }
 }
 
@@ -337,7 +352,7 @@ impl FesControlStore {
         self.banks
             .values()
             .find(|object| object.drag_origin.is_some())
-            .and_then(|object| object.buttons[1])
+            .and_then(|object| object.buttons.primary[1])
     }
 
     pub(super) fn owns_lower(&self, task: u32) -> bool {
@@ -347,8 +362,15 @@ impl FesControlStore {
     pub(super) fn region_receiver(&self, region: u32) -> Option<u32> {
         self.banks
             .values()
-            .find(|object| object.is_slider() && object.buttons.contains(&Some(region)))?
+            .find(|object| object.is_slider() && object.has_region(region))?
             .lower
+    }
+
+    pub(super) fn legacy_scroll_react_region(
+        &self, owner: u32, name: &[u8], bank: i32,
+    ) -> Option<Option<u32>> {
+        let object = self.banks.get(&(owner, name.to_vec(), bank))?;
+        (object.kind == Kind::Scroll).then(|| object.buttons.react_region())
     }
 
     /// The BUTTON controller first checks its own ENABLE/KEYBLOCK and the
@@ -371,7 +393,10 @@ impl FesControlStore {
         let Some(step) = direction.step(object.direction != 0) else {
             return Ok(None);
         };
-        let (minimum, maximum) = if object.kind == Kind::Scroll2 {
+        let (minimum, maximum) = if object.kind == Kind::Scroll {
+            let [minimum, maximum] = object.requested_range;
+            (minimum, maximum.saturating_sub(object.requested_page.unwrap_or(0)).max(minimum))
+        } else if object.kind == Kind::Scroll2 {
             (
                 object.requested_range[0],
                 object.requested_range[1].wrapping_sub(
@@ -395,7 +420,7 @@ impl FesControlStore {
         Ok(Some(TaskCommand {
             target: lower as i32,
             sender: owner as i32,
-            code: if object.kind == Kind::Scroll2 {
+            code: if object.kind.is_scroll() {
                 377
             } else {
                 369
@@ -404,14 +429,14 @@ impl FesControlStore {
         }))
     }
 
-    pub(super) fn slider_motion_properties(
+    pub(super) fn alpha_motion_properties(
         &self,
         owner: u32,
         name: &[u8],
         bank: i32,
     ) -> Option<[u32; 36]> {
         let object = self.banks.get(&(owner, name.to_vec(), bank))?;
-        if !object.is_slider() {
+        if !object.is_slider() && object.kind != Kind::Window {
             return None;
         }
         let mut properties = [0; 36];
@@ -456,7 +481,7 @@ impl FesControlStore {
             .map(|object| object.alpha_pending)
     }
 
-    pub(super) fn apply_slider_motion_properties(
+    pub(super) fn apply_alpha_motion_properties(
         &mut self,
         owner: u32,
         name: &[u8],
@@ -466,11 +491,11 @@ impl FesControlStore {
         let Some(object) = self.banks.get_mut(&(owner, name.to_vec(), bank)) else {
             return false;
         };
-        if !object.is_slider() {
+        if !object.is_slider() && object.kind != Kind::Window {
             return false;
         }
         object.alpha = properties[28] >> 24;
-        object.alpha_pending = true;
+        object.alpha_pending = object.is_slider();
         true
     }
 
@@ -507,13 +532,19 @@ impl FesControlStore {
             return Ok(LowerInputOutcome::Applied(effects));
         }
         if command.code == 64 {
-            let knob = object.buttons[1] == Some(command.data[0]);
+            let knob = object.buttons.primary[1] == Some(command.data[0]);
             let object = self
                 .banks
                 .get_mut(&key)
                 .context("control focus bank disappeared")?;
             if knob && object.drag_origin.is_none() {
                 object.state = if command.data[1] != 0 { 2 } else { 0 };
+                object.visual_dirty = true;
+                effects.refresh = true;
+            }
+            if object.kind == Kind::Scroll
+                && object.buttons.focus(command.data[0], command.data[1] != 0)
+            {
                 object.visual_dirty = true;
                 effects.refresh = true;
             }
@@ -541,7 +572,7 @@ impl FesControlStore {
             if object.drag_origin.is_none() {
                 return Ok(LowerInputOutcome::Applied(effects));
             }
-            object.buttons[1].context("dragging control has no knob button")?
+            object.buttons.primary[1].context("dragging control has no knob button")?
         } else {
             command.data[0]
         };
@@ -558,8 +589,14 @@ impl FesControlStore {
         } else {
             2
         };
-        let known = object.buttons.contains(&Some(region));
-        let left = if known && object.kind == Kind::Scroll2 && command.code != 6 && mask & 2 != 0 {
+        let known = object.has_region(region);
+        let left = if object.kind == Kind::Scroll && command.code == 10 {
+            // Re-selecting a region may synthesize a release without a
+            // physical edge. Only an active legacy press can be released.
+            object.buttons.has_pressed_region() && context.left_button != Some(false)
+        } else if known && object.kind == Kind::Scroll && command.code == 9 && mask & 2 != 0 {
+            context.left_button == Some(true)
+        } else if known && object.kind == Kind::Scroll2 && command.code != 6 && mask & 2 != 0 {
             context.left_button.context(
                 "SCROLL2 input requires an explicit configured left-button classification",
             )?
@@ -576,7 +613,7 @@ impl FesControlStore {
             return Ok(LowerInputOutcome::Applied(effects));
         }
         // SCROLL2 track release leaves its state and geometry unchanged.
-        if command.code == 10 && object.kind == Kind::Scroll2 && object.buttons[0] == Some(region) {
+        if command.code == 10 && object.kind == Kind::Scroll2 && object.buttons.primary[0] == Some(region) {
             return Ok(LowerInputOutcome::Applied(effects));
         }
         if matches!(command.code, 6 | 9) && context.pointer.is_none() {
@@ -654,12 +691,12 @@ impl FesControlStore {
             let mut object = Bank::new(kind);
             if object.is_slider() {
                 object.lower = Some(host.create_task_object(
-                    if kind == Kind::Scroll2 { 41 } else { 42 },
+                    if kind.is_scroll() { 41 } else { 42 },
                     owner,
-                    if kind == Kind::Scroll2 {
-                        b"FE scroll2"
-                    } else {
-                        b"FE slider"
+                    match kind {
+                        Kind::Scroll => b"FE scroll",
+                        Kind::Scroll2 => b"FE scroll2",
+                        _ => b"FE slider",
                     },
                     b"",
                 )?);
@@ -747,9 +784,9 @@ impl FesControlStore {
                         b"POS" | b"BASE" | b"PRI" | b"DISP" | b"IDN" | b"BLEND"
                     ) || column.starts_with(b"ID.")
                 }
-                Some(Kind::Slider | Kind::Scroll2) => {
+                Some(Kind::Slider | Kind::Scroll2 | Kind::Scroll) =>
                     matches!(column.as_slice(), b"PRI" | b"DISP" | b"ENABLE")
-                }
+                        || kind == Some(Kind::Scroll) && column == b"PRI_P",
                 None => false,
             };
             if numeric {
@@ -818,6 +855,9 @@ impl FesControlStore {
                     b"PRI" if object.kind != Kind::Viewport => {
                         let value = values[0].wrapping_add(if priority_bank { key.2 } else { 0 });
                         object.priority = value.wrapping_add(20);
+                    }
+                    b"PRI_P" if object.kind == Kind::Scroll => {
+                        object.buttons.input_priority = Some(values[0]);
                     }
                     b"DISP" if object.kind != Kind::Viewport => object.display = values[0] as u32,
                     b"ENABLE" if object.is_slider() => object.enabled = values[0] as u32,
@@ -1019,7 +1059,7 @@ impl FesControlStore {
                     }
                     return Ok(true);
                 }
-                b"attach" if matches!(kind, Some(Kind::Slider | Kind::Scroll2)) => {
+                b"attach" if matches!(kind, Some(Kind::Slider | Kind::Scroll2 | Kind::Scroll)) => {
                     return Ok(true);
                 }
                 _ => bail!(
@@ -1101,7 +1141,7 @@ impl FesControlStore {
                 b"page" if object.is_slider() => {
                     object.requested_range = [values[0], values[1]];
                     object.range_pending = true;
-                    if object.kind == Kind::Scroll2 {
+                    if object.kind.is_scroll() {
                         object.requested_page = Some(values[2]);
                     }
                 }
@@ -1177,20 +1217,22 @@ impl FesControlStore {
         let key = self
             .banks
             .iter()
-            .find(|(_, object)| object.is_slider() && object.buttons.contains(&Some(region)))
+            .find(|(_, object)| object.is_slider() && object.has_region(region))
             .map(|(key, _)| key.clone());
         let Some(key) = key else { return Ok(None) };
         let object = self
             .banks
             .get_mut(&key)
             .context("control input bank disappeared")?;
-        if respect_enabled && object.enabled == 0 {
+        if (respect_enabled && object.enabled == 0)
+            || (object.kind == Kind::Scroll && (object.enabled == 0 || object.display == 0))
+        {
             return Ok(Some((key.0, None)));
         }
         if matches!(code, 2 | 6) && pointer.is_none() {
             bail!("control pointer input needs both logical coordinates");
         }
-        let knob = object.buttons[1] == Some(region);
+        let knob = object.buttons.primary[1] == Some(region);
         let coordinate = pointer.map(|point| {
             if object.direction == 0 {
                 point.x
@@ -1200,6 +1242,19 @@ impl FesControlStore {
         });
         let origin = object.rectangle[object.direction as usize];
         let before = object.lower_value();
+        if object.kind == Kind::Scroll {
+            legacy_scroll::pointer_input(object, region, code, coordinate);
+            let event = (before != object.lower_value()).then(|| {
+                object.requested_position = object.lower_value();
+                object.position_dirty = true;
+                FesDriverInput {
+                    code: 8,
+                    target: Some(object.target(&key.1, key.2)),
+                    event: Some(b"SCRL_P".to_vec()),
+                }
+            });
+            return Ok(Some((key.0, event)));
+        }
         let mut event = None;
         match code {
             2 => {
@@ -1300,9 +1355,12 @@ impl FesControlStore {
         let (key, object) = self
             .banks
             .iter_mut()
-            .find(|(_, object)| object.is_slider() && object.buttons.contains(&Some(region)))?;
-        if object.drag_origin.is_none() && object.buttons[1] == Some(region) {
+            .find(|(_, object)| object.is_slider() && object.has_region(region))?;
+        if object.drag_origin.is_none() && object.buttons.primary[1] == Some(region) {
             object.state = if focused { 2 } else { 0 };
+        }
+        if object.kind == Kind::Scroll {
+            object.buttons.focus(region, focused);
         }
         object.visual_dirty = true;
         Some((
@@ -1342,7 +1400,7 @@ impl FesControlStore {
             .context("control lower task disappeared")?;
         let operation = match (object.kind, command.code) {
             (Kind::Slider, 365..=373) => command.code - 365,
-            (Kind::Scroll2, 374..=382) => match command.code {
+            (Kind::Scroll2 | Kind::Scroll, 374..=382) => match command.code {
                 374 => 0,
                 375 => 2,
                 376 => 3,
@@ -1396,12 +1454,12 @@ impl FesControlStore {
                 Ok(LowerControlOutcome::Refresh { owner: key.0 })
             }
             3 => {
-                let count = if object.kind == Kind::Scroll2 { 12 } else { 8 };
+                let count = if object.kind.is_scroll() { 12 } else { 8 };
                 let bytes = buffer
                     .filter(|bytes| bytes.len() >= count)
                     .context("control range requires an explicit integer buffer")?;
                 let range = [read_dword(bytes, 0)? as i32, read_dword(bytes, 4)? as i32];
-                if object.kind == Kind::Scroll2 {
+                if object.kind.is_scroll() {
                     object.scroll.set_range(range, read_dword(bytes, 8)? as i32);
                     object.file_dirty = true;
                     Ok(LowerControlOutcome::Refresh { owner: key.0 })
@@ -1411,7 +1469,9 @@ impl FesControlStore {
                 }
             }
             4 => {
-                if object.kind == Kind::Scroll2 {
+                if object.kind == Kind::Scroll {
+                    legacy_scroll::set_position(object, command.data[1] as i32);
+                } else if object.kind == Kind::Scroll2 {
                     object.scroll.set_position(command.data[1] as i32)?;
                 } else {
                     object.slider.set_position(command.data[1] as i32)?;
@@ -1805,6 +1865,9 @@ fn update_store(
         if object.kind == Kind::Viewport {
             continue;
         }
+        if object.kind == Kind::Scroll && (object.display == 0 || object.enabled == 0 || view.paused != 0) {
+            legacy_scroll::cancel_drag(object);
+        }
         if lower_only.is_none() && !object.file_resolved {
             let expanded = expand_resource_name(host, &object.file)?;
             if object
@@ -1816,7 +1879,7 @@ fn update_store(
             }
             object.expanded_file = Some(expanded);
         }
-        if lower_only.is_none() && object.kind == Kind::Slider {
+        if lower_only.is_none() && matches!(object.kind, Kind::Slider | Kind::Scroll) {
             let enabled = if view.paused == 0 { object.enabled } else { 0 };
             if object.applied_enabled != Some(enabled) {
                 object.state = usize::from(enabled == 0);
@@ -1829,7 +1892,7 @@ fn update_store(
             prepare_control_source(host, object, lower_only.is_none())?;
         }
         if lower_only.is_none() && object.is_slider() && object.range_pending {
-            let page = if object.kind == Kind::Scroll2 {
+            let page = if object.kind.is_scroll() {
                 Some(
                     object
                         .requested_page
@@ -1855,7 +1918,16 @@ fn update_store(
                 object.position_source = None;
             }
         }
-        if object.visual_dirty && object.is_slider() && object.source.is_some() && !source_attempt {
+        if lower_only.is_none() && object.kind == Kind::Scroll && object.position_dirty {
+            let position = object.requested_position;
+            legacy_scroll::set_position(object, position);
+            object.requested_position = object.lower_value();
+            object.position_dirty = false;
+            object.visual_dirty = true;
+        }
+        if object.visual_dirty && object.is_slider() && object.source.is_some()
+            && (!source_attempt || object.kind == Kind::Scroll)
+        {
             prepare_slider(object, false)?;
             object.visual_dirty = false;
         }
@@ -1873,14 +1945,22 @@ fn update_store(
                 // the stored value remains available if list submission fails.
                 object.alpha_pending = false;
             }
-            if object.buttons.iter().any(Option::is_none) && object.control_image.is_some() {
+            if object.buttons.primary.iter().any(Option::is_none) && object.control_image.is_some() {
                 let parent = object.lower.context("FES slider has no lower task")?;
-                for slot in &mut object.buttons {
+                for slot in &mut object.buttons.primary {
                     if slot.is_none() {
                         *slot = Some(host.create_task_object(6, parent, b"control button", b"")?);
                     }
                 }
                 object.initial_region = true;
+            }
+            if object.kind == Kind::Scroll && object.control_image.is_some() {
+                let parent = object.lower.context("FES scroll has no lower task")?;
+                for slot in &mut object.buttons.arrows {
+                    if slot.is_none() {
+                        *slot = Some(host.create_task_object(6, parent, b"scroll arrow", b"")?);
+                    }
+                }
             }
             update_regions(
                 host,
@@ -1926,8 +2006,10 @@ fn update_store(
         }
         if object.is_slider() {
             position = [object.rectangle[0], object.rectangle[1]];
-            position[object.direction as usize] =
-                position[object.direction as usize].wrapping_add(object.pixel());
+            if object.kind != Kind::Scroll {
+                position[object.direction as usize] =
+                    position[object.direction as usize].wrapping_add(object.pixel());
+            }
         }
         let plane_name = object
             .plane
@@ -2087,7 +2169,7 @@ fn prepare_control_source(
         }
     }
     object.source = Some(parsed);
-    object.source_bytes = bytes;
+    object.source_bytes = std::sync::Arc::unwrap_or_clone(bytes);
     if object.kind == Kind::Window {
         if object.size[0] > 0 && object.size[1] > 0 {
             object.control_image = Some(compose_window(
@@ -2138,6 +2220,9 @@ fn window_position(
 }
 
 fn prepare_slider(object: &mut Bank, reloaded: bool) -> Result<()> {
+    if object.kind == Kind::Scroll {
+        return legacy_scroll::prepare(object);
+    }
     let source = object
         .source
         .as_ref()
@@ -2337,7 +2422,7 @@ pub(super) fn bank_release_targets(
     store: &FesControlStore, owner: u32, name: &[u8], bank: i32,
 ) -> Option<(Vec<u32>, String)> {
     let object = store.banks.get(&(owner, name.to_vec(), bank))?;
-    let tasks = object.buttons.into_iter().flatten().chain(object.lower).collect();
+    let tasks = object.button_regions().chain(object.lower).collect();
     Some((tasks, control_layer_key(name, bank)))
 }
 
@@ -2467,15 +2552,19 @@ impl HeadlessPlayer {
 }
 
 fn update_regions(host: &mut LoggingHost<'_>, object: &mut Bank, paused: u32) -> Result<()> {
-    let enabled = if paused != 0 { 0 } else { object.enabled };
+    let enabled = if paused != 0 || (object.kind == Kind::Scroll && object.display == 0) {
+        0
+    } else {
+        object.enabled
+    };
     let Some(image) = &object.control_image else {
         // This is input135 even when the addressed region is absent, or its
         // enable DWORD already has this value. Registration is independent.
-        if object.buttons.iter().any(Option::is_some) {
+        if object.button_regions().next().is_some() {
             host.mark_input_geometry_dirty();
         }
         for region in &mut host.input_task.regions {
-            if object.buttons.contains(&Some(region.id())) {
+            if object.has_region(region.id()) {
                 region.words[8] = enabled;
                 if enabled == 0 {
                     region.words[7] = 0;
@@ -2507,8 +2596,17 @@ fn update_regions(host: &mut LoggingHost<'_>, object: &mut Bank, paused: u32) ->
     if object.kind == Kind::Scroll2 && object.drag_origin.is_some() {
         knob = [0; 4];
     }
-    for (index, bounds) in [object.rectangle, knob].into_iter().enumerate() {
-        let Some(id) = object.buttons[index] else {
+    let (ids, bounds) = if object.kind == Kind::Scroll {
+        (
+            [object.buttons.primary[0], object.buttons.primary[1], object.buttons.arrows[0], object.buttons.arrows[1]],
+            legacy_scroll::regions(object),
+        )
+    } else {
+        ([object.buttons.primary[0], object.buttons.primary[1], None, None], [object.rectangle, knob, [0; 4], [0; 4]])
+    };
+    let priority = object.buttons.input_priority.unwrap_or(object.priority);
+    for (index, (id, bounds)) in ids.into_iter().zip(bounds).enumerate() {
+        let Some(id) = id else {
             continue;
         };
         if let Some(region) = host
@@ -2534,7 +2632,7 @@ fn update_regions(host: &mut LoggingHost<'_>, object: &mut Bank, paused: u32) ->
             }
             let mut words = [0; 15];
             words[0] = id;
-            words[1] = object.priority.wrapping_add(index as i32) as u32;
+            words[1] = priority.wrapping_add(index as i32) as u32;
             words[2] = 7;
             words[3..7].copy_from_slice(&bounds.map(|value| value as u32));
             words[8] = enabled;
@@ -2625,7 +2723,7 @@ pub(super) fn read_metadata(
     result.map_err(|error| RuntimeError::Host(error.to_string()))
 }
 
-fn optional_image(host: &LoggingHost<'_>, name: &[u8]) -> Result<Option<Vec<u8>>> {
+fn optional_image(host: &LoggingHost<'_>, name: &[u8]) -> Result<Option<std::sync::Arc<Vec<u8>>>> {
     if name.is_empty() {
         return Ok(None);
     }
@@ -2636,7 +2734,7 @@ fn optional_image(host: &LoggingHost<'_>, name: &[u8]) -> Result<Option<Vec<u8>>
             if resource.size > MAX_IMAGE {
                 bail!("FES control image resource exceeds 64 MiB");
             }
-            let bytes = host.resources.read_candidate(resource)?;
+            let bytes = host.read_encoded_image_candidate(resource)?;
             if bytes.len() as u64 > MAX_IMAGE {
                 bail!("FES control image resource exceeds 64 MiB");
             }
@@ -2962,6 +3060,8 @@ fn control_kind(kind: &[u8]) -> Option<Kind> {
         Some(Kind::Slider)
     } else if kind.eq_ignore_ascii_case(b"SCROLL2") {
         Some(Kind::Scroll2)
+    } else if kind.eq_ignore_ascii_case(b"SCROLL") {
+        Some(Kind::Scroll)
     } else {
         None
     }

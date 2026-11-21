@@ -71,12 +71,14 @@ pub struct ResourceRouter {
     island_chinese_scene: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     island_chinese_fes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daydream_gbk_scene_archive: Option<usize>,
 }
 
 impl Default for ResourceRouter {
     fn default() -> Self {
         Self { slots: vec![ResourceSlot::default(); 256], groups: Vec::new(), patches: Vec::new(),
-            island_chinese_scene: None, island_chinese_fes: None }
+            island_chinese_scene: None, island_chinese_fes: None, daydream_gbk_scene_archive: None }
     }
 }
 
@@ -112,6 +114,10 @@ impl ResourceRouter {
 
     pub fn is_island_chinese_fes(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
         Self::matches_archive(self.island_chinese_fes, index, path)
+    }
+
+    pub fn is_daydream_gbk_scene_archive(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
+        Self::matches_archive(self.daydream_gbk_scene_archive, index, path)
     }
 
     fn matches_archive(archive: Option<usize>, index: &crate::ResourceIndex, path: &Path) -> bool {
@@ -453,6 +459,12 @@ impl ResourceRouter {
         patches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         builder.router.patches = patches.into_iter().filter(|(_, _, entry)| entry.is_readable())
             .map(|(_, archive, entry)| ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() }).collect();
+        // The CST members of this exact Daydream patch use GBK.
+        builder.router.daydream_gbk_scene_archive = builder.verified_archive((
+            "update03.int", 28_078_220,
+            "cac79038baad0a266ce1e1ca75143285f2b09ad895e7b1af1af3a61df807c0f9",
+        ));
+
         Ok(builder.router)
     }
 }

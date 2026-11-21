@@ -1,0 +1,52 @@
+{
+  "14": {
+    "frames": 1045,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "trace-native:325", "trace-native:326", "trace-native:327",
+      "move:683:512,354", "require-hit:690:37", "690:512,354",
+      "inspect-log:865", "inspect-log:910", "inspect-log:1020", "inspect-log:1045"
+    ]
+  },
+  "first_two_pages": {
+    "checker": "scripts/analysis/check_pc_story_14_entry.py",
+    "batch_terminal": {"gate": "g0_wait_observed", "group": 0, "absolute_record": 6, "body_inputs": 0},
+    "pe_sha256": "9f3a5ad0ed22074420685f1e2a3bc92436d68289c7bac854d5f7d7331dc3ef67",
+    "startup": "kcs.int/main.kcs",
+    "entry": {
+      "point": [512, 354], "masked_region": 37,
+      "historical_candidates": [3, 37, 19, 55, 10, 7],
+      "historical_receipts": [[3, 0, 1], [37, 11, 0]],
+      "receipt_fields": ["region", "receiver", "response"],
+      "resume": [2, 512, 354, 0],
+      "loads": ["start", "OP"]
+    },
+    "source": {
+      "member": "UPDATE01.INT::op.cst",
+      "member_sha256": "2596c7c430dabed8e1e3144c50c4b8672b59b1d452e4b92b7e18cf0c9f409817",
+      "encoding": "gbk"
+    },
+    "first_page": {"group": 0, "body_relative": 5, "body_absolute": 5, "wait_relative": 6, "wait_absolute": 6},
+    "next_page": {"group": 1, "body_relative": 0, "body_absolute": 7, "wait_relative": 1, "wait_absolute": 8},
+    "later_page": {"group": 2, "body_relative": 68, "body_absolute": 77, "wait_relative": 69, "wait_absolute": 78},
+    "historical_input": {
+      "physical_code": 13, "group": 0, "observed_logical_order": [0, 2],
+      "consuming_key": 2, "consuming_region": 61, "consuming_receiver": 8,
+      "region_role": "bottom button", "resume": [2, 0, 0, 0],
+      "source_and_receipt_run": "20261120_030334_828901_uy33721r_playthrough",
+      "source_and_receipt_check_option": "--require-next-wait",
+      "single_enter_layer_run": "20261120_044547_870610_dd1dhe53_playthrough",
+      "second_enter_layer_run": "20261120_050128_681967__tnflq5p_playthrough",
+      "first_frame_layer_alpha": [910, 8382],
+      "next_stable_frame_layer_alpha": [[1020, 10665], [1045, 10665]]
+    },
+    "next_input_gate": {
+      "mode": "historical_evidence_only",
+      "require_live": [
+        "Matching PE, startup, OP source, completed g0/6 and current composed body.",
+        "Read the live physical binding and ordered candidate receivers before one Enter. Confirm key 0 has no consuming receipt and key 2 consumes at the live bottom-button/script pair.",
+        "Require one VM resume with [2, 0, 0, 0], then g1/7 executed and g1/8 observed with distinct stable composed body. Stop at g1/8."
+      ]
+    }
+  }
+}

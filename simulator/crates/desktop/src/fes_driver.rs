@@ -138,6 +138,7 @@ pub(crate) enum FesDriverEffect {
     /// Instruction budget exhausted; resume at the SAME logical frame.
     Yield,
     ControlFlow(main_flow::controls_flow::Request),
+    SharedStringWrite { destination: u32, source: Option<u32> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -181,7 +182,13 @@ pub(crate) struct FesScriptDriver {
     #[serde(skip)]
     rebellions_message_fes_source: bool,
     #[serde(skip)]
-    pub(super) kanmi_message_fes_source: Option<bool>,
+    pub(super) bounded_message_fes_source: Option<bool>,
+    #[serde(skip)]
+    pub(super) neko_message_fes_source: Option<bool>,
+    #[serde(skip)]
+    pub(super) newton_message_fes_source: Option<bool>,
+    #[serde(skip)]
+    pub(super) sudden_message_fes_source: Option<bool>,
     expression: ExpressionState,
     #[serde(skip)]
     external: SharedExternalStorage,
@@ -238,7 +245,10 @@ impl FesScriptDriver {
             adapter: FesRuntimeAdapter::new(),
             island_gbk_fes_source: false,
             rebellions_message_fes_source: false,
-            kanmi_message_fes_source: None,
+            bounded_message_fes_source: None,
+            neko_message_fes_source: None,
+            newton_message_fes_source: None,
+            sudden_message_fes_source: None,
             expression: ExpressionState::default(),
             external: SharedExternalStorage::default(),
             inputs: VecDeque::new(),
@@ -408,6 +418,18 @@ impl FesScriptDriver {
         }
         self.systems.push_back(SystemBlockRequest { name: name.to_vec(), header, object });
         Ok(true)
+    }
+
+    pub(super) fn in_unskipped_system_block(&self, block: &[u8]) -> bool {
+        !self.forced_skip && !self.skip_input && !self.keyskip_cont && !self.cancel_wait
+            && self.handler.as_ref().is_some_and(|handler| {
+                handler.phase == HandlerPhase::System && handler.event.as_slice() == block
+                    && handler.object_header.as_slice() == block && handler.target.name.is_empty()
+            })
+    }
+
+    pub(super) fn story_skip_flags(&self) -> (bool, bool, bool, bool) {
+        (self.forced_skip, self.skip_input, self.keyskip_cont, self.cancel_wait)
     }
 
     pub(crate) fn has_pending_handler(&self) -> bool {
@@ -685,9 +707,12 @@ impl FesScriptDriver {
                     });
                 }
             }
-            match self.interpreter.run(&mut self.expression, 1)? {
+            match self.interpreter.run_observing_shared_strings(&mut self.expression, 1)? {
                 FesStep::Yield => continue,
                 FesStep::Event => {}
+                FesStep::SharedStringWrite { destination, source } => {
+                    return Ok(FesDriverEffect::SharedStringWrite { destination, source });
+                }
             }
             let event = self.interpreter.pending().cloned()
                 .ok_or_else(|| anyhow::anyhow!("FES interpreter reported an event without data"))?;
@@ -832,7 +857,7 @@ impl FesScriptDriver {
                     false, kind == b"string")
             }
         };
-        if !ready && cancelled && !self.wait_cancel_announced {
+        if !ready && cancelled && (finish_motion || reveal_text) && !self.wait_cancel_announced {
             self.notices.push_back(FesDriverEffect::CancelWait {
                 wait: wait.clone(), finish_motion, reveal_text,
             });
@@ -1115,7 +1140,7 @@ impl FesScriptDriver {
                 && handler.target.name.is_empty()
                 && matches!(
                     (handler.event.as_slice(), self.interpreter.current_block()),
-                    (b"MES_SHOW" | b"MES_WAITINPUT", b"SETBUTTON" | b"_SETBUTTON")
+                    (b"MES_SHOW" | b"MES_WAITINPUT" | b"MES_WAITPAGE", b"SETBUTTON" | b"_SETBUTTON")
                         | (b"MES_SHOW", b"PDA_ON")
                 ));
         if self.interpreter.at_block_end()

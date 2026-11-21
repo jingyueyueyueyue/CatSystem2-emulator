@@ -1,0 +1,16 @@
+{
+  "9": {
+    "frames": 920,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "move:360:140,354",
+      "require-hit:380:14",
+      "380:140,354",
+      "inspect-log:618",
+      "inspect-log:900"
+    ]
+  }
+}

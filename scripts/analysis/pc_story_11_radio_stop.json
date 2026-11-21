@@ -1,0 +1,38 @@
+{
+  "11": {
+    "frames": 2700,
+    "inputs": [
+      "story-trace",
+      "story-events",
+      "capture-every:0",
+      "no-final-capture",
+      "legacy-11-radio-stop",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:69",
+      "trace-native:70",
+      "trace-native:702",
+      "trace-native:989",
+      "trace-native:13",
+      "trace-native:276",
+      "trace-native:630",
+      "trace-native:1002",
+      "trace-native:1037",
+      "trace-native:1038",
+      "trace-native:1051",
+      "215:13",
+      "385:13",
+      "550:13",
+      "move:605:1154,473",
+      "require-hit:612:15",
+      "612:1154,473",
+      "require-hit:810:62",
+      "810:640,360",
+      "require-hit:890:62",
+      "890:640,360",
+      "require-hit:970:62",
+      "970:640,360"
+    ]
+  }
+}

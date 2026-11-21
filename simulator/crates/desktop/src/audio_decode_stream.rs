@@ -1,5 +1,5 @@
 //! Frame indexing and bounded reads for long, single-stream Vorbis sources.
-use super::{MAX_PCM, error};
+use super::{MAX_PCM, PCM_READ_FRAMES, error};
 use cs2_formats::{AudioMetadata, OggVorbis};
 use cs2_runtime::RuntimeResult;
 use lewton::audio::{PreviousWindowRight, get_decoded_sample_count, read_audio_packet_generic};
@@ -9,6 +9,7 @@ use lewton::samples::InterleavedSamples;
 use ogg::PacketReader;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::thread;
 
 const MAX_PACKETS: usize = 65_536;
 
@@ -25,7 +26,7 @@ pub(super) struct IndexedVorbis {
 }
 
 impl IndexedVorbis {
-    pub(super) fn new(encoded: Arc<[u8]>) -> RuntimeResult<Option<Self>> {
+    pub(super) fn new(encoded: Arc<[u8]>, index_budget: usize) -> RuntimeResult<Option<Self>> {
         let metadata = OggVorbis::metadata_at_entry_boundary(&encoded)
             .map_err(|cause| error(format!("probe Ogg/Vorbis: {cause}")))?;
         let mut stream = PacketReader::new(Cursor::new(encoded.as_ref()));
@@ -34,6 +35,7 @@ impl IndexedVorbis {
         let frame_limit = MAX_PCM / size_of::<i16>() / channels;
         let mut packets: Vec<IndexedPacket> = Vec::new();
         let mut frames = 0usize;
+        let mut packet_data_bytes = 0usize;
         let mut granule: Option<u64> = None;
         while let Some(packet) = stream.read_packet().map_err(packet_error)? {
             if packets.len() == MAX_PACKETS {
@@ -42,10 +44,15 @@ impl IndexedVorbis {
             // The checked header supplies the sample count directly. Decode
             // packet bodies as the playback cursor reaches them. The first
             // packet emits nothing but must be valid to prime the overlap.
-            let count = get_decoded_sample_count(&ident, &setup, &packet.data)
-                .map_err(packet_error)?;
+            let count =
+                get_decoded_sample_count(&ident, &setup, &packet.data).map_err(packet_error)?;
             let decoded_frames = if packets.is_empty() {
-                decode_packet(&ident, &setup, &packet.data, &mut PreviousWindowRight::new())?;
+                decode_packet(
+                    &ident,
+                    &setup,
+                    &packet.data,
+                    &mut PreviousWindowRight::new(),
+                )?;
                 0
             } else {
                 count
@@ -53,7 +60,9 @@ impl IndexedVorbis {
             let mut emitted = decoded_frames;
             if let (Some(position), true) = (granule, packet.last_in_stream()) {
                 emitted = emitted.min(packet.absgp_page().saturating_sub(position) as usize);
-                if emitted == 0 && let Some(previous) = packets.last() {
+                if emitted == 0
+                    && let Some(previous) = packets.last()
+                {
                     // The playback cursor never visits an entirely trimmed
                     // final packet, so validate it here with its real overlap.
                     let mut window = PreviousWindowRight::new();
@@ -64,25 +73,99 @@ impl IndexedVorbis {
             if packet.last_in_page() {
                 granule = Some(packet.absgp_page());
             } else if let Some(position) = &mut granule {
-                *position = position.checked_add(emitted as u64)
+                *position = position
+                    .checked_add(emitted as u64)
                     .ok_or_else(|| packet_error("granule position overflow"))?;
             }
-            frames = frames.checked_add(emitted)
+            frames = frames
+                .checked_add(emitted)
                 .filter(|&frames| frames <= frame_limit)
                 .ok_or_else(|| error("decoded audio exceeds the 80 MiB PCM limit"))?;
-            packets.push(IndexedPacket { encoded: packet.data, end: frames, decoded_frames });
+            packet_data_bytes += packet.data.capacity();
+            packets.push(IndexedPacket {
+                encoded: packet.data,
+                end: frames,
+                decoded_frames,
+            });
+            if packet_data_bytes + packets.capacity() * size_of::<IndexedPacket>() > index_budget {
+                return Ok(None);
+            }
         }
         drop(stream);
-        Ok(Some(Self { metadata, encoded, packets }))
+        let retained_bytes = packet_data_bytes + packets.capacity() * size_of::<IndexedPacket>();
+        // The cache still charges the original decoded PCM size. Use this
+        // representation only when the index fits inside that charge.
+        if retained_bytes > frames * channels * size_of::<i16>() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            metadata,
+            encoded,
+            packets,
+        }))
     }
 
     pub(super) fn frames(&self) -> usize {
         self.packets.last().map_or(0, |packet| packet.end)
     }
 
-    pub(super) fn retained_bytes(&self) -> usize {
-        let packets = self.packets.capacity() * size_of::<IndexedPacket>();
-        packets + self.packets.iter().map(|packet| packet.encoded.capacity()).sum::<usize>()
+    pub(super) fn checkpoint_samples(&self) -> RuntimeResult<Vec<i16>> {
+        let frames = self.frames();
+        let channels = usize::from(self.metadata.channels);
+        let sample_count = frames * channels;
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(sample_count)
+            .map_err(|_| error("could not allocate bounded checkpoint PCM"))?;
+        samples.resize(sample_count, 0);
+
+        let lanes = if self.encoded.len() >= super::vorbis::MIN_PARALLEL_BYTES {
+            thread::available_parallelism().map_or(1, |threads| threads.get().min(3))
+        } else {
+            1
+        };
+        if lanes > 1 && frames > PCM_READ_FRAMES {
+            let frames_per_lane = frames.div_ceil(lanes);
+            let decoded = thread::scope(|scope| {
+                let mut chunks = samples.chunks_mut(frames_per_lane * channels);
+                let first = chunks.next().expect("nonempty checkpoint PCM");
+                let mut workers = Vec::new();
+                for (lane, chunk) in chunks.enumerate() {
+                    let start = (lane + 1) * frames_per_lane;
+                    let worker = thread::Builder::new()
+                        .spawn_scoped(scope, move || self.fill_pcm(start, chunk));
+                    let Ok(worker) = worker else {
+                        // The scope joins started lanes before a serial retry.
+                        return Ok(false);
+                    };
+                    workers.push(worker);
+                }
+                let mut result = self.fill_pcm(0, first);
+                for worker in workers {
+                    let lane_result = worker
+                        .join()
+                        .unwrap_or_else(|_| Err(error("Vorbis checkpoint worker panicked")));
+                    result = result.and(lane_result);
+                }
+                result.map(|()| true)
+            })?;
+            if decoded {
+                return Ok(samples);
+            }
+        }
+        self.fill_pcm(0, &mut samples)?;
+        Ok(samples)
+    }
+
+    fn fill_pcm(&self, mut start: usize, samples: &mut [i16]) -> RuntimeResult<()> {
+        let channels = usize::from(self.metadata.channels);
+        let mut reader = self.reader()?;
+        for chunk in samples.chunks_mut(PCM_READ_FRAMES * channels) {
+            let end = start + chunk.len() / channels;
+            chunk.copy_from_slice(reader.read(start, end)?);
+            start = end;
+        }
+        Ok(())
     }
 
     pub(super) fn reader(&self) -> RuntimeResult<VorbisReader<'_>> {
@@ -117,6 +200,9 @@ impl VorbisReader<'_> {
         if start > end || end > self.source.frames() {
             return Err(packet_error("requested frames beyond the indexed source"));
         }
+        if end - start > PCM_READ_FRAMES {
+            return Err(packet_error("requested PCM exceeds the streaming window"));
+        }
         let channels = usize::from(self.source.metadata.channels);
         let recent_end = self.recent_start + self.recent.len() / channels;
         // The output queue can reject an offered chunk while full. Replay
@@ -125,15 +211,22 @@ impl VorbisReader<'_> {
             let offset = self.recent_start;
             return Ok(&self.recent[(start - offset) * channels..(end - offset) * channels]);
         }
-        let mut index = self.source.packets.partition_point(|packet| packet.end <= start);
+        let mut index = self
+            .source
+            .packets
+            .partition_point(|packet| packet.end <= start);
         let mut copied = start;
         self.recent.clear();
+        self.recent
+            .try_reserve_exact((end - start) * channels)
+            .map_err(|_| packet_error("could not allocate the streaming window"))?;
         while copied < end {
             self.decode(index)?;
             let packet_start = self.start_of(index);
             let copy_end = end.min(self.source.packets[index].end);
             self.recent.extend_from_slice(
-                &self.packet_pcm[(copied - packet_start) * channels..(copy_end - packet_start) * channels],
+                &self.packet_pcm
+                    [(copied - packet_start) * channels..(copy_end - packet_start) * channels],
             );
             copied = copy_end;
             index += 1;
@@ -143,19 +236,32 @@ impl VorbisReader<'_> {
     }
 
     fn start_of(&self, index: usize) -> usize {
-        if index == 0 { 0 } else { self.source.packets[index - 1].end }
+        if index == 0 {
+            0
+        } else {
+            self.source.packets[index - 1].end
+        }
     }
 
     fn decode(&mut self, index: usize) -> RuntimeResult<()> {
         if self.packet_index == Some(index) {
             return Ok(());
         }
-        if self.packet_index.and_then(|previous| previous.checked_add(1)) != Some(index) {
+        if self
+            .packet_index
+            .and_then(|previous| previous.checked_add(1))
+            != Some(index)
+        {
             // For a loop or restored checkpoint, prime from the predecessor
             // instead of replaying the source up to the requested position.
             self.window = PreviousWindowRight::new();
             if let Some(previous) = index.checked_sub(1) {
-                decode_packet(&self.ident, &self.setup, &self.source.packets[previous].encoded, &mut self.window)?;
+                decode_packet(
+                    &self.ident,
+                    &self.setup,
+                    &self.source.packets[previous].encoded,
+                    &mut self.window,
+                )?;
             }
         }
         let packet = &self.source.packets[index];

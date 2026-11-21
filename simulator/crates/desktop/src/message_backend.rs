@@ -12,7 +12,6 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -33,7 +32,7 @@ use super::message_native::{decode_inline_image, decode_user_glyph, scale_user_g
 use super::perf_detail::{TextStage, TextTimer};
 #[cfg(any(windows, target_os = "android"))]
 use super::perf_detail::{TextFallbackEvent, text_fallback_event};
-use super::text::{FontOrigin, LoadedFont};
+use super::text::{FontOrigin, LoadedFont, read_font_file};
 
 const MAX_SURFACE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -101,6 +100,7 @@ pub(super) struct DesktopMessageDevice {
     fallback_cache: RefCell<FontFallbackCache>,
     platform_substitutions: RefCell<BTreeSet<MessageFontSubstitution>>,
     fonts_loaded: bool,
+    fes_font_faces: OnceLock<Vec<String>>,
     surfaces: BTreeMap<i32, MessageSurface>,
     composited_glyphs: RefCell<CompositedGlyphCache>,
     pixel_less_message: Option<i32>,
@@ -225,6 +225,7 @@ struct GameFontFile {
 #[derive(Debug)]
 struct GameFontFace {
     font: FontRasterizer,
+    name: String,
     bold: bool,
     italic: bool,
 }
@@ -233,13 +234,10 @@ impl GameFontFile {
     fn load(&self) -> std::result::Result<GameFontFace, String> {
         let face = self.path.file_name().map_or(&[][..], std::ffi::OsStr::as_encoded_bytes);
         let _load = TextTimer::new(TextStage::FaceLoad).face(face, 0);
-        let mut bytes = Vec::new();
-        {
+        let bytes = {
             let _read = TextTimer::new(TextStage::FaceRead);
-            std::fs::File::open(&self.path)
-                .and_then(|file| file.take(MAX_SURFACE_BYTES as u64 + 1).read_to_end(&mut bytes))
-                .map_err(|error| format!("could not be read: {error}"))?;
-        }
+            read_font_file(&self.path).map_err(|error| format!("could not be read: {error}"))?
+        };
         let offset = if bytes.starts_with(b"ttcf") {
             be32(&bytes, 12).unwrap_or(0) as usize
         } else {
@@ -247,15 +245,42 @@ impl GameFontFile {
         };
         let bold = sfnt_weight(&bytes, offset) == Some(700);
         let italic = sfnt_italic(&bytes, offset);
+        let name = sfnt_face_name(&sfnt_names(&bytes, offset))
+            .unwrap_or_else(|| self.path.to_string_lossy().into_owned());
         let font = {
             let _decode = TextTimer::new(TextStage::FaceDecode);
             FontRasterizer::from_shared_bytes(Arc::new(bytes), 0)
                 .map_err(|error| format!("could not be decoded: {error}"))?
         };
         Ok(GameFontFace {
-            font, bold, italic,
+            font, name, bold, italic,
         })
     }
+}
+
+struct SelectedFont<'a> {
+    font: &'a FontRasterizer,
+    name: &'a str,
+    bold: bool,
+    italic: bool,
+}
+
+fn message_glyph_error(stage: &str, requested: &str, actual: Option<&str>, character: char) -> ScriptError {
+    ScriptError::HostCallFailed {
+        message: format!(
+            "message glyph {stage}: codepoint=U+{:04X} requested_font={requested:?} actual_font={:?}",
+            character as u32,
+            actual.unwrap_or("<none>"),
+        ),
+    }
+}
+
+fn requested_font_name(configuration: &MessageConfiguration, override_name: Option<&[u16]>) -> String {
+    let units = override_name.map_or_else(|| configuration.font_name(), |name| name.to_vec());
+    if units.is_empty() {
+        return String::from("<default>");
+    }
+    String::from_utf16_lossy(&units)
 }
 
 #[derive(Debug)]
@@ -275,6 +300,10 @@ struct NamedFace {
 }
 
 impl NamedFace {
+    fn select<'a>(&'a self, font: &'a FontRasterizer) -> SelectedFont<'a> {
+        SelectedFont { font, name: &self.face_name, bold: self.weight == 700, italic: self.italic }
+    }
+
     fn get_if_covers(&self, characters: impl IntoIterator<Item = char> + Clone) -> Option<&FontRasterizer> {
         if self.font.get().is_none()
             && self.cmap.as_deref().and_then(ttf_parser::cmap::Table::parse).is_some_and(|table| {
@@ -301,7 +330,7 @@ impl NamedFace {
                     FontSource::Bytes(bytes) => Arc::clone(bytes),
                     FontSource::File(path) => {
                         let _read = TextTimer::new(TextStage::FaceRead);
-                        Arc::new(std::fs::read(path).ok()?)
+                        Arc::new(read_font_file(path).ok()?)
                     }
                 };
                 let _decode = TextTimer::new(TextStage::FaceDecode);
@@ -323,6 +352,7 @@ impl Default for DesktopMessageDevice {
             fallback_cache: RefCell::default(),
             platform_substitutions: RefCell::new(BTreeSet::new()),
             fonts_loaded: false,
+            fes_font_faces: OnceLock::new(),
             surfaces: BTreeMap::new(),
             composited_glyphs: RefCell::default(),
             pixel_less_message: None,
@@ -457,12 +487,7 @@ impl DesktopMessageDevice {
             0
         };
         let names = sfnt_names(bytes, offset);
-        let face_name = names
-            .iter()
-            .find(|name| name.is_ascii())
-            .or_else(|| names.iter().next())
-            .cloned()
-            .unwrap_or_else(|| String::from("unnamed SFNT face"));
+        let face_name = sfnt_face_name(&names).unwrap_or_else(|| String::from("unnamed SFNT face"));
         let face = Arc::new(NamedFace {
             source: Arc::new(FontSource::Bytes(Arc::new(bytes.to_vec()))),
             index: face,
@@ -504,6 +529,12 @@ impl DesktopMessageDevice {
         let mut seen = BTreeSet::new();
         candidates.into_iter().filter(|(name, _)| !name.starts_with('@') && name.encode_utf16().count() <= 63
             && self.has_font_name(name) && seen.insert(name.to_lowercase())).take(4096).collect()
+    }
+    pub(super) fn fes_font_faces(&mut self, resources: &ResourceIndex) -> &[String] {
+        self.load_fonts(resources);
+        self.fes_font_faces.get_or_init(|| {
+            self.settings_font_faces().into_iter().map(|(name, _)| name).collect()
+        })
     }
     pub(super) fn settings_font_preview(&self, name: &str, bold: bool, sample: &str) -> Result<Canvas> {
         if sample.chars().count() > 512 { return Err(invalid("font preview text exceeds limit")); }
@@ -630,7 +661,7 @@ impl DesktopMessageDevice {
                                     .any(|known| extension.eq_ignore_ascii_case(known))
                             })
                         {
-                            if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(bytes) = read_font_file(&path) {
                                 self.register_system_sfnt(&bytes, path);
                             }
                         }
@@ -643,7 +674,7 @@ impl DesktopMessageDevice {
             // Use the same discovered real files as the plain-text backend,
             // but register every SFNT collection member and style lazily.
             for path in super::text::android_font_paths() {
-                if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(bytes) = read_font_file(&path) {
                     self.register_system_sfnt(&bytes, path);
                 }
             }
@@ -657,7 +688,7 @@ impl DesktopMessageDevice {
     }
 
     fn register_sfnt(&mut self, bytes: &[u8], source: Arc<FontSource>, origin: &FontOrigin) {
-        if bytes.len() > MAX_SURFACE_BYTES {
+        if bytes.len() > FontRasterizer::MAX_FONT_BYTES {
             return;
         }
         #[cfg(any(windows, target_os = "android"))]
@@ -680,16 +711,10 @@ impl DesktopMessageDevice {
                 0
             };
             let aliases = sfnt_names(bytes, offset);
-            if aliases.is_empty() {
+            let Some(face_name) = sfnt_face_name(&aliases) else {
                 continue;
-            }
+            };
             let weight = sfnt_weight(bytes, offset).unwrap_or(400);
-            let face_name = aliases
-                .iter()
-                .find(|name| name.is_ascii())
-                .or_else(|| aliases.iter().next())
-                .cloned()
-                .unwrap();
             let cjk = aliases.iter().any(|name| {
                 let name = name.to_ascii_lowercase();
                 name.contains("cjk")
@@ -1031,7 +1056,7 @@ impl DesktopMessageDevice {
         bold: bool,
         italic: bool,
         override_name: Option<&[u16]>,
-    ) -> Result<(&FontRasterizer, bool, bool)> {
+    ) -> Result<SelectedFont<'_>> {
         let _select = TextTimer::new(TextStage::FontSelect);
         if configuration.font_backend() != 0 {
             let units = override_name.map_or_else(|| configuration.font_name(), |name| name.to_vec());
@@ -1039,17 +1064,17 @@ impl DesktopMessageDevice {
                 .map_err(|_| invalid("message font filename has an isolated UTF-16 surrogate"))?;
             let key = name.replace('\\', "/").to_ascii_lowercase();
             let file = self.resource_font_files.get(&key).ok_or_else(|| ScriptError::HostCallFailed {
-                message: format!("message font resource font/{name} not found"),
+                message: format!("message font resource font/{name} not found for U+{:04X}; actual_font=none", character as u32),
             })?;
             let face = file.face.get_or_init(|| file.load()).as_ref().map_err(|error| {
-                ScriptError::HostCallFailed { message: format!("message font resource font/{name} {error}") }
+                message_glyph_error(error, &name, None, character)
             })?;
             if !face.font.has_character(character) {
-                return Err(ScriptError::HostCallFailed {
-                    message: format!("message font resource font/{name} could not supply U+{:04X}", character as u32),
-                });
+                return Err(message_glyph_error("not covered", &name, Some(&face.name), character));
             }
-            return Ok((&face.font, face.bold, face.italic));
+            return Ok(SelectedFont {
+                font: &face.font, name: &face.name, bold: face.bold, italic: face.italic,
+            });
         }
         // The extra DWORD is a Windows character-set selector in its LOW
         // byte, not a glyph-size multiplier or a strict zero/one flag.
@@ -1097,7 +1122,7 @@ impl DesktopMessageDevice {
             });
             for face in candidates {
                 if let Some(font) = face.get_if_covers([character]) {
-                    return Ok((font, face.weight == 700, face.italic));
+                    return Ok(face.select(font));
                 }
             }
             // Font data without usable SFNT names can still be a valid
@@ -1106,10 +1131,11 @@ impl DesktopMessageDevice {
                 .fonts
                 .iter()
                 .filter(|_| self.fallback_faces.is_empty())
-                .find_map(|face| face.for_character(character))
-                .map(|font| (font, false, false))
-                .ok_or_else(|| ScriptError::HostCallFailed {
-                    message: format!("no available message font covers U+{:04X} for the default family", character as u32),
+                .find_map(|face| face.for_character(character).map(|font| SelectedFont {
+                    font, name: face.origin.name(), bold: false, italic: false,
+                }))
+                .ok_or_else(|| {
+                    message_glyph_error("no covering font", "<default>", None, character)
                 });
         }
         let name = String::from_utf16(&units)
@@ -1118,7 +1144,7 @@ impl DesktopMessageDevice {
             return Err(invalid("vertical message font is unsupported"));
         }
         let fonts = self.named_fonts.get(&name.to_lowercase());
-        let mut candidates: Vec<_> = fonts.into_iter().flatten().collect();
+        let mut candidates: Vec<_> = fonts.into_iter().flatten().filter(|face| !face.last_resort).collect();
         let requested_weight = if bold { 700 } else { 400 };
         candidates.sort_by_key(|face| {
             (
@@ -1127,19 +1153,18 @@ impl DesktopMessageDevice {
                 (i32::from(face.weight) - requested_weight).abs(),
             )
         });
-        for face in candidates {
+        for &face in &candidates {
             if let Some(font) = face.get_if_covers([character]) {
-                return Ok((font, face.weight == 700, face.italic));
+                return Ok(face.select(font));
             }
         }
         #[cfg(any(windows, target_os = "android"))]
-        {
-            return self.platform_substitute(&units, configuration, character, bold, italic);
+        if let Some(selected) = self.platform_substitute(&units, configuration, character, bold, italic) {
+            return Ok(selected);
         }
-        #[cfg(not(any(windows, target_os = "android")))]
-        Err(ScriptError::HostCallFailed {
-            message: format!("no configured message font covers U+{:04X} for {name:?}", character as u32),
-        })
+        Err(message_glyph_error(
+            "no covering font", &name, candidates.first().map(|face| face.face_name.as_str()), character,
+        ))
     }
 
     #[cfg(any(windows, target_os = "android"))]
@@ -1150,7 +1175,7 @@ impl DesktopMessageDevice {
         character: char,
         bold: bool,
         italic: bool,
-    ) -> Result<(&FontRasterizer, bool, bool)> {
+    ) -> Option<SelectedFont<'_>> {
         let _fallback = TextTimer::new(TextStage::FontFallback);
         let key = FallbackCharacter {
             charset: configuration.glyph_parameter() as u8,
@@ -1158,10 +1183,10 @@ impl DesktopMessageDevice {
         };
         let cached = self.fallback_cache.borrow().selected.get(requested)
             .and_then(|selections| selections.get(&key)).copied();
-        if let Some(index) = cached && let Some(font) = self.fallback_faces[index].get() {
+        if let Some(index) = cached && let Some(font) = self.fallback_faces[index].get_if_covers([character]) {
             let face = &self.fallback_faces[index];
             text_fallback_event(TextFallbackEvent::SelectionHit);
-            return Ok((font, face.weight == 700, face.italic));
+            return Some(face.select(font));
         }
 
         let requested_name = String::from_utf16_lossy(requested).to_lowercase();
@@ -1205,11 +1230,9 @@ impl DesktopMessageDevice {
                 });
             }
             self.fallback_cache.borrow_mut().remember(requested, key, index);
-            return Ok((font, face.weight == 700, face.italic));
+            return Some(face.select(font));
         }
-        Err(ScriptError::HostCallFailed {
-            message: format!("no real message font covers U+{:04X} for {requested_name:?}", character as u32),
-        })
+        None
     }
 
     fn measure(
@@ -1225,11 +1248,14 @@ impl DesktopMessageDevice {
             return Err(invalid("message font size exceeds i32"));
         }
         let bold = configuration.font_weight() == 700;
-        let (font, selected_bold, _) = self.font(configuration, character, bold, false, None)?;
+        let selected = self.font(configuration, character, bold, false, None)?;
         let _measure = TextTimer::new(TextStage::GlyphMeasure);
-        let measured = font
-            .measure_styled(character, size, bold && !selected_bold, false)
-            .map_err(|_| invalid("message glyph measurement failed"))?;
+        let measured = selected.font
+            .measure_styled(character, size, bold && !selected.bold, false)
+            .map_err(|error| message_glyph_error(
+                &format!("measurement failed: {error}"),
+                &requested_font_name(configuration, None), Some(selected.name), character,
+            ))?;
         if configuration.measure_parameter() == 0 {
             return Ok(measured);
         }
@@ -1254,7 +1280,8 @@ impl DesktopMessageDevice {
         // Original ui measures code ten through the ordinary selected font,
         // independently of the decoded image's width. SFNT's actual cmap (or
         // glyph zero) supplies this metric even when LF has no visible glyph.
-        let (font, selected_bold, _) = self.font(configuration, ' ', bold, false, None)?;
+        let SelectedFont { font, bold: selected_bold, .. } =
+            self.font(configuration, ' ', bold, false, None)?;
         let _measure = TextTimer::new(TextStage::GlyphMeasure);
         let measured = if font.has_character('\n') {
             font.measure_styled('\n', size, bold && !selected_bold, false)
@@ -1326,17 +1353,19 @@ impl DesktopMessageDevice {
             return GlyphMask::from_alpha_with_metrics(0, 0, Vec::new(), GlyphMetrics::default())
                 .map_err(|_| invalid("empty message glyph construction failed"));
         }
-        let (font, selected_bold, selected_italic) =
-            self.font(configuration, character, bold, italic, override_name)?;
+        let selected = self.font(configuration, character, bold, italic, override_name)?;
         let _raster = TextTimer::new(TextStage::GlyphRaster);
-        font
+        selected.font
             .rasterize_styled(
                 character,
                 size,
-                bold && !selected_bold,
-                italic && !selected_italic,
+                bold && !selected.bold,
+                italic && !selected.italic,
             )
-            .map_err(|_| invalid("message font rasterization failed"))
+            .map_err(|error| message_glyph_error(
+                &format!("rasterization failed: {error}"),
+                &requested_font_name(configuration, override_name), Some(selected.name), character,
+            ))
     }
 
     fn paint_entry(
@@ -2403,6 +2432,9 @@ fn sfnt_serif(bytes: &[u8], face: usize) -> bool {
         .and_then(|table| be16(bytes, table + 30))
         .is_some_and(|class| matches!(class >> 8, 1..=7))
 }
+fn sfnt_face_name(names: &BTreeSet<String>) -> Option<String> {
+    names.iter().find(|name| name.is_ascii()).or_else(|| names.iter().next()).cloned()
+}
 fn sfnt_names(bytes: &[u8], face: usize) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let Some(table) = sfnt_table(bytes, face, b"name") else {
@@ -2571,7 +2603,7 @@ mod game_font_tests {
         let source = Arc::new(FontSource::Bytes(Arc::clone(&bytes)));
         device.register_sfnt(&bytes, Arc::clone(&source), &origin);
         device.register_sfnt(&bytes, source, &FontOrigin::Resource("other/face.ttf".into()));
-        let selected = device.font(&configuration("Arial", 0), 'A', false, false, None).unwrap().0;
+        let selected = device.font(&configuration("Arial", 0), 'A', false, false, None).unwrap().font;
         assert!(std::ptr::eq(selected, rasterizer.as_ref()));
         assert!(device.fallback_faces[1].font.get().is_none());
     }
@@ -2587,7 +2619,9 @@ mod game_font_tests {
         assert!(glyph.alpha().iter().any(|&alpha| alpha != 0));
         assert!(device.font_substitutions()[0].selected_name.to_lowercase().contains("arial"));
         let error = device.mask(&requested, '\u{10ffff}', 24, false, false).unwrap_err().to_string();
-        assert!(error.contains("U+10FFFF") && error.contains("uninstalled game family"));
+        assert!(error.contains("codepoint=U+10FFFF"));
+        assert!(error.contains("requested_font=\"Uninstalled game family\""));
+        assert!(error.contains("actual_font=\"<none>\""));
     }
 
     #[test]
@@ -2625,7 +2659,10 @@ mod game_font_tests {
         assert!(error("outside.ttf", 'A').contains("not found"));
         assert!(error("Test family", 'A').contains("not found"));
         assert!(error("broken.ttf", 'A').contains("could not be decoded"));
-        assert!(error("face.ttf", '\u{10ffff}').contains("could not supply U+10FFFF"));
+        let missing = error("face.ttf", '\u{10ffff}');
+        assert!(missing.contains("codepoint=U+10FFFF"));
+        assert!(missing.contains("requested_font=\"face.ttf\""));
+        assert!(missing.contains("actual_font=\"Arial"));
     }
 }
 

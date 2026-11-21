@@ -49,6 +49,7 @@ const KCS_HEADER_LENGTH: usize = 52;
 const MAX_SCRIPT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SCRIPT_ITEMS: usize = 1_000_000;
 const EXTERNAL_ADDRESS_BIT: u32 = 0x8000_0000;
+const NATIVE_CALL_OPCODE: u8 = 0x2b;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ScriptError {
@@ -741,7 +742,7 @@ pub struct Vm {
     native_context_identity: Option<u32>,
     pub stack: Vec<Value>,
     pub instruction_pointer: usize,
-    program: Option<KcsProgram>,
+    program: Option<Arc<KcsProgram>>,
     program_code_sha256: OnceLock<String>,
     memory: Vec<u8>,
     external: SharedExternalStorage,
@@ -787,6 +788,14 @@ impl Vm {
         program: KcsProgram,
         external: SharedExternalStorage,
     ) -> Result<()> {
+        self.initialize_program(Arc::new(program), external)
+    }
+
+    fn initialize_program(
+        &mut self,
+        program: Arc<KcsProgram>,
+        external: SharedExternalStorage,
+    ) -> Result<()> {
         external.len()?;
         let stack_start = program.data.len();
         let memory_length = stack_start
@@ -823,7 +832,7 @@ impl Vm {
     }
 
     pub fn program(&self) -> Option<&KcsProgram> {
-        self.program.as_ref()
+        self.program.as_deref()
     }
 
     pub fn debug(&self) -> &DebugState {
@@ -1244,26 +1253,33 @@ impl Vm {
     pub fn reset(&mut self) -> Result<()> {
         let program = self.program.clone().ok_or(ScriptError::NoProgram)?;
         let external = self.external.clone();
-        self.load_program_with_shared_external(program, external)
+        self.initialize_program(program, external)
     }
 
     pub fn read(&self, address: u32, length: usize) -> Result<Vec<u8>> {
+        self.with_read_bytes(address, length, <[u8]>::to_vec)
+    }
+
+    fn with_read_bytes<T>(
+        &self,
+        address: u32,
+        length: usize,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T> {
         if address & EXTERNAL_ADDRESS_BIT != 0 {
             let bytes = self.external.read_guard()?;
             let offset = (address & !EXTERNAL_ADDRESS_BIT) as usize;
             let end = offset.checked_add(length)
                 .filter(|&end| end <= bytes.len())
                 .ok_or(ScriptError::MemoryOutOfBounds { address, length })?;
-            return Ok(bytes[offset..end].to_vec());
+            return Ok(read(&bytes[offset..end]));
         }
         let (storage, offset) = self.storage(address, length)?;
-        Ok(storage[offset..offset + length].to_vec())
+        Ok(read(&storage[offset..offset + length]))
     }
 
     pub fn read_u32(&self, address: u32) -> Result<u32> {
-        Ok(u32::from_le_bytes(
-            self.read(address, 4)?.try_into().unwrap(),
-        ))
+        self.with_read_bytes(address, 4, |bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     pub fn read_string(&self, address: u32) -> Result<Vec<u8>> {
@@ -1335,23 +1351,50 @@ impl Vm {
     }
 
     fn run_inner(&mut self, host: &mut impl Host, budget: usize) -> Result<Step> {
+        // A native call can replace the program. Keep the current instruction
+        // alive across that call and refresh the program before the next fetch.
+        let mut active_program = self.program.clone();
+        let mut instruction_cursor: Option<usize> = None;
         for _ in 0..budget {
-            let program = self.program.as_ref().ok_or(ScriptError::NoProgram)?;
+            let program = active_program.as_ref().ok_or(ScriptError::NoProgram)?;
             if self.instruction_pointer == program.code.len() {
                 return Ok(Step::Halted);
             }
-            let instruction = program
-                .instruction_at(self.instruction_pointer)
-                .cloned()
-                .ok_or(ScriptError::InvalidInstruction {
-                    offset: self.instruction_pointer,
-                })?;
+            let instruction = match instruction_cursor
+                .and_then(|index| program.instructions.get(index))
+                .filter(|instruction| instruction.offset == self.instruction_pointer)
+            {
+                Some(instruction) => instruction,
+                None => {
+                    let index = program
+                        .instructions
+                        .binary_search_by_key(&self.instruction_pointer, |instruction| {
+                            instruction.offset
+                        })
+                        .map_err(|_| ScriptError::InvalidInstruction {
+                            offset: self.instruction_pointer,
+                        })?;
+                    instruction_cursor = Some(index);
+                    &program.instructions[index]
+                }
+            };
             if instruction.opcode == 0x3b {
                 return Ok(Step::Halted);
             }
-            self.instruction_pointer += 1 + instruction.operands.len() * 5;
+            let opcode = instruction.opcode;
+            let next_offset = instruction.offset + 1 + instruction.operands.len() * 5;
+            let next_index = instruction_cursor.map(|index| index + 1);
+            self.instruction_pointer = next_offset;
             if let Some(event) = self.execute(instruction, host)? {
                 return Ok(Step::Event(event));
+            }
+            if opcode == NATIVE_CALL_OPCODE {
+                active_program = self.program.clone();
+                instruction_cursor = None;
+            } else if self.instruction_pointer == next_offset {
+                instruction_cursor = next_index;
+            } else {
+                instruction_cursor = None;
             }
         }
         Ok(Step::Yield)
@@ -1359,7 +1402,7 @@ impl Vm {
 
     fn execute(
         &mut self,
-        instruction: Instruction,
+        instruction: &Instruction,
         host: &mut impl Host,
     ) -> Result<Option<ExecutionEvent>> {
         let a = &instruction.operands;
@@ -1508,7 +1551,7 @@ impl Vm {
                 });
                 self.jump(target)?;
             }
-            0x2b => {
+            NATIVE_CALL_OPCODE => {
                 let index = self.value(a[0])?;
                 let parameter_bytes = self.value(a[1])? as usize;
                 let available = self
@@ -1771,8 +1814,7 @@ impl Vm {
             return Ok(raw);
         }
         let width = operand.flags.width()?;
-        let bytes = self.read(raw, width)?;
-        Ok(match width {
+        self.with_read_bytes(raw, width, |bytes| match width {
             1 if operand.flags.is_signed() => (bytes[0] as i8 as i32) as u32,
             1 => bytes[0] as u32,
             2 if operand.flags.is_signed() => {
@@ -2546,6 +2588,25 @@ mod tests {
     }
 
     #[test]
+    fn sequential_fetch_resumes_at_budget_and_rebuilds_after_jump() {
+        let mut code = Vec::new();
+        instruction(&mut code, 0x25, &[immediate(7)]);
+        instruction(&mut code, 0x25, &[immediate(8)]);
+        instruction(&mut code, 0x29, &[immediate(24)]);
+        instruction(&mut code, 0x25, &[immediate(99)]);
+        instruction(&mut code, 0x25, &[immediate(1)]);
+        code.push(0x3b);
+        let mut vm = Vm::from_program(program(&code)).unwrap();
+
+        assert_eq!(vm.run(&mut NullHost, 2).unwrap(), Step::Yield);
+        assert_eq!(vm.instruction_pointer, 12);
+        assert_eq!(vm.run(&mut NullHost, 2).unwrap(), Step::Yield);
+        assert_eq!(vm.instruction_pointer, 30);
+        assert_eq!(vm.run(&mut NullHost, 2).unwrap(), Step::Halted);
+        assert_eq!(vm.stack_bits().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
     fn code_call_and_return_restore_the_call_frame() {
         let mut code = Vec::new();
         instruction(&mut code, 0x25, &[immediate(7)]);
@@ -2861,6 +2922,54 @@ mod tests {
         assert_eq!(vm.run(&mut host, 64).unwrap(), Step::Halted);
         assert_eq!(host.calls, vec![(12, 7u32.to_le_bytes().to_vec())]);
         assert_eq!(vm.stack_bits().collect::<Vec<_>>(), vec![8]);
+    }
+
+    #[test]
+    fn native_continue_fetches_from_a_replaced_program_counter() {
+        let mut code = Vec::new();
+        instruction(
+            &mut code,
+            NATIVE_CALL_OPCODE,
+            &[immediate(30), immediate(0)],
+        );
+        instruction(&mut code, 0x25, &[immediate(99)]);
+        instruction(&mut code, 0x25, &[immediate(42)]);
+        code.push(0x3b);
+        let mut vm = Vm::from_program(program(&code)).unwrap();
+        let mut host = |index: u32, _arguments: &[u8], vm: &mut Vm| {
+            assert_eq!(index, 30);
+            vm.instruction_pointer = 17;
+            Ok(NativeReturn::Continue)
+        };
+
+        assert_eq!(vm.run(&mut host, 8).unwrap(), Step::Halted);
+        assert_eq!(vm.stack_bits().collect::<Vec<_>>(), vec![42]);
+    }
+
+    #[test]
+    fn native_continue_fetches_from_a_replaced_program() {
+        let mut code = Vec::new();
+        instruction(
+            &mut code,
+            NATIVE_CALL_OPCODE,
+            &[immediate(31), immediate(0)],
+        );
+        instruction(&mut code, 0x25, &[immediate(99)]);
+        code.push(0x3b);
+        let mut replacement = Vec::new();
+        instruction(&mut replacement, 0x25, &[immediate(42)]);
+        replacement.push(0x3b);
+        let mut vm = Vm::from_program(program(&code)).unwrap();
+        let mut host = |index: u32, _arguments: &[u8], vm: &mut Vm| {
+            assert_eq!(index, 31);
+            vm.load_program(program(&replacement), Vec::new())?;
+            Ok(NativeReturn::Continue)
+        };
+
+        assert_eq!(vm.run(&mut host, 8).unwrap(), Step::Halted);
+        assert_eq!(vm.program().unwrap().code, replacement);
+        assert_eq!(vm.instruction_pointer, 6);
+        assert_eq!(vm.stack_bits().collect::<Vec<_>>(), vec![42]);
     }
 
     #[test]

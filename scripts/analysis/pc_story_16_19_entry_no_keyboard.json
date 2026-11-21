@@ -1,0 +1,48 @@
+{
+  "16": {
+    "frames": 1440,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "require-hit:425:14",
+      "425:640,480",
+      "require-hit:661:15",
+      "661:66,72",
+      "require-hit:1041:62",
+      "1041:640,420",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "inspect-log:1060",
+      "inspect-log:1279",
+      "inspect-log:1440"
+    ]
+  },
+  "19": {
+    "frames": 3100,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "require-hit:2270:17",
+      "2270:335,488",
+      "move:2304:40,32",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "inspect-log:2900",
+      "inspect-log:3100"
+    ]
+  }
+}

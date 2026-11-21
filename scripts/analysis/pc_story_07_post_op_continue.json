@@ -1,0 +1,35 @@
+{
+  "7": {
+    "frames": 6200,
+    "diagnostics": [
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:265",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:269",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:630",
+      "trace-native:645"
+    ],
+    "route": {
+      "label": "07 natural OP exit, two guarded Enter presses through com01 2/68",
+      "idle_frames": 600,
+      "page_scenes": [],
+      "kamikaze_post_op": {
+        "keyboard_press": {
+          "region": 64,
+          "receiver": 8,
+          "key": 2,
+          "group": 0,
+          "response": 0
+        },
+        "last_group": 2
+      },
+      "steps": []
+    }
+  }
+}

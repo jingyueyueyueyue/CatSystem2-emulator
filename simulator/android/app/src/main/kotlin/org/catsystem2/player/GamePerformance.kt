@@ -42,6 +42,7 @@ internal class GameRateSampler {
     private val displayed = FrameRateSampler(windowNanos = 1_000_000_000L)
     private var displayGeneration: Triple<Long, DisplaySource, Long>? = null
     private var displayObservedAt = 0L
+    private var displayUnresolved = 0L
     private var displayedRate: Float? = null
     private var gpuSequence: Pair<Long, Long>? = null
     private var gpuObservedAt = 0L
@@ -59,6 +60,7 @@ internal class GameRateSampler {
             displayed.reset()
             displayGeneration = generation
             displayObservedAt = 0
+            displayUnresolved = latest?.unresolved ?: 0
             displayedRate = null
         }
         val logicRate = logic.sample(now, ticks)
@@ -69,7 +71,10 @@ internal class GameRateSampler {
             displayObservedAt = 0
         } else if (latest != null && latest.sampledAt != displayObservedAt) {
             displayObservedAt = latest.sampledAt
+            if (latest.unresolved != displayUnresolved) displayed.reset()
+            displayUnresolved = latest.unresolved
             displayedRate = displayed.sample(displayObservedAt, latest.displayed)
+                ?.takeUnless { it == 0f && latest.pending > 0 }
         }
         val sequence = latest?.takeIf { it.gpuSequence > 0 }?.let { it.session to it.gpuSequence }
         if (gpuSequence != sequence) {
@@ -94,6 +99,7 @@ internal class GameRateSampler {
         displayed.reset()
         displayGeneration = null
         displayObservedAt = 0
+        displayUnresolved = 0
         displayedRate = null
         gpuSequence = null
         gpuObservedAt = 0

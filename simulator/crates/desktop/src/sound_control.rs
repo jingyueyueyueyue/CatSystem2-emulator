@@ -17,7 +17,42 @@ pub(super) struct HostPauseState {
     window_audio_suspended: bool,
 }
 
+pub(super) fn audio_channel_for_type(kind: &[u8]) -> Option<AudioChannel> {
+    if kind.eq_ignore_ascii_case(b"voice") || kind.eq_ignore_ascii_case(b"sysvoice") {
+        Some(AudioChannel::Voice)
+    } else if kind.eq_ignore_ascii_case(b"bgm") {
+        Some(AudioChannel::Bgm)
+    } else if kind.eq_ignore_ascii_case(b"se") || kind.eq_ignore_ascii_case(b"sysse") {
+        Some(AudioChannel::SoundEffect)
+    } else {
+        None
+    }
+}
+
 impl LoggingHost<'_> {
+    pub(super) fn configured_sound_channel(&self, resource: &str, speech: bool) -> Option<AudioChannel> {
+        if speech {
+            return Some(AudioChannel::Voice);
+        }
+        let (directory, name) = resource.rsplit_once(['/', '\\']).unwrap_or(("", resource));
+        if self.sound_config_enabled == 0 {
+            let path = super::sound_native::encode_name(self.text_encoding, resource).ok()?;
+            return self.legacy_file_audio_channel(&path, !directory.is_empty());
+        }
+        let name = super::sound_native::encode_name(self.text_encoding, name).ok()?;
+        let path = self.sound_config.find_path(&name, super::SoundMatch::Prefix);
+        if !directory.is_empty() {
+            let directory = directory.rsplit_once('.')
+                .filter(|(_, ext)| ext.eq_ignore_ascii_case("int"))
+                .map_or(directory, |(stem, _)| stem);
+            let directory = super::sound_native::encode_name(self.text_encoding, directory).ok()?;
+            if !path.last()?.archive.eq_ignore_ascii_case(&directory) {
+                return None;
+            }
+        }
+        path.iter().rev().find_map(|part| audio_channel_for_type(&part.type_name))
+    }
+
     /// Direct FES command 219 adapter. Updates the existing PCM worker without
     /// starting/restarting playback or changing its paused state.
     pub(super) fn control_sound_play_count(
@@ -329,18 +364,14 @@ impl LoggingHost<'_> {
                                 .map_err(|cause| self.sound_host_error(cause))?;
                             state.handle = None;
                         }
+                        let configured = self.configured_sound_channel(&resource, state.task.is_speech);
                         let request = AudioRequest {
-                            channel: if state.task.is_speech {
-                                AudioChannel::Voice
-                            } else {
-                                sound_audio_channel(&resource)
-                            },
+                            channel: configured.unwrap_or_else(|| sound_audio_channel(&resource)),
                             resource,
                             volume: state.request_volume(),
                             pan: state.request_pan(),
                             looped: native_play_looped(value),
                         };
-                        let sound_effect = request.channel == AudioChannel::SoundEffect;
                         let playback = match crate::audio::play_loaded_sound_range(
                             self.audio_host,
                             request,
@@ -354,7 +385,7 @@ impl LoggingHost<'_> {
                             },
                         ) {
                             Ok(playback) => playback,
-                            Err(RuntimeError::AudioStartTimeout(cause)) if sound_effect => {
+                            Err(RuntimeError::AudioStartTimeout(cause)) if configured == Some(AudioChannel::SoundEffect) => {
                                 state.paused = false;
                                 state.repeat_remaining = 0;
                                 state.task.signal = None;
@@ -363,6 +394,11 @@ impl LoggingHost<'_> {
                                     event.detail.push_str(&format!(" sound_effect_start_skipped channel={channel}: {cause}"));
                                 }
                                 return Ok(NativeReturn::Continue);
+                            }
+                            Err(RuntimeError::AudioStartTimeout(cause)) => {
+                                return Err(self.sound_host_error(format!(
+                                    "start timeout channel={channel} resource={:?}: {cause}", state.resource
+                                )));
                             }
                             Err(cause) => return Err(self.sound_host_error(cause)),
                         };

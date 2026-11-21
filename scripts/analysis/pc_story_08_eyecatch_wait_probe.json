@@ -1,0 +1,22 @@
+{
+  "8": {
+    "frames": 6060,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:614",
+      "move:2948:634,90",
+      "4950:634,90",
+      "require-hit:4950:13",
+      "move:5020:120,185",
+      "5030:120,185",
+      "require-hit:5030:32",
+      "inspect-log:5700",
+      "inspect-log:6060"
+    ]
+  }
+}

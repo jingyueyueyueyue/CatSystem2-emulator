@@ -17,7 +17,7 @@ use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 use super::{
     HeadlessPlayer, LoggingHost, SceneNode,
     message_backend::DesktopMessageDevice,
-    message_native::{CAMPANELLA_STRING_KIND, MessageNativeContext, MessageRoute, UTATE_STRING_KIND},
+    message_native::{LEGACY_STRING_KIND_45, MessageNativeContext, MessageRoute, UTATE_STRING_KIND},
     native_tasks::NativeTaskStore,
     ordinary_native::OrdinaryNativeServices,
 };
@@ -328,13 +328,16 @@ fn masked_region_at(
 }
 
 impl LoggingHost<'_> {
-    pub(super) fn host_input_region_ready(&self, id: u32) -> bool {
-        let receiver = match self.data_services.messages.input_buttons.get(&id) {
+    pub(super) fn effective_input_region_receiver(&self, id: u32) -> Option<u32> {
+        match self.data_services.messages.input_buttons.get(&id) {
             Some(button) if button.registration_bound => button.state.receiver,
             _ => self.scene_nodes.get(&id)
                 .and_then(|node| self.input_button_region_receiver(id, node.kind)),
-        };
-        !receiver.and_then(|owner| self.data_services.tasks.fes.runtime(owner))
+        }
+    }
+
+    pub(super) fn host_input_region_ready(&self, id: u32) -> bool {
+        !self.effective_input_region_receiver(id).and_then(|owner| self.data_services.tasks.fes.runtime(owner))
             .and_then(|runtime| runtime.driver.as_ref())
             .is_some_and(super::fes_driver::FesScriptDriver::initialization_pending)
     }
@@ -505,7 +508,7 @@ impl LoggingHost<'_> {
                 };
             }
             138 | 139 => {
-                self.request_device_pointer(id, command.code, command.data)?;
+                self.request_device_pointer(Some(id), command.code, command.data)?;
             }
             145 => {
                 // Store each completed OR, retaining the prefix on error.
@@ -2632,11 +2635,12 @@ impl LoggingHost<'_> {
                 .and_then(|id| self.data_services.tasks.message_task_state(id))
                 .is_some_and(|(kind, _, _)| kind == UTATE_STRING_KIND)
             && self.bind_utate_plane_input_profile()?;
-        let campanella_string_receiver = matches!(index, 611..=619)
-            && self.css_task_sha() == Some(super::particle_external::CAMPANELLA_SHA)
+        // Both PEs use a 0xbc config and the kind-45 layout receiver for this group.
+        let legacy_string_receiver_45 = matches!(index, 611..=619)
+            && matches!(self.css_task_sha(), Some(super::particle_external::CAMPANELLA_SHA) | Some(super::css_model::SHA))
             && target
                 .and_then(|id| self.data_services.tasks.message_task_state(id))
-                .is_some_and(|(kind, _, _)| kind == CAMPANELLA_STRING_KIND);
+                .is_some_and(|(kind, _, _)| kind == LEGACY_STRING_KIND_45);
         self.data_services.message_device.load_fonts(self.resources);
         if !self.data_services.message_device.settings_loaded {
             initialize_settings(self.data_services, self.resources, Some(self.save_root))?;
@@ -2652,8 +2656,11 @@ impl LoggingHost<'_> {
             sender: self.current_task_id,
             drawing_available: self.canvas.is_some(),
             utate_string_receiver,
-            campanella_string_receiver,
+            legacy_string_receiver_45,
         };
+        let complete_before_utate_append = data.story_trace && utate_string_receiver && index == 614
+            && target.and_then(|id| data.messages.object(id))
+                .is_some_and(|object| object.complete_snapshot() && object.last_complete() && !object.active());
         let result = data
             .messages
             .call(index, arguments, vm, self.scene_nodes, &mut context);
@@ -2666,7 +2673,76 @@ impl LoggingHost<'_> {
             let id = u32::from_le_bytes(arguments[..4].try_into().unwrap());
             data.messages.legacy.paint_pending(id, context.device)?;
         }
-        if result.is_ok() && index == 612 && (utate_string_receiver || campanella_string_receiver) {
+        if data.story_trace && utate_string_receiver
+            && self.cst_contexts.values().any(|cst| cst.story.is_scene("00_01"))
+            && (matches!(index, 612..=615 | 617..=619) && result.is_ok()
+                || index == 616 && matches!(&result, Ok(NativeReturn::Value(1))))
+            && let Some(id) = target
+            && let Some(object) = data.messages.object(id)
+        {
+            let caller = self.current_task_id;
+            let configured = object.configured();
+            let remaining = configured.then(|| object.remaining_all().ok()).flatten();
+            let append = (index == 614 && configured).then(|| {
+                let address = super::read_u32(arguments, 4).ok()?;
+                let raw = vm.read_string(address).ok()?;
+                let expanded = super::expand_kcs_format(vm, &raw, 0).ok()?;
+                let appended = expanded.split(|&byte| byte == 0).next().unwrap_or_default();
+                let unchanged = raw.as_slice() == appended;
+                let source = unchanged.then(|| data.cst_text_origins.returned_body(caller, address, appended)).flatten();
+                Some((address, raw.len(), appended.len(), unchanged, source))
+            }).flatten();
+            self.events.push(crate::LogicEvent {
+                frame: self.frame,
+                kind: "utate-string-receiver".into(),
+                detail: format!("native={index} id={id} caller={caller} configured={configured} \
+                    remaining={remaining:?} generation={} return_one={} \
+                    append(address,raw_bytes,appended_bytes,unchanged,source)={append:?}",
+                    object.surface_generation(), matches!(&result, Ok(NativeReturn::Value(1)))),
+            });
+        }
+        if data.story_trace && utate_string_receiver && result.is_ok()
+            && let Some(id) = target
+        {
+            let caller = self.current_task_id;
+            let object = data.messages.object(id);
+            let generation = object.map(|object| object.surface_generation());
+            let remaining = object.filter(|object| object.configured())
+                .and_then(|object| object.remaining_all().ok());
+            let newline_tail = object.is_some_and(|object| {
+                matches!(object.raw_appends(), [body, tail] if !body.is_empty() && tail == b"\\n")
+            });
+            let same_draw = |draw: &super::message_native::UtateBodyDraw| {
+                draw.caller == caller && Some(draw.generation) == generation
+            };
+            match index {
+                614 if newline_tail && data.messages.utate_body_draws.get(&id).is_some_and(same_draw) => {
+                    if let Some(draw) = data.messages.utate_body_draws.get_mut(&id) {
+                        draw.completed_before_newline = complete_before_utate_append && draw.completed.is_some();
+                    }
+                }
+                619 if newline_tail && remaining == Some(0)
+                    && data.messages.utate_body_draws.get(&id).is_some_and(same_draw) => {}
+                612..=615 | 617..=621 => {
+                    data.messages.utate_body_draws.remove(&id);
+                    if index == 619 && matches!(remaining, Some(1..)) && let Some(generation) = generation {
+                        data.messages.utate_body_draws.insert(id, super::message_native::UtateBodyDraw {
+                            caller, generation, started: self.frame, completed: None, completed_before_newline: false,
+                        });
+                    }
+                }
+                616 if remaining == Some(0) && matches!(&result, Ok(NativeReturn::Value(1))) => {
+                    if let Some(draw) = data.messages.utate_body_draws.get_mut(&id)
+                        && draw.caller == caller && Some(draw.generation) == generation
+                        && draw.started < self.frame
+                    {
+                        draw.completed.get_or_insert(self.frame);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if result.is_ok() && index == 612 && (utate_string_receiver || legacy_string_receiver_45) {
             let id = target.unwrap();
             if let Some((size, _)) = data.messages.object(id)
                 .and_then(|object| object.registered_geometry())
@@ -3654,7 +3730,28 @@ impl LoggingHost<'_> {
         Ok(NativeReturn::Continue)
     }
 
-    fn request_device_pointer(&mut self, input: u32, code: u32, data: [u32; 3]) -> Result<()> {
+    pub(super) fn move_fes_navigation_pointer(&mut self, owner: u32, point: [i32; 2]) -> Result<()> {
+        let packed = u32::from(point[0] as u16) | (u32::from(point[1] as u16) << 16);
+        let data = [1, packed, 0];
+        if let Some(input) = self.input_task.owner_id {
+            let command = cs2_runtime::TaskCommand {
+                target: input as i32,
+                sender: owner as i32,
+                code: 139,
+                data,
+            };
+            self.receive_device_input_buffers(command, &mut Default::default(), &mut 0)?
+                .ok_or_else(|| invalid("navigation input receiver is absent"))?;
+        } else if self.input_task.alive {
+            // Older roots provide the input service without a kind-11 task.
+            self.request_device_pointer(None, 139, data)?;
+        } else {
+            return Err(invalid("navigation input service is unavailable"));
+        }
+        Ok(())
+    }
+
+    fn request_device_pointer(&mut self, input: Option<u32>, code: u32, data: [u32; 3]) -> Result<()> {
         if code == 138 {
             self.ensure_fes_settings().map_err(|_| {
                 invalid("pointer movement cannot read the real EFFECT/auto_c setting")
@@ -3689,11 +3786,9 @@ impl LoggingHost<'_> {
             self.data_services.messages.key_sample_physical.clear();
             self.data_services.messages.input_suppressed = 0;
         }
-        let elapsed = self
-            .data_services
-            .tasks
-            .message_task_state(input)
-            .map_or(0, |(_, _, elapsed)| elapsed);
+        let elapsed = input
+            .and_then(|id| self.data_services.tasks.message_task_state(id))
+            .map_or(self.task_time, |(_, _, elapsed)| elapsed);
         self.data_services
             .messages
             .pointer_move
@@ -4299,7 +4394,7 @@ impl LoggingHost<'_> {
         result
     }
 
-    fn device_press_region_eligible(
+    pub(super) fn device_press_region_eligible(
         &self,
         region: super::InputRegionState,
         event_mask: u32,
@@ -4314,7 +4409,16 @@ impl LoggingHost<'_> {
             return Ok(true);
         }
         let [left, top, right, bottom] = region.bounds();
-        if left < right && top < bottom && !region.contains(point) {
+        let has_bounds = left < right && top < bottom;
+        // FES object buttons can be registered before their image supplies
+        // dimensions. An empty object has no mouse hit area, even without a mask.
+        if !has_bounds && self.data_services.messages.fes_button_lookup
+            .and_then(|lookup| lookup(self, region.id()))
+            .is_some_and(|(_, target)| target.is_some())
+        {
+            return Ok(false);
+        }
+        if has_bounds && !region.contains(point) {
             return Ok(false);
         }
         if region.words[11] == 0 {
@@ -4741,7 +4845,7 @@ impl LoggingHost<'_> {
             sender: self.current_task_id,
             drawing_available: self.canvas.is_some(),
             utate_string_receiver: false,
-            campanella_string_receiver: false,
+            legacy_string_receiver_45: false,
         };
         let Some(route) = context
             .route_message(target)?
@@ -5150,6 +5254,10 @@ impl HeadlessPlayer {
             point,
             |_| true,
         )?)
+    }
+
+    pub fn host_replay_input_regions(&self) -> impl Iterator<Item = [u32; 15]> + '_ {
+        self.input_task.regions.iter().map(|region| region.words)
     }
 
     pub fn mouse_press_candidate_regions(&mut self, point: [i32; 2]) -> anyhow::Result<Vec<u32>> {
@@ -5764,7 +5872,7 @@ impl HeadlessPlayer {
                 sender: self.current_task_id,
                 drawing_available: true,
                 utate_string_receiver: legacy_kind == Some(UTATE_STRING_KIND),
-                campanella_string_receiver: legacy_kind == Some(CAMPANELLA_STRING_KIND),
+                legacy_string_receiver_45: legacy_kind == Some(LEGACY_STRING_KIND_45),
             };
             data.messages
                 .frame_update(id, elapsed, &self.scene_nodes, deletion, &mut context)?;
@@ -5974,7 +6082,7 @@ struct MessagePlatformContext<'a> {
     sender: u32,
     drawing_available: bool,
     utate_string_receiver: bool,
-    campanella_string_receiver: bool,
+    legacy_string_receiver_45: bool,
 }
 
 impl MessageBackend for MessagePlatformContext<'_> {
@@ -6026,8 +6134,8 @@ impl MessageNativeContext for MessagePlatformContext<'_> {
         self.utate_string_receiver
     }
 
-    fn campanella_string_receiver(&self) -> bool {
-        self.campanella_string_receiver
+    fn legacy_string_receiver_45(&self) -> bool {
+        self.legacy_string_receiver_45
     }
 
     fn route_message(&mut self, raw_target: u32) -> Result<Option<MessageRoute>> {
@@ -6061,7 +6169,7 @@ impl MessageNativeContext for MessagePlatformContext<'_> {
             kind,
             48 | 63 | super::legacy_text_native::LEGACY_STRING_KIND
         ) || (self.utate_string_receiver && kind == UTATE_STRING_KIND)
-            || (self.campanella_string_receiver && kind == CAMPANELLA_STRING_KIND);
+            || (self.legacy_string_receiver_45 && kind == LEGACY_STRING_KIND_45);
         let display = if !text_plane || !self.drawing_available || !self.device.drawing_enabled {
             MessagePlaneDisplay::Unreachable
         } else if self.nodes.get(&raw_target).is_some_and(|node| node.visible) {

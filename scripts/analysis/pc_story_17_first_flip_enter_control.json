@@ -1,0 +1,48 @@
+{
+  "17": {
+    "frames": 2100,
+    "route": {
+      "label": "Daydream prologue: one Enter from the ready cinema window",
+      "idle_frames": 720,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "Press Enter once on the first ready cinema page",
+          "wait": {"state": "page", "scene": "prologue", "group": 0, "record": 18, "window": "cinema"},
+          "key": 13,
+          "after": {"state": "page", "scene": "prologue", "group": 1, "record": 22, "window": "cinema"}
+        },
+        {
+          "label": "Log the second ready cinema page without sending input",
+          "wait": {"state": "page", "scene": "prologue", "group": 1, "record": 22, "window": "cinema"},
+          "probe_points": [[640, 395]]
+        }
+      ]
+    }
+  },
+  "probe_anchors": {
+    "baseline_host_log": "2026-11/20261120_043320_925091_6lyqj1hp_playthrough/17.host.log",
+    "source_tree_sha256": "0ea3ae575b662d18b80d7f8ff7f673cc577ff0f00d34a7ce4c6299492bfb0b11",
+    "first_page": {"not_ready_line": 64, "body_layer_line": 110, "ready_line": 127, "body_nonzero_alpha": 3413},
+    "cst": {
+      "source": "update03.int::prologue.cst",
+      "member_sha256": "4f713b09acbe41fd0d19e072eb3d5f89d3ee34854904aa8300640f0ba00e05e8",
+      "installed_and_cn_backup_archive_sha256": "cac79038baad0a266ce1e1ca75143285f2b09ad895e7b1af1af3a61df807c0f9",
+      "lower_priority_japanese_member_sha256": "331d5bcdc888780d28da61ec4cd20654dfd1f54305326f0d33588155e9cdfd56",
+      "stored_codec": "GBK",
+      "runtime_text_codec": "UTF-8",
+      "language": "zh-Hans",
+      "second_body_records": [20, 21],
+      "second_body_gbk_bytes": [18, 48],
+      "second_body_utf8_bytes": [27, 71],
+      "second_body_utf8_sha256": [
+        "84484a35456ece384aad670b7f6fcc2964c5f6b6655a2ce1ff8c13702ecb6559",
+        "6828aab05c36691c3276823c161f74fa41b7509a3ec0cb67ffb907ead7162031"
+      ],
+      "language_acceptance": "Static patch identity does not verify the replay. Correlate the loaded member and GBK-to-UTF-8 records 20 and 21 with the new cinema body; then check the displayed text against that translation. Pixel counts alone cannot establish source or language."
+    },
+    "fes": {"source": "fes.int::cinema.fes", "show_line": 478, "wait_input_line": 503},
+    "requires": "A candidate exposing page/cinema only for a confirmed CST page and the unique focused, unpaused cinema receiver with WAIT_KEY, settled MES_SHOW, no queued input, no active movie, and no menu or choice. Observation-only candidates must not send a key.",
+    "acceptance": "One Keyboard(13) down with normal release, then exactly the ready group 1, record 22 and new readable body glyphs in the composed checkpoint. Check the fresh physical input route and same-press VM resume in the logs; a host down log or completed status alone does not prove consumption. Stop on any other state or timeout without retrying the key."
+  }
+}

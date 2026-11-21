@@ -1,0 +1,78 @@
+{
+  "17": {
+    "frames": 1500,
+    "route": {
+      "label": "Daydream prologue first readable page: observation only",
+      "idle_frames": 720,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "Observe the first page without sending input",
+          "wait": {"state": "page", "scene": "prologue", "group": 0, "record": 18},
+          "capture": true
+        }
+      ]
+    }
+  },
+  "text_anchors": {
+    "17": {
+      "evidence": {
+        "events_log": "2026-11/20261120_032150_657268_ffjol34p_playthrough/17.events.log",
+        "source_tree_sha256": "ce5efe5510badf5720f0eefd2665abd60ab35fd499d3cc8ddeef034e7d513ec4",
+        "first_observed_scene_frame": 644,
+        "queued_frame": 711,
+        "queued_utf8_bytes": {"body": 39, "speaker": 6},
+        "unclassified_wait_frame": 743,
+        "last_frame": 840,
+        "last_frame_nonblack_pixels": 0,
+        "input_observed": false
+      },
+      "resource": {
+        "archive": "update03.int",
+        "member": "prologue.cst",
+        "sha256": "4f713b09acbe41fd0d19e072eb3d5f89d3ee34854904aa8300640f0ba00e05e8"
+      },
+      "transition_acceptance": {
+        "baseline_events_log": "2026-11/20261120_035536_324103_h4iwdhxn_playthrough/17.events.log",
+        "baseline_source_tree_sha256": "97c3d6246a1afa6ca693805fab644fca65437b9901df1121743d3eeae6a93392",
+        "baseline_wipe": {"task": 65, "configure_frame": 647, "enable_frame": 648, "last_query_frame": 900},
+        "before_draw": {"wipe_record": 4, "view_record": 6, "bare_wait_record": 7, "bare_wait_frame": 743},
+        "expected_after_wipe": {"draw_record": 13, "draw_duration": 300, "bare_wait_record": 14, "timed_wait_record": 15},
+        "required_order": [
+          "The wipe ends naturally and the script issues rdraw 300, without injected frameon or input.",
+          "The draw ends naturally, the script finishes its waits, and the exact first CST page boundary is reached.",
+          "The first-page capture contains readable body glyphs in the final composition, not only an allocated text list."
+        ],
+        "on_unrecognized_wait": "Use unfiltered native calls to distinguish repeated native 520 queries of the Wipe task before rdraw from queries of a newly created Draw task after rdraw. Query calls alone do not prove completion; frame 900 is only a baseline checkpoint."
+      },
+      "expected_pages_from_resource": [
+        {"group": 0, "speaker_record": 16, "body_records": [17], "body_utf8_bytes": [39], "wait_record": 18},
+        {"group": 1, "speaker_record": 19, "body_records": [20, 21], "body_utf8_bytes": [27, 71], "wait_record": 22}
+      ],
+      "input_candidate": {
+        "status": "unverified",
+        "key": 13,
+        "require_first": [
+          "The current CST wait matches group 0, absolute record 18, not a script command wait.",
+          "Exactly one foreground dialogue receiver is waiting for input, with no pending handler, menu or choice.",
+          "The host is focused and unpaused with no queued messages or active movie, and body glyphs are present in the final composition."
+        ],
+        "verify_after": {"state": "page", "scene": "prologue", "group": 1, "record": 22},
+        "require_after": "Input is accepted; new body records 20 and 21 reach the second page and body glyphs are present. Stop here."
+      }
+    },
+    "11": {
+      "evidence": {
+        "events_log": "2026-11/20261120_032324_392455_fo3anxd9_playthrough/11.events.log",
+        "source_tree_sha256": "ce5efe5510badf5720f0eefd2665abd60ab35fd499d3cc8ddeef034e7d513ec4",
+        "previous_encoding_failure_frame": 1036,
+        "movie_request_frame": 1068,
+        "movie_request": "radio_wave",
+        "last_frame": 1230,
+        "last_frame_nonblack_pixels": 0
+      },
+      "next_input": null,
+      "require_first": "Confirm the movie state and the actual CST/FES wait before considering input; native 71 alone does not establish readiness."
+    }
+  }
+}

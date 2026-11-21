@@ -380,7 +380,7 @@ impl FesTaskPlatform {
             .map(|list| (list.output, list.size, list.offset, list.submit))
     }
 
-    fn region_target(&self, region: u32) -> Option<(u32, Option<FesDriverTarget>)> {
+    pub(super) fn region_target(&self, region: u32) -> Option<(u32, Option<FesDriverTarget>)> {
         if let Some((owner, name, bank)) = self.button_regions.get(&region) {
             return Some((*owner, Some(FesDriverTarget {
                 name: name.clone(), bank: *bank, value: region as i32, default_group: None,
@@ -531,6 +531,9 @@ impl LoggingHost<'_> {
     pub(super) fn release_fes_list_output(&mut self, id: u32) -> cs2_script::Result<()> {
         if let Some(list) = self.data_services.tasks.fes.platform.lists.remove(&id) {
             self.release_image_wrapper(list.output)?;
+            // A scene can retire the shared list before its message window.
+            // Drop cached bindings before the task ID can be reused by the title.
+            self.data_services.tasks.fes.detach_image_list(id);
         }
         Ok(())
     }
@@ -828,7 +831,7 @@ pub(super) fn plan_bank_release(
                         .map(|(record, _)| (record, item.bank)).collect();
                 }
             }
-            b"SLIDER" | b"SCROLL2" | b"IMGWND" | b"VIEWPORT" => {
+            b"SLIDER" | b"SCROLL2" | b"SCROLL" | b"IMGWND" | b"VIEWPORT" => {
                 let (tasks, key) = super::fes_controls::bank_release_targets(
                     &host.data_services.fes_controls, owner, &item.name, item.bank,
                 ).context("FES delete control bank is unavailable or executing in another owner")?;
@@ -863,16 +866,9 @@ pub(super) fn finish_bank_release(
 ) -> Result<()> {
     super::fes_motion::commit_release_identity(&mut host.data_services.fes_motion, &item.motion)?;
     driver.adapter.remove_object_bank(&item.name, item.bank as usize);
-    if item.kind == b"BUTTON"
-        && let Ok(name) = std::str::from_utf8(&item.name)
-        && let std::collections::btree_map::Entry::Occupied(mut binding) =
-            driver.interpreter.named.entry(name.to_owned())
-    {
-        binding.get_mut().remove(&item.bank);
-        if binding.get().is_empty() {
-            binding.remove();
-        }
-    }
+    // A script can still compare the declared button token after DELETE.
+    // Clearing it aliases zero, the idle value of _CLICK_L_. The live bank
+    // and its input region have already been removed.
     Ok(())
 }
 
@@ -959,7 +955,8 @@ fn graphics_delete_command(
     let source = object_command_target(command)?;
     let (name, index) = super::fes_media::split_target(&source, host.text_encoding)?;
     let Some(object) = driver.adapter.object(name).filter(|object| matches!(
-        object.definition.kind_name.as_slice(), b"PLANE" | b"CPLANE" | b"IMAGE" | b"CIMAGE" | b"BUTTON",
+        object.definition.kind_name.as_slice(),
+        b"PLANE" | b"CPLANE" | b"IMAGE" | b"CIMAGE" | b"BUTTON" | b"SAVEPANEL",
     )) else { return Ok(false); };
     let count = object.definition.bank_count as i32;
     let bank = index.map(|source| driver.evaluate_parameter(source, command.context.current, shared)).transpose()?;
@@ -1176,15 +1173,21 @@ fn apply_effect(
         }
         FesDriverEffect::React { target } => {
             if let Some(target) = target {
-                let binding = host
+                let region = host
                     .data_services
                     .tasks
                     .fes
                     .platform
                     .objects
                     .get(&(view.id, target.name.clone(), target.bank))
+                    .map(|binding| binding.child)
+                    .or_else(|| {
+                        host.data_services.fes_controls.legacy_scroll_react_region(
+                            view.id, &target.name, target.bank,
+                        )
+                    })
                     .context("FES react target is not registered")?;
-                if let Some(id) = binding.child {
+                if let Some(id) = region {
                     if let Some(region) = host
                         .input_task
                         .regions
@@ -1379,8 +1382,22 @@ fn button_property_command(
     }
     let source = object_command_target(command)?;
     let (name, bank) = super::fes_media::split_target(&source, host.text_encoding)?;
-    let Some(definition) = driver.adapter.object(name)
-        .filter(|object| object.definition.kind_name == b"BUTTON") else { return Ok(false); };
+    let Some(definition) = driver.adapter.object(name) else { return Ok(false); };
+    let kind = definition.definition.kind_name.as_slice();
+    if kind != b"BUTTON" {
+        if !lock || kind != b"IMAGE" {
+            return Ok(false);
+        }
+        // The legacy lock receiver evaluates the argument for IMAGE too, but
+        // writes the lock field only for a BUTTON receiver.
+        if let Some(bank) = bank {
+            driver.evaluate_parameter(bank, command.context.current, shared)?;
+        }
+        if let Some(value) = command.parameters.get(2) {
+            driver.evaluate_parameter(value, 0, shared)?;
+        }
+        return Ok(true);
+    }
     let count = definition.definition.bank_count;
     let bank = bank.map(|bank| driver.evaluate_parameter(bank, command.context.current, shared))
         .transpose()?;
@@ -1712,7 +1729,14 @@ fn initialize_objects(
                 }
             }
             _ if column.starts_with(b"ID.") => {
-                let index: usize = std::str::from_utf8(&column[3..])?.parse()?;
+                let index = match &column[3..] {
+                    b"N" => 0,
+                    b"D" => 1,
+                    b"F" => 2,
+                    b"P" => 3,
+                    suffix => std::str::from_utf8(suffix)?.parse::<usize>()
+                        .with_context(|| format!("invalid FES image ID column {:?}", String::from_utf8_lossy(column)))?,
+                };
                 if index > 4095 {
                     bail!("FES image ID table exceeds 4096 entries");
                 }
@@ -1788,7 +1812,22 @@ fn initialize_objects(
     Ok(())
 }
 
+pub(super) fn is_sudden_message_fes(bytes: &[u8]) -> bool {
+    bytes.len() == 2647
+        && super::particle_plugin_digest::sha256(bytes)
+            == "43cd548dc7bad4e08df4aca6a8495a598bb425a78d2353ba390f53e7a38acc96"
+}
+
 pub(super) fn finish_task_media(
+    host: &mut LoggingHost<'_>,
+    view: &FesTaskView,
+    runtime: &mut FesRuntime,
+    driver: &mut FesScriptDriver,
+) -> Result<bool> {
+    host.with_encoded_image_batch(|host| finish_task_media_inner(host, view, runtime, driver))
+}
+
+fn finish_task_media_inner(
     host: &mut LoggingHost<'_>,
     view: &FesTaskView,
     runtime: &mut FesRuntime,
@@ -1871,15 +1910,27 @@ pub(super) fn finish_task_media(
         let identity = (view.id, name.clone(), bank);
         let Some(binding) = host.data_services.tasks.fes.platform.objects.get(&identity) else { continue; };
         let key = binding.key.clone();
-        if host.data_services.tasks.fes.platform.button_source_pending.contains(&identity) {
-            let image = if let Some(layer) = runtime.media.get(&key) {
-                super::fes_media::source_image(host, layer)?
-            } else { None };
+        let layer = runtime.media.get(&key).context("FES button media disappeared")?;
+        // This message window leaves banks 3 and 4 without button frames.
+        // The shared HG3's frame zero is a full-panel geometry reference.
+        let unused = name == b"btn" && matches!(bank, 3 | 4) && layer.frame_ids.is_empty()
+            && *driver.sudden_message_fes_source.get_or_insert_with(|| {
+                // The cached identity is rebuilt when restoring a checkpoint.
+                host.resources.find("fes.int/meswnd.fes")
+                    .filter(|candidate| candidate.size == 2647)
+                    .and_then(|candidate| host.resources.read_candidate(candidate).ok())
+                    .filter(|bytes| is_sudden_message_fes(bytes))
+                    .and_then(|bytes| cs2_script::FesDocument::parse(&bytes).ok())
+                    .is_some_and(|document| document == runtime.document)
+            });
+        let pending = host.data_services.tasks.fes.platform.button_source_pending.contains(&identity);
+        if unused || pending {
+            let image = if unused { None } else { super::fes_media::source_image(host, layer)? };
             let record = host.data_services.tasks.fes.platform.button_records
                 .get_mut(&(view.id, declaration, bank))
                 .context("BUTTON source update has no original declaration record")?;
+            record.source_updated |= pending || record.image.is_some();
             record.image = image;
-            record.source_updated = true;
             host.data_services.tasks.fes.platform.button_source_pending.remove(&identity);
         }
         let record = host.data_services.tasks.fes.platform.button_records
@@ -1919,7 +1970,7 @@ pub(super) fn finish_task_media(
                     (image, options, None)
                 };
                 super::fes_controls::apply_layer_clip(host.data_services, view.id, name, &mut options);
-                if let Some(plane) = &layer.plane {
+                if let Some(plane) = layer.plane.as_deref().and_then(|name| runtime.driver_plane_key(name)) {
                     super::fes_controls::apply_layer_clip(host.data_services, view.id, plane, &mut options);
                 }
                 replacement.push(((view.id, name.clone()), Layer {
@@ -2261,6 +2312,39 @@ mod media_lifecycle_tests {
             assert_eq!(runtime.media["btn1"].plane.as_deref(), Some("pl[5]"));
             Ok(())
         })
+    }
+
+    #[test]
+    fn fes_image_projects_to_an_explicit_single_plane_bank() -> Result<()> {
+        with_script(b"IMAGE background", &[b"background disp 1"],
+            |host, view, runtime, driver, shared| {
+                runtime.planes.insert("panel".into(), FesPlaneLayer {
+                    size: [8, 6],
+                    vram: [11, 19],
+                    ..Default::default()
+                });
+                let initializer = cs2_script::FesObjectInitialization {
+                    offset: 100,
+                    target: b"background".to_vec(),
+                    columns: vec![b"PL".to_vec()],
+                    values: vec![b"panel[0]".to_vec()],
+                };
+                initialize_objects(host, view, runtime, driver, &initializer, shared)?;
+                command(host, view, runtime, driver, shared)?;
+
+                let frame = RgbaFrame::from_rgba8(1, 1, vec![10, 20, 30, 255])?;
+                let layer = runtime.media.get_mut("background").unwrap();
+                super::super::fes_media::install_ordinary_frame(layer, frame.clone());
+
+                let options = runtime.driver_media_draw_options("background")?.unwrap();
+                assert_eq!(options.clip, Some(Rect::new(11, 19, 8, 6)));
+                let placement = super::super::fes_motion::image_list_placement(
+                    host, view, runtime, "background", &frame,
+                )?;
+                assert_eq!(placement.position, [11., 19.]);
+                assert!(runtime.driver_plane_key("panel[1]").is_none());
+                Ok(())
+            })
     }
 
     #[test]

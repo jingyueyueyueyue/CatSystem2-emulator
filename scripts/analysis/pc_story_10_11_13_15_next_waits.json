@@ -1,0 +1,53 @@
+{
+  "10": {
+    "frames": 2400,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "djibril10-op01-next",
+      "trace-native:325", "trace-native:326", "trace-native:327",
+      "trace-native:276", "trace-native:630",
+      "move:708:190,222", "require-hit:710:39", "710:190,222"
+    ]
+  },
+  "11": {
+    "frames": 2700,
+    "inputs": [
+      "story-trace", "story-events", "capture-every:0", "no-final-capture",
+      "legacy-11-radio-r94-enter",
+      "trace-native:266", "trace-native:267", "trace-native:268",
+      "trace-native:69", "trace-native:70", "trace-native:702", "trace-native:989",
+      "trace-native:13", "trace-native:276", "trace-native:630",
+      "trace-native:1002", "trace-native:1037", "trace-native:1038", "trace-native:1051",
+      "215:13", "385:13", "550:13",
+      "move:605:1154,473", "require-hit:612:15", "612:1154,473",
+      "require-hit:810:62", "810:640,360", "require-hit:890:62", "890:640,360",
+      "require-hit:970:62", "970:640,360"
+    ]
+  },
+  "13": {
+    "frames": 7800,
+    "inputs": [
+      "story-trace", "story-events", "capture-every:0", "no-final-capture",
+      "legacy-13-r188",
+      "trace-native:266", "trace-native:267", "trace-native:268", "trace-native:327",
+      "trace-native:276", "trace-native:630", "eden-live-entry"
+    ]
+  },
+  "15": {
+    "frames": 5600,
+    "inputs": [
+      "capture-every:0", "no-final-capture", "story-events", "story-trace",
+      "labyrinth15-opening",
+      "trace-native:276", "trace-native:325", "trace-native:326", "trace-native:327", "trace-native:630",
+      "move:691:512,353", "require-hit:692:20", "692:512,353",
+      "require-hit:821:67", "821:400,130"
+    ]
+  },
+  "eden_r188": [
+    {"group": 13, "wait": 151, "body": [150], "body_bytes": 38, "body_sha256": "bd20b4d6ba3ccecfaa9d387afb250d0c40e461e021dc96a40f3251cd6c23927e", "rdraw": 30},
+    {"group": 14, "wait": 163, "body": [162], "body_bytes": 28, "body_sha256": "36a945ec4669e57aed9240d3fa5ab23af09d16e8a0c6e24d47e284d94fdfd417", "rdraw": 30},
+    {"group": 15, "wait": 174, "body": [173], "body_bytes": 69, "body_sha256": "0089dce6c06bbdcc486571b5082784b03b6d27f4e6c25ee51172fbeea80fe8b9", "rdraw": 30},
+    {"group": 16, "wait": 186, "body": [185], "body_bytes": 24, "body_sha256": "c890576c5e782a13f040d7dffe105ce8a6f49317b4ad6172c3660a715a720b0d", "rdraw": 30},
+    {"group": 17, "wait": 188, "body": [187], "body_bytes": 78, "body_sha256": "af3d8fd27234cf61f0a3c7802f9bdf9722466f13797b8d03063e9ce958537ae9"}
+  ]
+}

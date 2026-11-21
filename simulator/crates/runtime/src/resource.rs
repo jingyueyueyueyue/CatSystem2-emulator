@@ -467,14 +467,35 @@ pub struct BoundedReader {
     position: u64,
 }
 
-/// A bounded encoded-media reader. Encrypted entries are decrypted a block at
-/// a time; the final 0..7 bytes retain the archive's original clear tail.
+/// A bounded encoded-media reader. Complete Blowfish blocks are decrypted
+/// independently. The final 0..7 bytes retain the archive's original clear tail.
 pub struct MediaResourceReader {
     source: BoundedReader,
-    cipher: Option<BlowfishLE>,
-    block: [u8; 8],
-    block_start: usize,
-    block_length: usize,
+    encrypted: Option<EncryptedMedia>,
+}
+
+const MEDIA_BLOCK_BYTES: usize = 8;
+const MEDIA_BUFFER_BYTES: usize = 64 * 1024;
+
+struct EncryptedMedia {
+    cipher: BlowfishLE,
+    buffer: Vec<u8>,
+    buffered: std::ops::Range<u64>,
+    position: u64,
+}
+
+impl MediaResourceReader {
+    fn new(source: BoundedReader, cipher: Option<BlowfishLE>) -> Self {
+        Self {
+            source,
+            encrypted: cipher.map(|cipher| EncryptedMedia {
+                cipher,
+                buffer: Vec::new(),
+                buffered: 0..0,
+                position: 0,
+            }),
+        }
+    }
 }
 
 impl ResourceIndex {
@@ -522,10 +543,9 @@ impl ResourceIndex {
         let cipher = key.map(|key| BlowfishLE::new_from_slice(&key.to_le_bytes()))
             .transpose()
             .map_err(|_| RuntimeError::Archive("invalid media payload key".into()))?;
-        Ok(MediaResourceReader {
-            source: BoundedReader { file, start, length, position: 0 },
-            cipher, block: [0; 8], block_start: 0, block_length: 0,
-        })
+        Ok(MediaResourceReader::new(
+            BoundedReader { file, start, length, position: 0 }, cipher,
+        ))
     }
 
     pub fn scan(root: impl AsRef<Path>) -> RuntimeResult<Self> {
@@ -1410,55 +1430,62 @@ impl Read for BoundedReader {
 
 impl Read for MediaResourceReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        let Some(cipher) = &self.cipher else {
+        let Some(encrypted) = &mut self.encrypted else {
             return self.source.read(output);
         };
-        let mut written = 0;
-        while written < output.len() {
-            if self.block_start == self.block_length {
-                let remaining = self.source.length.saturating_sub(self.source.position);
-                if remaining == 0 {
-                    break;
-                }
-                let count = remaining.min(8) as usize;
-                self.source.read_exact(&mut self.block[..count])?;
-                if count == 8 {
-                    cipher.decrypt_block((&mut self.block).into());
-                }
-                self.block_start = 0;
-                self.block_length = count;
-            }
-            let count = (self.block_length - self.block_start).min(output.len() - written);
-            output[written..written + count].copy_from_slice(
-                &self.block[self.block_start..self.block_start + count],
-            );
-            self.block_start += count;
-            written += count;
+        if output.is_empty() || encrypted.position == self.source.length {
+            return Ok(0);
         }
-        Ok(written)
+        if !encrypted.buffered.contains(&encrypted.position) {
+            let start = encrypted.position / MEDIA_BLOCK_BYTES as u64 * MEDIA_BLOCK_BYTES as u64;
+            if self.source.position != start {
+                self.source.seek(SeekFrom::Start(start))?;
+            }
+            let count = (self.source.length - start).min(MEDIA_BUFFER_BYTES as u64) as usize;
+            encrypted.buffered = 0..0;
+            encrypted.buffer.resize(count, 0);
+            self.source.read_exact(&mut encrypted.buffer)?;
+            for block in encrypted.buffer.as_chunks_mut::<MEDIA_BLOCK_BYTES>().0 {
+                encrypted.cipher.decrypt_block(block.into());
+            }
+            encrypted.buffered = start..start + count as u64;
+        }
+        let offset = (encrypted.position - encrypted.buffered.start) as usize;
+        let count = (encrypted.buffer.len() - offset).min(output.len());
+        output[..count].copy_from_slice(&encrypted.buffer[offset..offset + count]);
+        encrypted.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for MediaResourceReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let Some(encrypted) = &mut self.encrypted else {
+            return self.source.seek(position);
+        };
+        encrypted.position = bounded_seek_position(self.source.length, encrypted.position, position)?;
+        Ok(encrypted.position)
     }
 }
 
 impl Seek for BoundedReader {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        let next = match position {
-            SeekFrom::Start(offset) => offset as i128,
-            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
-            SeekFrom::End(offset) => self.length as i128 + offset as i128,
-        };
-        if !(0..=self.length as i128).contains(&next) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "resource seek outside bounded archive entry",
-            ));
-        }
-        self.file.seek(SeekFrom::Start(self.start + next as u64))?;
-        self.position = next as u64;
-        Ok(self.position)
+        let next = bounded_seek_position(self.length, self.position, position)?;
+        self.file.seek(SeekFrom::Start(self.start + next))?;
+        self.position = next;
+        Ok(next)
     }
+}
+
+fn bounded_seek_position(length: u64, current: u64, position: SeekFrom) -> std::io::Result<u64> {
+    let next = match position {
+        SeekFrom::Start(offset) => Some(offset),
+        SeekFrom::Current(offset) => current.checked_add_signed(offset),
+        SeekFrom::End(offset) => length.checked_add_signed(offset),
+    };
+    next.filter(|&next| next <= length).ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::InvalidInput, "resource seek outside bounded archive entry",
+    ))
 }
 
 fn collect_files(directory: &Path, output: &mut Vec<PathBuf>) -> RuntimeResult<()> {

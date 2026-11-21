@@ -1,0 +1,72 @@
+{
+  "11": {
+    "frames": 1800,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:266",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:527",
+      "trace-native:528",
+      "215:13",
+      "385:13",
+      "550:13",
+      "move:605:1154,473",
+      "require-hit:612:15",
+      "612:1154,473",
+      "require-hit:810:62",
+      "810:640,360",
+      "require-hit:890:62",
+      "890:640,360",
+      "require-hit:970:62",
+      "970:640,360",
+      "inspect-log:1309",
+      "inspect-log:1549",
+      "inspect-log:1555",
+      "inspect-log:1800"
+    ]
+  },
+  "12": {
+    "frames": 1050,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:325",
+      "trace-native:326",
+      "move:208:640,443",
+      "require-hit:234:15",
+      "234:640,443",
+      "inspect-log:653",
+      "inspect-log:677",
+      "inspect-log:900",
+      "inspect-log:901",
+      "inspect-log:1050"
+    ]
+  },
+  "probe_anchors": {
+    "mode": "observation only; no body input and no screenshots",
+    "11": {
+      "baseline_run": "2026-11/20261120_050932_697698_izegy8_a_playthrough",
+      "scene": "scene.int::00_001.cst",
+      "movie": "movie.int::radio_wave.mpg",
+      "first": {"group": 0, "record": 81, "window": "cinema", "wait_address": "0xd6d", "flow": "GAME_WAIT", "body_layer_host_line": 194, "stable_host_line": 273},
+      "successor_after_enter": {"group": 1, "record": 86, "body_records": [84, 85]},
+      "guard_gap": "Bind this PE/startup and the unique running scene movie to the looping radio_wave resource before permitting any cinema input. The presence of one movie is not sufficient.",
+      "observe": "Require the first body wait with looping movie still active and no spontaneous successor. Record 86 is a later one-Enter acceptance target, not an expected result of this run."
+    },
+    "12": {
+      "enter_control_run": "2026-11/20261120_043423_909610_d8r65g_j_playthrough",
+      "scene": "scene.int::op001.cst",
+      "first": {"group": 0, "record": 69, "window": "meswnd", "wait_address": "0xc29", "flow": "LOOP_GAME", "stable_host_line": 199},
+      "successor_after_enter": {"group": 1, "record": 72, "body_records": [71], "partial_body_host_line": 249, "early_wait_key_host_line": 265, "stable_body_host_line": 380, "stable_wait_host_line": 396},
+      "guard_gap": "Bind this PE/startup and require fresh natural reveal and submission of the current body epoch. Local WAIT_KEY can still be true during the successor reveal.",
+      "observe": "Compare the first page before and after the old f900 Enter point without sending it. The historical one-Enter control is evidence only; do not reuse its fixed-frame key."
+    },
+    "acceptance": "Sample frames are not gates. A future one-key probe needs the exact first page, unique ready owner, one Enter down/up with a receiver receipt, then the exact successor with a newer naturally revealed and submitted body epoch; stop without a second key. Missing diagnostics or a guarded entry miss must not trigger extra input."
+  }
+}

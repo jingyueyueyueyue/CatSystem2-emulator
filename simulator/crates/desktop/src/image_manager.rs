@@ -2,13 +2,15 @@
 //! Cache records own independent pixels; neither task wrappers nor their
 //! shared-pixel aliases can mutate a cached decode.
 use std::collections::{BTreeMap, VecDeque};
+use std::cell::RefCell;
+use std::sync::Arc;
 
-use cs2_formats::ConfigXml;
-use cs2_renderer::{AnimationFrameSelection, FrameMetadata, HgFrameAttributes, RgbaFrame};
-use cs2_runtime::RuntimeError;
+use cs2_formats::{ConfigXml, HgFile, HgFrame};
+use cs2_renderer::{AnimationFrameSelection, FrameMetadata, HgFrameAttributes, HgFrameDecoder, RgbaFrame};
+use cs2_runtime::{ResourceCandidate, RuntimeError};
 use cs2_script::{NativeReturn, Result, Vm};
 
-use super::{LoggingHost, cp932_to_utf8, expand_kcs_format, native_state_error, read_u32, trim_nul};
+use super::{LoggingHost, cp932_to_utf8, expand_kcs_format, native_state_error, native_state_error_owned, read_u32, trim_nul};
 use super::perf_detail::{ImageSourceStage, ImageSourceStep, SlowTask};
 
 const MAX_FILE: usize = 64 * 1024 * 1024;
@@ -70,6 +72,13 @@ pub(super) struct ImageManager {
     /// saved execution state. Restored cache/layer frames already contain the
     /// committed replacement; they must not run this decoder hook again.
     island_patch_enabled: Option<bool>,
+    encoded_batch: RefCell<Option<EncodedImageBatch>>,
+}
+
+#[derive(Default)]
+struct EncodedImageBatch {
+    bytes: usize,
+    assets: Vec<(ResourceCandidate, Arc<Vec<u8>>)>,
 }
 
 impl Default for ImageManager {
@@ -80,6 +89,7 @@ impl Default for ImageManager {
             animation_aliases: Default::default(), aliases_initialized: false,
             resource_layers: BTreeMap::new(),
             island_patch_enabled: None,
+            encoded_batch: Default::default(),
         }
     }
 }
@@ -167,6 +177,37 @@ impl ImageManager {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn with_encoded_image_batch<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
+        let batch = self.data_services.image_manager.encoded_batch.get_mut();
+        if batch.is_some() {
+            return operation(self);
+        }
+        *batch = Some(EncodedImageBatch::default());
+        let result = operation(self);
+        *self.data_services.image_manager.encoded_batch.get_mut() = None;
+        result
+    }
+
+    pub(super) fn read_encoded_image_candidate(
+        &self, candidate: &ResourceCandidate,
+    ) -> cs2_runtime::RuntimeResult<Arc<Vec<u8>>> {
+        let mut batch = self.data_services.image_manager.encoded_batch.borrow_mut();
+        if let Some(batch) = batch.as_ref()
+            && let Some((_, bytes)) = batch.assets.iter().find(|(source, _)| source == candidate)
+        {
+            return Ok(bytes.clone());
+        }
+        let bytes = Arc::new(self.resources.read_candidate(candidate)?);
+        if let Some(batch) = batch.as_mut()
+            && batch.assets.len() < 256
+            && batch.bytes + bytes.len() <= 24 * 1024 * 1024
+        {
+            batch.bytes += bytes.len();
+            batch.assets.push((candidate.clone(), bytes.clone()));
+        }
+        Ok(bytes)
+    }
+
     /// Ordinary710 shares the category, HG decoder and layer compositor with
     /// the image manager, rather than the legacy direct CST filename guesses.
     pub(super) fn load_image_resource_native710(&mut self, args: &[u8], vm: &Vm) -> Result<NativeReturn> {
@@ -297,19 +338,42 @@ impl LoggingHost<'_> {
 
     fn load_resource_animation_layer(&mut self, name: &str, anm_name: &str) -> Result<Option<ResourceLayer>> {
         let Some((path, bytes)) = self.read_managed_image_asset(name, false)? else { return Ok(None); };
-        let ids = if bytes.starts_with(b"HG-3") {
-            cs2_formats::HgFile::parse(&bytes)
-                .map_err(|_| native_state_error("native 710 animated HG directory is malformed"))?
-                .frames.iter().map(|frame| frame.id).collect::<std::collections::BTreeSet<_>>()
-        } else { std::collections::BTreeSet::from([0]) };
         let mut frames = BTreeMap::new();
-        let mut total = 0usize;
-        for id in ids {
-            if let Some(frame) = self.decode_named_image_frame(&bytes, id, &path)? {
+        if bytes.starts_with(b"HG-3") {
+            let file = {
+                let _timing = super::measure_host_phase(super::HostPhase::Decode);
+                HgFile::parse(&bytes)
+                    .map_err(|_| native_state_error("native 710 animated HG directory is malformed"))?
+            };
+            let mut indices = BTreeMap::new();
+            for (index, source) in file.frames.iter().enumerate() {
+                // Native lookup uses the first directory entry for a duplicate ID.
+                indices.entry(source.id).or_insert(index);
+            }
+            if indices.is_empty() {
+                return Ok(None);
+            }
+            let decoder = {
+                let _timing = super::measure_host_phase(super::HostPhase::Decode);
+                HgFrameDecoder::new(&bytes, &file)
+                    .map_err(|_| native_state_error("image manager HG frame decode failed"))?
+            };
+            let mut total = 0usize;
+            for (id, index) in indices {
+                let frame = {
+                    let _timing = super::measure_host_phase(super::HostPhase::Decode);
+                    checked_hg_frame(decoder.decode(index))?
+                };
+                let frame = self.apply_managed_hg3_patch(&bytes, id, Some(&file.frames[index]), frame)?;
                 total = total.checked_add(frame.pixels().len()).filter(|&n| n <= MAX_CACHE)
                     .ok_or_else(|| native_state_error("native 710 retained frames exceed 256 MiB"))?;
-                frames.insert(id, frame);
+                frames.insert(id, name_image_frame(frame, &path, id));
             }
+        } else if let Some(frame) = self.decode_named_image_frame(&bytes, 0, &path)? {
+            if frame.pixels().len() > MAX_CACHE {
+                return Err(native_state_error("native 710 retained frames exceed 256 MiB"));
+            }
+            frames.insert(0, frame);
         }
         if frames.is_empty() { return Ok(None); }
         let mut animation = cs2_script::ImageAnimation::default();
@@ -584,7 +648,7 @@ impl LoggingHost<'_> {
         let asset = {
             let _detail = scope("image_encoded_ingress");
             let _stage = ImageSourceStep::new(ImageSourceStage::Ingress);
-            self.read_managed_image_asset(name, false)?
+            self.read_shared_image_asset(name, false)?
         };
         let Some((path, bytes)) = asset else { return Ok(None); };
         let frame = {
@@ -605,10 +669,19 @@ impl LoggingHost<'_> {
 
     pub(super) fn decode_named_image_frame(&mut self, bytes: &[u8], id: u32, path: &str)
         -> Result<Option<RgbaFrame>> {
-        Ok(self.decode_managed_image_frame(bytes, id)?.map(|frame| {
-            let path = path.replace('\\', "/").to_ascii_lowercase();
-            frame.with_asset_source(path.trim_start_matches("./").trim_start_matches('/').into(), id)
-        }))
+        let frame = self.decode_managed_image_frame(bytes, id).map_err(|error| {
+            native_state_error_owned(format!("image manager resource={path:?} frame_id={id}: {error}"))
+        })?;
+        if self.data_services.story_trace && id == 0
+            && path.rsplit(['/', '\\']).next().is_some_and(|name| name.eq_ignore_ascii_case("TyukDra01.hg3"))
+            && let Some(frame) = &frame
+        {
+            self.events.push(super::LogicEvent { frame: self.frame, kind: "hatsumira-large-hg".into(),
+                detail: format!("resource={path:?} frame_id={id} sha256={} size={}x{} rgba_bytes={}",
+                    super::particle_plugin_digest::sha256(bytes), frame.width(), frame.height(), frame.pixels().len()),
+            });
+        }
+        Ok(frame.map(|frame| name_image_frame(frame, path, id)))
     }
 
     /// The original translation hook runs inside native HG-3 decoding, before
@@ -618,6 +691,11 @@ impl LoggingHost<'_> {
         -> Result<Option<RgbaFrame>> {
         let Some(frame) = decode_image_frame(bytes, id)? else { return Ok(None); };
         if !bytes.starts_with(b"HG-3") { return Ok(Some(frame)); }
+        self.apply_managed_hg3_patch(bytes, id, None, frame).map(Some)
+    }
+
+    fn apply_managed_hg3_patch(&mut self, bytes: &[u8], id: u32, source: Option<&HgFrame>,
+        frame: RgbaFrame) -> Result<RgbaFrame> {
         let _timing = super::measure_host_phase(super::HostPhase::Patch);
         let enabled = match self.data_services.image_manager.island_patch_enabled {
             Some(enabled) => enabled,
@@ -629,15 +707,15 @@ impl LoggingHost<'_> {
                 enabled
             }
         };
-        if !enabled { return Ok(Some(frame)); }
+        if !enabled { return Ok(frame); }
         let mut warnings = Vec::new();
-        let replacement = island_patch::apply(self.resources, bytes, id, frame,
+        let replacement = island_patch::apply(self.resources, bytes, id, source, frame,
             &mut |warning| warnings.push(warning));
         for warning in warnings {
             self.events.push(super::LogicEvent { frame: self.frame,
                 kind: "island-image-patch".into(), detail: warning });
         }
-        replacement.map(Some)
+        replacement
     }
 
     pub(super) fn image_is_animation_resource(&mut self, name: &str) -> Result<bool> {
@@ -780,12 +858,17 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn read_managed_image_asset(&self, name: &str, raw: bool) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(self.read_shared_image_asset(name, raw)?
+            .map(|(path, bytes)| (path, Arc::unwrap_or_clone(bytes))))
+    }
+
+    fn read_shared_image_asset(&self, name: &str, raw: bool) -> Result<Option<(String, Arc<Vec<u8>>)>> {
         let _timing = super::measure_host_phase(super::HostPhase::Read);
         if name.encode_utf16().count() >= 260 {
             return Err(native_state_error("image manager name exceeds 259 UTF-16 units"));
         }
         if let Some(bytes) = self.data_services.ordinary.cached_resource(name) {
-            return Ok((raw || !bytes.is_empty()).then(|| (name.to_owned(), bytes.to_vec())));
+            return Ok((raw || !bytes.is_empty()).then(|| (name.to_owned(), Arc::new(bytes.to_vec()))));
         }
         let Some(candidate) = self.resources.resolve_mode_utf16(
             &name.encode_utf16().collect::<Vec<_>>(), cs2_runtime::resource_router::ResourceMode::LooseFirst,
@@ -795,7 +878,7 @@ impl LoggingHost<'_> {
         if candidate.size > MAX_FILE as u64 {
             return Err(native_state_error("image manager resource exceeds 64 MiB"));
         }
-        match self.resources.read_candidate(candidate) {
+        match self.read_encoded_image_candidate(candidate) {
             Ok(bytes) if !raw && bytes.is_empty() => Ok(None),
             Ok(bytes) if bytes.len() <= MAX_FILE => Ok(Some((candidate.name.clone(), bytes))),
             Ok(_) => Err(native_state_error("image manager resource exceeds 64 MiB")),
@@ -805,6 +888,11 @@ impl LoggingHost<'_> {
             Err(_) => Err(native_state_error("image manager resource read failed")),
         }
     }
+}
+
+fn name_image_frame(frame: RgbaFrame, path: &str, id: u32) -> RgbaFrame {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    frame.with_asset_source(path.trim_start_matches("./").trim_start_matches('/').into(), id)
 }
 
 fn image_plan_components(name: &str) -> (Vec<&str>, &str) {
@@ -1131,17 +1219,20 @@ pub(super) fn decode_image_frame(bytes: &[u8], id: u32) -> Result<Option<RgbaFra
             .map_err(|_| native_state_error("image dispatcher JPEG frame construction failed"));
     }
     let file = cs2_formats::HgFile::parse(bytes)
-        .map_err(|_| native_state_error("image manager malformed HG or unsupported image format"))?;
+        .map_err(|error| native_state_error_owned(format!("image manager HG header parse failed: {error}")))?;
     let selection = if file.signature == *b"HG-2" && file.version as u16 == 0x10 {
         AnimationFrameSelection::Index(0)
     } else {
         if !file.frames.iter().any(|frame| frame.id == id) { return Ok(None); }
         AnimationFrameSelection::Id(id)
     };
-    let frame = RgbaFrame::decode_parsed_hg(bytes, &file, selection)
-        .map_err(|_| native_state_error("image manager HG frame decode failed"))?;
+    checked_hg_frame(RgbaFrame::decode_parsed_hg(bytes, &file, selection)).map(Some)
+}
+
+fn checked_hg_frame(frame: cs2_renderer::Result<RgbaFrame>) -> Result<RgbaFrame> {
+    let frame = frame.map_err(|error| native_state_error_owned(format!("image manager HG frame decode failed: {error}")))?;
     if frame.pixels().len() > MAX_PIXELS {
         return Err(native_state_error("image manager decoded pixels exceed 128 MiB"));
     }
-    Ok(Some(frame))
+    Ok(frame)
 }

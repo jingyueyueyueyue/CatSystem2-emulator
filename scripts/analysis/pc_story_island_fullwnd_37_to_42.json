@@ -1,0 +1,167 @@
+{
+  "3": {
+    "frames": 5000,
+    "route": {
+      "label": "ISLAND: verify the same full window from 37/291 through 42/361, then stop",
+      "idle_frames": 3600,
+      "page_click": {"point":[557,530],"region":73},
+      "page_scenes": ["com01"],
+      "page_fallback_before": 4,
+      "steps": [
+        {
+          "label": "New Game",
+          "wait": {"state":"title","hit":{"point":[138,362],"region":15}},
+          "shared_flags": [{"slot":722,"mask":2,"expected":0}],
+          "click": [138,362],
+          "after": {"state":"page","scene":"com01","group":0,"record":54}
+        },
+        {
+          "label": "First page to second page",
+          "wait": {"state":"page","scene":"com01","group":0,"record":54},
+          "key": 13,
+          "after": {"state":"page","scene":"com01","group":1,"record":62}
+        },
+        {
+          "label": "Second page, then preserved common prefix",
+          "wait": {"state":"page","scene":"com01","group":1,"record":62}
+        },
+        {
+          "label": "Preserve the verified 28/182 prompt action",
+          "wait": {"state":"page_prompt","scene":"com01","group":28,"record":182,"hit":{"point":[557,530],"region":73}},
+          "click": [557,530],
+          "after": {"state":"page_probe","scene":"com01","group":29,"record":209}
+        },
+        {
+          "label": "29/209: one guarded full-window press",
+          "wait": {"state":"page_probe","scene":"com01","group":29,"record":209,"hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "after": {"state":"page_or_prompt","scene":"com01","group":30,"record":222,"window":"novelwnd"}
+        },
+        {
+          "label": "30/222: one guarded novel-window press",
+          "wait": {"state":"page","scene":"com01","group":30,"record":222,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "after": {"state":"page_or_prompt","scene":"com01","group":31,"record":226,"window":"novelwnd"}
+        },
+        {
+          "label": "31/226: one guarded press from the observed first stage",
+          "wait": {"state":"page","scene":"com01","group":31,"record":226,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "after": {"state":"page_probe","scene":"com01","group":32,"record":247,"window":"fullwnd"}
+        },
+        {
+          "label": "32/247: one guarded full-window press",
+          "wait": {"state":"page_probe","scene":"com01","group":32,"record":247,"window":"fullwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "after": {"state":"page","scene":"com01","group":33,"record":258,"window":"novelwnd"}
+        },
+        {
+          "label": "33/258: verify same novel window through the next page",
+          "wait": {"state":"page","scene":"com01","group":33,"record":258,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "same_novel_window": true,
+          "after": {"state":"page","scene":"com01","group":34,"record":262,"window":"novelwnd"}
+        },
+        {
+          "label": "34/262: verify same novel window through the next page",
+          "wait": {"state":"page","scene":"com01","group":34,"record":262,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "same_novel_window": true,
+          "after": {"state":"page","scene":"com01","group":35,"record":266,"window":"novelwnd"}
+        },
+        {
+          "label": "35/266: one guarded first-stage press to the same-record prompt",
+          "wait": {"state":"page","scene":"com01","group":35,"record":266,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "same_novel_window": true,
+          "continue_same_record_prompt": true,
+          "after": {"state":"page_prompt","scene":"com01","group":35,"record":266,"window":"novelwnd"}
+        },
+        {
+          "label": "35/266: one guarded prompt press toward 36/270",
+          "wait": {"state":"page_prompt","scene":"com01","group":35,"record":266,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "same_novel_window": true,
+          "after": {"state":"page","scene":"com01","group":36,"record":270,"window":"novelwnd"}
+        },
+        {
+          "label": "36/270: one guarded first-stage press",
+          "wait": {"state":"page","scene":"com01","group":36,"record":270,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "same_novel_window": true,
+          "continue_same_record_prompt": true,
+          "after": {"state":"page_prompt","scene":"com01","group":36,"record":270,"window":"novelwnd"}
+        },
+        {
+          "label": "36/270: one guarded prompt press toward 37/291",
+          "wait": {"state":"page_prompt","scene":"com01","group":36,"record":270,"window":"novelwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,43,7],"region":43,"key":0,"group":0,"response":1},
+          "after": {"state":"page_probe","scene":"com01","group":37,"record":291,"window":"fullwnd"}
+        },
+        {
+          "label": "37/291: guarded same-window press toward 38/305",
+          "wait": {"state":"page_probe","scene":"com01","group":37,"record":291,"window":"fullwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "same_full_window": true,
+          "after": {"state":"page_probe","scene":"com01","group":38,"record":305,"window":"fullwnd"}
+        },
+        {
+          "label": "38/305: guarded same-window press toward 39/319",
+          "wait": {"state":"page_probe","scene":"com01","group":38,"record":305,"window":"fullwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "same_full_window": true,
+          "after": {"state":"page_probe","scene":"com01","group":39,"record":319,"window":"fullwnd"}
+        },
+        {
+          "label": "39/319: guarded same-window press toward 40/333",
+          "wait": {"state":"page_probe","scene":"com01","group":39,"record":319,"window":"fullwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "same_full_window": true,
+          "after": {"state":"page_probe","scene":"com01","group":40,"record":333,"window":"fullwnd"}
+        },
+        {
+          "label": "40/333: guarded same-window press toward 41/347",
+          "wait": {"state":"page_probe","scene":"com01","group":40,"record":333,"window":"fullwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "same_full_window": true,
+          "after": {"state":"page_probe","scene":"com01","group":41,"record":347,"window":"fullwnd"}
+        },
+        {
+          "label": "41/347: guarded same-window press toward 42/361",
+          "wait": {"state":"page_probe","scene":"com01","group":41,"record":347,"window":"fullwnd","hit":{"point":[557,324],"region":73}},
+          "probe_points": [[557,530],[557,324]],
+          "click": [557,324],
+          "mouse_press": {"candidates":[3,73,14,7],"region":14,"key":0,"group":0,"response":1},
+          "same_full_window": true,
+          "after": {"state":"page_probe","scene":"com01","group":42,"record":361,"window":"fullwnd"}
+        },
+        {
+          "label": "42/361: observe the final full-window page without crossing to 43",
+          "wait": {"state":"page_probe","scene":"com01","group":42,"record":361,"window":"fullwnd"},
+          "probe_points": [[557,530],[557,324]]
+        }
+      ]
+    }
+  }
+}

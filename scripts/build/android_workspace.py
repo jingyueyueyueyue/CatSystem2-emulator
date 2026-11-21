@@ -29,24 +29,25 @@ def default_sdk() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / "AppData/Local/Android/Sdk"
 
 
-def source_snapshot() -> dict:
+def source_snapshot(root: Path = ROOT) -> dict:
     """Fingerprint build inputs, including assets, without generated outputs.
 
     Metadata is compared between build steps as well as content: an edit and
     revert during compilation must not turn a mixed build into a valid one.
     """
     digest = hashlib.sha256()
+    simulator = root / "simulator"
     ignored = {*ANDROID_LOCAL_FILES, "target", ".git", "__pycache__"}
     paths = {
-        path for folder in [SIMULATOR / "crates", SIMULATOR / "android", SIMULATOR / "vendor"]
+        path for folder in [simulator / "crates", simulator / "android", simulator / "vendor"]
         for path in folder.rglob("*")
         if path.is_file() and not any(part in ignored for part in path.relative_to(folder).parts)
     }
-    paths.update(SIMULATOR / name for name in [
+    paths.update(simulator / name for name in [
         "Cargo.toml", "Cargo.lock", "THIRD_PARTY.md", "rust-toolchain", "rust-toolchain.toml",
         ".cargo/config", ".cargo/config.toml",
-    ] if (SIMULATOR / name).is_file())
-    paths.update((ROOT / "scripts/build").glob("*.py"))
+    ] if (simulator / name).is_file())
+    paths.update((root / "scripts/build").glob("*.py"))
     files = {}
     for path in sorted(paths):
         before = path.stat()
@@ -54,7 +55,7 @@ def source_snapshot() -> dict:
         after = path.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise RuntimeError(f"Build input changed while fingerprinting: {path}")
-        name = path.relative_to(ROOT).as_posix()
+        name = path.relative_to(root).as_posix()
         digest.update(name.encode("utf-8") + b"\0" + content + b"\0")
         files[name] = {"sha256": hashlib.sha256(content).hexdigest(),
                        "size": after.st_size, "mtime_ns": after.st_mtime_ns}
@@ -102,61 +103,41 @@ def ascii_path(path: Path) -> Path:
     return physical
 
 
-def new_build_directory(name: str, integration: bool) -> Path:
+def new_build_directory(name: str, integration: bool, *, archive_root: Path = ROOT / "archive") -> Path:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
     stage = "integration" if integration else "complete"
-    output = ROOT / "archive" / f"{stamp[:4]}-{stamp[4:6]}" / f"{stamp}_{name}_{stage}"
+    output = archive_root / f"{stamp[:4]}-{stamp[4:6]}" / f"{stamp}_{name}_{stage}"
     output.mkdir(parents=True, exist_ok=False)
     return output
 
 
-def build_cache_directory(name: str, integration: bool) -> Path:
-    date = datetime.now().astimezone().strftime("%Y%m%d")
+def build_cache_directory(name: str, integration: bool, *, workspace_root: Path = ROOT) -> Path:
     stage = "integration" if integration else "complete"
-    month = f"{date[:4]}-{date[4:6]}"
-    cache_name = f"{date}_{name}_{stage}_cache"
+    cache_name = f"{name}_{stage}"
     override = os.environ.get("CS2_BUILD_CACHE_ROOT")
     if override:
         cache_root = Path(override)
         if not cache_root.is_absolute() or not str(cache_root.resolve()).isascii():
             raise RuntimeError("CS2_BUILD_CACHE_ROOT must be an absolute, physically ASCII path")
         cache_root = cache_root.resolve()
-    elif os.name != "nt" or str(ROOT).isascii():
-        return ROOT / "archive" / month / cache_name
+    elif os.name != "nt" or str(workspace_root).isascii():
+        physical = workspace_root / "archive" / "build-cache" / cache_name
+        physical.mkdir(parents=True, exist_ok=True)
+        return physical
     else:
         # rustc canonicalizes dependency rlibs before passing them to GNU ld.
-        # A junction pointing INTO a Unicode directory therefore fixes output
-        # paths only. Keep the actual cache ASCII and link it back into archive.
-        identity = hashlib.sha256(str(ROOT).casefold().encode("utf-8")).hexdigest()[:12]
-        cache_root = Path(ROOT.anchor) / f"cs2-build-cache-{identity}"
+        # Keep the physical cache ASCII so GNU ld can open those paths.
+        identity = hashlib.sha256(str(workspace_root).casefold().encode("utf-8")).hexdigest()[:12]
+        cache_root = Path(workspace_root.anchor) / f"cs2-build-cache-{identity}"
     marker = cache_root / "workspace.json"
     if cache_root.exists():
-        if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")).get("root") != str(ROOT):
+        if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")).get("root") != str(workspace_root):
             raise RuntimeError(f"Build cache belongs to another workspace: {cache_root}")
     else:
         cache_root.mkdir()
-        marker.write_text(json.dumps({"root": str(ROOT)}, ensure_ascii=True) + "\n", encoding="utf-8")
-    if override:
-        physical = cache_root / f"{name}_{stage}"
-        physical.mkdir(exist_ok=True)
-        return physical
-    physical = cache_root / month / cache_name
-    physical.mkdir(parents=True, exist_ok=True)
-    archived = ROOT / "archive" / month / f"{cache_name}_ascii"
-    archived.parent.mkdir(parents=True, exist_ok=True)
-    if not os.path.lexists(archived):
-        environment = os.environ.copy()
-        environment["CS2_ALIAS_LINK"] = str(archived)
-        environment["CS2_ALIAS_TARGET"] = str(physical)
-        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-        result = subprocess.run([
-            str(powershell), "-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CS2_ALIAS_LINK -Target $env:CS2_ALIAS_TARGET | Out-Null",
-        ], env=environment, capture_output=True, text=True, errors="replace", timeout=30)
-        if result.returncode and not os.path.lexists(archived):
-            raise RuntimeError(f"Cannot archive ASCII build cache: {result.stderr}")
-    if not archived.is_dir() or not os.path.samefile(archived, physical):
-        raise RuntimeError(f"Archive cache link points elsewhere: {archived}")
+        marker.write_text(json.dumps({"root": str(workspace_root)}, ensure_ascii=True) + "\n", encoding="utf-8")
+    physical = cache_root / cache_name
+    physical.mkdir(exist_ok=True)
     return physical
 
 
@@ -209,11 +190,12 @@ def host_c_compiler() -> Path:
 class BuildAttempt:
     """One source-bound attempt; never reuse a successful record for new bytes."""
 
-    def __init__(self, output: Path, integration: bool):
+    def __init__(self, output: Path, integration: bool, *, source_root: Path = ROOT):
         self.output = output
         self.integration = integration
+        self.source_root = source_root
         try:
-            self.source = source_snapshot()
+            self.source = source_snapshot(self.source_root)
         except (OSError, RuntimeError) as error:
             if not integration:
                 raise
@@ -245,7 +227,7 @@ class BuildAttempt:
 
     def verify_source(self, stage: str) -> None:
         try:
-            current = source_snapshot()
+            current = source_snapshot(self.source_root)
         except (OSError, RuntimeError) as error:
             self.record.update(source_consistent=False, source_changed_at=stage,
                                source_snapshot_error=str(error))
@@ -270,6 +252,8 @@ class BuildAttempt:
         self.verify_source(f"before {name}")
         cwd = ascii_path(cwd)
         self.record["workspace"] = {"physical": str(ROOT), "build_alias": str(ascii_workspace())}
+        if self.source_root != ROOT:
+            self.record["workspace"]["source_snapshot"] = str(self.source_root)
         log_path = self.output / f"{name}.log"
         step = {"name": name, "command": command, "cwd": str(cwd), "log": str(log_path),
                 "started_at": self.now(), "source_before_sha256": self.source["sha256"],
@@ -398,12 +382,14 @@ def gradle_wrapper_command(project: Path) -> list[str]:
 def build_media(sdk: Path, output: Path, env: dict, attempt: BuildAttempt,
                 staging: Path, msys: Path) -> tuple[Path, Path]:
     """Build pinned media in the same explicit stage/source-bound attempt."""
-    prepare = ROOT / "scripts/build/prepare_android_ffmpeg.py"
+    prepare = attempt.source_root / "scripts/build/prepare_android_ffmpeg.py"
     media = build_cache_directory("android", attempt.integration) / "ffmpeg"
     preparation = [
         sys.executable, "-B", "-X", "utf8", str(ascii_path(prepare)), "--prepare",
         "--ndk", str(ascii_path(sdk / "ndk/28.2.13676358")), "--output", str(media),
     ]
+    if attempt.source_root != ROOT:
+        preparation.extend(("--workspace-root", str(ROOT)))
     if attempt.integration:
         preparation.append("--integration")
     source = ROOT / "archive/2026-11/20261116_ffmpeg-8.0.2.tar.xz"
@@ -443,10 +429,36 @@ def build_media(sdk: Path, output: Path, env: dict, attempt: BuildAttempt,
     return libraries.parent, notices.parents[1]
 
 
-def build(sdk: Path, integration: bool = False) -> Path:
-    output = new_build_directory("android", integration)
-    attempt = BuildAttempt(output, integration)
+def replay_source(receipt: Path) -> tuple[Path, str]:
+    build = json.loads(receipt.read_text(encoding="utf-8"))
+    before = build.get("source_before", {}).get("sha256")
+    after = build.get("source_after", {}).get("sha256")
+    workspace = build.get("workspace", {})
+    snapshot = workspace.get("source_snapshot")
+    artifact = receipt.resolve().with_name("story_replay.exe")
+    artifact_hash = build.get("artifacts", {}).get(str(artifact), {}).get("sha256")
+    if (build.get("schema") != "cs2-build-attempt/v1" or build.get("status") != "built"
+            or build.get("source_consistent") is not True or not before or before != after
+            or workspace.get("physical") != str(ROOT) or not snapshot or not artifact_hash):
+        raise RuntimeError(f"Expected a successful frozen PC replay build: {receipt}")
+    with artifact.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != artifact_hash:
+            raise RuntimeError(f"PC replay does not match its build receipt: {artifact}")
+    return ascii_path(Path(snapshot)), before
+
+
+def build(sdk: Path, integration: bool = False, *, replay_build: Path | None = None) -> Path:
+    source_root, expected_sha256 = replay_source(replay_build) if replay_build else (ROOT, None)
+    archive_root = ROOT / "archive"
+    if os.environ.get("CS2_BUILD_CACHE_ROOT"):
+        archive_root = build_cache_directory("android", integration).parent / "archive"
+    output = new_build_directory("android", integration, archive_root=archive_root)
+    attempt = BuildAttempt(output, integration, source_root=source_root)
     try:
+        if replay_build:
+            if attempt.source["sha256"] != expected_sha256:
+                raise RuntimeError(f"Frozen source no longer matches the PC build: {source_root}")
+            attempt.record["paired_replay_build"] = str(replay_build.resolve())
         return build_apk(sdk, output, attempt)
     except Exception as error:
         attempt.fail(error)
@@ -454,6 +466,7 @@ def build(sdk: Path, integration: bool = False) -> Path:
 
 
 def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
+    simulator = attempt.source_root / "simulator"
     ndk = ascii_path(sdk / "ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64")
     linker = ndk / "bin/aarch64-linux-android26-clang.cmd"
     ar = ndk / "bin/llvm-ar.exe"
@@ -473,7 +486,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     # Gradle/CMake canonicalize project and imported-library paths too. Build
     # from a small source copy on physical ASCII storage, not the inward link.
     project = staging / "project"
-    shutil.copytree(SIMULATOR / "android", project, ignore=shutil.ignore_patterns(*ANDROID_LOCAL_FILES))
+    shutil.copytree(simulator / "android", project, ignore=shutil.ignore_patterns(*ANDROID_LOCAL_FILES))
     gradle = gradle_wrapper_command(project)
     attempt.record["android_paths"] = {
         "physical_cache": str(cache), "staging": str(staging), "project": str(project),
@@ -493,14 +506,14 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
                                   str(ndk / "bin"), env.get("PATH", "")])
     media_libraries, media_notices = build_media(sdk, output, env, attempt, staging, msys)
     general_notices = media_notices / "third-party"
-    shutil.copy2(SIMULATOR / "crates/runtime/src/javascript_LICENSE-MIT.txt",
+    shutil.copy2(simulator / "crates/runtime/src/javascript_LICENSE-MIT.txt",
                  general_notices / "Boa-LICENSE-MIT.txt")
-    shutil.copy2(SIMULATOR / "THIRD_PARTY.md", general_notices / "CS2-THIRD-PARTY.md")
-    shutil.copy2(SIMULATOR / "vendor/ttf-parser-0.21.1/LICENSE-MIT",
+    shutil.copy2(simulator / "THIRD_PARTY.md", general_notices / "CS2-THIRD-PARTY.md")
+    shutil.copy2(simulator / "vendor/ttf-parser-0.21.1/LICENSE-MIT",
                  general_notices / "ttf-parser-LICENSE-MIT.txt")
-    shutil.copy2(SIMULATOR / "vendor/fontdue-0.9.3/LICENSE-MIT",
+    shutil.copy2(simulator / "vendor/fontdue-0.9.3/LICENSE-MIT",
                  general_notices / "fontdue-LICENSE-MIT.txt")
-    shutil.copy2(SIMULATOR / "vendor/lewton-0.10.2/LICENSE",
+    shutil.copy2(simulator / "vendor/lewton-0.10.2/LICENSE",
                  general_notices / "lewton-LICENSE.txt")
     env["CS2_ANDROID_MEDIA_LIBS"] = ascii_path(media_libraries).as_posix()
     env["CS2_ANDROID_MEDIA_NOTICES"] = ascii_path(media_notices).as_posix()
@@ -513,7 +526,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
          str(cache / "gradle-cache"), "-p", str(project), ":app:assembleDebug"],
     ]
     for index, command in enumerate(commands):
-        attempt.run(f"build-{index}", command, env=env)
+        attempt.run(f"build-{index}", command, env=env, cwd=simulator)
         if index == 0:
             shutil.copy2(target / "aarch64-linux-android" / profile / "libcs2_android.so",
                          libraries / "libcs2_android.so")
@@ -524,6 +537,8 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     shutil.copy2(built_apk, apk)
     attempt.finish([apk, output / "cs2-player-media-source.zip",
                     libraries / "libcs2_android.so", *sorted((media_libraries / "arm64-v8a").glob("*.so"))])
+    if attempt.record.get("paired_replay_build") and not attempt.record["source_consistent"]:
+        raise RuntimeError(f"Paired build inputs changed: {output / 'build.json'}")
     build_report_path(attempt.integration).write_text(json.dumps({
         "apk": str(apk), "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
         "source_tree_sha256": attempt.source["sha256"], "abi": "arm64-v8a",
@@ -580,16 +595,20 @@ def main() -> None:
     parser.add_argument("--serial")
     parser.add_argument("--integration", action="store_true",
                         help="Build/install unfinished integration artifacts; does not assert implementation completion.")
+    parser.add_argument("--replay-build", type=Path,
+                        help="Build from the frozen source of this PC story_replay build.json.")
     args = parser.parse_args()
     if args.integration and args.phase == "inventory":
         parser.error("--integration applies only to build/install")
+    if args.replay_build and (args.phase != "build" or not args.integration):
+        parser.error("--replay-build requires build --integration")
     if args.phase in {"inventory", "build"}:
         (ROOT / "reports").mkdir(exist_ok=True)
     if args.phase == "inventory":
         print(json.dumps(inventory(args.sdk, args.serial), ensure_ascii=True, indent=2))
         return
     if args.phase == "build":
-        print(build(args.sdk, args.integration))
+        print(build(args.sdk, args.integration, replay_build=args.replay_build))
         return
     install(args.sdk, args.serial, args.integration)
 

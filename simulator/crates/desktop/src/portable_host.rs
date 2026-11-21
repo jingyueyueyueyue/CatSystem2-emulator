@@ -130,6 +130,13 @@ impl HeadlessPlayer {
         super::gpu_raster::enable();
     }
 
+    /// Release DX12 objects before the Windows thread begins TLS teardown.
+    #[cfg(windows)]
+    pub fn disable_host_gpu_raster() {
+        #[cfg(feature = "gpu-raster")]
+        super::gpu_raster::disable();
+    }
+
     /// Latest completed hardware raster batch on this host thread.
     pub fn latest_host_gpu_timing() -> Option<(u64, u64)> {
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -210,6 +217,46 @@ impl HeadlessPlayer {
         self.canvas.pixels()
     }
 
+    pub(super) fn message_plane_rgb_probe(
+        &self,
+        object: &cs2_runtime::message_object::MessageObject,
+        node: &super::SceneNode,
+        submitted: &cs2_renderer::Canvas,
+    ) -> Option<((usize, usize), [i32; 2], (usize, usize))> {
+        let (registered_size, registered_offset) = object.registered_geometry()?;
+        let size = if node.initialized { node.size } else { registered_size.map(|val| val as f32) };
+        if !node.visible || node.scale[..2] != [1.0, 1.0] || node.color != u32::MAX
+            || node.overlay_color != 0 || size != [submitted.width() as f32, submitted.height() as f32]
+            || node.position.iter().any(|coordinate| !coordinate.is_finite())
+        {
+            return None;
+        }
+        let current_offset = object.configuration()?.canvas_offset();
+        let draw_origin = [0, 1].map(|axis| (node.position[axis] as i32).wrapping_add(registered_offset[axis]));
+        let mut tested = 0;
+        let mut matched = 0;
+        let mut texture_clipped = 0;
+        let mut viewport_clipped = 0;
+        for (index, pixel) in submitted.pixels().chunks_exact(4).enumerate().filter(|(_, pixel)| pixel[3] == 255) {
+            let local = [(index % submitted.width() as usize) as i64, (index / submitted.width() as usize) as i64];
+            let shifted = [0, 1].map(|axis| local[axis] + i64::from(current_offset[axis]) - i64::from(registered_offset[axis]));
+            if !(0..i64::from(submitted.width())).contains(&shifted[0])
+                || !(0..i64::from(submitted.height())).contains(&shifted[1])
+            {
+                texture_clipped += 1;
+                continue;
+            }
+            let screen = [0, 1].map(|axis| draw_origin[axis].wrapping_add(shifted[axis] as i32));
+            if let Ok(output) = self.canvas.pixel(screen[0], screen[1]) {
+                tested += 1;
+                matched += usize::from([output.r, output.g, output.b] == pixel[..3]);
+            } else {
+                viewport_clipped += 1;
+            }
+        }
+        Some(((matched, tested), draw_origin, (texture_clipped, viewport_clipped)))
+    }
+
     pub fn host_composition_diagnostic(&self) -> String {
         use std::fmt::Write;
 
@@ -239,42 +286,8 @@ impl HeadlessPlayer {
                 .filter(|pixel| pixel[3] != 0).count();
             let projected = self.project_message_plane(node).ok();
             let projected_position = projected.as_ref().map(|plane| plane.position);
-            let opaque_final_rgb_probe = (|| {
-                let (registered_size, registered_offset) = geometry?;
-                let node = projected.as_deref()?;
-                let submitted = surface.submitted;
-                let size = if node.initialized { node.size } else { registered_size.map(|val| val as f32) };
-                if !node.visible || node.scale[..2] != [1.0, 1.0] || node.color != u32::MAX
-                    || node.overlay_color != 0 || size != [submitted.width() as f32, submitted.height() as f32]
-                    || node.position.iter().any(|coordinate| !coordinate.is_finite())
-                {
-                    return None;
-                }
-                let current_offset = object.configuration()?.canvas_offset();
-                let draw_origin = [0, 1].map(|axis| (node.position[axis] as i32).wrapping_add(registered_offset[axis]));
-                let mut tested = 0;
-                let mut matched = 0;
-                let mut texture_clipped = 0;
-                let mut viewport_clipped = 0;
-                for (index, pixel) in submitted.pixels().chunks_exact(4).enumerate().filter(|(_, pixel)| pixel[3] == 255) {
-                    let local = [(index % submitted.width() as usize) as i64, (index / submitted.width() as usize) as i64];
-                    let shifted = [0, 1].map(|axis| local[axis] + i64::from(current_offset[axis]) - i64::from(registered_offset[axis]));
-                    if !(0..i64::from(submitted.width())).contains(&shifted[0])
-                        || !(0..i64::from(submitted.height())).contains(&shifted[1])
-                    {
-                        texture_clipped += 1;
-                        continue;
-                    }
-                    let screen = [0, 1].map(|axis| draw_origin[axis].wrapping_add(shifted[axis] as i32));
-                    if let Ok(output) = self.canvas.pixel(screen[0], screen[1]) {
-                        tested += 1;
-                        matched += usize::from([output.r, output.g, output.b] == pixel[..3]);
-                    } else {
-                        viewport_clipped += 1;
-                    }
-                }
-                Some(((matched, tested), draw_origin, (texture_clipped, viewport_clipped)))
-            })();
+            let opaque_final_rgb_probe = projected.as_deref()
+                .and_then(|node| self.message_plane_rgb_probe(object, node, surface.submitted));
             let opaque_final_rgb_matches = opaque_final_rgb_probe.map(|probe| probe.0);
             let draw_origin = opaque_final_rgb_probe.map(|probe| probe.1);
             let opaque_texture_viewport_clipped = opaque_final_rgb_probe.map(|probe| probe.2);

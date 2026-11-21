@@ -1,0 +1,139 @@
+{
+  "2": {
+    "frames": 16800,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:530",
+      "trace-native:1033",
+      "trace-native:1037",
+      "trace-native:1038",
+      "move:695:105,64",
+      "move:730:400,144",
+      "require-hit:745:26",
+      "745:400,144",
+      "require-hit:805:35",
+      "805:400,144",
+      "legacy-02-segment"
+    ]
+  },
+  "6": {
+    "frames": 8800,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:265",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:269",
+      "trace-native:527",
+      "trace-native:71",
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:530",
+      "trace-native:630",
+      "trace-native:645",
+      "trace-native:882",
+      "move:500:98,208",
+      "require-hit:530:18",
+      "530:98,208",
+      "move:640:98,104",
+      "require-hit:660:10",
+      "660:98,104",
+      "legacy-06-segment"
+    ]
+  },
+  "7": {
+    "frames": 9400,
+    "diagnostics": [
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:265",
+      "trace-native:266",
+      "trace-native:267",
+      "trace-native:268",
+      "trace-native:269",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:630",
+      "trace-native:645"
+    ],
+    "route": {
+      "label": "07 natural OP and guarded com01 body through 13/190",
+      "idle_frames": 600,
+      "page_scenes": [],
+      "kamikaze_post_op": {
+        "keyboard_press": {
+          "region": 64,
+          "receiver": 8,
+          "key": 2,
+          "group": 0,
+          "response": 0
+        },
+        "last_group": 13
+      },
+      "steps": []
+    }
+  },
+  "16": {
+    "frames": 14000,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "require-hit:425:14",
+      "425:640,480",
+      "require-hit:661:15",
+      "661:66,72",
+      "require-hit:1041:62",
+      "1041:640,420",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "legacy-16-segment"
+    ]
+  },
+  "19": {
+    "frames": 11600,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:520",
+      "trace-native:527",
+      "trace-native:528",
+      "trace-native:530",
+      "trace-native:531",
+      "require-hit:2270:17",
+      "2270:335,488",
+      "move:2304:40,32",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "legacy-19-segment"
+    ]
+  }
+}

@@ -208,6 +208,8 @@ impl HeadlessPlayer {
                 order_depths: s.order_depths, order_dirty: s.order_dirty,
                 grid_records: s.grid_records, histories: s.histories,
                 history_owners: s.history_owners, inert_media: s.inert_media, raster: s.raster,
+                #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                sampled_planes: Default::default(),
                 vram_overflow: None },
             projection, cameras, next_sequence: s.next_sequence, snapshot_active: s.snapshot_active,
             proxy_nodes, raster_parameters: s.raster_parameters, meshes: s.meshes,

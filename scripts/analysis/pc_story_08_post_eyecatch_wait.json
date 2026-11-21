@@ -1,0 +1,105 @@
+{
+  "8": {
+    "frames": 8600,
+    "route": {
+      "label": "08 normal entry, guarded eyecatch exit, passive first body r144",
+      "idle_frames": 5500,
+      "page_scenes": [],
+      "eyecatch_08_exit": true,
+      "steps": [],
+      "eyecatch_08_first_body": true
+    },
+    "diagnostics": [
+      "trace-native:69",
+      "trace-native:71",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:614",
+      "trace-native:616",
+      "trace-native:619",
+      "trace-native:72"
+    ]
+  },
+  "kind": "state_observation",
+  "title_id": 8,
+  "scene": "c01_01",
+  "source": {
+    "path": "scene/c01_01.cst",
+    "container_sha256": "942ca2dbd98382b7196ba97f8b38709d672ce5d9c97d62068a9e3b423dafdee2",
+    "runtime_source_digest": "942ca2dbd98382b7196ba97f8b38709d672ce5d9c97d62068a9e3b423dafdee2",
+    "startup_category": "scene",
+    "first_group_record_count": 145
+  },
+  "records": {
+    "eyecatch_command": {
+      "group": 0,
+      "relative": 1,
+      "absolute": 1,
+      "kind": 48
+    },
+    "first_body": {
+      "group": 0,
+      "relative": 143,
+      "absolute": 143,
+      "kind": 32,
+      "length": 20,
+      "payload_sha256": "068ee1431f77545df6c451d197364ecfdf916856e2636a3035e589c8963771c6"
+    },
+    "first_wait": {
+      "group": 0,
+      "relative": 144,
+      "absolute": 144,
+      "kind": 2
+    },
+    "next_static_body": {
+      "group": 1,
+      "relative": 2,
+      "absolute": 147,
+      "kind": 32,
+      "length": 28,
+      "payload_sha256": "248258c57570522d5a4d7ea057bc345514034ca82dbf3f74e019af3bb793f3b9"
+    },
+    "next_static_wait": {
+      "group": 1,
+      "relative": 3,
+      "absolute": 148,
+      "kind": 2
+    }
+  },
+  "control": {
+    "run": "20261120_080055_340291_tj7gr2c2_playthrough",
+    "context": 182,
+    "loaded_frame": 5404,
+    "prefetch_frame": 5406,
+    "prefetch_before_eyecatch_event_lines": [
+      16600,
+      16601,
+      16607
+    ]
+  },
+  "passive_observation_after_verified_release": {
+    "route_current_terminal": "c01_01 0/144",
+    "entry_increment": "archive/2026-11/20261120_pc_story_08_card_bank.patch",
+    "runtime_increment": "archive/2026-11/20261120_pc_story_08_ordinary_body_route.patch",
+    "release_checker": "scripts/analysis/check_pc_story_08_eyecatch.py --require-first-body",
+    "input_authorized_after_release": false,
+    "native_trace": [
+      69,
+      325,
+      326,
+      327,
+      614,
+      616,
+      619
+    ],
+    "max_extra_frames": 600,
+    "require": [
+      "Continue the exact title, card and eye route through the eye click, EXIT, unbind and release.",
+      "Require the same fingerprinted c01_01 CST load captured before the eye click.",
+      "Allow early CST reads. Require the exact r143 bytes in the ordinary kind-45 string and an executed r144 input marker after the eye click.",
+      "Require the live kind-12 meswnd under the script VM, root wait at 0x32f, native69 reveal completion and final body pixels.",
+      "Stop without sending body input at the first verified wait, changed CST, frame limit or post-release timeout."
+    ]
+  }
+}

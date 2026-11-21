@@ -25,7 +25,7 @@ pub(super) const SUPPORTED_SLOTS: [u32; 13] = [
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OBJECTS: usize = 65_536;
 pub(super) const UTATE_STRING_KIND: u32 = 47;
-pub(super) const CAMPANELLA_STRING_KIND: u32 = 45;
+pub(super) const LEGACY_STRING_KIND_45: u32 = 45;
 const UTATE_CONFIG_SIZE: usize = 0xbc;
 
 const BODY_NATIVES: &[(u32, usize, MessageEncoding)] = &[
@@ -96,7 +96,7 @@ pub(super) trait MessageNativeContext: MessageBackend {
     fn utate_string_receiver(&self) -> bool {
         false
     }
-    fn campanella_string_receiver(&self) -> bool {
+    fn legacy_string_receiver_45(&self) -> bool {
         false
     }
     fn raw_message_image(&mut self, handle: u32) -> Result<Vec<u8>>;
@@ -115,6 +115,15 @@ pub(super) trait MessageNativeContext: MessageBackend {
     fn legacy_frame_rate(&self) -> u32;
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UtateBodyDraw {
+    pub(super) caller: u32,
+    pub(super) generation: u64,
+    pub(super) started: u64,
+    pub(super) completed: Option<u64>,
+    pub(super) completed_before_newline: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct MessageNativeServices {
     pub(super) kx: super::message_platform::kx_native::KxServices,
@@ -123,6 +132,7 @@ pub(super) struct MessageNativeServices {
     pub(super) font_panel_defaults: Option<MessageDefaults>,
     pub(super) legacy: super::legacy_text_native::LegacyTextNativeServices,
     legacy_string_visibility: BTreeMap<u32, (u32, bool)>,
+    pub(super) utate_body_draws: BTreeMap<u32, UtateBodyDraw>,
     pub(super) text_input: MessageTextInputState,
     pub(super) device_keys: DeviceKeys,
     pub(super) device_keys_loaded: bool,
@@ -319,6 +329,7 @@ impl MessageNativeServices {
         self.fes_button_owners.remove(&id);
         self.legacy.release(id);
         self.legacy_string_visibility.remove(&id);
+        self.utate_body_draws.retain(|&string, draw| string != id && draw.caller != id);
         self.plane_show.remove(&id);
         self.pending_display.retain(|(target, _)| *target != id);
         self.objects.remove(&id)
@@ -459,8 +470,8 @@ impl MessageNativeServices {
         if index == 620 && word(1) == 0 {
             return Ok(NativeReturn::Continue);
         }
-        let legacy_kind = if matches!(index, 611..=619) && context.campanella_string_receiver() {
-            Some(CAMPANELLA_STRING_KIND)
+        let legacy_kind = if matches!(index, 611..=619) && context.legacy_string_receiver_45() {
+            Some(LEGACY_STRING_KIND_45)
         } else if matches!(index, 611..=621) && context.utate_string_receiver() {
             Some(UTATE_STRING_KIND)
         } else {
@@ -475,8 +486,8 @@ impl MessageNativeServices {
             });
             return match route {
                 Some(route) => self.call_legacy_string(index, arguments, vm, route, kind, context),
-                None if index == 616 && kind == CAMPANELLA_STRING_KIND => Err(invalid(
-                    "Campanella layout query has no reachable live kind-45 handler",
+                None if index == 616 && kind == LEGACY_STRING_KIND_45 => Err(invalid(
+                    "legacy layout query has no reachable live kind-45 handler",
                 )),
                 None if index == 616 => Err(invalid(
                     "Utate layout query has no reachable live kind-47 handler",
@@ -638,7 +649,7 @@ impl MessageNativeServices {
                 let address = word(1);
                 if vm.read(address, 4)? == (UTATE_CONFIG_SIZE as u32).to_le_bytes() {
                     let legacy = vm.read(address, UTATE_CONFIG_SIZE)?;
-                    let mode_start = if kind == CAMPANELLA_STRING_KIND { 0x70 } else { 0x6c };
+                    let mode_start = if kind == LEGACY_STRING_KIND_45 { 0x70 } else { 0x6c };
                     let gradual = legacy[mode_start..mode_start + 4] != [0; 4];
                     let bytes = translate_legacy_string_config(&legacy, gradual)?;
                     if index == 612 {
@@ -859,7 +870,7 @@ mod utate_tests {
         fn utate_string_receiver(&self) -> bool {
             self.legacy
         }
-        fn campanella_string_receiver(&self) -> bool {
+        fn legacy_string_receiver_45(&self) -> bool {
             self.campanella
         }
         fn raw_message_image(&mut self, _handle: u32) -> Result<Vec<u8>> {
@@ -1001,7 +1012,7 @@ mod utate_tests {
         let id = 39u32;
         let mut nodes = BTreeMap::from([(
             id,
-            SceneNode::new(id, CAMPANELLA_STRING_KIND, 37, "string".into()),
+            SceneNode::new(id, LEGACY_STRING_KIND_45, 37, "string".into()),
         )]);
         let mut backend = Backend {
             legacy: false,
@@ -1030,7 +1041,7 @@ mod utate_tests {
         backend.deletion = 0;
         nodes.get_mut(&id).unwrap().kind = UTATE_STRING_KIND;
         assert!(call(616, &[], &nodes, &mut backend).is_err());
-        assert_eq!(services.legacy_string_kind(id), Some(CAMPANELLA_STRING_KIND));
+        assert_eq!(services.legacy_string_kind(id), Some(LEGACY_STRING_KIND_45));
         Ok(())
     }
 }

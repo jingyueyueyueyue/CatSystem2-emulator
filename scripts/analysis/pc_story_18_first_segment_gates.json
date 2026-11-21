@@ -1,0 +1,107 @@
+{
+  "18": {
+    "frames": 1980,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:66",
+      "trace-native:69",
+      "trace-native:99",
+      "trace-native:104",
+      "trace-native:105",
+      "trace-native:110",
+      "trace-native:145",
+      "trace-native:146",
+      "trace-native:147",
+      "trace-native:148",
+      "trace-native:154",
+      "trace-native:286",
+      "trace-native:90",
+      "trace-native:92",
+      "trace-native:325",
+      "trace-native:326",
+      "trace-native:327",
+      "trace-native:401",
+      "trace-native:612",
+      "trace-native:616",
+      "trace-native:619",
+      "875:183,434",
+      "require-hit:875:11",
+      "inspect-log:875",
+      "inspect-log:1800",
+      "inspect-log:1860",
+      "inspect-log:1980"
+    ]
+  },
+  "first_segment_gate": {
+    "mode": "offline_log_evidence_only",
+    "checker": "scripts/analysis/check_pc_story_18_gate.py",
+    "wait_check_option": "--require-wait-lookup",
+    "pe_sha256": "659d5f069f3c97f69a61e12449cf1510b45e48a10649b9ac6977c2b93d6d28ad",
+    "startup": "kcs.int/main.kcs",
+    "title_click": {"point": [183, 434], "masked_region": 11, "receipt_receiver": 7},
+    "scene": "0001_00",
+    "scene_sha256": "22d8aef073b8d125bad43817274c77765d0665bfd3224598f1f5fb0ae3905e62",
+    "group": 0,
+    "body_records": [88, 89],
+    "wait_record": 90,
+    "observed_wait_control": {
+      "run": "20261120_185751_529597_26t0ql7p_playthrough",
+      "context": 370,
+      "lookup_event_line": 6981,
+      "input_marker_event_line": 6982,
+      "settled_frames": [1860, 1980],
+      "vm_wait_address": "0x59f",
+      "opaque_final_rgb_matches": [6696, 6696],
+      "advance_status": "live_keyboard_routes_unproven"
+    },
+    "next_line": {
+      "group": 1, "name_record": 91, "body_record": 92, "relative_body_record": 1,
+      "newline_only_record": 94, "wait_record": 95, "relative_wait_record": 4
+    },
+    "body_receiver": {"kind": 45, "name": "string", "parent_name": "message main", "owner_kind": 12, "owner_name": "meswnd"},
+    "body_input_diagnostics": {
+      "mode": "read_only_preflight",
+      "input_authorized": false,
+      "candidate_keyboard_code": 13,
+      "keyboard_source_mask": 1,
+      "startup_keyboard_candidates": [{"group": 0, "key": 0}, {"group": 0, "key": 2}],
+      "observed_candidates_for_read_only_check": {
+        "ordinary_script": 30, "bottom_button": 80, "meswnd": 32, "message_main": 37, "string": 86,
+        "earlier_bottom_button": {
+          "id": 61, "frame": 1002, "parent": 30, "registration_native": 104, "priority": 6,
+          "trace_run": "20261120_035627_359080_bqtg_027_playthrough", "trace_event_line": 8780
+        },
+        "note": "Observed task IDs only. Native104 registers its caller as receiver, while native110 may change it. Determine the live region/callback pair and any earlier competing regions at g0/90."
+      },
+      "inspect_frames": [1860, 1980],
+      "require_from_existing_logs": [
+        "Require the guarded title hit, the consuming mouse receipt and the same-frame VM resume. Bind native325 to the sole 0001_00 load. Require native326(context,0,90) in the same frame as the g0 [input] following executed g0/88 and g0/89; a prefetch does not count.",
+        "Match the current ordinary MesWnd2 and the live kind-45 string under its message main plane. Confirm native69(owner,13,0,0) after reveal and two settled snapshots matching the VM wait address, generation, alpha, final RGB and projected origin with zero clipping. Do not require an FES meswnd WAIT_KEY or treat a generic VM wait as this boundary."
+      ],
+      "needs_live_diagnostics": [
+        "On one completed frame record build and resource identity, CST handle/load/wait, live meswnd and body ancestry, current message wait and focus. Reject a pause, other modal or overlay, pending media/FES/host input, pressed keys, capture, and a pending key scan or receiver dispatch.",
+        "Read the initialized live device_key_bindings for every group/key matching Keyboard:13, including disabled competitors. Record binding.enabled, the live scan enable switch, current mask/count/capture, force count, and the debug-mode physical key limit. Order queries by group then key; do not call the mutating sample_device_key or send Enter to get a listing.",
+        "For each eligible query, list the live region table traversal order with index, priority, enabled/source mask, kind/deletion, parent, registered receiver and task state. Inspect the native110/command97 receiver override and the registered lazy lookup when no bound receiver is cached. Keyboard-only eligibility does not use pointer geometry. Include competing callbacks before the bottom button, dynamic reordering and the possibility of multiple logical queries for one press. Receiver IDs 30 and 32 have different roles. A callback response requires a physical receipt."
+      ],
+      "on_unproven_binding": "Stop at g0/90 without a key. Do not publish a verified-advance-binding from configuration XML or from this checklist."
+    },
+    "one_advance_acceptance": {
+      "mode": "deferred_until_live_binding_verified",
+      "require": [
+        "Use the state guard at the current g0/90 wait before one normal down/up pair. Record the fresh physical receipt from the verified binding and receiver. Stop on an absent or different receipt.",
+        "Require execution of g1/92 via native327(context,destination,1,1) and its message log, followed by the g1/95 input marker with native326(context,1,4). Verify the new page's stable body pixels separately before taking another step."
+      ]
+    },
+    "require": [
+      "Observed scene load matches the intended scene after the guarded title receipt.",
+      "The active body contains records 88 and 89 in CP932; identify its live receiver from the run, not by a fixed task ID.",
+      "The body emits the g0 input marker and the same receiver finishes reveal; retain native326 to corroborate the g0/90 record lookup. A scheduler yield, the end of native616 calls, or nonzero alpha alone is insufficient.",
+      "The stable projected origin agrees with the live native90 binding. Use final RGB counts with the texture and viewport clip counts; check both lines of text, not just any nonzero pixel."
+    ],
+    "on_first_ready": "Let the title-only replay finish at the observation cap. Use --require-wait-lookup to check g0/90 and the zero-body-input control.",
+    "on_unknown": "Stop and retain logs on an unexpected menu, choice, scene, receiver, engine error or unproven wait; do not inject input. In observation mode the frame cap is the safety limit."
+  }
+}

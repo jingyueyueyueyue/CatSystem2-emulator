@@ -74,7 +74,9 @@ pub use control::{
 };
 pub use cpu::{
     CpuEmoteBackend, CpuEmoteResources, CpuMotionModel, CpuPlayer, CpuTexture, CpuViewport,
-    DiagnosticFrame, decode_rgba_rle, rasterize_emote_stencil_triangle,
+    DiagnosticFrame, EmoteDrawDiagnostics, EmoteDrawTarget, EmoteSpriteMesh, EmoteSpritePass,
+    EmoteTextureSpan, decode_rgba_rle, rasterize_emote_stencil_triangle, repair_emote_raster,
+    visit_emote_texture_spans,
 };
 pub use dispatch::{
     EMOTE_NATIVE_DESCRIPTORS, EmoteBatchValue, EmoteCommandSelector, EmoteDispatchShape,
@@ -392,6 +394,41 @@ impl EmoteRasterFrame {
     }
     pub fn rgba(&self) -> &[u8] {
         &self.pixels.rgba
+    }
+
+    /// Return the original frame when possible, otherwise clip and pad it to a full viewport.
+    pub fn into_viewport(self, size: [u32; 2]) -> Result<Self> {
+        if self.origin == [0, 0] && self.width == size[0] && self.height == size[1] {
+            return Ok(self);
+        }
+        let byte_count = (size[0] as usize)
+            .checked_mul(size[1] as usize)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|&n| n <= MAX_FRAME_BYTES)
+            .ok_or(EmoteError::InvalidFrame)?;
+        if size.contains(&0) {
+            return Err(EmoteError::InvalidFrame);
+        }
+        let origin = self.origin.map(i64::from);
+        let left = origin[0].max(0);
+        let top = origin[1].max(0);
+        let right = (origin[0] + i64::from(self.width)).min(i64::from(size[0]));
+        let bottom = (origin[1] + i64::from(self.height)).min(i64::from(size[1]));
+        let mut rgba = vec![0; byte_count];
+        if right > left && bottom > top {
+            let source_x = (left - origin[0]) as usize;
+            let source_y = (top - origin[1]) as usize;
+            let source_stride = self.width as usize;
+            let target_stride = size[0] as usize;
+            let row_bytes = (right - left) as usize * 4;
+            for row in 0..(bottom - top) as usize {
+                let source = ((source_y + row) * source_stride + source_x) * 4;
+                let target = ((top as usize + row) * target_stride + left as usize) * 4;
+                rgba[target..target + row_bytes]
+                    .copy_from_slice(&self.rgba()[source..source + row_bytes]);
+            }
+        }
+        Self::new(size[0], size[1], [0, 0], rgba)
     }
 
     fn rgba_mut(&mut self) -> &mut [u8] {
@@ -1082,6 +1119,38 @@ mod tests {
             EmoteResource::decode(&trailing),
             Err(EmoteError::Decompression)
         ));
+    }
+
+    #[test]
+    fn raster_frame_viewport_materialization_clips_and_reuses_matching_frames() -> Result<()> {
+        let matching = EmoteRasterFrame::new(1, 1, [0, 0], vec![1, 2, 3, 4])?;
+        let address = matching.rgba().as_ptr();
+        let matching = matching.into_viewport([1, 1])?;
+        assert_eq!(matching.rgba().as_ptr(), address);
+
+        let cropped = EmoteRasterFrame::new(2, 2, [1, 1], vec![
+            1, 2, 3, 255, 4, 5, 6, 255,
+            7, 8, 9, 255, 10, 11, 12, 255,
+        ])?;
+        let expanded = cropped.clone().into_viewport([3, 2])?;
+        assert_eq!(expanded.origin(), [0, 0]);
+        assert_eq!(expanded.rgba(), [
+            [0u8, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 0, 0, 0], [1, 2, 3, 255], [4, 5, 6, 255],
+        ].concat().as_slice());
+
+        let clipped = EmoteRasterFrame::new(2, 2, [-1, 0], cropped.rgba().to_vec())?
+            .into_viewport([2, 2])?;
+        assert_eq!(clipped.rgba(), [
+            [4u8, 5, 6, 255], [0, 0, 0, 0],
+            [10, 11, 12, 255], [0, 0, 0, 0],
+        ].concat().as_slice());
+        let outside = EmoteRasterFrame::new(1, 1, [5, 5], vec![255; 4])?
+            .into_viewport([2, 2])?;
+        assert!(outside.rgba().iter().all(|&byte| byte == 0));
+        assert!(outside.into_viewport([0, 2]).is_err());
+        assert!(cropped.into_viewport([u32::MAX, u32::MAX]).is_err());
+        Ok(())
     }
 
     #[test]

@@ -1,0 +1,30 @@
+{
+  "3": {
+    "frames": 535,
+    "inputs": [
+      "move:205:138,362",
+      "capture:230",
+      "230:138,362",
+      "capture:231",
+      "capture:253",
+      "capture:254",
+      "capture:264",
+      "capture:414",
+      "capture:459",
+      "465:13",
+      "capture:466",
+      "capture:500"
+    ]
+  },
+  "0": {
+    "frames": 375,
+    "inputs": [
+      "194:400,329",
+      "capture:195",
+      "capture:263",
+      "capture:270",
+      "capture:300",
+      "capture:340"
+    ]
+  }
+}

@@ -7,9 +7,9 @@ use cs2_formats::ConfigXml;
 use cs2_runtime::language::{LanguageChangeRequest, LanguageTarget};
 use cs2_runtime::message_object::MessageDefaults;
 use cs2_script::ExpressionState;
-use super::fes_driver::{FesDriverEffect, FesScriptDriver};
+use super::fes_driver::{FesDriverCommand, FesDriverEffect, FesScriptDriver};
 use super::fes_tasks::FesTaskView;
-use super::{FesRuntime, LoggingHost, trim_nul};
+use super::{FesRuntime, LoggingHost, LogicEvent, ScriptTextEncoding, trim_nul};
 
 struct Field {
     name: &'static [u8],
@@ -571,6 +571,9 @@ pub(super) fn apply_effect(
         host.post_effect_settings()?;
         return Ok(Some(true));
     }
+    if verb == b"fontcom" {
+        return apply_font_command(host, driver, command, shared);
+    }
     if !matches!(verb, b"getconf" | b"setconf") { return Ok(None); }
     host.ensure_fes_settings()?;
     let args = &command.parameters[1..];
@@ -598,7 +601,12 @@ pub(super) fn apply_effect(
                 let units = if name == b"font" {
                     host.data_services.messages.defaults.as_ref().context("message defaults are unavailable")?.font_name.as_slice()
                 } else { host.data_services.message_device.ruby_font_name.as_slice() };
-                shared.strings.insert(values[0] as u32, font_bytes(units));
+                let destination = values[0] as u32;
+                let bytes = font_bytes(units);
+                host.data_services.cst_text_origins.set_shared_encoding(
+                    destination, &bytes, ScriptTextEncoding::Utf8,
+                );
+                shared.strings.insert(destination, bytes);
             }
         } else if verb == b"setconf" {
             host.set_fes_setting(name, values[0] as u32, values[1], values[2])?;
@@ -615,6 +623,63 @@ pub(super) fn apply_effect(
     })();
     if result.is_err() { host.data_services.fes_settings.pending.insert(stamp, values); }
     result.map(|_| Some(true))
+}
+
+fn apply_font_command(
+    host: &mut LoggingHost<'_>, driver: &mut FesScriptDriver, command: &FesDriverCommand,
+    shared: &mut ExpressionState,
+) -> Result<Option<bool>> {
+    let args = &command.parameters[1..];
+    let Some(operation) = args.first().map(Vec::as_slice) else { return Ok(None); };
+    if operation == b"init" {
+        host.data_services.message_device.fes_font_faces(host.resources);
+        return Ok(Some(true));
+    }
+    if !matches!(operation, b"count" | b"search" | b"default" | b"get") { return Ok(None); }
+    let destination = args.get(if operation == b"get" { 2 } else { 1 })
+        .context("fontcom destination is missing")?;
+    let index = if operation == b"get" {
+        Some(driver.evaluate_parameter(&args[1], 0, shared)?)
+    } else { None };
+    let destination = driver.evaluate_parameter(destination, 0, shared)?;
+    let faces = host.data_services.message_device.fes_font_faces(host.resources);
+    let find_face = |name: &str| {
+        let name = name.to_lowercase();
+        faces.iter().position(|face| face.to_lowercase() == name)
+    };
+    if matches!(operation, b"count" | b"search") {
+        let value = if operation == b"count" {
+            faces.len() as i32
+        } else {
+            let name = args[2..].join(&b' ');
+            std::str::from_utf8(&name).ok().and_then(find_face).map_or(-1, |index| index as i32)
+        };
+        if let Some(target) = usize::try_from(destination).ok().and_then(|index| shared.shared.get_mut(index)) {
+            *target = value;
+        }
+        if operation == b"count" {
+            host.events.push(LogicEvent { frame: host.frame, kind: "fes-font-catalog".into(),
+                detail: format!("count={value} destination={destination}") });
+        }
+    } else {
+        let name = if let Some(index) = index {
+            usize::try_from(index).ok().and_then(|index| faces.get(index))
+        } else {
+            host.data_services.messages.font_panel_defaults.as_ref()
+                .and_then(|defaults| String::from_utf16(&defaults.font_name).ok())
+                .and_then(|name| find_face(&name)).and_then(|index| faces.get(index))
+                .or_else(|| faces.first())
+        };
+        let bytes = name.map_or_else(Vec::new, |name| name.as_bytes().to_vec());
+        if let Some(index) = index {
+            host.events.push(LogicEvent { frame: host.frame, kind: "fes-font-catalog".into(),
+                detail: format!("index={index} destination={destination} bytes={}", bytes.len()) });
+        }
+        let destination = destination as u32;
+        host.data_services.cst_text_origins.set_shared_encoding(destination, &bytes, ScriptTextEncoding::Utf8);
+        shared.strings.insert(destination, bytes);
+    }
+    Ok(Some(true))
 }
 
 pub(super) fn release_owner(host: &mut LoggingHost<'_>, owner: u32) {

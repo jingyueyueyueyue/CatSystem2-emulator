@@ -1,0 +1,85 @@
+{
+  "3": {
+    "frames": 24000,
+    "route": {
+      "label": "ISLAND BAD_02 / \u65b0\u6e38\u620f\u81f3\u6d77\u6ee9\u9009\u9879",
+      "idle_frames": 3600,
+      "page_click": {"point": [557, 530], "region": 73},
+      "page_scenes": [
+        "com01", "OPMOVIE_END", "com01_selA_1", "com01_flowA_1",
+        "com01_flowA", "com01_flowB_1", "com01_selB_1"
+      ],
+      "steps": [
+        {
+          "label": "\u70b9\u51fb\u65b0\u6e38\u620f",
+          "wait": {"state": "title", "hit": {"point": [138, 362], "region": 15}},
+          "shared_flags": [{"slot": 722, "mask": 2, "expected": 0}],
+          "click": [138, 362],
+          "after": {"state": "page", "scene": "com01", "group": 0, "record": 54},
+          "capture": true
+        },
+        {
+          "label": "\u9996\u9875\u7ffb\u9875",
+          "wait": {"state": "page", "scene": "com01", "group": 0, "record": 54},
+          "key": 13,
+          "after": {"state": "page", "scene": "com01", "group": 1, "record": 62},
+          "capture": true
+        },
+        {
+          "label": "\u7b2c\u4e8c\u9875",
+          "wait": {"state": "page", "scene": "com01", "group": 1, "record": 62},
+          "capture": true
+        },
+        {
+          "label": "\u6d77\u6ee9\u4e09\u9009\u4e00",
+          "wait": {"state": "choice", "scene": "com01_selC"},
+          "capture": true,
+          "probe_points": [[640, 206], [640, 326], [640, 446]]
+        }
+      ]
+    }
+  },
+  "island_route": {
+    "pc_scenario_scope": "State route stops at the first beach choice. The shared_flags gate requires the unified player build; the archived f136 run used the previous route schema.",
+    "pc_player_archive": "archive/2026-11/20261119_msadpcm_playthrough_manifest.exe",
+    "pc_player_sha256": "e49e9f00e8495f2a979f124a4a30ba2a98e28d265e20778837b6b2b9185dfa48",
+    "pc_start_receipt_frame": 2451,
+    "pc_start_scene_frame": 2472,
+    "pc_com01_scene_frame": 2476,
+    "profile": "fresh; #722 == 0 and #525 == 0",
+    "first_choice": "com01_selC",
+    "android_layout": {
+      "screen_wh": [3200, 2136],
+      "game_view_xywh": [0, 213, 3200, 1800],
+      "logical_wh": [1280, 720],
+      "new_game_observed_xy": [371, 1116],
+      "dialogue_observed_xy": [160, 1800],
+      "dialogue_example_post_tap_delay_seconds": 0.32
+    },
+    "choice_rows": [
+      {"index": 0, "ja": "\u4ffa\u306f\u4ffa\u3060", "logical_candidate_xy": [640, 206], "screen_candidate_xy": [1600, 728], "target": "com01_selC_1", "recommended": true},
+      {"index": 1, "ja": "\u308f\u304b\u3089\u306a\u3044", "logical_candidate_xy": [640, 326], "screen_candidate_xy": [1600, 1028], "target": "com01_selC_2"},
+      {"index": 2, "ja": "\u2026\u2026\u305b\u3064\u306a", "logical_candidate_xy": [640, 446], "screen_candidate_xy": [1600, 1328], "target": "com01_selC_3"}
+    ],
+    "choice_coordinate_status": "PC coordinates are probe-only until three live masked hits identify the visible rows. Require distinct enabled row regions, not the background or a full-window region.",
+    "ending": "BAD_02",
+    "branch_waits": 6,
+    "ending_waits": 38,
+    "pending_pc_checkpoints": {
+      "choice": {"state": "choice", "scene": "com01_selC", "row": 0, "target": "com01_selC_1", "requires_live_hit_region": true},
+      "ending_card": {"state": "page", "scene": "BAD_02", "group": 37, "record": 207},
+      "return_to_title": {"wait": {"state": "title"}, "shared_flags": [{"slot": 722, "mask": 2, "expected": 2}]}
+    },
+    "pc_evidence_plan": {
+      "prologue_second_stage": {"state": "page_prompt", "scene": "com01", "group": 8, "record": 92},
+      "prologue_after_transition": {"state": "page", "scene": "com01", "group": 9, "record": 109},
+      "choice_receipt": "Match visible row 0 (\u4ffa\u306f\u4ffa\u3060 / \u6211\u5c31\u662f\u6211) to its live masked region, send one click, then verify the region accepted the input and the expected branch reached its first ready page.",
+      "choice_branch_page": {"state": "page", "scene": "com01_selC_1", "group": 0, "record": 4},
+      "ending_card_text": {"scene": "BAD_02", "group": 37, "record": 206, "ja": "\uff25\uff2e\uff24 \u300e\u8f2a\u5efb\u306e\u7d42\u7109\u300f", "zh": "\uff25\uff2e\uff24 \u300e\u8f6e\u56de\u7684\u7ec8\u7ed3\u300f"},
+      "ending_receipt": "Wait for the fullwnd draw and capture the visible end card at ready record 207. Advance once; check the settled title and #722 & 2 == 2 on the same candidate and profile. Keep the events log, flag receipt, and build identity."
+    },
+    "completion": "Visible BAD_02 end card, then #722 bit 1 and return to title after final advance.",
+    "pc_state_replay_receipt": "archive/2026-11/20261120_island_bad02_f136_receipt.json",
+    "evidence": "archive/2026-11/20261119_island_normal_start_bad02_sidecar.md"
+  }
+}

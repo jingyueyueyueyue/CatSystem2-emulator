@@ -1,0 +1,650 @@
+{
+  "kind": "analysis_only",
+  "title_id": "17",
+  "scene": "prologue",
+  "window": "cinema",
+  "wait_kind": 2,
+  "runtime_status": "r96 verified. The r107 and r221 scenarios require the player patch and PC replay.",
+  "player_patch": "scripts/analysis/generate_daydream_r96_player.patch",
+  "scenarios": {
+    "107": "scripts/analysis/pc_story_17_r18_to_r107_guarded_enter.json",
+    "221": "scripts/analysis/pc_story_17_r18_to_r221_guarded_enter.json"
+  },
+  "source_plan": "scripts/analysis/pc_story_17_r83_to_prologue_exit_plan.json",
+  "verified_r96": {
+    "candidate": "20261120_182559_920636_story_replay_integration",
+    "source_tree_sha256": "486116e9b1cadaa5d89094b2f266ee3b958f1ac1706098311ad46be81bc0f348",
+    "host_log": "F:/CS2-build-cache/playthrough/2026-11/20261120_182815_964984_cvl307fq_playthrough/17/17.host.log",
+    "events_log": "F:/CS2-build-cache/playthrough/2026-11/20261120_182815_964984_cvl307fq_playthrough/17/17.events.log",
+    "enter_down_frame": 3051,
+    "enter_receipt_frame": 3052,
+    "enter_receipt_host_line": 177,
+    "vm_resume_event_line": 37317,
+    "source_queue_event_line": 37294,
+    "wait_marker_event_line": 39889,
+    "successor_host_line": 181,
+    "input_target_host_line": 182,
+    "body_host_line": 183,
+    "frame": 3235,
+    "group": 20,
+    "wait_record": 96,
+    "wait_marked_frame": 3233,
+    "context": 159,
+    "load_id": 1,
+    "cinema_owner": 65,
+    "body_records": [
+      90
+    ],
+    "source_frame": 3052,
+    "natural_complete_frame": 3131,
+    "source_and_commit_epoch": 86,
+    "body_raw_bytes": 38,
+    "empty_record": 95,
+    "empty_raw_bytes": 0,
+    "exact_match": true,
+    "composited": true,
+    "fes_queue_operation_for_empty": "unobserved",
+    "terminal_input": false
+  },
+  "first_run": {
+    "from_wait": 96,
+    "terminal_wait": 107,
+    "guarded_enters": 1
+  },
+  "r96_input_gate": {
+    "wait": {
+      "state": "page_probe",
+      "scene": "prologue",
+      "group": 20,
+      "record": 96,
+      "window": "cinema"
+    },
+    "visible_body_records": [
+      90
+    ],
+    "zero_byte_body_records": [
+      95
+    ],
+    "expected_successor": {
+      "state": "page",
+      "scene": "prologue",
+      "group": 21,
+      "record": 107,
+      "window": "cinema"
+    },
+    "successor_body_records": [
+      106
+    ],
+    "checks": [
+      "Require the exact r96 live body and the adjacent r107 CST wait in the current document",
+      "Require the current region 62 to be enabled and bound to receiver 8",
+      "Resolve owner and load from the current run; require the same CST context and load at r107"
+    ]
+  },
+  "physical_input": {
+    "key": 13,
+    "keyboard_press": {
+      "region": 62,
+      "receiver": 8,
+      "key": 2,
+      "group": 0,
+      "response": 0
+    },
+    "root_resume": [
+      2,
+      0,
+      0,
+      0
+    ],
+    "presses_per_edge": 1,
+    "resume_on_first_frame": true,
+    "require_release_before_next_input": true
+  },
+  "edges": [
+    {
+      "before": {
+        "group": 20,
+        "wait_record": 96,
+        "body_records": [
+          90
+        ],
+        "empty_records": [
+          95
+        ]
+      },
+      "after": {
+        "group": 21,
+        "wait_record": 107,
+        "body_records": [
+          106
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 21,
+        "wait_record": 107,
+        "body_records": [
+          106
+        ]
+      },
+      "after": {
+        "group": 22,
+        "wait_record": 113,
+        "body_records": [
+          111,
+          112
+        ],
+        "newline_continuation": 112
+      }
+    },
+    {
+      "before": {
+        "group": 22,
+        "wait_record": 113,
+        "body_records": [
+          111,
+          112
+        ],
+        "newline_continuation": 112
+      },
+      "after": {
+        "group": 23,
+        "wait_record": 117,
+        "body_records": [
+          116
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 23,
+        "wait_record": 117,
+        "body_records": [
+          116
+        ]
+      },
+      "after": {
+        "group": 24,
+        "wait_record": 120,
+        "body_records": [
+          119
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 24,
+        "wait_record": 120,
+        "body_records": [
+          119
+        ]
+      },
+      "after": {
+        "group": 25,
+        "wait_record": 122,
+        "body_records": [
+          121
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 25,
+        "wait_record": 122,
+        "body_records": [
+          121
+        ]
+      },
+      "after": {
+        "group": 26,
+        "wait_record": 124,
+        "body_records": [
+          123
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 26,
+        "wait_record": 124,
+        "body_records": [
+          123
+        ]
+      },
+      "after": {
+        "group": 27,
+        "wait_record": 129,
+        "body_records": [
+          128
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 27,
+        "wait_record": 129,
+        "body_records": [
+          128
+        ]
+      },
+      "after": {
+        "group": 28,
+        "wait_record": 131,
+        "body_records": [
+          130
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 28,
+        "wait_record": 131,
+        "body_records": [
+          130
+        ]
+      },
+      "after": {
+        "group": 29,
+        "wait_record": 145,
+        "body_records": [
+          143,
+          144
+        ],
+        "newline_continuation": 144
+      }
+    },
+    {
+      "before": {
+        "group": 29,
+        "wait_record": 145,
+        "body_records": [
+          143,
+          144
+        ],
+        "newline_continuation": 144
+      },
+      "after": {
+        "group": 30,
+        "wait_record": 151,
+        "body_records": [
+          149,
+          150
+        ],
+        "newline_continuation": 150
+      }
+    },
+    {
+      "before": {
+        "group": 30,
+        "wait_record": 151,
+        "body_records": [
+          149,
+          150
+        ],
+        "newline_continuation": 150
+      },
+      "after": {
+        "group": 31,
+        "wait_record": 153,
+        "body_records": [
+          152
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 31,
+        "wait_record": 153,
+        "body_records": [
+          152
+        ]
+      },
+      "after": {
+        "group": 32,
+        "wait_record": 158,
+        "body_records": [
+          157
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 32,
+        "wait_record": 158,
+        "body_records": [
+          157
+        ]
+      },
+      "after": {
+        "group": 33,
+        "wait_record": 163,
+        "body_records": [
+          162
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 33,
+        "wait_record": 163,
+        "body_records": [
+          162
+        ]
+      },
+      "after": {
+        "group": 34,
+        "wait_record": 174,
+        "body_records": [
+          173
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 34,
+        "wait_record": 174,
+        "body_records": [
+          173
+        ]
+      },
+      "after": {
+        "group": 35,
+        "wait_record": 179,
+        "body_records": [
+          177,
+          178
+        ],
+        "newline_continuation": 178
+      }
+    },
+    {
+      "before": {
+        "group": 35,
+        "wait_record": 179,
+        "body_records": [
+          177,
+          178
+        ],
+        "newline_continuation": 178
+      },
+      "after": {
+        "group": 36,
+        "wait_record": 183,
+        "body_records": [
+          182
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 36,
+        "wait_record": 183,
+        "body_records": [
+          182
+        ]
+      },
+      "after": {
+        "group": 37,
+        "wait_record": 186,
+        "body_records": [
+          185
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 37,
+        "wait_record": 186,
+        "body_records": [
+          185
+        ]
+      },
+      "after": {
+        "group": 38,
+        "wait_record": 199,
+        "body_records": [
+          198
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 38,
+        "wait_record": 199,
+        "body_records": [
+          198
+        ]
+      },
+      "after": {
+        "group": 39,
+        "wait_record": 205,
+        "body_records": [
+          204
+        ]
+      }
+    },
+    {
+      "before": {
+        "group": 39,
+        "wait_record": 205,
+        "body_records": [
+          204
+        ]
+      },
+      "after": {
+        "group": 40,
+        "wait_record": 221,
+        "body_records": [
+          215
+        ],
+        "empty_records": [
+          220
+        ]
+      }
+    }
+  ],
+  "full_run": {
+    "from_wait": 96,
+    "terminal_wait": 221,
+    "guarded_enters": 20
+  },
+  "terminal_wait": 221,
+  "terminal_input": false,
+  "page_conditions": [
+    "Unique settled cinema MES_SHOW and flow GAME_WAIT, current-frame local WAIT_KEY",
+    "Exact CST 0x02 wait and [input] marker, same current context and load",
+    "Exact ordered body sources, fresh natural completion, same-epoch commit and composite",
+    "Each advance requires one live physical Enter consumer and one matching VM resume"
+  ],
+  "empty_body_observations": [
+    {
+      "wait_record": 96,
+      "nonempty_record": 90,
+      "nonempty_bytes_cn_jp": [
+        38,
+        48
+      ],
+      "empty_record": 95,
+      "empty_bytes_cn_jp": [
+        0,
+        0
+      ],
+      "runtime_status": "verified_r96",
+      "visible_effect": "Only r90 remains in the exact composited source list. The body source frame stays at 3052 through the r96 wait.",
+      "fes_queue_operation_for_empty": "unobserved"
+    },
+    {
+      "wait_record": 221,
+      "nonempty_record": 215,
+      "nonempty_bytes_cn_jp": [
+        36,
+        42
+      ],
+      "empty_record": 220,
+      "empty_bytes_cn_jp": [
+        0,
+        0
+      ],
+      "runtime_status": "not observed"
+    }
+  ],
+  "command_checkpoints": [
+    {
+      "before_wait": 96,
+      "records": [
+        [
+          84,
+          "eg 0 stop"
+        ],
+        [
+          89,
+          "rdraw 60"
+        ],
+        [
+          91,
+          "wait 120"
+        ],
+        [
+          93,
+          "rdraw 60"
+        ],
+        [
+          94,
+          "wait"
+        ]
+      ]
+    },
+    {
+      "before_wait": 107,
+      "records": [
+        [
+          102,
+          "rdraw 60"
+        ],
+        [
+          103,
+          "wait"
+        ],
+        [
+          104,
+          "wait 60"
+        ]
+      ]
+    },
+    {
+      "before_wait": 145,
+      "records": [
+        [
+          137,
+          "pl 0 m2move 2000 @+0 @+150"
+        ],
+        [
+          138,
+          "rdarw"
+        ],
+        [
+          139,
+          "rdraw 60"
+        ],
+        [
+          140,
+          "wait"
+        ],
+        [
+          141,
+          "wait 60"
+        ]
+      ],
+      "note": "Both assets contain rdarw. Observe engine behavior; do not rewrite or skip it."
+    },
+    {
+      "before_wait": 174,
+      "records": [
+        [
+          169,
+          "rdraw 60"
+        ],
+        [
+          170,
+          "wait"
+        ],
+        [
+          171,
+          "wait 60"
+        ]
+      ]
+    },
+    {
+      "before_wait": 199,
+      "records": [
+        [
+          187,
+          "se 0 fade 600 100 0"
+        ],
+        [
+          188,
+          "pl 0 stop"
+        ],
+        [
+          192,
+          "rdraw 60"
+        ],
+        [
+          193,
+          "wait"
+        ],
+        [
+          194,
+          "wait 60"
+        ],
+        [
+          196,
+          "rdraw"
+        ]
+      ]
+    },
+    {
+      "before_wait": 205,
+      "records": [
+        [
+          201,
+          "rdraw"
+        ],
+        [
+          202,
+          "wait"
+        ]
+      ]
+    },
+    {
+      "before_wait": 221,
+      "records": [
+        [
+          206,
+          "bgm 0 end 60"
+        ],
+        [
+          207,
+          "se 1 end 60"
+        ],
+        [
+          208,
+          "se 2 end 60"
+        ],
+        [
+          216,
+          "wait 120"
+        ],
+        [
+          218,
+          "rdraw 300"
+        ],
+        [
+          219,
+          "wait"
+        ]
+      ]
+    }
+  ]
+}

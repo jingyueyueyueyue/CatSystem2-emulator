@@ -1,4 +1,4 @@
-//! Raster18's single drawable vertex callback, recovered from two fixed PEs.
+//! Raster18's single drawable vertex callback.
 //! It changes the selected drawable's real vertices before its local matrix;
 //! it owns neither a second drawable nor an invented tessellation or depth.
 use std::collections::BTreeMap;
@@ -10,6 +10,9 @@ use super::{LoggingHost, PlaneShape, error, word};
 
 const V401: &str = "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f";
 const YUKI: &str = "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976";
+const KANMI_PACKED: &str = "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26";
+const KANMI_SSCRIPT_CODE: &str =
+    "7a068090a8d37c7a446a74e98448458e3d6ed75d94bb1a00022eaeb07d7a3921";
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -223,7 +226,10 @@ pub(super) fn synchronize_movie_callbacks(
 
 impl LoggingHost<'_> {
     pub(crate) fn register_raster_task(&mut self, id: u32) -> Result<()> {
-        version(self)?;
+        // This packed identity is issued only after matching both producer KCS files.
+        if self.data_services.particle_message_pe_sha256 != Some(KANMI_PACKED) {
+            version(self)?;
+        }
         // The thread ctor's second argument is reported as '%d fps'; manager
         // passes it to root+48 and each child factory inherits parent+48.
         if self.data_services.planes.raster.constructor_fps.is_none() {
@@ -272,6 +278,14 @@ impl LoggingHost<'_> {
         if !matches!(kind, 18 | 25) {
             return Ok(None);
         }
+        // Kanmi's Raster reset uses native 67 and the base task delete command.
+        if kind == 18
+            && command.code == 3
+            && self.data_services.particle_message_pe_sha256 == Some(KANMI_PACKED)
+            && self.data_services.native_profile.is_none()
+        {
+            return Ok(None);
+        }
         let current = version(self)?;
         if kind == 25 {
             // Both identified Hydro vtables delegate these messages without
@@ -296,12 +310,21 @@ impl LoggingHost<'_> {
         if deletion != 0 {
             return Ok(consumed);
         }
+        self.apply_raster_operation(id, *operation, buffers.data1.as_deref(), output)?;
+        Ok(consumed)
+    }
+
+    fn apply_raster_operation(
+        &mut self,
+        id: u32,
+        operation: Operation,
+        bytes: Option<&[u8]>,
+        output: &mut u32,
+    ) -> Result<()> {
         self.register_raster_task(id)?;
         match operation {
             Operation::Configure => {
-                let bytes = buffers
-                    .data1
-                    .as_deref()
+                let bytes = bytes
                     .filter(|bytes| bytes.len() >= 20)
                     .ok_or_else(|| error("Raster primary configuration requires20 bytes"))?;
                 let target = word(bytes, 0)?;
@@ -313,15 +336,7 @@ impl LoggingHost<'_> {
                     .constructor_fps
                     .ok_or_else(|| error("Raster constructor frame rate is unavailable"))?;
                 self.bind_raster_media_context(id, mode & 0x8000_0000 != 0, fps)?;
-                self.receive_media_effect_command(
-                    TaskCommand {
-                        code: if current { 270 } else { 259 },
-                        ..command
-                    },
-                    buffers,
-                    output,
-                )?
-                .ok_or_else(|| error("Raster parameter recipient is missing"))?;
+                self.update_raster_media_parameters(id, Some(bytes))?;
                 let task = self.data_services.planes.raster.tasks.get_mut(&id).unwrap();
                 task.target = Some(target);
                 task.axis = mode & 0x7fff_ffff;
@@ -331,8 +346,7 @@ impl LoggingHost<'_> {
                 // D owns the exact raw float words and relative conversion.
                 // Refresh here, rather than only during task body: root script
                 // parameter changes must affect this frame's real geometry.
-                self.receive_media_effect_command(command, buffers, output)?
-                    .ok_or_else(|| error("Raster parameter recipient is missing"))?;
+                self.update_raster_media_parameters(id, bytes)?;
                 self.synchronize_raster_parameters(id)?;
             }
             Operation::Start => {
@@ -404,7 +418,7 @@ impl LoggingHost<'_> {
             }
         }
         self.synchronize_raster_movie_vertices();
-        Ok(consumed)
+        Ok(())
     }
 
     pub(crate) fn advance_raster_task(&mut self, id: u32) -> Result<()> {
@@ -489,6 +503,20 @@ impl LoggingHost<'_> {
         };
         if args.len() < required {
             return Err(error("Raster/Hydro ordinary argument record is truncated"));
+        }
+        // The producer proves these operations through their post-call PCs.
+        // Keep the packed PE out of the raw object-message descriptor table.
+        if kind == 18
+            && self.data_services.particle_message_pe_sha256 == Some(KANMI_PACKED)
+            && vm.program_code_sha256() == Some(KANMI_SSCRIPT_CODE)
+            && let Some(operation) = match (index, vm.instruction_pointer) {
+                (196, 0x96c1b) => Some(Operation::Configure),
+                (197, 0x96d2b) => Some(Operation::Start),
+                (200, 0x96db3) => Some(Operation::Query),
+                _ => None,
+            }
+        {
+            return self.kanmi_raster_native(id, operation, args, vm).map(Some);
         }
         let current = version(self)?;
         if kind == 25 {
@@ -581,6 +609,47 @@ impl LoggingHost<'_> {
         } else {
             NativeReturn::Continue
         }))
+    }
+
+    fn kanmi_raster_native(
+        &mut self, id: u32, operation: Operation, args: &[u8], vm: &Vm,
+    ) -> Result<NativeReturn> {
+        if !self.data_services.tasks.message_task_state(id)
+            .is_some_and(|(kind, deletion, _)| kind == 18 && deletion == 0)
+        {
+            return Err(error("Kanmi Raster requires its live kind18 recipient"));
+        }
+        let mut output = 0;
+        let record = if matches!(operation, Operation::Configure) {
+            Some(vm.read(word(args, 4)?, 20)?)
+        } else {
+            None
+        };
+        self.apply_raster_operation(id, operation, record.as_deref(), &mut output)?;
+        let raster = &self.data_services.planes.raster;
+        let detail = match operation {
+            Operation::Configure => {
+                let bytes = record.as_deref().unwrap();
+                format!(
+                    "configure owner={id} target={} mode={:#010x} amplitude={:#010x} wavelength={:#010x} phase_period={:#010x}",
+                    word(bytes, 0)?, word(bytes, 4)?, word(bytes, 8)?,
+                    word(bytes, 12)?, word(bytes, 16)?,
+                )
+            }
+            Operation::Start => {
+                let target = raster.tasks[&id].target.unwrap();
+                let bound = raster.callbacks.get(&target).is_some_and(|binding| binding.owner == id);
+                format!("start owner={id} target={target} bound={bound}")
+            }
+            Operation::Query => return Ok(NativeReturn::Value(output)),
+            _ => unreachable!("Kanmi Raster callsite operation"),
+        };
+        self.events.push(crate::LogicEvent {
+            frame: self.frame,
+            kind: "kanmi-raster".into(),
+            detail,
+        });
+        Ok(NativeReturn::Continue)
     }
 
     pub(crate) fn dispatch_raster_message(

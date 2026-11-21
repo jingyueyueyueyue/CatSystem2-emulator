@@ -163,7 +163,10 @@ fn kind(bytes: &[u8]) -> Kind {
         Kind::Image
     } else if bytes.eq_ignore_ascii_case(b"PLANE") || bytes.eq_ignore_ascii_case(b"CPLANE") {
         Kind::Plane
-    } else if bytes.eq_ignore_ascii_case(b"SLIDER") || bytes.eq_ignore_ascii_case(b"SCROLL2") {
+    } else if [b"SLIDER".as_slice(), b"SCROLL2", b"SCROLL"]
+        .iter()
+        .any(|name| bytes.eq_ignore_ascii_case(name))
+    {
         Kind::Slider
     } else if bytes.eq_ignore_ascii_case(b"SOUND") || bytes.eq_ignore_ascii_case(b"SNDTABLE") {
         Kind::Sound
@@ -609,8 +612,12 @@ pub(super) fn apply_effect(
         return Ok(None);
     }
     let node_kind = kind(kind_name);
-    if node_kind == Kind::Other && !(verb == b"stop" && kind_name.eq_ignore_ascii_case(b"IMGWND")) {
-        return Ok(None);
+    if node_kind == Kind::Other {
+        let window_fade = verb == b"fade" && binding.as_ref()
+            .is_some_and(|binding| binding.target.eq_ignore_ascii_case(b"motFade"));
+        if !kind_name.eq_ignore_ascii_case(b"IMGWND") || (verb != b"stop" && !window_fade) {
+            return Ok(None);
+        }
     }
     if verb == b"color" && !matches!(node_kind, Kind::Image | Kind::Plane) {
         return Ok(None);
@@ -1340,6 +1347,10 @@ fn context(
             ..Default::default()
         });
     }
+    if node.kind == Kind::Other {
+        let words = capture(host, owner_id, owner, id, runtime, encoding)?;
+        return Ok(FesMotionContext { argb: words[28], ..Default::default() });
+    }
     let words = capture(host, owner_id, owner, id, runtime, encoding)?;
     let key = runtime_key(id, runtime, encoding)?;
     let argb = if node.kind == Kind::Image {
@@ -1398,12 +1409,12 @@ fn capture(
     if node.kind == Kind::Base {
         return Ok(node.controller.properties);
     }
-    if node.kind == Kind::Slider {
+    if matches!(node.kind, Kind::Slider | Kind::Other) {
         return host
             .data_services
             .fes_controls
-            .slider_motion_properties(owner_id, &id.0, id.1)
-            .context("motion target slider was released");
+            .alpha_motion_properties(owner_id, &id.0, id.1)
+            .context("FES motion alpha target has no live control bank");
     }
     if node.kind == Kind::Sound {
         return super::fes_sound::motion_properties(
@@ -1541,13 +1552,13 @@ fn writeback(
             // Direct property writes must not replace its motion baseline.
             owner.nodes.get_mut(id).unwrap().controller.properties = words;
         }
-        Kind::Slider => {
+        Kind::Slider | Kind::Other => {
             if !host
                 .data_services
                 .fes_controls
-                .apply_slider_motion_properties(owner_id, &id.0, id.1, &words)
+                .apply_alpha_motion_properties(owner_id, &id.0, id.1, &words)
             {
-                bail!("FES motion slider target was released");
+                bail!("FES motion alpha target has no live control bank");
             }
         }
         Kind::Sound => {
@@ -1618,7 +1629,6 @@ fn writeback(
                 }
             }
         }
-        Kind::Other => bail!("FES motion writeback has no contract for this object type"),
     }
     Ok(())
 }
@@ -1637,9 +1647,11 @@ fn create_fes_motion_runner(
 }
 
 fn uses_short_fes_motion_layout(pe_sha: Option<&str>) -> bool {
+    const UTATE_MEGURI_SHA: &str =
+        "a9f8b08713aac278671853b2293a13b2623a122ede9341cb921901b09601cb52";
     matches!(
         pe_sha,
-        Some(super::particle_external::CAMPANELLA_SHA | super::css_model::SHA)
+        Some(super::particle_external::CAMPANELLA_SHA | super::css_model::SHA | UTATE_MEGURI_SHA)
     )
 }
 
@@ -2040,8 +2052,9 @@ pub(super) fn image_list_placement(
     let layer = &runtime.media[name];
     let parent = inherited_image_position(host, view.id, runtime, name)?;
     let animation = layer.animation_display.map_or([0; 2], |display| [display.x, display.y]);
-    let vram = layer.plane.as_ref().filter(|plane| !runtime.media.contains_key(*plane))
-        .and_then(|plane| runtime.planes.get(plane)).map_or([0; 2], |plane| plane.vram);
+    let vram = layer.plane.as_deref().and_then(|name| runtime.driver_plane_key(name))
+        .filter(|name| !runtime.media.contains_key(*name))
+        .map_or([0; 2], |name| runtime.planes[name].vram);
     let mut position = [layer.position.x, layer.position.y].map(|value| value as f32);
     let mut base = layer.image_base.map(|value| value as f32);
     let mut offset = layer.image_offset;
@@ -2243,8 +2256,8 @@ pub(super) fn button_input_position(
 ) -> Result<Point> {
     let mut point = button_image_coordinates(host, view.id, runtime, name)?;
     let layer = &runtime.media[name];
-    if let Some(plane) = layer.plane.as_ref()
-        .filter(|plane| runtime.planes.contains_key(*plane) && !runtime.media.contains_key(*plane)) {
+    if let Some(plane) = layer.plane.as_deref().and_then(|name| runtime.driver_plane_key(name))
+        .filter(|name| !runtime.media.contains_key(*name)) {
         let words = plane_render_properties(host, view, runtime, plane)?;
         for axis in 0..2 {
             point[axis] = point[axis] + f32::from_bits(words[6 + axis]) - f32::from_bits(words[3 + axis]);

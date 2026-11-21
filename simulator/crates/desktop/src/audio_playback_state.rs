@@ -153,7 +153,15 @@ impl crate::movie_audio::MovieAudioOutput for TrackedOutput {
 
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
-struct Playback { channel: AudioChannel, resource: String, source: PcmState, worker: WorkerState, ogg: bool }
+struct Playback {
+    channel: AudioChannel,
+    resource: String,
+    source: PcmState,
+    worker: WorkerState,
+    ogg: bool,
+    #[serde(skip)]
+    captured_source: Option<Arc<PreparedAudio>>,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 struct Snapshot { version: u32, playbacks: BTreeMap<u64, Playback> }
@@ -182,7 +190,8 @@ impl CapturedAudioState {
 }
 impl Playback {
     fn source_matches(&self, source: &PreparedAudio) -> bool {
-        PcmState::capture(source).is_ok_and(|saved| saved.matches(&self.source))
+        self.captured_source.as_deref().is_some_and(|captured| std::ptr::eq(captured, source))
+            || self.source.matches_source(source).unwrap_or(false)
     }
 }
 impl WorkerState {
@@ -219,6 +228,7 @@ impl DesktopAudioHost {
             return Err(error("SOUND checkpoint host/backend ownership differs"));
         }
         let mut saved = CapturedAudioState { snapshot: Snapshot { version: 1, playbacks: BTreeMap::new() }, release: Vec::new() };
+        let mut checkpoint_pcm_bytes = 0usize;
         for (&id, backend) in &self.handles {
             let playback = self.playback(id).ok_or_else(|| error("SOUND checkpoint handle lost its actual backend"))?;
             let (inner, category) = match backend {
@@ -233,9 +243,14 @@ impl DesktopAudioHost {
             let worker = rx.recv_timeout(Duration::from_secs(5)).map_err(|_| error("SOUND worker did not acknowledge checkpoint"))??;
             if worker.paused != playback.paused { return Err(error("SOUND worker/host script pause differs")); }
             worker.validate(&playback.prepared, &playback._parameters)?;
-            let source = PcmState::capture(&playback.prepared)?;
+            checkpoint_pcm_bytes += playback.prepared.sample_count() * size_of::<i16>();
+            if checkpoint_pcm_bytes > wire::MAX_GRAPH_BYTES {
+                return Err(error("SOUND checkpoint playback PCM exceeds the portable graph byte bound"));
+            }
+            let source = PcmState::capture(&playback.prepared)
+                .map_err(|cause| error(format!("checkpoint SOUND resource {:?}: {cause}", playback.resource)))?;
             saved.snapshot.playbacks.insert(id, Playback { channel: playback.channel.clone(), resource: playback.resource.clone(), source, worker,
-                ogg: matches!(backend, AudioBackendHandle::Ogg(_, _)) });
+                ogg: matches!(backend, AudioBackendHandle::Ogg(_, _)), captured_source: Some(playback.prepared.clone()) });
         }
         Ok(saved)
     }
@@ -301,10 +316,11 @@ impl WavAudioHost {
             let (commands, rx) = mpsc::channel(); let (started, ready) = mpsc::sync_channel(1);
             let (done, finished) = mpsc::channel();
             let source = prepared.clone(); let controls = parameters.clone(); let suspended = self.suspended;
+            let worker_resource = resource.clone();
             let worker = thread::Builder::new().name(format!("cs2-pcm-restore-{id}")).spawn(move || {
                 let startup_error = started.clone();
                 let result = super::pcm_worker::run_playback(
-                    source, controls, 0, saved.loop_spec, suspended, rx, started, Some(saved),
+                    source, &worker_resource, controls, 0, saved.loop_spec, suspended, rx, started, Some(saved),
                     #[cfg(target_os = "android")]
                     None,
                 );

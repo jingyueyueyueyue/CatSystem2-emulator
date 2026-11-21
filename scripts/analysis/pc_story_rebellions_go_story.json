@@ -1,0 +1,23 @@
+{
+  "20": {
+    "frames": 3200,
+    "route": {
+      "label": "Rebellions: one verified title click to the settled episode menu",
+      "idle_frames": 2400,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "title WAIT00: click enabled btn1[0] once",
+          "wait": {"state": "title", "hit": {"point": [480, 667], "region": 16}},
+          "click": [480, 667],
+          "after": {"state": "choice", "scene": "epselect"}
+        },
+        {
+          "label": "GO_STORY exit 5 branch: settled epselect; no episode input",
+          "wait": {"state": "choice", "scene": "epselect"},
+          "probe_points": [[353, 308]]
+        }
+      ]
+    }
+  }
+}

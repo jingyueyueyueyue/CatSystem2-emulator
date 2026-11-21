@@ -222,9 +222,44 @@ impl FesSavePanelStore {
             return Ok(false);
         }
         let Some(verb) = command.parameters.get(1).map(Vec::as_slice) else { return Ok(true) };
+        if verb.eq_ignore_ascii_case(b"delete") {
+            return Ok(false); // The shared graphics release also detaches list and motion state.
+        }
         let mut bank = raw_bank.map(|text| driver.evaluate_parameter(text, command.context.current, shared)).transpose()?;
         if bank.is_none_or(|index| index == -1)
             && driver.adapter.object(name).unwrap().definition.bank_count <= 1 { bank = Some(0); }
+        if verb == b"getsavestr" {
+            let Some(bank) = bank.filter(|&bank| bank != -1) else { return Ok(true) };
+            let Some(destination) = number(command, 2, driver, shared)? else { return Ok(true) };
+            let Some(record) = number(command, 3, driver, shared)? else { return Ok(true) };
+            let key = (view.id, name.to_vec(), bank);
+            if let Some(panel) = self.banks.get(&key) {
+                let record = record as u32;
+                let source = panel.data.record(record)?;
+                let bytes = match source {
+                    None | Some([]) => &[][..],
+                    Some(source) => {
+                        let end = source.iter().position(|&byte| byte == 0)
+                            .context("SAVEPANEL getsavestr CSS record lacks a terminator")?;
+                        &source[..end]
+                    }
+                };
+                let codec = panel.data.text_encoding(host, record, bytes)?;
+                // The shared string remains a byte string for KCS and the comment editor.
+                // Record its codec for FES text expansion without attaching a CST page.
+                host.data_services.cst_text_origins.set_shared_encoding(destination as u32, bytes, codec);
+                if host.data_services.story_trace {
+                    host.events.push(crate::LogicEvent {
+                        frame: host.frame,
+                        kind: "fes-savepanel-getsavestr".into(),
+                        detail: format!("owner={} bank={bank} destination={destination} record={record:#010x} present={} bytes={} sha256={}",
+                            view.id, source.is_some(), bytes.len(), crate::particle_plugin_digest::sha256(bytes)),
+                    });
+                }
+                shared.strings.insert(destination as u32, bytes.to_vec());
+            }
+            return Ok(true);
+        }
         if let Some(request) = PanelDataRequest::prepare(command, bank, driver, shared)? {
             if let Some(key) = bank.filter(|&bank| bank != -1)
                 .map(|bank| (view.id, name.to_vec(), bank)).filter(|key| self.banks.contains_key(key)) {

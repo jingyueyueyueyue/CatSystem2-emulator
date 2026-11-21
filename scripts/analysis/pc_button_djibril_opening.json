@@ -1,0 +1,11 @@
+{
+  "10": {
+    "frames": 1200,
+    "inputs": [
+      "capture-every:0", "story-events",
+      "trace-native:520", "trace-native:527", "trace-native:528",
+      "move:708:190,222", "require-hit:710:39", "710:190,222",
+      "inspect:776", "778:13", "inspect:835", "inspect:1000"
+    ]
+  }
+}

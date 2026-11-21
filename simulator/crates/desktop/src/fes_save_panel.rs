@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use cs2_formats::CssFile;
 use cs2_script::ExpressionState;
 
-use crate::{LoggingHost, fes_driver::{FesDriverCommand, FesScriptDriver}};
+use crate::{LoggingHost, ScriptTextEncoding, fes_driver::{FesDriverCommand, FesScriptDriver}};
 
 #[path = "fes_save_panel_time.rs"]
 mod file_date;
@@ -116,6 +116,26 @@ impl SavePanelData {
     pub(crate) fn record(&self, id: u32) -> Result<Option<&[u8]>> {
         self.data.as_ref().map(|data| data.try_record(id)).transpose()
             .context("SAVEPANEL CSS source record is invalid").map(Option::flatten)
+    }
+
+    fn text_encoding(&self, host: &LoggingHost<'_>, record: u32, text: &[u8]) -> Result<ScriptTextEncoding> {
+        if std::str::from_utf8(text).is_ok() {
+            return Ok(ScriptTextEncoding::Utf8);
+        }
+        let encoding = host.text_encoding;
+        if record != 0x200 || self.record(record)?.map(crate::trim_nul) != Some(text) {
+            return Ok(encoding);
+        }
+        // The legacy CST snapshot puts the scene name after its first DWORD
+        // and copies the dialogue into 0x200 in that scene's original codec.
+        let Some(scene) = self.record(5)?.and_then(|header| header.get(4..))
+            .map(crate::trim_nul).filter(|scene| !scene.is_empty()) else { return Ok(encoding) };
+        if crate::fes_text::is_island_gbk_scene(host.resources, scene)?
+            && encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(text).is_some()
+        {
+            return Ok(ScriptTextEncoding::Gbk);
+        }
+        Ok(encoding)
     }
 
     pub(crate) fn apply(

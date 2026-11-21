@@ -234,13 +234,69 @@ impl LoggingHost<'_> {
                 NativeReturn::Value(u32::from(index == 268))
             });
         }
+        let trace_daydream_end1 = self.data_services.story_trace
+            && self.css_task_sha() == Some("1f3288d5fd5408bee4d395faab708aca78c9eeaa6c172dc06dcce09c844ba9d5")
+            && self.movie_resources.get(&handle).is_some_and(|resource| {
+                resource.rsplit(['/', '\\']).next().is_some_and(|member| member.eq_ignore_ascii_case("ed_c03.mpg"))
+            });
+        let trace_hatsumira_op = self.data_services.story_trace
+            && self.css_task_sha() == Some(super::story_trace::story_trace_12::PE)
+            && self.movie_resources.get(&handle).is_some_and(|resource|
+                resource.eq_ignore_ascii_case("movie.int/hatsuop.mpg"));
+        let trace_kanmi_op = self.data_services.story_trace
+            && self.data_services.particle_message_pe_sha256
+                == Some("c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26")
+            && self.movie_resources.get(&handle).is_some_and(|resource|
+                resource.eq_ignore_ascii_case("movie.int/op.mpg"));
+        let trace_neko = self.data_services.story_trace
+            && self.css_task_sha() == Some("c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc");
+        let neko_movie = self.movie_resources.get(&handle)
+            .filter(|_| trace_neko)
+            .and_then(|name| name.rsplit(['/', '\\']).next())
+            .and_then(|name| match name.to_ascii_lowercase().as_str() {
+                "nekopara3op.wmv" => Some("op"),
+                "nekopara3ed.wmv" => Some("ed"),
+                _ => None,
+            });
+        let trace_eden_op = index == 269 && self.data_services.story_trace
+            && self.css_task_sha() == Some("c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c")
+            && self.movie_resources.get(&handle).map(String::as_str) == Some("movie.int/blaop1.mpg");
         let events = &mut *self.events;
         let host = self
             .movie_host
             .as_deref_mut()
             .ok_or_else(|| native_state_error("movie control has no real movie host"))?;
         if index == 268 {
-            self.movie_playbacks.remove(&handle);
+            let playback = self.movie_playbacks.remove(&handle);
+            let opening = self.data_services.story_trace && !host.is_plane_movie(handle)
+                && self.movie_resources.get(&handle).is_some_and(|resource| {
+                    resource.eq_ignore_ascii_case("movie.int/OPmovie.mpg")
+                });
+            let finished = if let Some(playback) = playback.filter(|_| opening || trace_daydream_end1
+                || trace_hatsumira_op && !host.is_plane_movie(handle))
+            {
+                host.finished(playback)
+                    .map_err(|cause| record_host_error(events, cause))?
+                    && (!trace_hatsumira_op || host.replay_finished_naturally(playback))
+            } else {
+                false
+            };
+            if let (Some(name), Some(playback)) = (neko_movie, playback) {
+                host.finished(playback).map_err(|cause| record_host_error(events, cause))?;
+                let natural = host.replay_finished_naturally(playback);
+                events.push(super::LogicEvent {
+                    frame: self.frame, kind: "neko-film-end".into(),
+                    detail: format!("{name} handle={handle} playback={playback} natural={natural}"),
+                });
+            }
+            if trace_kanmi_op && let Some(playback) = playback {
+                host.finished(playback).map_err(|cause| record_host_error(events, cause))?;
+                let natural = host.replay_finished_naturally(playback);
+                events.push(super::LogicEvent {
+                    frame: self.frame, kind: "kanmi-film-end".into(),
+                    detail: format!("handle={handle} playback={playback} natural={natural}"),
+                });
+            }
             self.movie_resources.remove(&handle);
             if host.is_plane_movie(handle) {
                 if let Some(movie) = host.planes.movies.get(&handle)
@@ -254,6 +310,15 @@ impl LoggingHost<'_> {
             } else {
                 host.unload()
                     .map_err(|cause| record_host_error(events, cause))?;
+            }
+            if finished && let Some(event) = events.last_mut() {
+                if trace_daydream_end1 {
+                    event.detail.push_str(&format!(" movie_daydream_end1_released handle={handle}"));
+                } else if trace_hatsumira_op {
+                    event.detail.push_str(&format!(" movie_hatsumira_op_released handle={handle}"));
+                } else {
+                    event.detail.push_str(&format!(" movie_naturally_released handle={handle}"));
+                }
             }
             return Ok(NativeReturn::Value(1));
         }
@@ -289,6 +354,22 @@ impl LoggingHost<'_> {
                     )
                     .map_err(|cause| record_host_error(events, cause))?;
                 self.movie_playbacks.insert(handle, started.handle);
+                if let Some(name) = neko_movie {
+                    events.push(super::LogicEvent {
+                        frame: self.frame, kind: "neko-film-start".into(),
+                        detail: format!("{name} handle={handle} playback={} count={count}", started.handle),
+                    });
+                }
+                if neko_movie == Some("ed") && let Some(value) = self.shared_values.get(550) {
+                    events.push(super::LogicEvent {
+                        frame: self.frame, kind: "neko-credits-flag".into(),
+                        detail: format!("handle={handle} flag550={value}"),
+                    });
+                }
+                if (trace_daydream_end1 || trace_hatsumira_op) && let Some(event) = events.last_mut() {
+                    let operation = if trace_hatsumira_op { "hatsumira_op" } else { "daydream_end1" };
+                    event.detail.push_str(&format!(" movie_{operation}_started handle={handle}"));
+                }
                 Ok(NativeReturn::Value(1))
             }
             267 => {
@@ -296,6 +377,9 @@ impl LoggingHost<'_> {
                     let playing = !host
                         .finished(playback)
                         .map_err(|cause| record_host_error(events, cause))?;
+                    if playing && trace_daydream_end1 && let Some(event) = events.last_mut() {
+                        event.detail.push_str(&format!(" movie_daydream_end1_interrupted handle={handle}"));
+                    }
                     if playing || !implicit {
                         host.stop(playback)
                             .map_err(|cause| record_host_error(events, cause))?;
@@ -314,6 +398,14 @@ impl LoggingHost<'_> {
                 } else {
                     false
                 };
+                if trace_eden_op && !playing && let Some(playback) = playback
+                    && host.replay_finished_naturally(playback)
+                {
+                    events.push(super::LogicEvent {
+                        frame: self.frame, kind: "story-op-finished".into(),
+                        detail: format!("handle={handle} playback={playback}"),
+                    });
+                }
                 Ok(NativeReturn::Value(u32::from(playing)))
             }
             270 => {

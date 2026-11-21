@@ -1,0 +1,47 @@
+{
+  "4": {
+    "frames": 2100,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:327",
+      "trace-native:527",
+      "trace-native:530",
+      "trace-native:531",
+      "215:638,446",
+      "require-hit:215:19",
+      "move:372:165,386",
+      "390:165,386",
+      "require-hit:390:15",
+      "trace-native:1037",
+      "trace-native:1038",
+      "legacy-04-enter"
+    ]
+  },
+  "5": {
+    "frames": 2800,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "trace-native:71",
+      "trace-native:327",
+      "trace-native:616",
+      "require-hit:260:13",
+      "260:400,300",
+      "require-hit:380:13",
+      "380:400,300",
+      "move:860:235,509",
+      "require-hit:885:15",
+      "885:235,509",
+      "trace-native:614",
+      "trace-native:615",
+      "trace-native:619",
+      "legacy-05-enter"
+    ]
+  }
+}

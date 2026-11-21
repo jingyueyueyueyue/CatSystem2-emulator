@@ -1,0 +1,44 @@
+{
+  "17": {
+    "frames": 2100,
+    "route": {
+      "label": "Daydream: replay the verified r18 to r22 prefix, then one r22 to r25 observation",
+      "idle_frames": 720,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "Verified prefix: one Enter at the ready cinema r18",
+          "wait": {"state": "page", "scene": "prologue", "group": 0, "record": 18, "window": "cinema"},
+          "key": 13,
+          "after": {"state": "page", "scene": "prologue", "group": 1, "record": 22, "window": "cinema"}
+        },
+        {
+          "label": "Log ready cinema r22, then send the only new Enter",
+          "wait": {"state": "page", "scene": "prologue", "group": 1, "record": 22, "window": "cinema"},
+          "probe_points": [[640, 395]],
+          "key": 13,
+          "after": {"state": "page", "scene": "prologue", "group": 2, "record": 25, "window": "cinema"}
+        },
+        {
+          "label": "Log ready cinema r25 and stop without input",
+          "wait": {"state": "page", "scene": "prologue", "group": 2, "record": 25, "window": "cinema"},
+          "probe_points": [[640, 395]]
+        }
+      ]
+    },
+    "review": {
+      "prefix_host_log": "F:/CS2-build-cache/playthrough/2026-11/20261120_071003_915162_bmlw9j13_playthrough/17/17.host.log",
+      "prefix_ready_line": 7,
+      "resource": "update03.int::prologue.cst",
+      "member_sha256": "4f713b09acbe41fd0d19e072eb3d5f89d3ee34854904aa8300640f0ba00e05e8",
+      "origin_body_records": [20, 21],
+      "successor_body_records": [24],
+      "manual_acceptance": [
+        "Before the new press, confirm the r22 probe shows ordered sources [20,21], exact and composited, with a naturally completed and committed current epoch and no movie.",
+        "Check that the fresh, nonrepeated physical Keyboard(13) is consumed by bottom-button owner 8 (region 62, logical key 2, group 0, response 0) and that message-resume [2, 0, 0, 0] occurs in the same frame. Cinema is the ready body window, not the consuming receiver. A down event or route completion alone is not proof of consumption.",
+        "At r25, require source [24] in the same CST context and load, with a fresh naturally completed and committed current epoch, exact and composited. No subsequent press is defined."
+      ],
+      "limitation": "This legacy observation config does not declare keyboard_press. Use pc_story_17_r18_to_r25_guarded_enter.json with the strict validator to enforce the consuming receipt."
+    }
+  }
+}

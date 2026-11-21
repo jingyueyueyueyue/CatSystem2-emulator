@@ -1,0 +1,62 @@
+{
+  "20": {
+    "frames": 9000,
+    "route": {
+      "label": "Rebellions A - guarded opening through page 5",
+      "idle_frames": 3000,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "New Game",
+          "wait": {"state": "title", "hit": {"point": [480, 667], "region": 16}},
+          "click": [480, 667],
+          "after": {"state": "choice", "scene": "epselect"}
+        },
+        {
+          "label": "Select A card",
+          "wait": {"state": "choice", "scene": "epselect", "hit": {"point": [353, 308], "region": 14}},
+          "click": [353, 308],
+          "after": {"state": "confirm2", "window": "confirm2"}
+        },
+        {
+          "label": "Decline male voice prompt",
+          "wait": {"state": "confirm2", "window": "confirm2", "hit": {"point": [723, 418], "region": 15}},
+          "click": [723, 418],
+          "after": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 0, "record": 13}
+        },
+        {
+          "label": "Enter once from the committed first line",
+          "wait": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 0, "record": 13},
+          "key": 13,
+          "keyboard_press": {"key": 2, "group": 0, "response": 0, "region_name": "bottom button", "receiver_script": "sscript.kcs", "resume": [2, 0, 0, 0]},
+          "after": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 1, "record": 15}
+        },
+        {
+          "label": "Page 2 to 3: transition and first voiced line",
+          "wait": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 1, "record": 15},
+          "key": 13,
+          "keyboard_press": {"key": 2, "group": 0, "response": 0, "region_name": "bottom button", "receiver_script": "sscript.kcs", "resume": [2, 0, 0, 0]},
+          "after": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 2, "record": 26}
+        },
+        {
+          "label": "Page 3 to 4: second voiced line",
+          "wait": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 2, "record": 26},
+          "key": 13,
+          "keyboard_press": {"key": 2, "group": 0, "response": 0, "region_name": "bottom button", "receiver_script": "sscript.kcs", "resume": [2, 0, 0, 0]},
+          "after": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 3, "record": 30}
+        },
+        {
+          "label": "Page 4 to 5: next body line",
+          "wait": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 3, "record": 30},
+          "key": 13,
+          "keyboard_press": {"key": 2, "group": 0, "response": 0, "region_name": "bottom button", "receiver_script": "sscript.kcs", "resume": [2, 0, 0, 0]},
+          "after": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 4, "record": 32}
+        },
+        {
+          "label": "Stop at page 5",
+          "wait": {"state": "page", "window": "meswnd01", "scene": "A_01_01", "group": 4, "record": 32}
+        }
+      ]
+    }
+  }
+}

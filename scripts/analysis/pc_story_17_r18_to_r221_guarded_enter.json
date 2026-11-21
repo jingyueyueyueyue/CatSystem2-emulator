@@ -1,0 +1,1275 @@
+{
+  "17": {
+    "frames": 12000,
+    "route": {
+      "label": "Daydream: guarded prologue route through terminal r221",
+      "idle_frames": 1200,
+      "page_scenes": [],
+      "steps": [
+        {
+          "label": "r18: verify the physical Enter and VM resume before accepting r22",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 0,
+            "record": 18,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 1,
+            "record": 22,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r22: one additional guarded Enter toward r25",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 1,
+            "record": 22,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 2,
+            "record": 25,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r25: observe source [24] and verify one Enter toward r28",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 2,
+            "record": 25,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 3,
+            "record": 28,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r28: observe source [27] and verify one Enter toward r31",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 3,
+            "record": 28,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 4,
+            "record": 31,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r31: observe source [30] and verify one Enter toward r33",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 4,
+            "record": 31,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 5,
+            "record": 33,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r33: observe source [32] and verify one Enter toward r35",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 5,
+            "record": 33,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 6,
+            "record": 35,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r35: observe source [34] and verify one Enter toward r37",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 6,
+            "record": 35,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 7,
+            "record": 37,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r37: observe source [36] and verify one Enter toward r40",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 7,
+            "record": 37,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 8,
+            "record": 40,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r40: observe source [39] and verify one Enter toward r44",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 8,
+            "record": 40,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 9,
+            "record": 44,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r44: observe source [42,43] and verify one Enter toward r47",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 9,
+            "record": 44,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 10,
+            "record": 47,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r47: observe source [46] and verify one Enter toward r55",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 10,
+            "record": 47,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 11,
+            "record": 55,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r55: observe source [54] and verify one Enter toward r57",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 11,
+            "record": 55,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 12,
+            "record": 57,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r57: observe source [56] and verify one Enter toward r62",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 12,
+            "record": 57,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 13,
+            "record": 62,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r62: observe source [61] and verify one Enter toward r64",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 13,
+            "record": 62,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 14,
+            "record": 64,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r64: observe source [63] and verify one Enter toward r75",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 14,
+            "record": 64,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 15,
+            "record": 75,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r75: observe source [74] and verify one Enter toward r77",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 15,
+            "record": 75,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 16,
+            "record": 77,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r77: observe source [76] and verify one Enter toward r79",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 16,
+            "record": 77,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 17,
+            "record": 79,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r79: observe source [78] and verify one Enter toward r81",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 17,
+            "record": 79,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 18,
+            "record": 81,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r81: observe source [80] and verify one Enter toward r83",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 18,
+            "record": 81,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ],
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 19,
+            "record": 83,
+            "window": "cinema"
+          }
+        },
+        {
+          "label": "r83: one guarded Enter to observe r96",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 19,
+            "record": 83,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page_probe",
+            "scene": "prologue",
+            "group": 20,
+            "record": 96,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r96: one guarded Enter toward r107",
+          "wait": {
+            "state": "page_probe",
+            "scene": "prologue",
+            "group": 20,
+            "record": 96,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 21,
+            "record": 107,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r107: one guarded Enter toward r113",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 21,
+            "record": 107,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 22,
+            "record": 113,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r113: one guarded Enter toward r117",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 22,
+            "record": 113,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 23,
+            "record": 117,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r117: one guarded Enter toward r120",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 23,
+            "record": 117,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 24,
+            "record": 120,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r120: one guarded Enter toward r122",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 24,
+            "record": 120,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 25,
+            "record": 122,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r122: one guarded Enter toward r124",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 25,
+            "record": 122,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 26,
+            "record": 124,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r124: one guarded Enter toward r129",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 26,
+            "record": 124,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 27,
+            "record": 129,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r129: one guarded Enter toward r131",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 27,
+            "record": 129,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 28,
+            "record": 131,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r131: one guarded Enter toward r145",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 28,
+            "record": 131,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 29,
+            "record": 145,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r145: one guarded Enter toward r151",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 29,
+            "record": 145,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 30,
+            "record": 151,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r151: one guarded Enter toward r153",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 30,
+            "record": 151,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 31,
+            "record": 153,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r153: one guarded Enter toward r158",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 31,
+            "record": 153,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 32,
+            "record": 158,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r158: one guarded Enter toward r163",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 32,
+            "record": 158,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 33,
+            "record": 163,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r163: one guarded Enter toward r174",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 33,
+            "record": 163,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 34,
+            "record": 174,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r174: one guarded Enter toward r179",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 34,
+            "record": 174,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 35,
+            "record": 179,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r179: one guarded Enter toward r183",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 35,
+            "record": 179,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 36,
+            "record": 183,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r183: one guarded Enter toward r186",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 36,
+            "record": 183,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 37,
+            "record": 186,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r186: one guarded Enter toward r199",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 37,
+            "record": 186,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 38,
+            "record": 199,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r199: one guarded Enter toward r205",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 38,
+            "record": 199,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 39,
+            "record": 205,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r205: one guarded Enter toward r221",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 39,
+            "record": 205,
+            "window": "cinema"
+          },
+          "key": 13,
+          "keyboard_press": {
+            "region": 62,
+            "receiver": 8,
+            "key": 2,
+            "group": 0,
+            "response": 0
+          },
+          "after": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 40,
+            "record": 221,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        },
+        {
+          "label": "r221: terminal observation",
+          "wait": {
+            "state": "page",
+            "scene": "prologue",
+            "group": 40,
+            "record": 221,
+            "window": "cinema"
+          },
+          "probe_points": [
+            [
+              640,
+              395
+            ]
+          ]
+        }
+      ]
+    },
+    "review": {
+      "static_source_plan": "scripts/analysis/pc_story_17_r83_to_prologue_exit_plan.json",
+      "generator": "scripts/analysis/generate_daydream_r96_route.py",
+      "entry": "Normal startup in a fresh profile",
+      "acceptance": "Run check_daydream_prologue.py --to 221 against the batch results. Require 20 fresh guarded Enter receipts from r96 onward, ending with the composed body and zero input at r221.",
+      "player_patch": "scripts/analysis/generate_daydream_r96_player.patch"
+    }
+  }
+}

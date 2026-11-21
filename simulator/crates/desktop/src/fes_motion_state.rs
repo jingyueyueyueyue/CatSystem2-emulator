@@ -202,6 +202,8 @@ impl FesMotionStore {
                         || tasks.checkpoint_extension_creation_pending(id, &key.0, false) => {},
                     Kind::Text if extensions.texts.contains(&identity)
                         || tasks.checkpoint_extension_creation_pending(id, &key.0, false) => {},
+                    Kind::Other if definition.kind_name.eq_ignore_ascii_case(b"IMGWND")
+                        && extensions.inert.contains(&identity) => {},
                     Kind::Other if (extensions.inert.contains(&identity)
                             || extensions.texts.contains(&identity)
                             || tasks.checkpoint_extension_creation_pending(id, &key.0, false)
@@ -225,8 +227,12 @@ impl FesMotionStore {
                     || u.order.iter().collect::<BTreeSet<_>>().len() != u.order.len()
                     || u.order.iter().any(|key| !owner.nodes.contains_key(key))
                     || u.writeback.is_some() && u.cursor == u.order.len()
-                    || u.writeback.is_some() && u.order.get(u.cursor)
-                        .is_some_and(|key| owner.nodes.get(key).is_some_and(|node| node.kind == Kind::Other))
+                    || u.writeback.is_some() && u.order.get(u.cursor).is_some_and(|key| {
+                        owner.nodes.get(key).is_some_and(|node| node.kind == Kind::Other)
+                            && usize::try_from(key.1).ok()
+                                .and_then(|bank| driver.adapter.object_bank_definition(&key.0, bank))
+                                .is_none_or(|definition| !definition.kind_name.eq_ignore_ascii_case(b"IMGWND"))
+                    })
                 { bail!("FES motion checkpoint update/writeback cursor is invalid"); }
                 Ok(())
             };

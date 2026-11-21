@@ -13,19 +13,21 @@ use cs2_runtime::message_object::{
 };
 use cs2_script::{Expression, ExpressionState, FesEvent, FesObjectDefinition, FesObjectInitialization};
 
-use super::cst_context_native::{CstBodySource, CstTextOrigins, body_control_only, join_body_sources};
+use super::cst_context_native::{CstBodySource, CstSourceProbe, CstTextOrigins, body_control_only, join_body_sources};
 use super::fes_driver::{
     FesDriverCommand, FesDriverEffect, FesDriverWait, FesScriptDriver,
 };
 use super::fes_tasks::FesTaskView;
-use super::perf_detail::{SlowTask, TextStage, TextTimer, TextWork};
-use super::{FesRuntime, LoggingHost, LogicEvent, ScriptTextEncoding, message_backend::DesktopMessageDevice};
+use super::perf_detail::{SlowTask, TextHostTimer, TextProjection, TextStage, TextTimer, TextWork};
+use super::story_trace::{story_trace_10 as djibril10, story_trace_15 as labyrinth15};
+use super::{FesRuntime, HeadlessPlayer, LoggingHost, LogicEvent, ScriptTextEncoding, message_backend::DesktopMessageDevice};
 
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BANKS: usize = 65536;
 
 #[path = "fes_log.rs"]
 mod log;
+pub(super) use log::is_island_gbk_scene;
 #[path = "fes_text_state.rs"]
 mod state;
 pub(crate) use state::PreparedFesTextState;
@@ -107,7 +109,12 @@ struct StoryBodyProgress {
     source: Option<(u64, u64)>,
     provenance: Option<Vec<CstBodySource>>,
     natural_complete: Option<(u64, u64)>,
+    eden_layout_skip_pending: bool,
+    yukikoi_layout_skip_pending: bool,
+    eden_layout_surface: Option<u64>,
+    eden_layout_complete: Option<(u64, u64)>,
     committed_epoch: Option<u64>,
+    novel_composed: Option<(u64, u64)>,
     forced: bool,
 }
 
@@ -129,6 +136,8 @@ impl StoryBodyProgress {
     fn force(&mut self) {
         self.forced = true;
         self.natural_complete = None;
+        self.eden_layout_surface = None;
+        self.eden_layout_complete = None;
         self.committed_epoch = None;
     }
 }
@@ -154,6 +163,8 @@ struct NovelText {
     division: i32,
     insert_pending: bool,
     speaker: Vec<u8>,
+    #[serde(default)]
+    preceding_markers: u32,
 }
 
 impl NovelText {
@@ -280,6 +291,14 @@ impl FesTextStore {
         })
     }
 
+    pub(super) fn eden_layout_complete(&self, owner: u32) -> Option<(u64, u64)> {
+        let bank = self.banks.get(&(owner, b"str".to_vec(), 0))?;
+        if bank.story_body.eden_layout_surface != Some(bank.message.surface_generation()) {
+            return None;
+        }
+        bank.story_body.eden_layout_complete
+    }
+
     pub(super) fn story_body_sources(&self, owner: u32, source_epoch: u64, origins: &CstTextOrigins)
         -> Option<&[CstBodySource]>
     {
@@ -287,6 +306,40 @@ impl FesTextStore {
         let (epoch, _) = bank.story_body.source?;
         let sources = bank.story_body.provenance.as_deref()?;
         (epoch == source_epoch && origins.body_is_current(sources)).then_some(sources)
+    }
+
+    pub(super) fn story_body_appends_match_gbk(&self, owner: u32, epoch: u64, raw: &[u8]) -> bool {
+        let Some(bank) = self.banks.get(&(owner, b"str".to_vec(), 0)) else { return false; };
+        if bank.story_body.source.is_none_or(|(current, _)| current != epoch) {
+            return false;
+        }
+        let decoded;
+        let expected = if bank.message.encoding() == MessageEncoding::Unicode {
+            let Ok(text) = decode_text(raw, ScriptTextEncoding::Gbk) else { return false; };
+            decoded = text;
+            decoded.as_bytes()
+        } else {
+            raw
+        };
+        // OP's sscript sends the default color as a separate MES_SETSTRING.
+        // FES apendmark uses append_separator and stays out of raw_appends.
+        let mut appends = bank.message.raw_appends().iter().filter(|append| !append.is_empty()).peekable();
+        if appends.peek().is_some_and(|append| append.as_slice() == b"\\cd") {
+            appends.next();
+        }
+        appends.flatten().copied().eq(expected.iter().copied())
+    }
+
+    pub(super) fn story_body_append_diagnostics(&self, owner: u32) -> String {
+        let Some(bank) = self.banks.get(&(owner, b"str".to_vec(), 0)) else {
+            return "bank missing".into();
+        };
+        let appends = bank.message.raw_appends();
+        let sizes: Vec<_> = appends.iter().take(12).map(Vec::len).collect();
+        let color_prefix = appends.iter().find(|append| !append.is_empty())
+            .is_some_and(|append| append.as_slice() == b"\\cd");
+        format!("encoding={:?} queued_bytes={} append_count={} append_sizes={sizes:?} color_prefix={color_prefix}",
+            bank.message.encoding(), bank.source.len(), appends.len())
     }
 
     pub(super) fn story_novel_segment_ready(&self, owner: u32) -> bool {
@@ -301,6 +354,25 @@ impl FesTextStore {
             && bank.remaining_segment == 0
             && bank.projection.as_ref().is_some_and(|projection|
                 projection.options.visible && projection.options.opacity > 0)
+    }
+
+    pub(super) fn note_rebellions_novel_composed(&mut self, layer: &FesTextProjection, frame: u64) {
+        if layer.name.as_slice() != b"str" || layer.bank != 0 || layer.options.opacity == 0 {
+            return;
+        }
+        let Some(bank) = self.banks.get_mut(&(layer.owner, b"str".to_vec(), 0)) else { return; };
+        let progress = &mut bank.story_body;
+        if let Some(epoch) = progress.committed_epoch
+            && bank.novel.is_some() && !progress.forced
+        {
+            progress.novel_composed = Some((epoch, frame));
+        }
+    }
+
+    pub(super) fn rebellions_novel_composed(&self, owner: u32, epoch: u64, frame: u64) -> bool {
+        self.banks.get(&(owner, b"str".to_vec(), 0)).is_some_and(|bank| {
+            bank.novel.is_some() && bank.story_body.novel_composed == Some((epoch, frame))
+        })
     }
 
     pub(crate) fn checkpoint_options(&self) -> (i32, bool, u32, i32) {
@@ -323,6 +395,7 @@ impl FesTextStore {
     fn refresh_font_defaults(&mut self, owner: u32, defaults: &MessageDefaults) -> Result<()> {
         for ((id, _, _), bank) in &mut self.banks {
             if *id != owner { continue; }
+            let previous = bank.configuration.clone();
             let tail = tail(bank.message.encoding());
             if bank.inherited[0] { set(&mut bank.configuration, tail + 12, 0); }
             if bank.inherited[1] { put_font(&mut bank.configuration, bank.message.encoding(), &defaults.font_name)?; }
@@ -331,7 +404,7 @@ impl FesTextStore {
                 set(&mut bank.configuration, tail + 4, defaults.shadow);
                 set(&mut bank.configuration, tail + 8, defaults.outline);
             }
-            bank.dirty = true;
+            bank.dirty |= bank.configuration != previous;
         }
         Ok(())
     }
@@ -576,11 +649,23 @@ impl FesTextStore {
         {
             bail!("LOGSTRING command {:?} has no connected history receiver", String::from_utf8_lossy(verb));
         }
+        let yukikoi_before = (host.data_services.story_trace
+            && matches!(verb, b"str" | b"strsj" | b"apend" | b"apendmark" | b"clear"
+                | b"reset" | b"draw" | b"skip")
+            && host.css_task_sha() == Some("63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976")
+            && host.cst_contexts.values().any(|cst| cst.story.is_scene("__tar01")))
+            .then(|| keys.iter().find_map(|key| {
+                let record = &self.banks[key];
+                record.is_story_body(key).then(|| record.story_body.clone())
+            }))
+            .flatten();
+        let mut yukikoi_input = None;
         match verb {
             b"layout" => self.layout(&keys, command, driver, shared, defaults)?,
             b"insert" if self.banks[&keys[0]].novel.is_some() => {
                 for key in &keys {
-                    self.banks.get_mut(key).unwrap().novel.as_mut().unwrap().insert_pending = true;
+                    self.banks.get_mut(key).unwrap()
+                        .insert_novel_paragraph(driver.is_rebellions_message_fes_source());
                 }
             }
             b"name" => {
@@ -595,13 +680,115 @@ impl FesTextStore {
             b"str" | b"strsj" | b"apend" => {
                 let raw = raw_after_spaces(&command.source, 2).unwrap_or_default();
                 let decoded = sourced_text(owner, command, verb, raw, driver, shared, host)?;
+                let hatsumira_setstring = host.data_services.story_trace
+                    && host.css_task_sha() == Some(super::story_trace::story_trace_12::PE)
+                    && verb == b"apend"
+                    && command.object_event.is_none()
+                    && command.context.block.as_slice() == b"MES_SETSTRING"
+                    && fes_text_statement(driver, command.offset).is_some_and(|(block, template)|
+                        block == b"MES_SETSTRING" && template == b"$str1000");
+                // sscript publishes the standalone default-color control before
+                // publishing the body. It contributes no CST record to the bank.
+                let hatsumira_color_reset = hatsumira_setstring && raw == b"\\cd"
+                    && shared.strings.get(&1000).is_some_and(|value| value.as_slice() == raw);
+                // Eden also publishes the color-default control before the scene body.
+                let eden_color_reset = host.data_services.story_trace && verb == b"apend"
+                    && raw == b"\\cd" && command.offset == 0x640f
+                    && command.object_event.is_none()
+                    && command.context.block.as_slice() == b"MES_SETSTRING"
+                    && shared.strings.get(&1000).is_some_and(|value| value.as_slice() == raw)
+                    && eden_diagnostic_fes(host, driver) == Some(true);
+                let labyrinth_color_reset = host.data_services.story_trace && verb == b"apend"
+                    && raw == b"\\cd" && command.offset == 0x55c3
+                    && command.object_event.is_none()
+                    && command.context.block.as_slice() == b"MES_SETSTRING"
+                    && shared.strings.get(&1000).is_some_and(|value| value.as_slice() == raw)
+                    && host.css_task_sha() == Some(labyrinth15::PE)
+                    && host.cst_contexts.values().any(labyrinth15::opening_scene)
+                    && labyrinth15::verified_meswnd(host.resources, &driver.interpreter.program).is_some();
+                let yukikoi_color_reset = yukikoi_before.is_some() && verb == b"apend"
+                    && command.offset == 0x73cf && raw == b"\\cd" && command.object_event.is_none()
+                    && fes_text_statement(driver, command.offset)
+                        .is_some_and(|(block, template)|
+                        block == b"MES_SETSTRING" && template == b"$str1000")
+                    && shared.strings.get(&1000).is_some_and(|value| value.as_slice() == raw);
+                let djibril_color_reset = host.data_services.story_trace && verb == b"apend"
+                    && raw == b"\\cd" && command.offset == 0x5b1f && command.object_event.is_none()
+                    && fes_text_statement(driver, command.offset).is_some_and(|(block, template)|
+                        block == b"MES_SETSTRING" && template == b"$str1000")
+                    && shared.strings.get(&1000).is_some_and(|value| value.as_slice() == raw)
+                    && host.css_task_sha() == Some(djibril10::PE)
+                    && host.cst_contexts.values().any(djibril10::opening_scene)
+                    && djibril10::verified_meswnd(host.resources, &driver.interpreter.program);
+                // Track the live segment without changing the accumulated NVSTRING.
+                let rebellions_novel = host.data_services.story_trace && verb == b"apend"
+                    && command.object_event.is_none()
+                    && command.context.block.as_slice() == b"MES_SETSTRING"
+                    && fes_text_statement(driver, command.offset)
+                        .is_some_and(|(block, template)| block == b"MES_SETSTRING" && template == b"$str1000")
+                    && host.data_services.cst_text_origins.shared_body(1000, raw).is_some_and(|sources| {
+                        let [source] = sources else { return false; };
+                        host.data_services.cst_text_origins.source_record_observations(source.context_handle)
+                            .iter().any(|read| read.probe == CstSourceProbe::Rebellions && read.source == *source
+                                && read.native == 327 && read.kind == 0x20 && read.body_tagged)
+                    })
+                    && HeadlessPlayer::verified_rebellions_novel_fes(host.resources, &driver.interpreter.program).is_some();
                 let provenance = (host.data_services.story_trace && verb != b"strsj"
-                    && keys.iter().any(|key| self.banks[key].is_story_body(key)))
-                    .then(|| story_command_sources(raw, command, driver, shared, &host.data_services.cst_text_origins))
+                    && (rebellions_novel || keys.iter().any(|key| self.banks[key].is_story_body(key))))
+                    .then(|| {
+                        if hatsumira_color_reset || eden_color_reset || labyrinth_color_reset || yukikoi_color_reset
+                            || djibril_color_reset
+                        {
+                            Some(Vec::new())
+                        } else {
+                            story_command_sources(raw, command, driver, shared, &host.data_services.cst_text_origins)
+                        }
+                    })
                     .flatten();
+                if yukikoi_before.is_some() {
+                    let statement = fes_text_statement(driver, command.offset);
+                    yukikoi_input = Some((raw.len(), body_control_only(raw), decoded.is_some(),
+                        statement.is_some(), provenance.clone()));
+                }
                 for key in &keys {
                     let record = self.banks.get_mut(key).unwrap();
                     let keep_prefix = verb == b"apend" && !record.source.is_empty();
+                    if host.data_services.story_trace && record.novel.is_some() && key.1.as_slice() == b"str" && key.2 == 0
+                        && (rebellions_novel || record.story_body.source.is_some())
+                    {
+                        let current = provenance.as_deref().filter(|sources| rebellions_novel && sources.len() == 1);
+                        record.story_body.note_text(host.frame, false, current);
+                    }
+                    if djibril_color_reset && record.is_story_body(key) {
+                        host.events.push(LogicEvent {
+                            frame: host.frame, kind: "djibril10-color-reset".into(),
+                            detail: format!("owner={owner} offset=0x5b1f prefix_bytes={}", record.source.len()),
+                        });
+                    }
+                    if eden_color_reset && record.is_story_body(key) {
+                        host.events.push(LogicEvent {
+                            frame: host.frame,
+                            kind: "fes-text-eden-color-reset".into(),
+                            detail: format!("owner={owner} offset=0x640f prefix_bytes={}", record.source.len()),
+                        });
+                    }
+                    if labyrinth_color_reset && record.is_story_body(key) {
+                        host.events.push(LogicEvent {
+                            frame: host.frame,
+                            kind: "labyrinth15-color-reset".into(),
+                            detail: format!("owner={owner} offset=0x55c3 prefix_bytes={}", record.source.len()),
+                        });
+                    }
+                    if hatsumira_setstring && record.is_story_body(key) {
+                        let shared_body = host.data_services.cst_text_origins.shared_body(1000, raw);
+                        let prefix = record.story_body.provenance.as_deref();
+                        host.events.push(LogicEvent {
+                            frame: host.frame,
+                            kind: "hatsumira-body-setstring".into(),
+                            detail: format!("owner={owner} bytes={} prefix_bytes={} color_reset={hatsumira_color_reset} prefix={prefix:?} shared={shared_body:?} suffix={provenance:?}",
+                                raw.len(), record.source.len()),
+                        });
+                    }
                     let legacy_gbk = host.data_services.newton_legacy_gbk
                         && record.message.encoding() == MessageEncoding::Cp932;
                     if let Some(SourcedText { text, .. }) = &decoded {
@@ -616,9 +803,9 @@ impl FesTextStore {
                         record.observe_story_text(key, host, keep_prefix, provenance.as_deref());
                         continue;
                     }
-                    let explicit_cp932 = verb == b"strsj" && legacy_gbk;
+                    let explicit_cp932 = verb == b"strsj";
                     let text = normalize_text(raw, record.message.encoding(),
-                        verb == b"strsj" && !explicit_cp932, resource_encoding)?;
+                        explicit_cp932, resource_encoding)?;
                     if verb == b"apend" {
                         record.append_body(&text, legacy_gbk)?;
                     } else {
@@ -645,11 +832,18 @@ impl FesTextStore {
                 record.source.extend_from_slice(marker);
                 record.pending.push_back(TextRequest::Separator);
                 record.needs_prepare = true;
+                if record.novel.is_some() && record.story_body.source.is_some() {
+                    // A separator changes reveal boundaries while retaining the appended body.
+                    record.story_body.note_text(host.frame, true, Some(&[]));
+                }
                 record.observe_story_text(key, host, keep_prefix, Some(&[]));
             },
             b"clear" => for key in &keys {
                 let record = self.banks.get_mut(key).unwrap();
                 record.replace(&[])?;
+                if record.novel.is_some() && record.story_body.source.is_some() {
+                    record.story_body.note_source(host.frame);
+                }
                 record.observe_story_source(key, host);
             },
             b"reset" => for key in &keys {
@@ -663,18 +857,123 @@ impl FesTextStore {
                 }
                 record.inherited = [record.message.encoding() == MessageEncoding::Cp932, true, true, true];
                 record.dirty = true;
-                record.story_body.provenance = None;
+                if host.data_services.story_trace && record.is_story_body(key)
+                    && host.css_task_sha() == Some(labyrinth15::PE)
+                    && command.context.block.as_slice() == b"STRLAYOUT"
+                    && host.cst_contexts.values().any(|cst| cst.story.is_scene("yum_h01"))
+                    && let Some((epoch, source_frame)) = record.story_body.source
+                    && host.frame <= source_frame.saturating_add(80)
+                {
+                    host.events.push(LogicEvent {
+                        frame: host.frame,
+                        kind: "labyrinth15-text".into(),
+                        detail: format!("owner={owner} block=STRLAYOUT offset={:#x} op=reset epoch={epoch} source_frame={source_frame} provenance_before={:?}",
+                            command.offset, record.story_body.provenance),
+                    });
+                }
+                let labyrinth_layout = host.data_services.story_trace && command.offset == 0x53a0
+                    && command.context.block.as_slice() == b"STRLAYOUT"
+                    && command.object_event.is_none() && record.is_story_body(key)
+                    && host.css_task_sha() == Some(labyrinth15::PE) && record.labyrinth_first_body(host)
+                    && labyrinth15::verified_meswnd(host.resources, &driver.interpreter.program).is_some();
+                // STRLAYOUT rebuilds formatting while retaining the queued line.
+                let yukikoi_relayout = yukikoi_before.is_some() && record.is_story_body(key)
+                    && command.offset == 0x6613 && command.context.block.as_slice() == b"STRLAYOUT"
+                    && command.object_event.is_none() && record.story_body.eden_layout_skip_pending;
+                let djibril_layout = host.data_services.story_trace && command.offset == 0x57fb
+                    && command.context.block.as_slice() == b"STRLAYOUT"
+                    && command.object_event.is_none() && record.is_story_body(key)
+                    && host.css_task_sha() == Some(djibril10::PE)
+                    && record.story_body.provenance.as_deref().is_some_and(|sources| {
+                        let origins = &host.data_services.cst_text_origins;
+                        origins.body_is_current(sources) && sources.iter().all(|&source| {
+                            host.cst_contexts.get(&source.context_handle).is_some_and(djibril10::opening_scene)
+                                && djibril10::source_read(origins, source, 0, host.frame)
+                        })
+                    })
+                    && djibril10::verified_meswnd(host.resources, &driver.interpreter.program);
+                if !labyrinth_layout && !yukikoi_relayout && !djibril_layout
+                    && record.eden_body_source(&host.data_services.cst_text_origins).is_none()
+                {
+                    record.story_body.provenance = None;
+                }
             },
             b"draw" => {
                 let segment = optional_number(args, 0, 0, driver, shared)?;
                 for key in &keys {
                     let record = self.banks.get_mut(key).unwrap();
-                    record.draw = Some(segment as u32);
+                    record.draw = Some(record.draw_range(segment));
                     record.remaining = 1;
                     record.remaining_segment = 1;
                 }
             }
-            b"skip" => for key in &keys { self.banks.get_mut(key).unwrap().skip = true; },
+            b"skip" => {
+                // MES_SCROLLSPD can rebuild the hidden layout outside the system handler.
+                let flags = driver.story_skip_flags();
+                let yukikoi_automag = yukikoi_before.is_some() && command.offset == 0x7afc
+                    && command.context.block.as_slice() == b"MES_AUTOMAG"
+                    && command.object_event.is_none() && flags == (false, false, false, false)
+                    && driver.interpreter.local_values().get(150) == Some(&-1);
+                let scroll_layout = host.data_services.story_trace && command.offset == 0x6809
+                    && command.context.block.as_slice() == b"MES_SCROLLSPD"
+                    && command.object_event.is_none()
+                    && flags == (false, false, false, false)
+                    && keys.iter().any(|key| {
+                        let bank = &self.banks[key];
+                        bank.is_story_body(key)
+                            && bank.eden_body_source(&host.data_services.cst_text_origins).is_some()
+                    })
+                    && eden_diagnostic_fes(host, driver) == Some(true);
+                let labyrinth_layout = host.data_services.story_trace && command.offset == 0x5baa
+                    && command.context.block.as_slice() == b"MES_SCROLLSPD"
+                    && command.object_event.is_none()
+                    && flags == (false, false, false, false)
+                    && host.css_task_sha() == Some(labyrinth15::PE)
+                    && keys.iter().any(|key| self.banks[key].is_story_body(key) && self.banks[key].labyrinth_first_body(host))
+                    && labyrinth15::verified_meswnd(host.resources, &driver.interpreter.program).is_some();
+                for key in &keys {
+                    let bank = self.banks.get_mut(key).unwrap();
+                    let body = &bank.story_body;
+                    let sourced_layout = (scroll_layout
+                        && bank.eden_body_source(&host.data_services.cst_text_origins).is_some())
+                        || (labyrinth_layout && bank.labyrinth_first_body(host));
+                    let layout = sourced_layout && bank.is_story_body(key)
+                        && (!bank.visible || body.eden_layout_surface.is_some())
+                        && (!bank.skip || body.eden_layout_skip_pending) && !body.forced
+                        && body.natural_complete.is_none();
+                    if host.data_services.story_trace && command.offset == 0x6809
+                        && command.context.block.as_slice() == b"MES_SCROLLSPD"
+                        && bank.is_story_body(key)
+                        && let Some(source) = bank.eden_body_source(&host.data_services.cst_text_origins)
+                        && (source.group, source.absolute_record) == (4, 102)
+                        && let Some((epoch, source_frame)) = body.source
+                        && host.frame <= source_frame.saturating_add(80)
+                    {
+                        let unskipped = driver.in_unskipped_system_block(b"MES_SCROLLSPD");
+                        let object = command.object_event.is_some();
+                        let live_fes = eden_diagnostic_fes(host, driver);
+                        host.events.push(LogicEvent {
+                            frame: host.frame,
+                            kind: "eden-scroll-gate".into(),
+                            detail: format!("owner={owner} epoch={epoch} source={source:?} object={object} \
+                                unskipped={unskipped} flags(force,input,cont,cancel)={flags:?} live_fes={live_fes:?} \
+                                visible={} already_skip={} forced={} natural={:?} layout_surface={:?} layout={layout}",
+                                bank.visible, bank.skip, body.forced, body.natural_complete, body.eden_layout_surface),
+                        });
+                    }
+                    let yukikoi_layout = yukikoi_automag && bank.is_story_body(key)
+                        && (!bank.skip || body.yukikoi_layout_skip_pending) && !body.forced
+                        && bank.yukikoi_body_source(&host.data_services.cst_text_origins);
+                    if yukikoi_layout {
+                        // The new layout must submit again even if storage is reused.
+                        bank.story_body.committed_epoch = None;
+                        bank.story_body.eden_layout_complete = None;
+                    }
+                    bank.story_body.eden_layout_skip_pending = layout || yukikoi_layout;
+                    bank.story_body.yukikoi_layout_skip_pending = yukikoi_layout;
+                    bank.skip = true;
+                }
+            },
             b"userfontobj" => {
                 let Some(reference) = args.first() else { return Ok(true) };
                 let (source_name, source_bank) = split_target(reference)?;
@@ -838,6 +1137,63 @@ impl FesTextStore {
         }
         for key in &keys {
             host.data_services.fes_motion.synchronize_text(self, owner, &key.1, key.2, verb)?;
+            let record = &self.banks[key];
+            if let Some(before) = &yukikoi_before && record.is_story_body(key) {
+                let block = String::from_utf8_lossy(&command.context.block);
+                let op = String::from_utf8_lossy(verb);
+                let object_event = command.object_event.is_some();
+                let flags = driver.story_skip_flags();
+                let after = &record.story_body;
+                host.events.push(LogicEvent {
+                    frame: host.frame,
+                    kind: "yukikoi-body-op".into(),
+                    detail: format!("owner={owner} block={block} offset={:#x} op={op} object_event={object_event} \
+                        input(bytes,control_only,decoded,statement,provenance)={yukikoi_input:?} \
+                        before={before:?} after={after:?} visible={} skip={} flags(force,input,cont,cancel)={flags:?}",
+                        command.offset, record.visible, record.skip),
+                });
+            }
+            if host.data_services.story_trace && matches!(verb, b"apend" | b"apendmark" | b"skip" | b"draw")
+                && host.css_task_sha() == Some(labyrinth15::PE)
+                && host.cst_contexts.values().any(|cst| cst.story.is_scene("yum_h01"))
+                && let Some(record) = self.banks.get(key).filter(|bank| bank.is_story_body(key))
+                && let Some((epoch, source_frame)) = record.story_body.source
+                && host.frame <= source_frame.saturating_add(80)
+            {
+                let op = String::from_utf8_lossy(verb);
+                let block = String::from_utf8_lossy(&command.context.block);
+                let flags = driver.story_skip_flags();
+                host.events.push(LogicEvent {
+                    frame: host.frame,
+                    kind: "labyrinth15-text".into(),
+                    detail: format!("owner={owner} block={block} offset={:#x} op={op} epoch={epoch} source_frame={source_frame} provenance={:?} visible={} skip={} layout_skip={} object={} flags(force,input,cont,cancel)={flags:?}",
+                        command.offset, record.story_body.provenance, record.visible, record.skip,
+                        record.story_body.eden_layout_skip_pending, command.object_event.is_some()),
+                });
+            }
+            if host.data_services.story_trace && matches!(verb, b"apend" | b"reset" | b"skip" | b"draw") {
+                let record = &self.banks[key];
+                if let Some((epoch, source_frame)) = record.story_body.source
+                    && let Some(source) = record.eden_body_source(&host.data_services.cst_text_origins)
+                {
+                    let block = String::from_utf8_lossy(driver.interpreter.current_block());
+                    let op = String::from_utf8_lossy(verb);
+                    let payload = host.cst_contexts.get(&source.context_handle)
+                        .and_then(|context| context.document.as_ref())
+                        .and_then(|document| document.records.get(source.absolute_record))
+                        .map(|record| record.text.as_slice());
+                    if let Some(payload) = payload {
+                        let digest = super::particle_plugin_digest::sha256(payload);
+                        host.events.push(LogicEvent {
+                            frame: host.frame,
+                            kind: "fes-text-eden-body-op".into(),
+                            detail: format!("owner={owner} block={block} offset={:#x} op={op} epoch={epoch} source_frame={source_frame} source={source:?} body_bytes={} body_sha256={digest} visible={} skip={} draw={:?} layout_skip={}",
+                                command.offset, payload.len(), record.visible, record.skip, record.draw,
+                                record.story_body.eden_layout_skip_pending),
+                        });
+                    }
+                }
+            }
         }
         Ok(true)
     }
@@ -986,6 +1342,31 @@ impl FesTextStore {
 }
 
 impl TextBank {
+    fn yukikoi_body_source(&self, origins: &CstTextOrigins) -> bool {
+        let Some([source]) = self.story_body.provenance.as_deref() else { return false; };
+        origins.source_record_observations(source.context_handle).iter().any(|entry| {
+            entry.source == *source && entry.probe == super::cst_context_native::CstSourceProbe::Yukikoi
+                && entry.body_tagged && entry.kind == 0x20 && entry.raw_bytes > 0 && entry.output_bytes > 0
+        })
+    }
+
+    fn eden_body_source(&self, origins: &CstTextOrigins) -> Option<CstBodySource> {
+        let [source] = self.story_body.provenance.as_deref()? else { return None; };
+        origins.source_record_observations(source.context_handle).iter().any(|entry| {
+            entry.source == *source
+                && entry.probe == super::cst_context_native::CstSourceProbe::Eden
+                && entry.native == 327 && entry.kind == 0x20 && entry.body_tagged && !entry.localized
+                && entry.stored_codec == ScriptTextEncoding::Gbk && entry.output_codec == ScriptTextEncoding::Gbk
+        }).then_some(*source)
+    }
+
+    fn labyrinth_first_body(&self, host: &LoggingHost<'_>) -> bool {
+        let Some(sources @ [source]) = self.story_body.provenance.as_deref() else { return false; };
+        host.data_services.cst_text_origins.body_is_current(sources)
+            && host.cst_contexts.get(&source.context_handle)
+                .is_some_and(|context| labyrinth15::first_body(context, *source))
+    }
+
     fn is_story_body(&self, key: &Key) -> bool {
         key.1.as_slice() == b"str" && key.2 == 0 && self.novel.is_none() && self.log.is_none()
     }
@@ -1011,15 +1392,18 @@ impl TextBank {
         if self.story_body.forced || self.source.is_empty() {
             return;
         }
-        if naturally_updated && !self.message.active() && self.message.last_complete()
-            && self.remaining == 0 && self.remaining_segment == 0
-            && self.projection.as_ref().is_some_and(|projection| projection.options.visible)
-        {
+        let fully_visible = !self.message.active() && self.remaining == 0 && self.remaining_segment == 0
+            && self.projection.as_ref().is_some_and(|projection| projection.options.visible);
+        let layout_rendered = self.story_body.eden_layout_surface == Some(self.message.surface_generation());
+        let layout_ready = layout_rendered && fully_visible && self.pending.is_empty()
+            && !self.needs_prepare && self.draw.is_none() && !self.skip;
+        if !layout_rendered && naturally_updated && fully_visible && self.message.last_complete() {
             self.story_body.natural_complete.get_or_insert((epoch, frame));
         }
-        if self.story_body.natural_complete.is_some()
+        if (self.story_body.natural_complete.is_some() || layout_ready)
             && self.story_body.committed_epoch != Some(epoch)
-            && (start_requested || self.message.configuration().is_some_and(|config| config.ordinary_submit())
+            && (layout_rendered || start_requested
+                || self.message.configuration().is_some_and(|config| config.ordinary_submit())
                 || self.message.complete_snapshot())
             && device.surface(self.message.id()).is_some_and(|surface| {
                 surface.generation == self.message.surface_generation() && surface.dirty.is_none()
@@ -1027,6 +1411,11 @@ impl TextBank {
             })
         {
             self.story_body.committed_epoch = Some(epoch);
+            if layout_rendered {
+                // The hidden force operation can paint without submitting.
+                // Count this only after the current surface is visible and clean.
+                self.story_body.eden_layout_complete = Some((epoch, frame));
+            }
         }
     }
 
@@ -1069,6 +1458,30 @@ impl TextBank {
     fn append(&mut self, bytes: &[u8], legacy_gbk: bool) -> Result<()> {
         self.append_text(bytes, legacy_gbk, None)
     }
+
+    fn insert_novel_paragraph(&mut self, paragraph_local_draw: bool) {
+        let novel = self.novel.as_mut().unwrap();
+        novel.insert_pending = true;
+        if paragraph_local_draw {
+            // Rebellions starts a new native message paragraph on insert.
+            // Our shared layout keeps earlier paragraphs in the same surface.
+            novel.preceding_markers = self.pending.iter().fold(
+                self.message.separator_offsets().len() as u32,
+                |count, request| match request {
+                    TextRequest::Clear => 0,
+                    TextRequest::Separator => count + 1,
+                    _ => count,
+                },
+            );
+        }
+    }
+
+    fn draw_range(&self, segment: i32) -> u32 {
+        if segment < 0 { return segment as u32; }
+        let preceding = self.novel.as_ref().map_or(0, |novel| novel.preceding_markers);
+        segment.saturating_add(preceding as i32) as u32
+    }
+
     fn append_text(&mut self, bytes: &[u8], legacy_gbk: bool, decoded: Option<&str>) -> Result<()> {
         self.check_append(bytes.len())?;
         self.source.extend_from_slice(bytes);
@@ -1139,6 +1552,7 @@ impl TextBank {
         if let Some(novel) = &mut self.novel {
             novel.insert_pending = false;
             novel.speaker.clear();
+            novel.preceding_markers = 0;
         }
         self.source.clear(); self.pending.clear();
         self.pending.push_back(TextRequest::Clear);
@@ -1199,8 +1613,14 @@ fn fes_story_body_provenance_requires_every_fragment_of_the_current_page() {
     progress.note_text(2, true, Some(&[second]));
     assert_eq!(progress.source, Some((2, 2)));
     assert_eq!(progress.provenance.as_deref(), Some([first, second].as_slice()));
+    progress.natural_complete = Some((2, 2));
+    progress.committed_epoch = Some(2);
+    progress.novel_composed = Some((2, 2));
     progress.note_text(3, true, Some(&[]));
+    assert_eq!(progress.source, Some((3, 3)));
     assert_eq!(progress.provenance.as_deref(), Some([first, second].as_slice()));
+    assert_eq!((progress.natural_complete, progress.committed_epoch, progress.novel_composed),
+        (None, None, None));
     progress.note_text(4, true, Some(&[other_page]));
     assert!(progress.provenance.is_none());
     progress.note_text(5, true, Some(&[other_page]));
@@ -1209,7 +1629,8 @@ fn fes_story_body_provenance_requires_every_fragment_of_the_current_page() {
     assert_eq!(progress.provenance.as_deref(), Some([other_page].as_slice()));
     progress.note_text(7, true, None);
     assert!(progress.provenance.is_none());
-    progress.note_source(8);
+    progress.note_text(8, false, Some(&[other_page]));
+    progress.note_source(9);
     assert!(progress.provenance.is_none());
 }
 
@@ -1391,10 +1812,16 @@ pub(super) fn update_owner(
         .filter(|(owner, _, _)| *owner == view.id).cloned().collect();
     for key in keys {
         if host.data_services.fes_text.banks[&key].log.is_some() {
+            let _stage = TextHostTimer::new(TextStage::Metadata);
             log::geometry(host, &key)?;
             continue;
         }
-        let metadata = host.data_services.fes_text.banks[&key].metadata.clone();
+        let metadata = &host.data_services.fes_text.banks[&key].metadata;
+        if !metadata.size_dirty && metadata.position_source.is_none() {
+            continue;
+        }
+        let _stage = TextHostTimer::new(TextStage::Metadata);
+        let metadata = metadata.clone();
         if metadata.size_dirty {
             if let Some(reference) = &metadata.size_source {
                 let size = super::fes_controls::read_metadata(host, reference)?.map_or([0; 2], |(_, size)| size);
@@ -1412,6 +1839,7 @@ pub(super) fn update_owner(
         }
     }
     {
+        let _stage = TextHostTimer::new(TextStage::FontCatalog);
         let _detail = SlowTask::new(view.id, || 34, "fes_text_load_fonts");
         host.data_services.message_device.load_fonts(host.resources);
     }
@@ -1420,29 +1848,33 @@ pub(super) fn update_owner(
     for ((owner, name, index), bank) in &mut data.fes_text.banks {
         if *owner != view.id { continue; }
         if bank.log.is_some() {
+            let _stage = TextHostTimer::new(TextStage::History);
             let _detail = SlowTask::new(view.id, || 34, "fes_text_log").named(name, None).code(*index);
             log::update(bank, next_surface, &mut data.message_device, view, runtime, name, *index,
-                host.backlogs, data.newton_legacy_gbk)?;
+                host.backlogs, host.resources, data.newton_legacy_gbk)?;
         } else {
             let observed = bank.story_body.source.is_some();
-            let forced = observed && bank.skip;
+            let forced = observed && bank.skip && !bank.story_body.eden_layout_skip_pending;
             let start_requested = bank.draw.is_some();
             let naturally_updated = observed && !forced && bank.last_frame != Some(view.now)
                 && view.list.is_some() && (bank.message.active() || start_requested);
             if forced { bank.story_body.force(); }
-            render_bank(&mut data.message_device, view, runtime, bank, name, *index)?;
+            render_bank(&mut data.message_device, view, runtime, bank, name, *index)
+                .with_context(|| format!("FES text {}[{index}] source={:?}",
+                    String::from_utf8_lossy(name), bank.metadata.size_source))?;
             if observed {
                 bank.observe_story_reveal(host.frame, naturally_updated, start_requested, &data.message_device);
             }
         }
     }
     if view.list.is_some() {
-        let novel: Vec<_> = host.data_services.fes_text.banks.iter()
-            .filter(|((owner, _, _), bank)| *owner == view.id && bank.novel.is_some())
+        let scene_text: Vec<_> = host.data_services.fes_text.banks.iter()
+            .filter(|((owner, _, _), bank)| *owner == view.id && has_scene_projection(bank))
             .filter_map(|(key, bank)| Some((key.clone(), bank.projection.clone()?)))
             .collect();
-        for (key, projection) in novel {
-            let _detail = SlowTask::new(view.id, || 34, "fes_text_novel_projection").named(&key.1, None).code(key.2);
+        for (key, projection) in scene_text {
+            let _stage = TextHostTimer::new(TextStage::NovelProjection);
+            let _detail = SlowTask::new(view.id, || 34, "fes_text_scene_projection").named(&key.1, None).code(key.2);
             let mut projection = prepare_motion_projection(host, view, runtime, projection)?;
             let layer = projection.layer_key();
             super::fes_controls::apply_layer_clip(host.data_services, view.id, &layer, &mut projection.options);
@@ -1456,13 +1888,17 @@ fn render_bank(
     device: &mut DesktopMessageDevice, view: &FesTaskView, runtime: &FesRuntime,
     bank: &mut TextBank, name: &[u8], index: i32,
 ) -> Result<()> {
-    let pixel_less_dummy = uses_canvas_atlas(bank)
+    let pixel_less = uses_canvas_atlas(bank)
         && word(&bank.configuration, 8) == 0 && word(&bank.configuration, 12) == 0
         && bank.metadata.size_source.as_ref().is_some_and(|reference| {
-            matches!(reference.frame, 10 | 11)
-                && reference.name.eq_ignore_ascii_case(b"sys_mdummy.hg3")
+            (matches!(reference.frame, 10 | 11)
+                && reference.name.eq_ignore_ascii_case(b"sys_mdummy.hg3"))
+                // This configuration script creates six banks for five image slots.
+                || (name == b"font_list" && index == 5 && reference.frame == 735
+                    && (reference.name.eq_ignore_ascii_case(b"sys_config")
+                        || reference.name.eq_ignore_ascii_case(b"sys_config.hg3")))
         });
-    if pixel_less_dummy {
+    if pixel_less {
         device.without_message_pixels(bank.message.id(), |device| {
             render_bank_with_surface(device, view, runtime, bank, (name, index), false)
         })
@@ -1475,7 +1911,7 @@ fn render_bank_with_surface(
     device: &mut DesktopMessageDevice, view: &FesTaskView, runtime: &FesRuntime,
     bank: &mut TextBank, (name, index): (&[u8], i32), allocate_surface: bool,
 ) -> Result<()> {
-    let _text = TextWork::new(view.id, index, name);
+    let text = TextWork::new(view.id, index, name);
     let layout = SlowTask::new(view.id, || 34, "fes_text_layout").named(name, None).code(index);
     let scale = device.time_scale;
     let parent = bank.parent_plane.as_ref().map(|name|
@@ -1513,9 +1949,22 @@ fn render_bank_with_surface(
             bank.user_mapping_cursor += 1;
         }
     }
+    let mut restore_completed_plane = false;
     if bank.dirty {
         let _stage = TextTimer::new(TextStage::Configure);
-        bank.message.reconfigure(&bank.configuration, scale, device)?;
+        let completed_plane = allocate_surface
+            && bank.novel.is_none()
+            && has_scene_projection(bank)
+            && bank.visible
+            && !bank.message.active()
+            && bank.remaining == 0
+            && bank.draw.is_none()
+            && bank.pending.is_empty()
+            && !bank.message.source().is_empty();
+        if !completed_plane || bank.message.configuration_bytes() != Some(bank.configuration.as_slice()) {
+            bank.message.reconfigure(&bank.configuration, scale, device)?;
+            restore_completed_plane = completed_plane;
+        }
         bank.dirty = false;
     }
     if bank.shift_dirty {
@@ -1564,6 +2013,10 @@ fn render_bank_with_surface(
     let visible = bank.visible && display_parent.is_none_or(|plane| plane.visible);
     let display = if view.list.is_none() { MessagePlaneDisplay::Unreachable }
         else if visible { MessagePlaneDisplay::Visible } else { MessagePlaneDisplay::Hidden };
+    let playback = TextTimer::new(TextStage::Playback);
+    if restore_completed_plane {
+        bank.message.force_complete(display, scale, device)?;
+    }
     if let Some(segment) = bank.draw {
         let continuing_novel_segment = bank.novel.is_some()
             && matches!(display, MessagePlaneDisplay::Visible)
@@ -1574,14 +2027,35 @@ fn render_bank_with_surface(
         bank.draw = None;
     }
     if bank.skip {
-        bank.message.force_complete(display, scale, device)?;
+        let update = bank.message.force_complete(display, scale, device)?;
+        if std::mem::take(&mut bank.story_body.eden_layout_skip_pending) {
+            let previous_surface = bank.story_body.eden_layout_surface;
+            let yukikoi_layout = std::mem::take(&mut bank.story_body.yukikoi_layout_skip_pending);
+            // Yukikoi's verified MES_AUTOMAG path can rebuild an already visible window.
+            if (matches!(display, MessagePlaneDisplay::Hidden)
+                || (matches!(display, MessagePlaneDisplay::Visible) && (previous_surface.is_some() || yukikoi_layout)))
+                && update.is_some_and(|update| update.complete)
+                && bank.message.remaining_all()? == 0
+            {
+                let surface = Some(bank.message.surface_generation());
+                if previous_surface != surface {
+                    bank.story_body.eden_layout_complete = None;
+                    bank.story_body.committed_epoch = None;
+                }
+                bank.story_body.eden_layout_surface = surface;
+            } else {
+                bank.story_body.force();
+            }
+        }
         bank.skip = false;
     }
     if bank.last_frame != Some(view.now) {
         bank.message.frame_update(view.now, scale, device)?;
         bank.last_frame = Some(view.now);
     }
+    drop(playback);
     if allocate_surface {
+        let _stage = TextTimer::new(TextStage::SurfaceSync);
         device.sync_object(&bank.message)?;
     }
     bank.remaining = bank.message.remaining_all()?;
@@ -1590,6 +2064,7 @@ fn render_bank_with_surface(
         bank.cursor = layout.cursor; bank.draw_area = layout.cursor;
     }
     drop(raster);
+    let _stage = TextTimer::new(TextStage::Projection);
     let _detail = SlowTask::new(view.id, || 34, "fes_text_projection").named(name, None).code(index);
     let Some(frame) = device.projection_frame(bank.message.id(), bank.tint)? else {
         bank.projection = None; return Ok(());
@@ -1619,6 +2094,20 @@ fn render_bank_with_surface(
             None => parent_clip,
         })
     } else { bank.clip };
+    if text.enabled() && bank.novel.is_none() {
+        // Novel motion can replace the stored frame after this comparison point.
+        let previous = bank.projection.as_ref().map(|projection| &projection.frame);
+        let change = if previous.is_some_and(|previous| previous.pixel_identity().matches(&frame)) {
+            TextProjection::Reused
+        } else if let Some((base, region)) = frame.pixel_patch()
+            && previous.is_some_and(|previous| base.matches(previous))
+        {
+            TextProjection::Patched(u64::from(region.width) * u64::from(region.height))
+        } else {
+            TextProjection::Replaced
+        };
+        text.projection(change, view.list.is_some() && options.visible && options.opacity != 0);
+    }
     bank.projection = Some(FesTextProjection {
         owner: view.id, name: name.to_vec(), bank: index, frame, options, priority: bank.priority,
     });
@@ -1634,21 +2123,23 @@ fn fes_dummy_text_defers_pixels_without_skipping_layout() {
     let view = FesTaskView {
         id: 39, parent: 8, context: Vec::new(), list: None, now: 269, paused: 0,
     };
-    for (offset, name, frame, size) in [
-        (0, b"name".as_slice(), 11, [471, 28]),
-        (1, b"str".as_slice(), 10, [819, 125]),
+    for (offset, name, index, resource, frame, size) in [
+        (0, b"name".as_slice(), 0, "sys_mdummy.hg3", 11, [471, 28]),
+        (1, b"str".as_slice(), 0, "sys_mdummy.hg3", 10, [819, 125]),
+        (2, b"font_list".as_slice(), 5, "sys_config", 735, [171, 20]),
     ] {
         store.create(view.id, &FesObjectDefinition {
-            offset, name: name.to_vec(), kind: b"STRING".to_vec(), bank_expression: None, banks: 1,
+            offset, name: name.to_vec(), kind: b"STRING".to_vec(), bank_expression: None,
+            banks: index + 1,
         }, &defaults(), &mut device).unwrap();
-        let bank = store.banks.get_mut(&(view.id, name.to_vec(), 0)).unwrap();
+        let bank = store.banks.get_mut(&(view.id, name.to_vec(), index)).unwrap();
         bank.metadata.size_source = Some(super::fes_controls::metadata_reference(
-            format!("sys_mdummy.hg3:{frame}").as_bytes(), ScriptTextEncoding::Cp932,
+            format!("{resource}:{frame}").as_bytes(), ScriptTextEncoding::Cp932,
         ).unwrap());
         bank.set_size([0, 0]).unwrap();
         bank.replace(b"\n").unwrap();
         bank.draw = Some(0);
-        render_bank(&mut device, &view, &runtime, bank, name, 0).unwrap();
+        render_bank(&mut device, &view, &runtime, bank, name, index).unwrap();
         assert_eq!(bank.message.source(), "\n");
         assert!(bank.pending.is_empty() && bank.draw.is_none());
         assert!(bank.message.layout().is_some());
@@ -1662,13 +2153,19 @@ fn fes_dummy_text_defers_pixels_without_skipping_layout() {
         let mut partial_size = bank.clone();
         partial_size.set_size([0, 28]).unwrap();
         for mut invalid in [wrong_resource, wrong_frame, partial_size] {
-            let error = render_bank(&mut device, &view, &runtime, &mut invalid, name, 0).unwrap_err();
+            let error = render_bank(&mut device, &view, &runtime, &mut invalid, name, index).unwrap_err();
+            assert!(format!("{error:#}").contains("message pixel surface"));
+        }
+
+        if name == b"font_list" {
+            let error = render_bank(&mut device, &view, &runtime, &mut bank.clone(), name, index - 1)
+                .unwrap_err();
             assert!(format!("{error:#}").contains("message pixel surface"));
         }
 
         bank.set_size(size).unwrap();
         let next_view = FesTaskView { now: view.now + 1, ..view.clone() };
-        render_bank(&mut device, &next_view, &runtime, bank, name, 0).unwrap();
+        render_bank(&mut device, &next_view, &runtime, bank, name, index).unwrap();
         assert_eq!(bank.message.source(), "\n");
         let surface = device.surface(bank.message.id()).unwrap();
         assert_eq!([surface.submitted.width(), surface.submitted.height()], size.map(|dimension| dimension as u32));
@@ -1677,6 +2174,13 @@ fn fes_dummy_text_defers_pixels_without_skipping_layout() {
 
 fn uses_canvas_atlas(bank: &TextBank) -> bool {
     bank.novel.is_none() && bank.log.is_none()
+}
+
+fn has_scene_projection(bank: &TextBank) -> bool {
+    // An unparented STRING with its own VRAM source samples its submitted
+    // glyphs at its screen pose and PRI, independently of any FES list plane.
+    bank.novel.is_some()
+        || (bank.log.is_none() && bank.parent_plane.is_none() && bank.vram != [0; 2])
 }
 
 fn is_canvas_parent(bank: &TextBank, runtime: &FesRuntime) -> bool {
@@ -1758,7 +2262,7 @@ pub(super) fn release_bank(
 pub(super) fn projections(data: &super::data_services::DataServices, owner: u32) -> Vec<FesTextProjection> {
     let mut result = Vec::new();
     for ((id, name, index), bank) in &data.fes_text.banks {
-        if *id != owner || bank.novel.is_some() { continue; }
+        if *id != owner || has_scene_projection(bank) { continue; }
         // The reference belongs to the original FES bank. History row names
         // identify independent submitted surfaces, not new viewport owners.
         // Start from the saved, unclipped projection each time so a moved or
@@ -1778,11 +2282,11 @@ pub(super) fn projections(data: &super::data_services::DataServices, owner: u32)
     result
 }
 
-pub(super) fn novel_projections(
+pub(super) fn scene_projections(
     data: &super::data_services::DataServices, lower: f32, upper: f32,
 ) -> Vec<FesTextProjection> {
     let mut projections: Vec<_> = data.fes_text.banks.values()
-        .filter(|bank| bank.novel.is_some())
+        .filter(|bank| has_scene_projection(bank))
         .filter_map(|bank| bank.projection.as_ref())
         .filter(|projection| {
             let depth = projection.priority as f32;
@@ -2240,6 +2744,9 @@ fn unicode_layout_font(mut raw: &[u8]) -> Result<Vec<u16>> {
 }
 fn normalize_text(raw: &[u8], encoding: MessageEncoding, sjis: bool, resource: ScriptTextEncoding) -> Result<Vec<u8>> {
     if sjis {
+        if encoding == MessageEncoding::Cp932 {
+            return Ok(raw.to_vec());
+        }
         let (text, _, errors) = encoding_rs::SHIFT_JIS.decode(raw);
         if errors { bail!("STRING strsj input is invalid CP932"); }
         return Ok(text.as_bytes().to_vec());
@@ -2253,6 +2760,15 @@ fn normalize_text(raw: &[u8], encoding: MessageEncoding, sjis: bool, resource: S
         std::str::from_utf8(raw).context("STRING8 source is not valid UTF-8")?;
     }
     Ok(raw.to_vec())
+}
+
+#[test]
+fn fes_strsj_uses_the_target_message_encoding() {
+    let sample = b"\x83\x81\x83b\x83Z\x81[\x83W";
+    let legacy = normalize_text(sample, MessageEncoding::Cp932, true, ScriptTextEncoding::Gbk).unwrap();
+    let unicode = normalize_text(sample, MessageEncoding::Unicode, true, ScriptTextEncoding::Gbk).unwrap();
+    assert_eq!(legacy, sample);
+    assert_eq!(str::from_utf8(&unicode).unwrap(), "\u{30e1}\u{30c3}\u{30bb}\u{30fc}\u{30b8}");
 }
 
 fn intersect_clip(left: Rect, right: Rect) -> Rect {

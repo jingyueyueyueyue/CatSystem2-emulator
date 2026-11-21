@@ -82,7 +82,8 @@ impl FesControlStore {
                 || bank.source_bytes.len() as u64 > MAX_IMAGE
                 || bank.kind == Kind::Viewport && !bank.source_bytes.is_empty()
                 || (!bank.is_slider() && (bank.lower.is_some()
-                    || bank.buttons.iter().any(Option::is_some) || bank.drag_origin.is_some())) {
+                    || bank.button_regions().next().is_some() || bank.drag_origin.is_some()))
+                || !bank.buttons.valid_for(bank.kind) {
                 bail!("FES controls checkpoint bank or source identity is invalid");
             }
             for reference in bank.plane.iter().chain(&bank.parent) {
@@ -101,7 +102,7 @@ impl FesControlStore {
                     || !tasks.insert(lower) {
                     bail!("control checkpoint lower task kind/identity differs");
                 }
-                for button in bank.buttons.into_iter().flatten() {
+                for button in bank.button_regions() {
                     if kinds.get(&button) != Some(&6) || !tasks.insert(button) {
                         bail!("control checkpoint button task kind/identity differs");
                     }
@@ -193,7 +194,7 @@ impl FesControlStore {
                 if parents.get(&lower) != Some(owner) {
                     bail!("control checkpoint lower task has a different parent");
                 }
-                for button in bank.buttons.into_iter().flatten() {
+                for button in bank.button_regions() {
                     if parents.get(&button) != Some(&lower) {
                         bail!("control checkpoint button is not its actual lower-task child");
                     }

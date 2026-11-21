@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use super::{
@@ -119,7 +119,7 @@ pub(super) fn draw_sampled(
     } else {
         1
     };
-    for_rows(target, stride, top, workers, draw_row);
+    draw_pixel_rows(target, stride, top, workers, draw_row);
 }
 
 fn row_mask(
@@ -160,13 +160,40 @@ fn composite(
     blend_into(target, source, options.blend_mode);
 }
 
-fn for_rows(
+/// Draw disjoint RGBA rows. The callback receives the absolute row index.
+pub fn draw_pixel_rows(
     target: &mut [u8],
     stride: usize,
     top: u32,
     workers: usize,
     draw_row: impl Fn(&mut [u8], u32) + Sync,
 ) {
+    static USE_ROW_POOL: OnceLock<bool> = OnceLock::new();
+    let use_row_pool = *USE_ROW_POOL.get_or_init(|| {
+        match std::env::var("CS2_RENDERER_ROW_POOL") {
+            Ok(value) => value == "1",
+            Err(_) => false,
+        }
+    });
+    if use_row_pool {
+        super::row_pool::draw_pixel_rows(target, stride, top, workers, draw_row);
+    } else {
+        draw_pixel_rows_scoped(target, stride, top, workers, draw_row);
+    }
+}
+
+fn draw_pixel_rows_scoped(
+    target: &mut [u8],
+    stride: usize,
+    top: u32,
+    workers: usize,
+    draw_row: impl Fn(&mut [u8], u32) + Sync,
+) {
+    assert!(stride > 0 && target.len().is_multiple_of(stride));
+    if target.is_empty() {
+        return;
+    }
+    let workers = workers.clamp(1, target.len() / stride);
     let process = |first: u32, band: &mut [u8]| {
         for (row, pixels) in band.chunks_exact_mut(stride).enumerate() {
             draw_row(pixels, first + row as u32);

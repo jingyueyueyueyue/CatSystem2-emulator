@@ -1,0 +1,47 @@
+{
+  "9": {
+    "frames": 1600,
+    "diagnostics": ["trace-native:71", "trace-native:325", "trace-native:327"],
+    "route": {
+      "label": "Kanmi: guarded New Game, one guarded Enter, stop at sc01 g1/r43",
+      "idle_frames": 600,
+      "page_scenes": [],
+      "kanmi_exact": {
+        "contract": "kanmi-title-r43/v1",
+        "startup": "kcs.int/main.kcs",
+        "runtime_pe_sha256": "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26",
+        "flow_fes_sha256": "8a22b583e1e6dca573c2cbc56097a2134a5f3a3c21a4075fea077bd1c1fa5fea",
+        "title_fes_sha256": "b737c7557f43be7c399173cd181532dc6af01cbe4f6ebf5cbda3df5861ab40fb",
+        "scene_cst_sha256": "7c0d796d069db416291effc217aa3664ba449f23ce43b88a11a5d13cfff1a55e"
+      },
+      "steps": [
+        {
+          "label": "New Game: title/WAIT, main bank btn1[0], unique consuming receipt",
+          "wait": {"state": "title", "window": "title", "hit": {"point": [140, 354], "region": 14}},
+          "probe_points": [[140, 354]],
+          "click": [140, 354],
+          "mouse_press": {"candidates": [3, 14, 23, 7], "region": 14, "key": 0, "group": 0, "response": 0},
+          "after": {"state": "page", "scene": "sc01", "group": 0, "record": 41, "window": "meswnd"}
+        },
+        {
+          "label": "First body: one Enter, confirm live sscript consumption and fresh r42 commit",
+          "wait": {"state": "page", "scene": "sc01", "group": 0, "record": 41, "window": "meswnd"},
+          "key": 13,
+          "keyboard_press": {"region": 60, "receiver": 8, "key": 2, "group": 0, "response": 0},
+          "after": {"state": "page", "scene": "sc01", "group": 1, "record": 43, "window": "meswnd"}
+        },
+        {
+          "label": "Stop at the settled r43 wait without any further input",
+          "wait": {"state": "page", "scene": "sc01", "group": 1, "record": 43, "window": "meswnd"}
+        }
+      ]
+    }
+  },
+  "review": {
+    "availability": "The 19:39 candidate passed the positive route with the title hit, receipt and CST first-read fixes. Use the same player for the wrong-receiver control.",
+    "title_guard": "Check the loaded FES winners, settled flow/TITLE_WAIT and its live title/WAIT child, main bank $541=0, enabled btn1[0], native 71 wait 0xcae and the current hit and candidate order. The baseline region 14 uses a rectangle. Allow the observed region 3 forwarding receipt before the unique region 14 Mouse(1) consumer and same-frame VM resume. Confirm the new sscript and exact r41 after the normal title exit.",
+    "body_guard": "Use story_trace_09::observe and the live original sc01 winner. Resolve bottom button and its live sscript receiver independently of configured IDs, then compare both IDs before dispatch. Require exactly one non-repeated consuming Keyboard(13) receipt, logical key 2/group 0, exactly one root native 71 resume [2,0,0,0] and observed release. On missing or extra consumption/resume, fail without retry.",
+    "expect": {"status": "completed", "mouse_down": 1, "enter_down": 1, "enter_up": 1, "root_enter_resumes": 1, "stop": "sc01 g1/r43; original CP932 source r42 born after dispatch, new naturally completed and committed epoch in the same CST load and meswnd lifetime, with composed body and prompt"},
+    "evidence": "20261120_194633_972895_ssnpdfie_playthrough/09. The guarded title press ran at f315. f599 consumed one Enter via region 60 -> task 8 and resumed the VM. f653 settled on sc01 g1/r43 with a fresh r42 body. The offline checker returned successor_verified."
+  }
+}

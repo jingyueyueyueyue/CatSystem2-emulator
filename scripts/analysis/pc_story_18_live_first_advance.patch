@@ -1,0 +1,931 @@
+--- a/simulator/crates/desktop/src/story_trace.rs
++++ b/simulator/crates/desktop/src/story_trace.rs
+@@ -15,6 +15,8 @@
+ mod story_trace_20;
+ #[path = "story_trace_14.rs"]
+ pub(super) mod story_trace_14;
++#[path = "story_trace_18.rs"]
++pub(super) mod story_trace_18;
+ #[path = "legacy_story_wait.rs"]
+ mod legacy_story_wait;
+ 
+@@ -29,6 +31,7 @@
+     Legacy07Observation,
+     Legacy11Observation,
+     Legacy13Observation,
++    Campanella18Observation,
+     Grisaia14Observation,
+ }
+ 
+@@ -49,6 +52,9 @@
+ }
+ 
+ fn story_trace_profile(pe_sha256: &str, startup: Option<&str>) -> Option<StoryTraceProfile> {
++    if pe_sha256 == story_trace_18::PE && startup == Some("kcs.int/main.kcs") {
++        return Some(StoryTraceProfile::Campanella18Observation);
++    }
+     if story_trace_08::is_profile(pe_sha256, startup) {
+         return Some(StoryTraceProfile::Eyecatch08Observation);
+     }
+@@ -295,7 +301,7 @@
+         if story.next().is_some() {
+             return unknown;
+         }
+-        if matches!(profile, StoryTraceProfile::Legacy07Observation
++        if matches!(profile, StoryTraceProfile::Campanella18Observation | StoryTraceProfile::Legacy07Observation
+             | StoryTraceProfile::Legacy11Observation | StoryTraceProfile::Legacy13Observation
+             | StoryTraceProfile::Grisaia14Observation)
+         {
+--- a/simulator/crates/desktop/src/cst_context_native.rs
++++ b/simulator/crates/desktop/src/cst_context_native.rs
+@@ -38,6 +38,7 @@
+     Kanmi,
+     August,
+     Kamikaze,
++    Campanella,
+     Grisaia14,
+     Rebellions,
+ }
+@@ -53,6 +54,8 @@
+                 && matches!((group, record, kind), (0, 5, 0x20) | (1, 7, 0x20))
+             || self == Self::Rebellions && native == 327
+                 && matches!((group, record, kind), (0, 12, 0x20) | (1, 14, 0x20))
++            || self == Self::Campanella && native == 327
++                && matches!((group, record, kind), (0, 88 | 89, 0x20) | (1, 92, 0x20))
+             || self == Self::August && native == 1037
+                 && matches!((group, record, kind), (0, 78, 0x21) | (0, 79 | 80, 0x20) | (1, 84 | 85, 0x20))
+     }
+@@ -367,6 +370,13 @@
+         }
+         if !archive.eq_ignore_ascii_case("scene.int") {
+             return None;
++        }
++        use crate::story_trace::story_trace_18;
++        if self.css_task_sha() == Some(story_trace_18::PE)
++            && resource.source.name.eq_ignore_ascii_case("0001_00.cst")
++            && sha256(&resource.bytes) == story_trace_18::CST
++        {
++            return Some(CstSourceProbe::Campanella);
+         }
+         if self.css_task_sha() == Some("c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c")
+             && resource.source.name.eq_ignore_ascii_case("BLAOP1_END.cst")
+--- a/simulator/crates/desktop/src/message_platform.rs
++++ b/simulator/crates/desktop/src/message_platform.rs
+@@ -328,13 +328,16 @@
+ }
+ 
+ impl LoggingHost<'_> {
+-    pub(super) fn host_input_region_ready(&self, id: u32) -> bool {
+-        let receiver = match self.data_services.messages.input_buttons.get(&id) {
++    pub(super) fn effective_input_region_receiver(&self, id: u32) -> Option<u32> {
++        match self.data_services.messages.input_buttons.get(&id) {
+             Some(button) if button.registration_bound => button.state.receiver,
+             _ => self.scene_nodes.get(&id)
+                 .and_then(|node| self.input_button_region_receiver(id, node.kind)),
+-        };
+-        !receiver.and_then(|owner| self.data_services.tasks.fes.runtime(owner))
++        }
++    }
++
++    pub(super) fn host_input_region_ready(&self, id: u32) -> bool {
++        !self.effective_input_region_receiver(id).and_then(|owner| self.data_services.tasks.fes.runtime(owner))
+             .and_then(|runtime| runtime.driver.as_ref())
+             .is_some_and(super::fes_driver::FesScriptDriver::initialization_pending)
+     }
+--- a/simulator/crates/desktop/src/portable_host.rs
++++ b/simulator/crates/desktop/src/portable_host.rs
+@@ -210,6 +210,46 @@
+         self.canvas.pixels()
+     }
+ 
++    pub(super) fn message_plane_rgb_probe(
++        &self,
++        object: &cs2_runtime::message_object::MessageObject,
++        node: &super::SceneNode,
++        submitted: &cs2_renderer::Canvas,
++    ) -> Option<((usize, usize), [i32; 2], (usize, usize))> {
++        let (registered_size, registered_offset) = object.registered_geometry()?;
++        let size = if node.initialized { node.size } else { registered_size.map(|val| val as f32) };
++        if !node.visible || node.scale[..2] != [1.0, 1.0] || node.color != u32::MAX
++            || node.overlay_color != 0 || size != [submitted.width() as f32, submitted.height() as f32]
++            || node.position.iter().any(|coordinate| !coordinate.is_finite())
++        {
++            return None;
++        }
++        let current_offset = object.configuration()?.canvas_offset();
++        let draw_origin = [0, 1].map(|axis| (node.position[axis] as i32).wrapping_add(registered_offset[axis]));
++        let mut tested = 0;
++        let mut matched = 0;
++        let mut texture_clipped = 0;
++        let mut viewport_clipped = 0;
++        for (index, pixel) in submitted.pixels().chunks_exact(4).enumerate().filter(|(_, pixel)| pixel[3] == 255) {
++            let local = [(index % submitted.width() as usize) as i64, (index / submitted.width() as usize) as i64];
++            let shifted = [0, 1].map(|axis| local[axis] + i64::from(current_offset[axis]) - i64::from(registered_offset[axis]));
++            if !(0..i64::from(submitted.width())).contains(&shifted[0])
++                || !(0..i64::from(submitted.height())).contains(&shifted[1])
++            {
++                texture_clipped += 1;
++                continue;
++            }
++            let screen = [0, 1].map(|axis| draw_origin[axis].wrapping_add(shifted[axis] as i32));
++            if let Ok(output) = self.canvas.pixel(screen[0], screen[1]) {
++                tested += 1;
++                matched += usize::from([output.r, output.g, output.b] == pixel[..3]);
++            } else {
++                viewport_clipped += 1;
++            }
++        }
++        Some(((matched, tested), draw_origin, (texture_clipped, viewport_clipped)))
++    }
++
+     pub fn host_composition_diagnostic(&self) -> String {
+         use std::fmt::Write;
+ 
+@@ -239,42 +279,8 @@
+                 .filter(|pixel| pixel[3] != 0).count();
+             let projected = self.project_message_plane(node).ok();
+             let projected_position = projected.as_ref().map(|plane| plane.position);
+-            let opaque_final_rgb_probe = (|| {
+-                let (registered_size, registered_offset) = geometry?;
+-                let node = projected.as_deref()?;
+-                let submitted = surface.submitted;
+-                let size = if node.initialized { node.size } else { registered_size.map(|val| val as f32) };
+-                if !node.visible || node.scale[..2] != [1.0, 1.0] || node.color != u32::MAX
+-                    || node.overlay_color != 0 || size != [submitted.width() as f32, submitted.height() as f32]
+-                    || node.position.iter().any(|coordinate| !coordinate.is_finite())
+-                {
+-                    return None;
+-                }
+-                let current_offset = object.configuration()?.canvas_offset();
+-                let draw_origin = [0, 1].map(|axis| (node.position[axis] as i32).wrapping_add(registered_offset[axis]));
+-                let mut tested = 0;
+-                let mut matched = 0;
+-                let mut texture_clipped = 0;
+-                let mut viewport_clipped = 0;
+-                for (index, pixel) in submitted.pixels().chunks_exact(4).enumerate().filter(|(_, pixel)| pixel[3] == 255) {
+-                    let local = [(index % submitted.width() as usize) as i64, (index / submitted.width() as usize) as i64];
+-                    let shifted = [0, 1].map(|axis| local[axis] + i64::from(current_offset[axis]) - i64::from(registered_offset[axis]));
+-                    if !(0..i64::from(submitted.width())).contains(&shifted[0])
+-                        || !(0..i64::from(submitted.height())).contains(&shifted[1])
+-                    {
+-                        texture_clipped += 1;
+-                        continue;
+-                    }
+-                    let screen = [0, 1].map(|axis| draw_origin[axis].wrapping_add(shifted[axis] as i32));
+-                    if let Ok(output) = self.canvas.pixel(screen[0], screen[1]) {
+-                        tested += 1;
+-                        matched += usize::from([output.r, output.g, output.b] == pixel[..3]);
+-                    } else {
+-                        viewport_clipped += 1;
+-                    }
+-                }
+-                Some(((matched, tested), draw_origin, (texture_clipped, viewport_clipped)))
+-            })();
++            let opaque_final_rgb_probe = projected.as_deref()
++                .and_then(|node| self.message_plane_rgb_probe(object, node, surface.submitted));
+             let opaque_final_rgb_matches = opaque_final_rgb_probe.map(|probe| probe.0);
+             let draw_origin = opaque_final_rgb_probe.map(|probe| probe.1);
+             let opaque_texture_viewport_clipped = opaque_final_rgb_probe.map(|probe| probe.2);
+--- a/simulator/crates/desktop/src/lib.rs
++++ b/simulator/crates/desktop/src/lib.rs
+@@ -139,6 +139,7 @@
+ mod backlog_native;
+ mod cst_context_native;
+ mod story_trace;
++pub use story_trace::story_trace_18::CampanellaWait;
+ pub use story_trace::story_trace_14::Grisaia14Body;
+ mod cst_window_native;
+ mod cst_state;
+--- a/simulator/crates/desktop/examples/story_route/mod.rs
++++ b/simulator/crates/desktop/examples/story_route/mod.rs
+@@ -1,3 +1,4 @@
++mod campanella;
+ mod grisaia;
+ mod kamikaze;
+ mod neko_ordinary;
+@@ -491,6 +492,8 @@
+     kamikaze_post_op: Option<kamikaze::Contract>,
+     #[serde(default)]
+     grisaia_14_first_advance: bool,
++    #[serde(default)]
++    campanella_18_first_advance: bool,
+     rebellions_r15: Option<rebellions::Mode>,
+     neko_ordinary: Option<neko_ordinary::Config>,
+     steps: Vec<Step>,
+@@ -762,6 +765,7 @@
+     eye08: Option<Eye08Route>,
+     kamikaze: Option<kamikaze::Replay>,
+     grisaia: Option<grisaia::GrisaiaRoute>,
++    campanella: Option<campanella::Replay>,
+     neko_ordinary: Option<neko_ordinary::Ordinary>,
+     rebellions: Option<rebellions::RebellionsRoute>,
+ }
+@@ -778,6 +782,22 @@
+     }
+ 
+     fn from_route(route: Route) -> Result<Self> {
++        if route.campanella_18_first_advance {
++            ensure!(
++                !route.eyecatch_08_exit && !route.grisaia_14_first_advance
++                    && route.kamikaze_post_op.is_none() && route.kanmi_exact.is_none()
++                    && route.rebellions_r15.is_none() && route.neko_ordinary.is_none()
++                    && route.steps.is_empty() && route.page_scenes.is_empty()
++                    && route.page_click.is_none() && route.page_fallback_before.is_none()
++                    && route.idle_frames > 3,
++                "18 requires its dedicated title and single body advance"
++            );
++            return Ok(Self {
++                route, next: 0, pending: None, last_position: None, changed: 0,
++                eye08: None, kamikaze: None, grisaia: None, rebellions: None, neko_ordinary: None,
++                campanella: Some(campanella::Replay::default()),
++            });
++        }
+         if let Some(config) = &route.neko_ordinary {
+             config.validate(&route)?;
+         }
+@@ -789,7 +809,7 @@
+                 && !route.grisaia_14_first_advance && route.idle_frames > 3,
+                 "Rebellions r15 uses its fixed entry and body route");
+             return Ok(Self { route, next: 0, pending: None, last_position: None, changed: 0,
+-                eye08: None, kamikaze: None, grisaia: None,
++                eye08: None, kamikaze: None, grisaia: None, campanella: None,
+                 rebellions: Some(rebellions::RebellionsRoute::new(mode)), neko_ordinary });
+         }
+         if route.grisaia_14_first_advance {
+@@ -799,7 +819,7 @@
+                 && route.page_fallback_before.is_none() && route.idle_frames > 3,
+                 "14 first advance requires its dedicated title, first page and terminal checkpoint");
+             return Ok(Self { route, next: 0, pending: None, last_position: None, changed: 0,
+-                eye08: None, kamikaze: None, grisaia: Some(grisaia::GrisaiaRoute::Title { moved: false }),
++                eye08: None, kamikaze: None, grisaia: Some(grisaia::GrisaiaRoute::Title { moved: false }), campanella: None,
+                 rebellions: None, neko_ordinary });
+         }
+         if let Some(contract) = &route.kamikaze_post_op {
+@@ -808,21 +828,21 @@
+                 && route.page_fallback_before.is_none() && route.kanmi_exact.is_none()
+                 && !route.eyecatch_08_exit, "07 requires the post-OP route without generic steps");
+             return Ok(Self { route, next: 0, pending: None, last_position: None, changed: 0,
+-                eye08: None, kamikaze: Some(kamikaze::Replay::default()), grisaia: None, rebellions: None, neko_ordinary });
++                eye08: None, kamikaze: Some(kamikaze::Replay::default()), grisaia: None, campanella: None, rebellions: None, neko_ordinary });
+         }
+         if route.eyecatch_08_exit {
+             ensure!(route.steps.is_empty() && route.page_scenes.is_empty() && route.page_click.is_none()
+                 && route.page_fallback_before.is_none() && route.kanmi_exact.is_none() && route.idle_frames > 3,
+                 "08 eyecatch exit uses only its verified entry and terminal click");
+             return Ok(Self { route, next: 0, pending: None, last_position: None, changed: 0,
+-                eye08: Some(Eye08Route::Entry { card: false, since: 0 }), kamikaze: None, grisaia: None,
++                eye08: Some(Eye08Route::Entry { card: false, since: 0 }), kamikaze: None, grisaia: None, campanella: None,
+                 rebellions: None, neko_ordinary });
+         }
+         ensure!(route.idle_frames > 3 && !route.steps.is_empty(), "route requires steps and a wait limit");
+         if let Some(contract) = &route.kanmi_exact {
+             ensure!(contract.matches() && route.valid_kanmi_steps(), "Kanmi requires its exact title and two body checkpoints");
+             return Ok(Self { route, next: 0, pending: None, last_position: None, changed: 0,
+-                eye08: None, kamikaze: None, grisaia: None, rebellions: None, neko_ordinary });
++                eye08: None, kamikaze: None, grisaia: None, campanella: None, rebellions: None, neko_ordinary });
+         }
+         let last = route.steps.len() - 1;
+         ensure!(route.page_fallback_before.is_none_or(|end| end <= route.steps.len()),
+@@ -1046,10 +1066,14 @@
+             }
+         }
+         Ok(Self { route, next: 0, pending: None, last_position: None, changed: 0,
+-            eye08: None, kamikaze: None, grisaia: None, rebellions: None, neko_ordinary })
++            eye08: None, kamikaze: None, grisaia: None, campanella: None, rebellions: None, neko_ordinary })
+     }
+ 
+     pub(super) fn observe_lifecycle_events(&mut self, events: &[LogicEvent], batch_start: usize) {
++        if let Some(campanella) = &mut self.campanella {
++            campanella.observe_lifetimes(events, batch_start);
++            return;
++        }
+         if let Some(neko) = &mut self.neko_ordinary && neko.active() {
+             if let Some(batch) = events.get(batch_start..) {
+                 neko.observe_events(batch);
+@@ -1101,6 +1125,10 @@
+     }
+ 
+     pub(super) fn observe_frame(&mut self, player: &HeadlessPlayer) {
++        if let Some(campanella) = &mut self.campanella {
++            campanella.observe_frame(player);
++            return;
++        }
+         if let Some(neko) = &mut self.neko_ordinary && neko.active() {
+             neko.observe(player);
+             return;
+@@ -1176,6 +1204,9 @@
+     }
+ 
+     pub(super) fn poll(&mut self, player: &mut HeadlessPlayer, frame: u64, output: &Path) -> Result<Decision> {
++        if let Some(campanella) = &mut self.campanella {
++            return campanella.poll(player, frame, self.route.idle_frames);
++        }
+         if let Some(neko) = &mut self.neko_ordinary && neko.active() {
+             return neko.poll(player, frame, self.route.idle_frames);
+         }
+--- /dev/null
++++ b/simulator/crates/desktop/src/story_trace_18.rs
+@@ -0,0 +1,343 @@
++use cs2_runtime::message_object::ButtonSource;
++
++use super::HeadlessPlayer;
++use super::story_trace_09::{
++    bottom_registration, enter_mapping, live_child, quiet_root_at, settled_poll,
++};
++use crate::cst_context_native::CstSourceProbe;
++
++pub(crate) const PE: &str = "659d5f069f3c97f69a61e12449cf1510b45e48a10649b9ac6977c2b93d6d28ad";
++pub(crate) const CST: &str = "22d8aef073b8d125bad43817274c77765d0665bfd3224598f1f5fb0ae3905e62";
++const ROOT_WAIT: u32 = 0x59f;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct CampanellaWait {
++    pub context: u32,
++    pub load: u64,
++    pub script: u32,
++    pub owner: u32,
++    pub plane: u32,
++    pub string: u32,
++    pub generation: u64,
++    pub marked: u64,
++    pub opaque: usize,
++}
++
++impl CampanellaWait {
++    pub fn same_instance(self, other: Self) -> bool {
++        (
++            self.context,
++            self.load,
++            self.script,
++            self.owner,
++            self.plane,
++            self.string,
++        ) == (
++            other.context,
++            other.load,
++            other.script,
++            other.owner,
++            other.plane,
++            other.string,
++        )
++    }
++}
++
++impl HeadlessPlayer {
++    fn campanella_quiet(&self) -> Option<u64> {
++        let frame = self.state.clock.frame;
++        quiet_root_at(self, frame, ROOT_WAIT)?;
++        let input = &self.data_services.messages;
++        (self.host_story_pe_sha256() == Some(PE)
++            && self.default_entry() == Some("kcs.int/main.kcs")
++            && input.key_capture.is_empty()
++            && input.typed_physical_owners.is_empty()
++            && input.input_frame_complete
++            && self
++                .device_key_scan_state()
++                .records()
++                .iter()
++                .flatten()
++                .all(|key| key.mask & 15 == 0))
++        .then_some(frame)
++    }
++
++    pub fn host_campanella_title(&self) -> Option<u32> {
++        let frame = self.campanella_quiet()?;
++        if !self.cst_contexts.is_empty() {
++            return None;
++        }
++        let tasks = &self.data_services.tasks;
++        let mut flow = None;
++        let mut title = None;
++        for (owner, name, runtime, waiting) in tasks.fes.story_runtimes() {
++            let name = name.strip_suffix(b".fes").unwrap_or(name);
++            let driver = runtime.driver.as_ref()?;
++            let (expected, slot) = match name {
++                b"flow" => (b"TITLE_WAIT".as_slice(), &mut flow),
++                b"title" => (b"WAIT".as_slice(), &mut title),
++                _ => return None,
++            };
++            if waiting
++                || driver.initialization_pending()
++                || slot.replace(owner).is_some()
++                || !settled_poll(
++                    driver.interpreter.current_block(),
++                    expected,
++                    driver.has_pending_handler(),
++                    driver.waiting(),
++                    frame,
++                )
++            {
++                return None;
++            }
++        }
++        let flow = flow?;
++        let title = title?;
++        (live_child(self, flow, 0, 34)
++            && live_child(self, title, flow, 34)
++            && live_child(self, 11, title, 6)
++            && tasks.fes.platform.region_target(11).is_some_and(|(owner, target)| {
++                owner == title && target.is_some_and(|target| target.name.as_slice() == b"btn_a_base")
++            })
++            && self.input_button_state(11).is_none_or(|button| {
++                button.receiver == Some(title) && button.show != 0
++            }))
++            .then_some(title)
++    }
++
++    pub fn host_campanella_wait(&self, successor: bool) -> Option<CampanellaWait> {
++        let frame = self.campanella_quiet()?;
++        let (group, wait, expected) = if successor {
++            (1, 95, &[92usize][..])
++        } else {
++            (0, 90, &[88usize, 89][..])
++        };
++        let services = &self.data_services;
++        let tasks = &services.tasks;
++        let mut runtimes = tasks.fes.story_runtimes();
++        let (flow, name, runtime, waiting) = runtimes.next()?;
++        let driver = runtime.driver.as_ref()?;
++        if runtimes.next().is_some()
++            || name.strip_suffix(b".fes").unwrap_or(name) != b"flow"
++            || waiting
++            || driver.initialization_pending()
++            || !settled_poll(
++                driver.interpreter.current_block(),
++                b"GAME_WAIT",
++                driver.has_pending_handler(),
++                driver.waiting(),
++                frame,
++            )
++            || !live_child(self, flow, 0, 34)
++        {
++            return None;
++        }
++
++        let mut contexts = self.cst_contexts.iter();
++        let (&context, state) = contexts.next()?;
++        let (marked, actual_group, actual_wait) = state.story.settled_body_record(frame)?;
++        if contexts.next().is_some()
++            || !state.story.is_scene("0001_00")
++            || (actual_group, actual_wait) != (group, wait)
++            || state.localization.is_some()
++        {
++            return None;
++        }
++        let origins = services
++            .cst_text_origins
++            .source_record_observations(context);
++        let mut load = None;
++        for &record in expected {
++            let entry = origins
++                .iter()
++                .find(|entry| entry.source.absolute_record == record)?;
++            if entry.probe != CstSourceProbe::Campanella
++                || !entry.body_tagged
++                || entry.localized
++                || entry.source.group != group
++                || entry.source.load_id == 0
++                || entry.frame != marked
++                || entry.native != 327
++                || entry.output_bytes == 0
++                || load.is_some_and(|id| id != entry.source.load_id)
++            {
++                return None;
++            }
++            load = Some(entry.source.load_id);
++        }
++
++        let mut windows = self
++            .scene_nodes
++            .values()
++            .filter(|node| node.name == "meswnd" && live_child(self, node.id, node.parent, 12));
++        let window = windows.next()?;
++        let owner = window.id;
++        let script = window.parent;
++        if windows.next().is_some()
++            || !live_child(self, script, flow, 0)
++            || self.task_vms.get(&script)?.program().is_none()
++            || tasks.task_clock(script)?.paused != 0
++        {
++            return None;
++        }
++        let mut planes = self
++            .scene_nodes
++            .values()
++            .filter(|node| node.name == "message main" && live_child(self, node.id, owner, 2));
++        let plane = planes.next()?.id;
++        if planes.next().is_some() {
++            return None;
++        }
++        let mut strings = self
++            .scene_nodes
++            .values()
++            .filter(|node| node.name == "string" && live_child(self, node.id, plane, 45));
++        let string = strings.next()?.id;
++        let object = services.messages.object(string)?;
++        let surface = services.message_device.surface(string as i32)?;
++        if strings.next().is_some()
++            || services.messages.legacy_string_kind(string) != Some(45)
++            || !object.prepared()
++            || object.remaining_all().ok()? != 0
++            || surface.dirty.is_some()
++            || surface.generation != object.surface_generation()
++        {
++            return None;
++        }
++
++        // Tie the current ordinary text object to the exact bytes of this page.
++        let document = state.document.as_ref()?;
++        let mut body = Vec::new();
++        for &record in expected {
++            let text = &document.records.get(record)?.text;
++            body.extend_from_slice(text.split(|&byte| byte == 0).next()?);
++        }
++        let appended = object.raw_appends().concat();
++        let mut submitted_body = appended.as_slice();
++        while let Some(core) = submitted_body
++            .strip_suffix(b"\\n")
++            .or_else(|| submitted_body.strip_suffix(b"\n"))
++        {
++            submitted_body = core;
++        }
++        if submitted_body != body.as_slice() {
++            return None;
++        }
++
++        let reveal_finished = format!(
++            "index=69 arguments=16 bytes [{:08x}0d0000000000000000000000]",
++            owner.swap_bytes()
++        );
++        if !self
++            .events
++            .iter()
++            .rev()
++            .take_while(|event| event.frame >= marked)
++            .any(|event| {
++                event.frame < frame
++                    && event.kind == "native-call"
++                    && event.detail.starts_with(&reveal_finished)
++            })
++        {
++            return None;
++        }
++        let projected = self
++            .project_message_plane(self.scene_nodes.get(&string)?)
++            .ok()?;
++        let ((matched, opaque), origin, clipping) =
++            self.message_plane_rgb_probe(object, &projected, surface.submitted)?;
++        if opaque == 0 || matched != opaque || (!successor && origin != [200, 487]) || clipping != (0, 0) {
++            return None;
++        }
++        Some(CampanellaWait {
++            context,
++            load: load?,
++            script,
++            owner,
++            plane,
++            string,
++            generation: surface.generation,
++            marked,
++            opaque,
++        })
++    }
++
++    /// Report the eligible keyboard regions in the same order as device dispatch.
++    pub fn host_campanella_enter(
++        &mut self,
++        body: CampanellaWait,
++    ) -> anyhow::Result<Option<((u32, u32), Vec<(u32, u32)>)>> {
++        let input = &self.data_services.messages;
++        let bindings = self.device_key_bindings();
++        if !enter_mapping(bindings, &self.input_task.key_enabled)
++            || !bindings[0].enabled
++            || !self.input_task.key_enabled[0]
++            || bindings[0].codes[ButtonSource::Keyboard.index()][0] != 13
++            || (0..80).any(|key| input.device_keys.forced_queries(key).ok() != Some(0))
++        {
++            return Ok(None);
++        }
++        let flow = self.task_parents.get(&body.script).copied();
++        self.with_host(|host| {
++            let mut candidates = Vec::new();
++            let mut bottom = None;
++            let mut seen = std::collections::BTreeSet::new();
++            for &region in &host.input_task.regions {
++                if region.words[8] == 0
++                    || region.words[2] & ButtonSource::Keyboard.mask() == 0
++                    || !host.host_input_region_ready(region.id())
++                {
++                    continue;
++                }
++                let id = region.id();
++                let Some(node) = host.scene_nodes.get(&id) else {
++                    return Ok(None);
++                };
++                if !seen.insert(id)
++                    || !matches!(node.kind, 2 | 6)
++                    || !host
++                        .data_services
++                        .tasks
++                        .message_task_state(id)
++                        .is_some_and(|(kind, deleted, _)| kind == node.kind && deleted == 0)
++                {
++                    return Ok(None);
++                }
++                let runtime = host.data_services.messages.input_buttons.get(&id);
++                let receiver = host.effective_input_region_receiver(id);
++                let Some(receiver) = receiver else {
++                    continue;
++                };
++                if !host.task_is_reachable(receiver)
++                    || !(receiver == 0
++                        || receiver == body.script
++                        || receiver == body.owner
++                        || Some(receiver) == flow)
++                {
++                    return Ok(None);
++                }
++                candidates.push((id, receiver));
++                if node.kind == 6 && node.name == "bottom button" && receiver == body.script {
++                    let Some(button) = runtime else {
++                        return Ok(None);
++                    };
++                    if node.parent != body.script
++                        || host.task_parents.get(&id) != Some(&body.script)
++                        || !bottom_registration(
++                            &region.words,
++                            &button.state,
++                            id,
++                            receiver,
++                            button.execution_checkpoint().3,
++                        )
++                        || bottom.replace((id, receiver)).is_some()
++                    {
++                        return Ok(None);
++                    }
++                }
++            }
++            Ok(bottom.map(|bottom| (bottom, candidates)))
++        })
++    }
++}
+--- /dev/null
++++ b/simulator/crates/desktop/examples/story_route/campanella.rs
+@@ -0,0 +1,257 @@
++use super::{
++    Action, Decision, HeadlessPlayer, InputKey, LogicEvent, MousePress, NovelWindowLifetime,
++    consuming_mouse_resume,
++};
++use cs2_desktop::CampanellaWait;
++use cs2_runtime::message_object::{ButtonSource, RoutedPhysicalButton};
++
++const TITLE: [i32; 2] = [183, 434];
++
++#[derive(Default)]
++pub(super) enum Replay {
++    #[default]
++    Title,
++    TitlePress {
++        frame: u64,
++        owner: u32,
++    },
++    First {
++        since: u64,
++        previous: Option<CampanellaWait>,
++    },
++    Successor {
++        pressed: u64,
++        first: CampanellaWait,
++        bottom: (u32, u32),
++        candidates: Vec<(u32, u32)>,
++        lifetimes: [NovelWindowLifetime; 5],
++        verified: bool,
++        previous: Option<CampanellaWait>,
++    },
++    Failed(&'static str),
++}
++
++impl Replay {
++    pub(super) fn observe_lifetimes(&mut self, events: &[LogicEvent], batch_start: usize) {
++        if let Self::Successor {
++            first,
++            bottom,
++            lifetimes,
++            ..
++        } = self
++        {
++            for (lifetime, id) in lifetimes.iter_mut().zip([
++                first.script,
++                first.owner,
++                first.plane,
++                first.string,
++                bottom.0,
++            ]) {
++                lifetime.observe(id, events, batch_start);
++            }
++        }
++    }
++
++    pub(super) fn observe_frame(&mut self, player: &HeadlessPlayer) {
++        match self {
++            Self::TitlePress { frame, owner } => {
++                let frame = *frame + 1;
++                let press = MousePress {
++                    candidates: vec![],
++                    region: 11,
++                    key: 0,
++                    group: 0,
++                    response: 0,
++                };
++                if consuming_mouse_resume(player, &press, frame, *owner, TITLE, None) {
++                    eprintln!("frame {frame}: 18 verified title click region=11 receiver={owner}");
++                    *self = Self::First {
++                        since: frame,
++                        previous: None,
++                    };
++                } else {
++                    *self = Self::Failed("18 title receipt or VM resume differed");
++                }
++            }
++            Self::Successor {
++                pressed,
++                bottom,
++                candidates,
++                verified,
++                ..
++            } => {
++                let receipts = player
++                    .host_input_route_receipts()
++                    .iter()
++                    .filter(|receipt| receipt.pressed != 0);
++                if *verified {
++                    if receipts.count() != 0 {
++                        *self = Self::Failed("18 received another press after Enter");
++                    }
++                    return;
++                }
++                let mut key = 0;
++                let mut cursor = 0;
++                let mut consumed = false;
++                for receipt in receipts {
++                    let target = (receipt.region, receipt.receiver);
++                    if receipt.key != key && key == 0 && receipt.key == 2 {
++                        key = 2;
++                        cursor = 0;
++                    }
++                    let candidate = candidates[cursor..].iter().position(|&pair| pair == target);
++                    if consumed
++                        || receipt.frame != *pressed + 1
++                        || receipt.key != key
++                        || receipt.group != 0
++                        || receipt.raw_mask != 1
++                        || receipt.pressed != 1
++                        || receipt.repeated
++                        || candidate.is_none()
++                        || receipt.physical
++                            != [RoutedPhysicalButton {
++                                source: ButtonSource::Keyboard,
++                                code: 13,
++                            }]
++                    {
++                        *self = Self::Failed("18 Enter receipt differed from the armed live chain");
++                        return;
++                    }
++                    cursor += candidate.unwrap() + 1;
++                    if receipt.response == 0 {
++                        consumed = key == 2 && target == *bottom;
++                        if !consumed {
++                            *self = Self::Failed("18 Enter consumed by a different callback");
++                            return;
++                        }
++                    }
++                }
++                if !consumed {
++                    *self = Self::Failed("18 no consuming Enter receipt");
++                    return;
++                }
++                *verified = true;
++                eprintln!(
++                    "frame {}: 18 verified Enter key=2 group=0 region={} receiver={}",
++                    *pressed + 1,
++                    bottom.0,
++                    bottom.1
++                );
++            }
++            _ => {}
++        }
++    }
++
++    pub(super) fn poll(
++        &mut self,
++        player: &mut HeadlessPlayer,
++        frame: u64,
++        idle: u64,
++    ) -> anyhow::Result<Decision> {
++        if frame % 120 == 0 {
++            println!("replay frame={frame} heartbeat");
++        }
++        match self {
++            Self::Title => {
++                if let Some(owner) = player.host_campanella_title()
++                    && let Some(hit) = player.masked_input_region_at(TITLE)?
++                    && hit[0] == 11
++                    && hit[8] != 0
++                    && player.mouse_press_candidate_regions(TITLE)? == [11, 29, 6]
++                {
++                    let [x, y] = TITLE;
++                    *self = Self::TitlePress { frame, owner };
++                    return Ok(Decision::Input(Action::Pointer {
++                        x,
++                        y,
++                        button: Some(0),
++                    }));
++                }
++                if frame >= idle {
++                    return Ok(Decision::Stop(
++                        "unrecognized_wait",
++                        "18 title wait did not settle".into(),
++                    ));
++                }
++            }
++            Self::First { since, previous } => {
++                let current = player.host_campanella_wait(false);
++                if let Some(first) = current.filter(|_| current == *previous) {
++                    let Some((bottom, candidates)) = player.host_campanella_enter(first)? else {
++                        return Ok(Decision::Stop(
++                            "checkpoint_mismatch",
++                            "18 g0/90 has an unverified live Enter binding".into(),
++                        ));
++                    };
++                    eprintln!(
++                        "frame {frame}: 18 armed g0/90 body={first:?} bottom={bottom:?} candidates={candidates:?}"
++                    );
++                    *self = Self::Successor {
++                        pressed: frame,
++                        first,
++                        bottom,
++                        candidates,
++                        lifetimes: [NovelWindowLifetime::Armed {
++                            first_event: player.events().len(),
++                        }; 5],
++                        verified: false,
++                        previous: None,
++                    };
++                    return Ok(Decision::Input(Action::Key(InputKey::Keyboard(13))));
++                }
++                *previous = current;
++                if frame - *since >= idle {
++                    return Ok(Decision::Stop(
++                        "unrecognized_wait",
++                        "18 g0/90 body did not settle".into(),
++                    ));
++                }
++            }
++            Self::Successor {
++                pressed,
++                first,
++                lifetimes,
++                verified,
++                previous,
++                ..
++            } => {
++                if !*verified
++                    || lifetimes
++                        .iter()
++                        .any(|lifetime| *lifetime != NovelWindowLifetime::Continuous)
++                {
++                    return Ok(Decision::Stop(
++                        "checkpoint_mismatch",
++                        "18 Enter or task lifetime differed".into(),
++                    ));
++                }
++                let current = player.host_campanella_wait(true);
++                if let Some(next) = current.filter(|_| current == *previous) {
++                    if !first.same_instance(next)
++                        || next.generation <= first.generation
++                        || next.marked <= *pressed
++                    {
++                        return Ok(Decision::Stop(
++                            "checkpoint_mismatch",
++                            "18 g1/95 did not settle in the same live load with a new body".into(),
++                        ));
++                    }
++                    eprintln!("frame {frame}: 18 settled g1/95 after release body={next:?}");
++                    return Ok(Decision::Done);
++                }
++                *previous = current;
++                if frame - *pressed >= idle {
++                    return Ok(Decision::Stop(
++                        "unrecognized_wait",
++                        "18 g1/95 body did not settle".into(),
++                    ));
++                }
++            }
++            Self::Failed(reason) => {
++                return Ok(Decision::Stop("checkpoint_mismatch", (*reason).into()));
++            }
++            Self::TitlePress { .. } => {}
++        }
++        Ok(Decision::Wait)
++    }
++}

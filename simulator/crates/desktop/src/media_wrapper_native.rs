@@ -209,7 +209,14 @@ impl LoggingHost<'_> {
         if deletion != 0 {
             return Ok(Some(TaskCommandOutcome { done: true, propagate: false }));
         }
-        let bytes = buffers.data1.as_deref()
+        self.update_raster_media_parameters(target, buffers.data1.as_deref())?;
+        Ok(Some(TaskCommandOutcome { done: true, propagate: false }))
+    }
+
+    pub(super) fn update_raster_media_parameters(
+        &mut self, target: u32, bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let bytes = bytes
             .filter(|bytes| bytes.len() >= 20)
             .ok_or_else(|| native_state_error("Raster parameter update requires20 explicit bytes"))?;
         let mut state = self.raster_media_parameters(target).unwrap_or(RasterParameters {
@@ -243,7 +250,7 @@ impl LoggingHost<'_> {
             return Err(native_state_error("Raster parameter owner limit exceeded65536"));
         }
         self.data_services.sound_media.effects.raster.insert(target, state);
-        Ok(Some(TaskCommandOutcome { done: true, propagate: false }))
+        Ok(())
     }
 
     pub(super) fn raster_media_parameters(&self, target: u32) -> Option<RasterParameters> {

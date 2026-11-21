@@ -1,0 +1,19 @@
+{
+  "2": {
+    "frames": 9500,
+    "inputs": [
+      "capture-every:0",
+      "no-final-capture",
+      "story-events",
+      "story-trace",
+      "move:695:105,64",
+      "move:730:400,144",
+      "require-hit:745:26",
+      "745:400,144",
+      "require-hit:805:35",
+      "805:400,144",
+      "legacy-02-segment",
+      "happiness-save-slot-zero"
+    ]
+  }
+}

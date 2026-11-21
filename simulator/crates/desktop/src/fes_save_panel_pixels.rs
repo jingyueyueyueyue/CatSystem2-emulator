@@ -4,7 +4,7 @@ use super::*;
 use std::collections::BTreeMap;
 use anyhow::{bail, ensure};
 use cs2_formats::HgFile;
-use cs2_renderer::{Canvas, FrameMetadata, GlyphEffects, HgContainer, ImageDrawOptions, Point, RgbaFrame};
+use cs2_renderer::{Canvas, FrameMetadata, GlyphEffects, ImageDrawOptions, Point, RgbaFrame};
 use cs2_runtime::message_object::{MessageConfiguration, MessageDefaults, MessageEncoding};
 use crate::{FesRuntime, ScriptTextEncoding};
 
@@ -40,24 +40,11 @@ fn image_name(host: &LoggingHost<'_>, raw: &[u8]) -> Result<String> {
 }
 
 fn blend_resource_image(target: &mut Canvas, host: &mut LoggingHost<'_>, bytes: &[u8],
-    directory: Option<&HgFile>, id: u32, position: [i32; 2]) -> Result<()> {
+    id: u32, position: [i32; 2]) -> Result<()> {
     // Reuse the real image decoder/patch hook. Do not substitute thumbnails
     // from ordinary IMAGE.current-frame for the requested cell frame.
     let Some(image) = host.decode_managed_image_frame(bytes, id)? else { return Ok(()); };
-    let flip_source_rows = match image.metadata().container {
-        HgContainer::None => false,
-        HgContainer::Hg3V300 => {
-            let parsed;
-            let directory = match directory {
-                Some(directory) => directory,
-                None => { parsed = HgFile::parse(bytes)?; &parsed }
-            };
-            directory.frames.iter().find(|frame| frame.id == id)
-                .is_some_and(|frame| frame.encoded_image.is_some())
-        }
-        _ => true,
-    };
-    blend_image(target, &image, position, flip_source_rows)
+    blend_image(target, &image, position)
 }
 
 pub(super) fn update(panel: &mut bank::Bank, sources: &mut BTreeMap<Vec<u8>, Vec<u8>>,
@@ -108,9 +95,9 @@ pub(super) fn update(panel: &mut bank::Bank, sources: &mut BTreeMap<Vec<u8>, Vec
         let position = directory.frames.iter().find(|info| info.id == id as u32)
             .map_or([0; 2], |info| info.offset);
         match content.record.word(0) {
-            0 => blend_resource_image(&mut canvas, host, &bytes, Some(&directory), id as u32, [0; 2])?,
+            0 => blend_resource_image(&mut canvas, host, &bytes, id as u32, [0; 2])?,
             1 | 6 => if let Some(image) = &content.image {
-                blend_image(&mut canvas, image, position, false)?;
+                blend_image(&mut canvas, image, position)?;
             },
             2 | 5 => {
                 let Some(reference) = reference_image(runtime, host, content) else { continue };
@@ -128,22 +115,19 @@ pub(super) fn update(panel: &mut bank::Bank, sources: &mut BTreeMap<Vec<u8>, Vec
                     selected = reference.frame_ids.get(selected as usize).copied().unwrap_or(0) as i32;
                 }
                 if let Some(bytes) = source(host, sources, &name)? {
-                    blend_resource_image(&mut canvas, host, bytes, None, selected as u32, position)?;
+                    blend_resource_image(&mut canvas, host, bytes, selected as u32, position)?;
                 }
             }
             3 | 4 => text(&mut canvas, host, sources, panel, id, content, position)?,
             7 => if let Some(image) = &content.image {
                 if let Some(image) = crop_image(image, &content.record)? {
-                    blend_image(&mut canvas, &image, position, false)?;
+                    blend_image(&mut canvas, &image, position)?;
                 }
             },
             _ => bail!("SAVEPANEL applied content kind is invalid"),
         }
     }
-    // Panel coordinates are top down; its submitted image/list source is bottom first.
-    let mut pixels = canvas.pixels().to_vec();
-    reverse_rows(&mut pixels, size);
-    let output = RgbaFrame::from_rgba8(size[0], size[1], pixels)?
+    let output = RgbaFrame::from_rgba8(size[0], size[1], canvas.pixels().to_vec())?
         .with_raw_metadata(FrameMetadata::raster(size));
     let layer = runtime.media.get_mut(&panel.layer).unwrap();
     layer.image = Some(output); layer.image_offset = [0; 2]; layer.image_base = [0; 2];
@@ -161,22 +145,10 @@ fn reference_image<'a>(runtime: &'a FesRuntime, host: &LoggingHost<'_>, content:
         .filter(|image| matches!(image.kind.as_str(), "IMAGE" | "BUTTON"))
 }
 
-fn reverse_rows(pixels: &mut [u8], size: [u32; 2]) {
-    let stride = size[0] as usize * 4;
-    for y in 0..size[1] as usize / 2 {
-        let opposite = size[1] as usize - 1 - y;
-        let (before, after) = pixels.split_at_mut(opposite * stride);
-        before[y * stride..(y + 1) * stride].swap_with_slice(&mut after[..stride]);
-    }
-}
-
-fn blend_image(target: &mut Canvas, image: &RgbaFrame, at: [i32; 2], flip_source_rows: bool) -> Result<()> {
+fn blend_image(target: &mut Canvas, image: &RgbaFrame, at: [i32; 2]) -> Result<()> {
     let metadata = image.metadata();
     let at = [at[0].wrapping_add(metadata.offset[0]), at[1].wrapping_add(metadata.offset[1])];
-    let mut pixels = image.pixels().to_vec();
-    if flip_source_rows {
-        reverse_rows(&mut pixels, [image.width(), image.height()]);
-    }
+    let pixels = image.pixels();
     // Preserve the original panel clip: negative placement clamps the target
     // origin while reading from source pixel zero, instead of skipping it.
     let start = [at[0].max(0), at[1].max(0)];
@@ -238,7 +210,10 @@ fn text(target: &mut Canvas, host: &mut LoggingHost<'_>, sources: &mut BTreeMap<
     let mut config = defaults.configuration(MessageEncoding::Unicode)?.bytes().to_vec();
     config[0x104..0x108].copy_from_slice(&400u32.to_le_bytes());
     let config = MessageConfiguration::from_bytes(&config, MessageEncoding::Unicode)?;
-    let text = decode_css_text(&content.text, host.text_encoding)?;
+    let source_record = panel.cells.get(&id).filter(|cell| cell.word(0) == 3 && cell.word(4) == 2)
+        .map_or(u32::MAX, |cell| cell.word(0x10));
+    let encoding = panel.data.text_encoding(host, source_record, &content.text)?;
+    let text = decode_css_text(&content.text, encoding)?;
     let size_i = size as i32;
     let limit = (record.word(0x3c) as i32).wrapping_mul(size_i).wrapping_sub(size_i / 2);
     let start = position[0]; let (mut width, mut line) = (0i32, 0i32);
@@ -273,7 +248,7 @@ fn text(target: &mut Canvas, host: &mut LoggingHost<'_>, sources: &mut BTreeMap<
             glyph.advance()
         };
         let image = RgbaFrame::from_rgba8(size + 8, size + 8, glyph_canvas.pixels().to_vec())?;
-        blend_image(target, &image, position, false)?;
+        blend_image(target, &image, position)?;
         position[0] = position[0].wrapping_add(if advance == 0 { size_i / 2 } else { advance });
         width = width.wrapping_add(if advance == 0 { size_i } else { advance });
         if effects.outline || effects.shadow {
