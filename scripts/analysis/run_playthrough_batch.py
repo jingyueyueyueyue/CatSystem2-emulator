@@ -375,12 +375,14 @@ def attempt_key(player_sha256, game_path, command_args, timeout, stall_seconds, 
 
 def run_case(index, game, frames, inputs, player, output, timeout, env, *,
              route=None, diagnostics=(), stall_seconds=30, ordinary_save=None, neko_language=None,
-             fast_text=False, reuse_attempts=None):
-    game_root = ROOT / game["root"]
+             fast_text=False, reuse_attempts=None, game_root_override=None):
+    game_root = game_root_override if game_root_override is not None else ROOT / game["root"]
     game_path = game_root
     if ordinary_save is None:
         game_path = game_root.resolve(strict=True)
-        if not game_path.is_dir() or not game_path.is_relative_to(ROOT):
+        if not game_path.is_dir():
+            raise ValueError(f"Not a game directory: {game_path}")
+        if game_root_override is None and not game_path.is_relative_to(ROOT):
             raise ValueError(f"Game is not a directory in the workspace: {game_path}")
     case_dir = output
     if route is not None:
@@ -536,7 +538,7 @@ def available_ram_bytes():
 
 
 def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_text=False,
-              reuse_attempts=None):
+              reuse_attempts=None, game_root_override=None):
     pending = deque(cases)
     active = {}
     case_failed = False
@@ -583,7 +585,8 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
                                    route=settings.get("route"), diagnostics=settings.get("diagnostics", ()),
                                    stall_seconds=args.stall_seconds,
                                    ordinary_save=ordinary_save, neko_language=settings.get("neko_language"),
-                                   fast_text=fast_text, reuse_attempts=reuse_attempts)
+                                   fast_text=fast_text, reuse_attempts=reuse_attempts,
+                                   game_root_override=game_root_override)
                 active[task] = (index, game, settings)
             if active:
                 recheck_resources = pending and len(active) < args.jobs
@@ -727,8 +730,11 @@ def identify_player(player, *, require_integration=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--player", type=Path, required=True)
-    parser.add_argument("--inventory", type=Path, default=INVENTORY,
-                        help="local JSON inventory containing a games array with workspace-relative or absolute root paths")
+    game_input = parser.add_mutually_exclusive_group()
+    game_input.add_argument("--game-root", type=Path,
+                            help="run one case (index 0) directly from an existing game directory")
+    game_input.add_argument("--inventory", type=Path, default=INVENTORY,
+                            help="local JSON inventory containing a games array with roots in the workspace")
     parser.add_argument("--indices", nargs="+", type=int,
                         help="sample indices (default: all games except the V401 fixture in the workspace inventory)")
     parser.add_argument("--scenarios", type=Path, action="append", default=[],
@@ -755,7 +761,16 @@ def main():
     parser.add_argument("--admission-wait-seconds", type=int, default=0,
                         help="wait this long for resources before deferring cases (default immediate)")
     args = parser.parse_args()
-    games, default_indices = load_inventory(args.inventory)
+    try:
+        if args.game_root is None:
+            games, default_indices = load_inventory(args.inventory)
+        else:
+            args.game_root = args.game_root.resolve(strict=True)
+            if not args.game_root.is_dir():
+                raise ValueError(f"Not a game directory: {args.game_root}")
+            games, default_indices = [{"root": str(args.game_root)}], [0]
+    except (OSError, ValueError, KeyError) as error:
+        parser.error(str(error))
     indices = list(dict.fromkeys(args.indices)) if args.indices else default_indices
     if any(index < 0 or index >= len(games) for index in indices):
         parser.error("sample index outside the inventory")
@@ -768,7 +783,10 @@ def main():
     if any(not math.isfinite(value) or value <= 0 for value in budgets):
         parser.error("stall seconds and resource budgets must be finite and positive")
     now = datetime.now().astimezone()
-    default_root = Path("F:/CS2-build-cache/playthrough") if os.name == "nt" else ROOT / "archive"
+    if args.game_root is not None or os.name != "nt":
+        default_root = ROOT / "archive"
+    else:
+        default_root = Path("F:/CS2-build-cache/playthrough")
     cache_override = os.environ.get("CS2_BUILD_CACHE_ROOT")
     cache_root = Path(cache_override) / "playthrough" if cache_override else default_root
     if not cache_root.is_absolute():
@@ -839,7 +857,7 @@ def main():
         env["PATH"] = os.pathsep.join(("C:/msys64/mingw64/bin", env.get("PATH", "")))
     reuse_attempts = (source["sha256"], load_attempt_history(cache_root, pending)) if args.reuse_attempts else None
     return run_batch(cases, player, output, args, env, ordinary_saves, fast_text=args.fast_text,
-                     reuse_attempts=reuse_attempts)
+                     reuse_attempts=reuse_attempts, game_root_override=args.game_root)
 
 
 if __name__ == "__main__":
