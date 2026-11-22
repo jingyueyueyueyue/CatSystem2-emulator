@@ -46,6 +46,7 @@ pub(super) fn call_message_body_native(
     index: u32,
     arguments: &[u8],
     vm: &mut Vm,
+    legacy_gbk: bool,
 ) -> Result<NativeReturn> {
     let &(_, words, encoding) = BODY_NATIVES
         .iter()
@@ -61,7 +62,18 @@ pub(super) fn call_message_body_native(
     if vm.read(target, 1).is_err() {
         return Ok(NativeReturn::Value(0));
     }
-    let mut body = extract_message_body(&formatted, encoding)?;
+    let mut body = if legacy_gbk {
+        let decoded = super::cst_context_native::decode_cst_dialogue(&formatted, super::ScriptTextEncoding::Gbk)?;
+        let plain = extract_message_body(decoded.as_bytes(), MessageEncoding::Unicode)?;
+        let text = std::str::from_utf8(&plain).map_err(|_| invalid("invalid extracted GBK message body"))?;
+        let (body, _, replaced) = encoding_rs::GBK.encode(text);
+        if replaced {
+            return Err(invalid("extracted message body is not representable in GBK"));
+        }
+        body.into_owned()
+    } else {
+        extract_message_body(&formatted, encoding)?
+    };
     let length = body
         .iter()
         .position(|&byte| byte == 0)
@@ -444,7 +456,7 @@ impl MessageNativeServices {
         context: &mut impl MessageNativeContext,
     ) -> Result<NativeReturn> {
         if is_body_native(index) {
-            return call_message_body_native(index, arguments, vm);
+            return call_message_body_native(index, arguments, vm, false);
         }
         if super::legacy_text_native::LegacyTextNativeServices::supports(index) {
             return self

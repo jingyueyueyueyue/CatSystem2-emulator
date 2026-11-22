@@ -2617,7 +2617,28 @@ impl LoggingHost<'_> {
             return self.task_message_native(index, arguments, vm);
         }
         if super::message_native::is_body_native(index) {
-            return super::message_native::call_message_body_native(index, arguments, vm);
+            let origins = &mut self.data_services.cst_text_origins;
+            let task = self.current_task_id;
+            let legacy_gbk = index == 392 && super::read_u32(arguments, 4).ok().is_some_and(|address| {
+                let gbk = super::ScriptTextEncoding::Gbk;
+                if let Some((_, codec)) = origins.sourced_vm_string(task, address, vm) {
+                    return codec == gbk;
+                }
+                // Kanmi's speaker handler copies the CST buffer into a local
+                // stack buffer in KCS bytecode before invoking native 392.
+                vm.instruction_pointer == 0x11b8
+                    && vm.program_code_sha256() == Some(super::story_trace::story_trace_09::SSCRIPT_CODE)
+                    && origins.sourced_vm_string(task, 0x5d70a, vm).is_some_and(|(record, codec)| {
+                        codec == gbk && vm.read_string(address).is_ok_and(|bytes| bytes == record)
+                    })
+            });
+            let result = super::message_native::call_message_body_native(index, arguments, vm, legacy_gbk)?;
+            let target = super::read_u32(arguments, 0)?;
+            origins.invalidate_returned(task, target);
+            if legacy_gbk && matches!(result, NativeReturn::Value(length) if length > 0) {
+                origins.record(task, target, &vm.read_string(target)?, super::ScriptTextEncoding::Gbk);
+            }
+            return Ok(result);
         }
         let empty_source = match index {
             136 => arguments.len() >= 8 && arguments.len() % 4 == 0,

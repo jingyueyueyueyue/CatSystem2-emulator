@@ -10,7 +10,7 @@ use cs2_script::CstDocument;
 #[path = "story_trace_08.rs"]
 pub(crate) mod story_trace_08;
 #[path = "story_trace_09.rs"]
-mod story_trace_09;
+pub(crate) mod story_trace_09;
 #[path = "story_trace_10.rs"]
 pub(crate) mod story_trace_10;
 #[path = "story_trace_12.rs"]

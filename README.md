@@ -16,8 +16,10 @@ CatSystem2 模拟器包含 Rust 引擎、Windows 播放器和 Android 应用。�
 | `simulator/android/` | Android 应用、游戏库、Kotlin 界面、Java 播放宿主和 JNI |
 | `simulator/vendor/` | 绑定到 Cargo 的第三方依赖及许可证，见 [THIRD_PARTY.md](simulator/THIRD_PARTY.md) |
 | `scripts/build/` | 模拟器构建、Android 安装和媒体依赖准备 |
+| `scripts/convert/` | 游戏资源及汉化补丁转换 |
 | `scripts/analysis/` | PC 回放及回归用例、Android 日志与性能分析、引擎静态检查 |
 | `games/`、`localization/` | 本地游戏原目录和翻译资料，Git 忽略 |
+| `localization/kanmi/` | 《尚有佳蜜伴恋心》的汉化归档和加载配置，Git 忽略 |
 | `reports/`、`resources/` | 本地批测清单、研究报告和参考资料，Git 忽略 |
 | `archive/YYYY-MM/` | 本地测试输出和按日期归档的游戏转换、历史探针、研究资料与旧发布工具，Git 忽略 |
 
@@ -52,3 +54,13 @@ Android 使用已安装的模拟器，从游戏库选中平板上已导入的原
 ```
 
 Android 游戏库可长按游戏选择「语种」，选项在下次启动时生效。「自动」沿用游戏和补丁默认设置。「日语原文」选择游戏的日语语言表并跳过可分离的汉化包和替字字体。「本地汉化」优先使用游戏自带的中文语言表和已接入的本地汉化资源。若补丁直接替换过原始资源，日语需要同版本的原始数据。
+
+### 尚有佳蜜伴恋心
+
+使用现有汉化补丁生成播放器可加载的 `kanmi_cn.int` 和 `cs2-localization.json`。`$launcher` 指向汉化补丁自带的启动器，`$scene` 指向原版 `scene.int`，`$images` 指向补丁的 `image` 目录。
+
+```powershell
+python -B -X utf8 scripts/convert/restore_kanmi_localization.py $launcher $scene $images localization/kanmi
+```
+
+将生成的两个文件放到与原版 `scene.int` 同一目录。播放器会按 GBK 加载补丁里的对白和说话人姓名。
