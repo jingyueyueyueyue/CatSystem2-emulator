@@ -1,7 +1,7 @@
 //! Bounded PSB texture conversion, independently derived from format facts and
 //! driver's common-platform converters545d0/546d0/547e0. No SDK/DLL loading.
 
-use super::{EmoteError, Result, decode_rgba_rle};
+use super::{EmoteError, Result, cpu::decode_rgba_rle_with_order};
 
 const MAX_TEXTURE_BYTES: usize = 128 * 1024 * 1024;
 
@@ -59,17 +59,16 @@ pub fn decode_emote_texture(
         return Err(EmoteError::InvalidResource("unrecovered texture platform"));
     }
     if kind == "RGBA8" {
-        let mut rgba = if bytes.len() == size {
-            bytes.to_vec()
-        } else {
-            decode_rgba_rle(bytes, size)?
-        };
-        if platform == "win" {
-            for pixel in rgba.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
+        if bytes.len() != size {
+            return decode_rgba_rle_with_order(bytes, size, platform == "win");
         }
-        return Ok(rgba);
+        if platform == "win" {
+            let rgba: Vec<[u8; 4]> = bytes.chunks_exact(4)
+                .map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                .collect();
+            return Ok(rgba.into_flattened());
+        }
+        return Ok(bytes.to_vec());
     }
     if platform != "common" || !matches!(kind, "RGBA5650" | "RGBA5551" | "RGBA4444") {
         return Err(EmoteError::Backend(format!(

@@ -77,7 +77,7 @@ pub(super) fn receive(
             .ok_or_else(|| unsupported(906, "M2 command524 requires owned load-spec bytes"))?;
         host.data_services
             .emote
-            .load_m2(host.resources, target, spec, addressed.data[0])?;
+            .load_m2(host.resources, &mut host.data_services.ordinary, target, spec, addressed.data[0])?;
         if let Some(node) = host.scene_nodes.get_mut(&target) {
             node.initialized = true;
         }
@@ -706,7 +706,7 @@ impl LoggingHost<'_> {
             let result = self
                 .data_services
                 .emote
-                .load_m2(self.resources, target, &spec, mode)?;
+                .load_m2(self.resources, &mut self.data_services.ordinary, target, &spec, mode)?;
             if let Some(node) = self.scene_nodes.get_mut(&target) {
                 node.initialized = true;
             }
@@ -793,9 +793,14 @@ impl EmoteNativeServices {
                 crate::gpu_raster::mix_emote_surfaces,
                 crate::gpu_raster::prepare_emote_surfaces,
                 crate::gpu_raster::expand_emote_surface,
+                crate::gpu_raster::draw_emote_surface,
             );
         }
         self.state.set_backend(Box::new(backend)).map_err(error)?;
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if crate::gpu_raster::emote_requested() {
+            crate::gpu_raster::prewarm_emote();
+        }
         self.target_size = Some(size);
         let mut fade = 30;
         for row in config.records(b"fade") {
@@ -810,6 +815,7 @@ impl EmoteNativeServices {
     fn load_m2(
         &mut self,
         resources: &ResourceIndex,
+        ordinary: &mut super::ordinary_native::OrdinaryNativeServices,
         task: u32,
         spec: &[u8],
         mode: u32,
@@ -843,6 +849,17 @@ impl EmoteNativeServices {
         let cached = version.as_ref().and_then(|version| {
             self.state.cached_m2_model(task, &plan.resource_name, version)
         });
+        let cached = if cached.is_none() && self.state.uses_unfiltered_m2_texture(task) {
+            let prepared = version.as_ref().and_then(|version| ordinary.take_preloaded_model(version));
+            if prepared.is_some() && version != EmoteArchiveVersion::observe(candidate) {
+                version = None;
+                None
+            } else {
+                prepared
+            }
+        } else {
+            cached
+        };
         let decoded;
         let source = if let Some((model, version)) = cached.zip(version.clone()) {
             CpuM2ModelSource::Shared(model, version)

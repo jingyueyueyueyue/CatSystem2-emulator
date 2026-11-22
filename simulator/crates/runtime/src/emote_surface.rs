@@ -3,10 +3,11 @@
 
 use super::{EmoteError, EmoteRasterFrame, Result};
 
-pub type EmoteSurfaceMixer = fn(&EmoteRasterFrame, &EmoteRasterFrame, u32, bool)
+// None leaves the incoming alpha classification on the host device.
+pub type EmoteSurfaceMixer = fn(&EmoteRasterFrame, &EmoteRasterFrame, u32, Option<bool>)
     -> Option<EmoteRasterFrame>;
 pub type EmoteSurfacePrepare = fn(&EmoteRasterFrame, &EmoteRasterFrame)
-    -> Option<(EmoteRasterFrame, EmoteRasterFrame, bool)>;
+    -> Option<(EmoteRasterFrame, EmoteRasterFrame, Option<bool>)>;
 pub type EmoteSurfaceExpand = fn(&EmoteRasterFrame, [u32; 2]) -> Option<EmoteRasterFrame>;
 
 #[derive(Clone)]
@@ -14,7 +15,7 @@ struct Blend {
     old: EmoteRasterFrame,
     new: EmoteRasterFrame,
     shown: EmoteRasterFrame,
-    new_is_transparent: bool,
+    new_is_transparent: Option<bool>,
     duration: u32,
     start: Option<u32>,
 }
@@ -47,7 +48,7 @@ impl Blend {
             }
         }
         Ok(Self { shown: old.clone(), old, new,
-            new_is_transparent: incoming_alpha == 0, duration, start: None })
+            new_is_transparent: Some(incoming_alpha == 0), duration, start: None })
     }
 
     /// False at retirement permits the same host tick to continue into the
@@ -77,7 +78,9 @@ impl Blend {
         if self.shown.device().is_some() {
             self.shown = self.old.clone();
         }
-        if self.new_is_transparent {
+        if *self.new_is_transparent.get_or_insert_with(||
+            !self.new.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0))
+        {
             // 19c7f0 preserves RGB rather than lerping toward black.
             for (out, old) in self.shown.rgba_mut().chunks_exact_mut(4)
                 .zip(self.old.rgba().chunks_exact(4)) {

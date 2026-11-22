@@ -84,7 +84,8 @@ fn sprite(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = (pos.y - command(6u)) * command(4u) + x - command(5u);
     let serial = command(7u);
     let reference = command(9u);
-    let operation = command(10u);
+    let operation = command(10u) & 255u;
+    let bgra = (command(10u) & 256u) != 0u;
     let opacity = bitcast<f32>(command(11u));
     var pixel = pixels[index];
     let same_plane = ((pixel.stencil & ~FLAGS) >> 8u) == serial;
@@ -101,7 +102,10 @@ fn sprite(@builtin(global_invocation_id) id: vec3<u32>) {
         let offset = start + advance;
         let base = vec2<i32>(bitcast<i32>(command(i + 6u)), bitcast<i32>(command(i + 7u)));
         let uncertainty = (abs(start) + abs(advance) + abs(offset)) * 0.00000013 + 0.0000002;
-        let sample = sample_atlas(base, offset, uncertainty);
+        var sample = sample_atlas(base, offset, uncertainty);
+        if bgra {
+            sample = Sample(sample.color.bgra, sample.error.bgra);
+        }
         let alpha = clamp(sample.color.a / 255.0 * opacity, 0.0, 1.0);
         // All four zero texels give exact zero inside the interpolation cell.
         let alpha_error = select(sample.error.a / 255.0 * abs(opacity) + 0.0000006, 0.0,
@@ -181,6 +185,9 @@ struct FadeParams {
 @group(0) @binding(2) var<storage, read> fade_new: array<u32>;
 @group(0) @binding(3) var<storage, read_write> fade_output: array<u32>;
 @group(0) @binding(4) var<storage, read_write> fade_prepared_new: array<u32>;
+@group(0) @binding(5) var<storage, read_write> fade_new_alpha: atomic<u32>;
+@group(0) @binding(6) var<storage, read> fade_alpha_class: u32;
+var<workgroup> fade_group_alpha: atomic<u32>;
 
 @compute @workgroup_size(8, 8)
 fn surface_expand(@builtin(global_invocation_id) id: vec3u) {
@@ -205,12 +212,26 @@ fn surface_prepare(@builtin(global_invocation_id) id: vec3u) {
 }
 
 @compute @workgroup_size(8, 8)
+fn surface_alpha(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_index) lane: u32) {
+    if all(id.xy < fade.size) {
+        let index = id.y * fade.size.x + id.x;
+        if fade_new[index] >> 24u != 0u {
+            atomicOr(&fade_group_alpha, 1u);
+        }
+    }
+    workgroupBarrier();
+    if lane == 0u && atomicLoad(&fade_group_alpha) != 0u {
+        atomicOr(&fade_new_alpha, 1u);
+    }
+}
+
+@compute @workgroup_size(8, 8)
 fn surface_fade(@builtin(global_invocation_id) id: vec3u) {
     if any(id.xy >= fade.size) { return; }
     let index = id.y * fade.size.x + id.x;
     let old_weight = 256u - fade.weight;
     let prior = fade_old[index];
-    if fade.transparent != 0u {
+    if fade.transparent == 1u || (fade.transparent == 2u && fade_alpha_class == 0u) {
         let alpha = ((prior >> 24u) * old_weight) >> 8u;
         fade_output[index] = (prior & 0xffffffu) | (alpha << 24u);
         return;

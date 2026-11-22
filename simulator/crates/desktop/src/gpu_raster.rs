@@ -81,7 +81,7 @@ pub(super) fn available() -> bool {
 
 pub(super) use emote_raster::{
     begin_emote_batch, blend_emote, draw_emote, expand_emote_surface, mix_emote_surfaces,
-    prepare_emote_poses, prepare_emote_surfaces,
+    draw_emote_surface, prepare_emote_poses, prepare_emote_surfaces, prewarm_emote, stage_emote_model,
 };
 
 pub(super) fn textured_planes_requested() -> bool {
@@ -818,10 +818,13 @@ impl Raster {
     fn direct_output_enabled(&self) -> bool {
         #[cfg(all(test, windows))]
         if self.test_direct_output { return true; }
+        #[cfg(windows)]
+        {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| std::env::var_os("CS2_REPLAY_DEVICE_OUTPUT").is_some_and(|value| value == "1"))
+        }
         #[cfg(target_os = "android")]
         return !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false);
-        #[allow(unreachable_code)]
-        false
     }
 
     fn source_texture(&mut self, frame: Option<&RgbaFrame>) -> wgpu::TextureView {

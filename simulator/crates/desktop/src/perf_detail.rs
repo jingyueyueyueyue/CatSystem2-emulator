@@ -62,9 +62,10 @@ impl HostPerfDetails {
             let collect = evaluate + prepare;
             let [scanlines, pack] = sample.collect_phases.map(|time| time.as_micros());
             let row = format!(
-                "emote_gpu session={session} frame={frame} call={call} poses={} draws={} batches={} pixels={} repaired={} sync_waits={} sync_poses={} collect_us={collect} evaluate_us={evaluate} prepare_us={prepare} scanlines_cpu_us={scanlines} pack_cpu_us={pack} encode_us={encode} readback_us={readback} repair_us={repair}",
+                "emote_gpu session={session} frame={frame} call={call} poses={} draws={} batches={} pixels={} repaired={} sync_waits={} sync_poses={} collect_us={collect} evaluate_us={evaluate} prepare_us={prepare} scanlines_cpu_us={scanlines} pack_cpu_us={pack} encode_us={encode} readback_us={readback} repair_us={repair} span_hits={} span_misses={} span_cache_peak_bytes={} parallel_wall_us={} parallel_join_us={} parallel_copy_bytes={}",
                 sample.poses, sample.draws, sample.batches, sample.pixels, sample.repaired,
-                sample.sync_waits, sample.sync_poses,
+                sample.sync_waits, sample.sync_poses, sample.span_hits, sample.span_misses, sample.span_cache_peak_bytes,
+                sample.parallel_wall.as_micros(), sample.parallel_join.as_micros(), sample.parallel_copy_bytes,
             );
             append_row(&mut rows, &row);
         }
@@ -194,6 +195,36 @@ struct EmoteGpuSample {
     sync_poses: usize,
     elapsed: [Duration; 5],
     collect_phases: [Duration; 2],
+    span_hits: usize,
+    span_misses: usize,
+    span_cache_peak_bytes: usize,
+    parallel_wall: Duration,
+    parallel_join: Duration,
+    parallel_copy_bytes: usize,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_prep_parallel(wall: Duration, join: Duration, copy_bytes: usize) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            let sample = &mut detail.emote_gpu;
+            sample.parallel_wall += wall;
+            sample.parallel_join += join;
+            sample.parallel_copy_bytes += copy_bytes;
+        }
+    });
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_span_cache(hits: usize, misses: usize, bytes: usize) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            let sample = &mut detail.emote_gpu;
+            sample.span_hits += hits;
+            sample.span_misses += misses;
+            sample.span_cache_peak_bytes = sample.span_cache_peak_bytes.max(bytes);
+        }
+    });
 }
 
 impl GpuOutputSample {

@@ -13,6 +13,7 @@ use cs2_runtime::emote::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::{Duration, Instant};
@@ -83,6 +84,35 @@ fn report_missing_raster_once() {
     }
 }
 
+pub(in crate) fn prewarm_emote() {
+    RASTER.with_borrow_mut(|slot| {
+        if let Some(raster) = slot.as_mut() {
+            let started = Instant::now();
+            match raster.ensure_emote() {
+                Ok(()) => report(&format!("emote_prewarm_us={}", started.elapsed().as_micros())),
+                Err(error) => report(&format!("emote_prewarm_failed={error:#}")),
+            }
+        }
+    });
+}
+
+/// Use one bounded upload for each new logical frame, before its script runs.
+pub(in crate) fn stage_emote_model(model: &Arc<CpuMotionModel>) {
+    RASTER.with_borrow_mut(|slot| {
+        let Some(raster) = slot.as_mut() else { return };
+        let Some(emote) = raster.emote.as_mut() else { return };
+        let started = Instant::now();
+        match emote.stage_atlas(&raster.device, &raster.queue, model) {
+            Ok(0) => {}
+            Ok(bytes) => {
+                raster.queue.submit([]);
+                report(&format!("emote_atlas_stage_bytes={bytes} submit_us={}", started.elapsed().as_micros()));
+            }
+            Err(error) => report(&format!("emote_atlas_stage_failed={error:#}")),
+        }
+    });
+}
+
 /// Wgpu uses one bounded readback per pose. The manager keeps the logical
 /// viewport dimensions for its held images and cross-fade surfaces.
 pub(in crate) fn draw_emote(
@@ -119,7 +149,7 @@ pub(in crate) fn blend_emote(
 }
 
 pub(in crate) fn mix_emote_surfaces(
-    old: &EmoteRasterFrame, new: &EmoteRasterFrame, weight: u32, transparent: bool,
+    old: &EmoteRasterFrame, new: &EmoteRasterFrame, weight: u32, transparent: Option<bool>,
 ) -> Option<EmoteRasterFrame> {
     if !super::emote_device_blend_requested() { return None; }
     RASTER.with_borrow_mut(|slot| {
@@ -131,12 +161,15 @@ pub(in crate) fn mix_emote_surfaces(
             return None;
         }
         let bytes = fade_extent(device, size)?;
+        let alpha = if transparent.is_none() {
+            Some(raster.fade_device_pose(new)?.fade_alpha.as_ref()?.clone())
+        } else { None };
         let emote = raster.emote.as_mut()?;
         let queue = &raster.queue;
         let old_buffer = emote.fade_source(device, queue, &raster.failed, old)?;
         let new_buffer = emote.fade_source(device, queue, &raster.failed, new)?;
         let output = emote.fade_output(device, bytes);
-        let params = [size[0], size[1], weight, u32::from(transparent), 0, 0, 0, 0];
+        let params = [size[0], size[1], weight, transparent.map_or(2, u32::from), 0, 0, 0, 0];
         let params: Vec<_> = params.into_iter().flat_map(u32::to_le_bytes).collect();
         queue.write_buffer(&emote.fade_params, 0, &params);
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -146,6 +179,7 @@ pub(in crate) fn mix_emote_surfaces(
                 wgpu::BindGroupEntry { binding: 1, resource: old_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: new_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: alpha.as_deref().unwrap_or(&emote.fade_empty_alpha).as_entire_binding() },
             ],
         });
         dispatch_fade(device, queue, &emote.fade, &bindings, size);
@@ -153,7 +187,7 @@ pub(in crate) fn mix_emote_surfaces(
         if !REPORTED.swap(true, Ordering::Relaxed) {
             report(&format!("draw=emote_surface_fade backend={}", raster.backend));
         }
-        raster.bind_fade_output(size, old.origin(), output, bytes)
+        raster.bind_fade_output(size, old.origin(), output, bytes, None)
     })
 }
 
@@ -185,28 +219,47 @@ pub(in crate) fn expand_emote_surface(
             ],
         });
         dispatch_fade(&raster.device, &raster.queue, &emote.fade_expand, &bindings, size);
-        raster.bind_fade_output(size, [0, 0], output, bytes)
+        raster.bind_fade_output(size, [0, 0], output, bytes, None)
     })
+}
+
+pub(in crate) fn draw_emote_surface(
+    player: &CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>,
+) -> Option<EmoteRasterFrame> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        #[cfg(windows)]
+        let enabled = std::env::var("CS2_EMOTE_DEVICE_ENDPOINT").is_ok_and(|value| value == "1");
+        #[cfg(target_os = "android")]
+        let enabled = super::android_property(c"debug.cs2.emote_device_endpoint", |value| value == b"1")
+            .unwrap_or(false);
+        enabled
+    });
+    if !enabled || !super::emote_device_blend_requested() { return None; }
+    let frame = draw_emote(player, viewport, variables)?;
+    expand_emote_surface(&frame, [viewport.width, viewport.height])
 }
 
 pub(in crate) fn prepare_emote_surfaces(
     old: &EmoteRasterFrame, new: &EmoteRasterFrame,
-) -> Option<(EmoteRasterFrame, EmoteRasterFrame, bool)> {
-    if !super::emote_device_blend_requested() || new.device().is_some() { return None; }
+) -> Option<(EmoteRasterFrame, EmoteRasterFrame, Option<bool>)> {
+    if !super::emote_device_blend_requested() || (old.device().is_none() && new.device().is_none()) { return None; }
     RASTER.with_borrow_mut(|slot| {
         let raster = slot.as_mut()?;
-        let prior = raster.fade_device_pose(old)?;
+        if !raster.direct_output_enabled() || raster.failed.load(Ordering::Relaxed) { return None; }
         let size = [old.width(), old.height()];
         if size != [new.width(), new.height()] || old.origin() != new.origin() {
             return None;
         }
         let [width, height] = size;
         let bytes = fade_extent(&raster.device, size)?;
-        let transparent = !new.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0);
+        let cpu_transparent = new.device().is_none().then(|| !new.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0));
         let emote = raster.emote.as_mut()?;
+        let prior = emote.fade_source(&raster.device, &raster.queue, &raster.failed, old)?;
         let next = emote.fade_source(&raster.device, &raster.queue, &raster.failed, new)?;
         let adjusted_old = emote.fade_output(&raster.device, bytes);
         let adjusted_new = emote.fade_output(&raster.device, bytes);
+        let alpha = cpu_transparent.is_none().then(|| Arc::new(buffer(&raster.device, 4, TARGET)));
         let params = [width, height, 0, 0, 0, 0, 0, 0];
         let params: Vec<_> = params.into_iter().flat_map(u32::to_le_bytes).collect();
         raster.queue.write_buffer(&emote.fade_params, 0, &params);
@@ -214,17 +267,28 @@ pub(in crate) fn prepare_emote_surfaces(
             label: Some("CS2 E-mote surface prepare"), layout: &emote.fade_prepare_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: emote.fade_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: prior.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: prior.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: next.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: adjusted_old.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: adjusted_new.as_entire_binding() },
             ],
         });
         dispatch_fade(&raster.device, &raster.queue, &emote.fade_prepare, &bindings, size);
+        if let Some(alpha) = &alpha {
+            let bindings = raster.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("CS2 E-mote capture alpha"), layout: &emote.fade_alpha_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: emote.fade_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: next.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: alpha.as_entire_binding() },
+                ],
+            });
+            dispatch_fade(&raster.device, &raster.queue, &emote.fade_alpha, &bindings, size);
+        }
         Some((
-            raster.bind_fade_output(size, old.origin(), adjusted_old, bytes)?,
-            raster.bind_fade_output(size, new.origin(), adjusted_new, bytes)?,
-            transparent,
+            raster.bind_fade_output(size, old.origin(), adjusted_old, bytes, None)?,
+            raster.bind_fade_output(size, new.origin(), adjusted_new, bytes, alpha)?,
+            cpu_transparent,
         ))
     })
 }
@@ -262,19 +326,23 @@ impl Raster {
 
     fn bind_fade_output(
         &self, size: [u32; 2], origin: [i32; 2], buffer: Arc<wgpu::Buffer>, bytes: u64,
+        fade_alpha: Option<Arc<wgpu::Buffer>>,
     ) -> Option<EmoteRasterFrame> {
         EmoteRasterFrame::from_device(size[0], size[1], origin, Arc::new(DevicePose {
             buffer, device: self.device.clone(), queue: self.queue.clone(), bytes,
-            failed: self.failed.clone(),
+            failed: self.failed.clone(), fade_alpha,
         })).ok()
     }
 }
 
 const ATLAS_BYTES: usize = 128 * 1024 * 1024;
+const ATLAS_STAGE_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const COMMAND_WORDS: usize = COMMAND_BYTES / size_of::<u32>();
 const MAX_DRAWS: usize = 1024;
 const MAX_PREP_WORKERS: usize = 4;
+const SPAN_CACHE_SLOTS: usize = 128;
+const SPAN_CACHE_ENTRY_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Default)]
 struct Stencil {
@@ -341,8 +409,52 @@ impl EmoteDrawTarget for Pose<'_> {
 #[derive(Default)]
 struct CommandBatch {
     commands: Vec<u32>,
-    rows: Vec<Vec<EmoteTextureSpan>>,
+    rows: Vec<Vec<[u32; 8]>>,
     phases: [Duration; 2],
+    span_cache: Vec<SpanCacheSlot>,
+    span_hits: usize,
+    span_misses: usize,
+}
+
+#[derive(Default)]
+struct SpanCacheSlot {
+    previous: Option<u64>,
+    cached: Option<CachedSpans>,
+}
+
+struct CachedSpans {
+    hash: u64,
+    size: [u32; 2],
+    grid: [u32; 2],
+    vertices: Box<[[f64; 4]]>,
+    bounds: [u32; 4],
+    words: Box<[u32]>,
+}
+
+impl CachedSpans {
+    fn matches(&self, hash: u64, size: [u32; 2], grid: [u32; 2], vertices: &[[f64; 4]]) -> bool {
+        self.hash == hash && self.size == size && self.grid == grid
+            && self.vertices.len() == vertices.len()
+            && self.vertices.iter().flatten().zip(vertices.iter().flatten())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.vertices) + std::mem::size_of_val(&*self.words)
+    }
+}
+
+fn span_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(windows)]
+        let enabled = std::env::var("CS2_EMOTE_SPAN_CACHE").is_ok_and(|value| value == "1");
+        #[cfg(target_os = "android")]
+        let enabled = super::android_property(c"debug.cs2.emote_span_cache", |value| value == b"1")
+            .unwrap_or(false);
+        report(&format!("emote_span_cache={enabled}"));
+        enabled
+    })
 }
 
 impl CommandBatch {
@@ -353,6 +465,11 @@ impl CommandBatch {
         self.commands.clear();
         self.rows.resize_with(viewport.height as usize, Vec::new);
         self.phases = [Duration::ZERO; 2];
+        self.span_hits = 0;
+        self.span_misses = 0;
+        if self.span_cache.is_empty() && span_cache_enabled() {
+            self.span_cache.resize_with(SPAN_CACHE_SLOTS, SpanCacheSlot::default);
+        }
         for row in &mut self.rows { row.clear(); }
         for draw in draws {
             draw.words = 0;
@@ -361,32 +478,86 @@ impl CommandBatch {
         Ok(())
     }
 
+    fn report_span_cache(&self, profile: bool) {
+        if profile && !self.span_cache.is_empty() {
+            crate::perf_detail::emote_span_cache(
+                self.span_hits, self.span_misses,
+                self.span_cache.iter().filter_map(|slot| slot.cached.as_ref()).map(CachedSpans::bytes).sum(),
+            );
+        }
+    }
+
     fn prepare_draw(
         &mut self, draw: &mut Draw<'_>, viewport: CpuViewport, alignment: usize, profile: bool,
         word_limit: usize,
     ) -> cs2_runtime::emote::Result<()> {
-        let Draw { mesh, stencil, reference, operation, .. } = draw;
+        let Draw { mesh, .. } = draw;
         let mut bounds = [viewport.width, viewport.height, 0, 0];
         let mut span_count = 0;
         let budget = word_limit.saturating_sub(self.commands.len()) / 8;
         let scanlines_started = profile.then(Instant::now);
+        let size = [viewport.width, viewport.height];
+        let grid = mesh.mesh_dimensions();
+        let mut cache_candidate = None;
+        if !self.span_cache.is_empty() && std::mem::size_of_val(mesh.vertices.as_slice()) < SPAN_CACHE_ENTRY_BYTES {
+            let mut hasher = DefaultHasher::new();
+            size.hash(&mut hasher);
+            grid.hash(&mut hasher);
+            for value in mesh.vertices.iter().flatten() {
+                hasher.write_u64(value.to_bits());
+            }
+            let hash = hasher.finish();
+            let slot = &mut self.span_cache[hash as usize % SPAN_CACHE_SLOTS];
+            if let Some(cached) = slot.cached.as_ref().filter(|cached|
+                cached.matches(hash, size, grid, &mesh.vertices))
+            {
+                self.span_hits += 1;
+                let pack_started = scanlines_started.map(|start| {
+                    let now = Instant::now();
+                    self.phases[0] += now - start;
+                    now
+                });
+                // The row table is independent of texture identity, opacity and stencil state.
+                let offset = self.commands.len().next_multiple_of(alignment);
+                let words = 12 + cached.words.len();
+                if offset + words > word_limit {
+                    return Err(EmoteError::Capacity);
+                }
+                self.commands.resize(offset + 12, 0);
+                self.commands.extend_from_slice(&cached.words);
+                set_draw_header(draw, cached.bounds, offset, words, &mut self.commands);
+                self.finish_pack_timing(pack_started);
+                return Ok(());
+            }
+            self.span_misses += 1;
+            // Admit repeated geometry only, so animated meshes do not constantly
+            // allocate span tables and replace reusable entries.
+            if slot.previous.replace(hash) == Some(hash) {
+                cache_candidate = Some(hash);
+            }
+        }
         for triangle in mesh.triangle_indices() {
-            visit_emote_texture_spans(triangle.map(|i| mesh.vertices[i]), [viewport.width, viewport.height], |span| {
+            let mut invalid_uv = false;
+            visit_emote_texture_spans(triangle.map(|i| mesh.vertices[i]), size, |span| {
                 span_count += 1;
-                if span_count <= budget {
+                if span_count <= budget && !invalid_uv {
                     extend_bounds(&mut bounds, [span.x.start, span.y, span.x.end, span.y + 1]);
-                    self.rows[span.y as usize].push(span);
+                    let row = span.y as usize;
+                    if let Some(words) = pack_span(span) {
+                        self.rows[row].push(words);
+                    } else {
+                        invalid_uv = true;
+                    }
                 }
             })?;
             if span_count > budget {
                 return Err(EmoteError::Capacity);
             }
+            if invalid_uv {
+                return Err(EmoteError::InvalidResource("E-mote UV exceeds accelerated precision"));
+            }
         }
-        let pack_started = scanlines_started.map(|start| {
-            let now = Instant::now();
-            self.phases[0] += now - start;
-            now
-        });
+        let pack_started = self.finish_scanline_timing(scanlines_started);
         if span_count == 0 {
             return Ok(());
         }
@@ -402,46 +573,75 @@ impl CommandBatch {
         }
         self.commands.resize(offset + words, 0);
         let block = &mut self.commands[offset..];
-        block[..12].copy_from_slice(&[
-            bounds[2] - bounds[0], height as u32, bounds[0], bounds[1],
-            0, 0, 0, stencil.serial, u32::from(stencil.clear), u32::from(*reference),
-            match operation {
-                None => 0,
-                Some(CpuStencilWrite::IncrementWrapping) => 1,
-                Some(CpuStencilWrite::DecrementWrapping) => 255,
-            },
-            (mesh.opacity as f32).to_bits(),
-        ]);
         let mut index = first_span;
         for (y, spans) in self.rows[bounds[1] as usize..bounds[3] as usize].iter_mut().enumerate() {
             block[12 + y] = index as u32;
-            for span in spans.drain(..) {
-                // Split the integer texel origin so a 4096-wide atlas
-                // doesn't round away the subpixel precision before sampling.
-                let base = span.uv.map(|n| n.floor());
-                let uv = std::array::from_fn::<_, 2, _>(|axis| (span.uv[axis] - base[axis]) as f32);
-                let step = span.step.map(|n| n as f32);
-                if base.into_iter().any(|n| !n.is_finite() || n.abs() > 1e6)
-                    || step.into_iter().any(|n| !n.is_finite() || n.abs() > 1e6) {
-                    return Err(EmoteError::InvalidResource("E-mote UV exceeds accelerated precision"));
-                }
-                block[index..index + 8].copy_from_slice(&[
-                    span.x.start, span.x.end, uv[0].to_bits(), uv[1].to_bits(),
-                    step[0].to_bits(), step[1].to_bits(),
-                    base[0] as i32 as u32, base[1] as i32 as u32,
-                ]);
-                index += 8;
-            }
+            let words = spans.as_flattened();
+            let end = index + words.len();
+            block[index..end].copy_from_slice(words);
+            index = end;
+            spans.clear();
         }
         block[12 + height] = index as u32;
-        draw.bounds = bounds;
-        draw.offset = offset;
-        draw.words = words;
-        if let Some(start) = pack_started {
-            self.phases[1] += start.elapsed();
+        if let Some(hash) = cache_candidate
+            && std::mem::size_of_val(mesh.vertices.as_slice()) + std::mem::size_of_val(&block[12..]) <= SPAN_CACHE_ENTRY_BYTES
+        {
+            self.span_cache[hash as usize % SPAN_CACHE_SLOTS].cached = Some(CachedSpans {
+                hash, size, grid, vertices: mesh.vertices.clone().into_boxed_slice(), bounds,
+                words: block[12..].into(),
+            });
         }
+        set_draw_header(draw, bounds, offset, words, &mut self.commands);
+        self.finish_pack_timing(pack_started);
         Ok(())
     }
+
+    fn finish_scanline_timing(&mut self, started: Option<Instant>) -> Option<Instant> {
+        started.map(|start| {
+            let now = Instant::now();
+            self.phases[0] += now - start;
+            now
+        })
+    }
+
+    fn finish_pack_timing(&mut self, started: Option<Instant>) {
+        if let Some(start) = started {
+            self.phases[1] += start.elapsed();
+        }
+    }
+}
+
+#[inline]
+fn pack_span(span: EmoteTextureSpan) -> Option<[u32; 8]> {
+    // Keep the integer and fractional parts separate for large atlases.
+    let base = span.uv.map(f64::floor);
+    let step = span.step.map(|n| n as f32);
+    if base.into_iter().any(|n| !n.is_finite() || n.abs() > 1e6)
+        || step.into_iter().any(|n| !n.is_finite() || n.abs() > 1e6)
+    {
+        return None;
+    }
+    let [u, v] = std::array::from_fn(|axis| (span.uv[axis] - base[axis]) as f32);
+    Some([
+        span.x.start, span.x.end, u.to_bits(), v.to_bits(), step[0].to_bits(), step[1].to_bits(),
+        base[0] as i32 as u32, base[1] as i32 as u32,
+    ])
+}
+
+fn set_draw_header(draw: &mut Draw<'_>, bounds: [u32; 4], offset: usize, words: usize, commands: &mut [u32]) {
+    commands[offset..offset + 12].copy_from_slice(&[
+        bounds[2] - bounds[0], bounds[3] - bounds[1], bounds[0], bounds[1],
+        0, 0, 0, draw.stencil.serial, u32::from(draw.stencil.clear), u32::from(draw.reference),
+        (match draw.operation {
+            None => 0,
+            Some(CpuStencilWrite::IncrementWrapping) => 1,
+            Some(CpuStencilWrite::DecrementWrapping) => 255,
+        }) | (u32::from(draw.mesh.texture.is_bgra()) << 8),
+        (draw.mesh.opacity as f32).to_bits(),
+    ]);
+    draw.bounds = bounds;
+    draw.offset = offset;
+    draw.words = words;
 }
 
 fn clamp_prep_workers(requested: usize, available: usize) -> usize {
@@ -468,6 +668,33 @@ fn prep_worker_limit() -> usize {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrepMode {
+    Serial,
+    AcrossPoses,
+    WithinPose,
+    Combined,
+}
+
+fn prep_mode() -> PrepMode {
+    static MODE: OnceLock<PrepMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let parse = |value: &[u8]| match value {
+            b"serial" => PrepMode::Serial,
+            b"across" => PrepMode::AcrossPoses,
+            b"within" => PrepMode::WithinPose,
+            _ => PrepMode::Combined,
+        };
+        #[cfg(windows)]
+        let mode = std::env::var("CS2_EMOTE_PREP_MODE").ok().map(|value| parse(value.as_bytes()));
+        #[cfg(target_os = "android")]
+        let mode = super::android_property(c"debug.cs2.emote_prep_mode", parse);
+        let mode = mode.unwrap_or(PrepMode::Combined);
+        report(&format!("emote_prep_mode={mode:?}"));
+        mode
+    })
+}
+
 fn prepare_commands(
     draws: &mut [Draw<'_>], batches: &mut [CommandBatch; MAX_PREP_WORKERS],
     viewport: CpuViewport, alignment: usize, profile: bool, commands: &mut Vec<u32>,
@@ -476,7 +703,9 @@ fn prepare_commands(
     if draws.is_empty() {
         return Ok([Duration::ZERO; 2]);
     }
-    let desired = if draws.len() >= 12 && u64::from(viewport.width) * u64::from(viewport.height) >= 256 * 1024 {
+    let desired = if matches!(prep_mode(), PrepMode::WithinPose | PrepMode::Combined)
+        && draws.len() >= 12 && u64::from(viewport.width) * u64::from(viewport.height) >= 256 * 1024
+    {
         prep_worker_limit()
     } else {
         1
@@ -484,6 +713,7 @@ fn prepare_commands(
     if desired == 1 {
         let batch = &mut batches[0];
         batch.prepare(draws, viewport, alignment, profile, COMMAND_WORDS)?;
+        batch.report_span_cache(profile);
         std::mem::swap(commands, &mut batch.commands);
         return Ok(batch.phases);
     }
@@ -492,21 +722,27 @@ fn prepare_commands(
     let word_limit = (COMMAND_WORDS / count / alignment) * alignment;
     let active = &mut batches[..count];
     let errors = Mutex::new(std::array::from_fn::<_, MAX_PREP_WORKERS, _>(|_| None));
+    let started = profile.then(Instant::now);
+    let main_thread = profile.then(|| std::thread::current().id());
+    let mut main_completion = [None; MAX_PREP_WORKERS];
     cs2_renderer::parallel_for_each(
-        active.iter_mut().zip(draws.chunks_mut(chunk_size)).enumerate(),
+        active.iter_mut().zip(draws.chunks_mut(chunk_size)).zip(&mut main_completion).enumerate(),
         count,
-        |(index, (batch, draws))| {
+        |(index, ((batch, draws), completed))| {
             if let Err(error) = batch.prepare(draws, viewport, alignment, profile, word_limit) {
                 let mut errors = errors.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 errors[index] = Some(error);
             }
+            *completed = main_thread.filter(|id| *id == std::thread::current().id()).map(|_| Instant::now());
         },
     );
+    let joined = started.map(|_| Instant::now());
     let errors = errors.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = errors.into_iter().flatten().next().map_or(Ok(()), Err);
     if matches!(result, Err(EmoteError::Capacity)) {
         let batch = &mut batches[0];
         batch.prepare(draws, viewport, alignment, profile, COMMAND_WORDS)?;
+        batch.report_span_cache(profile);
         std::mem::swap(commands, &mut batch.commands);
         return Ok(batch.phases);
     }
@@ -514,6 +750,7 @@ fn prepare_commands(
     let mut phases = [Duration::ZERO; 2];
     // The order of the GPU dispatches also determines stencil semantics.
     for (batch, chunk) in active.iter().zip(draws.chunks_mut(chunk_size)) {
+        batch.report_span_cache(profile);
         let start = commands.len().next_multiple_of(alignment);
         if start + batch.commands.len() > COMMAND_WORDS {
             return Err(EmoteError::Capacity);
@@ -526,6 +763,11 @@ fn prepare_commands(
         for (total, elapsed) in phases.iter_mut().zip(batch.phases) {
             *total += elapsed;
         }
+    }
+    if let (Some(started), Some(joined)) = (started, joined) {
+        let main_finished = main_completion.into_iter().flatten().max().unwrap_or(started);
+        let copied_bytes = active.iter().map(|batch| std::mem::size_of_val(batch.commands.as_slice())).sum();
+        crate::perf_detail::emote_prep_parallel(joined - started, joined - main_finished, copied_bytes);
     }
     Ok(phases)
 }
@@ -542,6 +784,34 @@ struct CachedAtlas {
     identity: usize,
     bytes: usize,
     view: wgpu::TextureView,
+    texture: wgpu::Texture,
+    uploaded_rows: u32,
+    used_by_draw: bool,
+}
+
+impl CachedAtlas {
+    fn upload(&mut self, queue: &wgpu::Queue, pixels: &[u8], byte_limit: usize) -> usize {
+        let size = self.texture.size();
+        let stride = size.width as usize * 4;
+        let start = self.uploaded_rows;
+        let rows = (size.height - start).min((byte_limit / stride) as u32);
+        if rows == 0 {
+            return 0;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                origin: wgpu::Origin3d { x: 0, y: start, z: 0 },
+                ..self.texture.as_image_copy()
+            },
+            &pixels[start as usize * stride..(start + rows) as usize * stride],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0, bytes_per_row: Some(size.width * 4), rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d { height: rows, ..size },
+        );
+        self.uploaded_rows += rows;
+        rows as usize * stride
+    }
 }
 
 struct OwnedDraw {
@@ -564,13 +834,18 @@ struct PreparedPose {
 }
 
 pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
+    let mode = prep_mode();
     let workers = prep_worker_limit().min(players.len());
-    if workers < 2 || players.len() > 4 {
+    if workers < 2 || players.len() > 4 || matches!(mode, PrepMode::Serial | PrepMode::WithinPose) {
         return;
     }
     let Some(alignment) = RASTER.with_borrow(|slot| slot.as_ref().map(|raster|
         raster.device.limits().min_storage_buffer_offset_alignment as usize / 4)) else { return };
     let profile = emote_gpu_start().is_some();
+    if mode == PrepMode::AcrossPoses {
+        prepare_across_poses(players, alignment, workers, profile);
+        return;
+    }
     let mut poses: Vec<_> = std::iter::repeat_with(|| None).take(players.len()).collect();
     cs2_renderer::parallel_for_each(poses.iter_mut().zip(players), workers, |(slot, &(player, viewport))| {
         let Ok(variables) = player.effective_variables() else { return };
@@ -599,6 +874,7 @@ pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
             return false;
         }
         for ((index, _, draws, _), batch) in jobs.into_iter().zip(batches) {
+            batch.report_span_cache(profile);
             let (words, phases) = &mut packed[index];
             let start = words.len().next_multiple_of(alignment);
             words.resize(start, 0);
@@ -624,6 +900,38 @@ pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
             }
         });
     }
+}
+
+fn prepare_across_poses(players: &[(&CpuPlayer, CpuViewport)], alignment: usize, workers: usize, profile: bool) {
+    let mut poses: Vec<_> = std::iter::repeat_with(|| None).take(players.len()).collect();
+    POSE_BATCHES.with_borrow_mut(|batches| {
+        batches.resize_with(players.len(), CommandBatch::default);
+        let started = profile.then(Instant::now);
+        let main_thread = profile.then(|| std::thread::current().id());
+        let jobs = poses.iter_mut().zip(players).zip(batches.iter_mut());
+        cs2_renderer::parallel_for_each(jobs, workers, |((slot, &(player, viewport)), batch)| {
+            let Ok(variables) = player.effective_variables() else { return };
+            let Ok(mut pose) = collect_pose(player, viewport, &variables, false) else { return };
+            if batch.prepare(&mut pose.draws, viewport, alignment, profile, COMMAND_WORDS).is_err() { return; }
+            *slot = Some((PreparedPose {
+                player: player as *const CpuPlayer as usize, variables, viewport,
+                draws: own_draws(pose.draws), words: std::mem::take(&mut batch.commands), phases: batch.phases,
+            }, main_thread.filter(|id| *id == std::thread::current().id()).map(|_| Instant::now())));
+        });
+        if let Some(started) = started {
+            let finished = Instant::now();
+            let main_finished = poses.iter().flatten().filter_map(|(_, time)| *time).max().unwrap_or(started);
+            crate::perf_detail::emote_prep_parallel(finished - started, finished - main_finished, 0);
+        }
+        PREPARED.with_borrow_mut(|prepared| {
+            for ((pose, _), batch) in poses.into_iter().zip(batches).filter_map(|(pose, batch)|
+                pose.map(|pose| (pose, batch)))
+            {
+                batch.report_span_cache(profile);
+                prepared.push(pose);
+            }
+        });
+    });
 }
 
 fn collect_pose<'a>(
@@ -686,6 +994,7 @@ pub(super) struct DevicePose {
     queue: wgpu::Queue,
     bytes: u64,
     failed: Arc<AtomicBool>,
+    fade_alpha: Option<Arc<wgpu::Buffer>>,
 }
 
 impl EmoteDeviceReadback for DevicePose {
@@ -730,7 +1039,10 @@ pub(super) struct EmoteRaster {
     fade_expand_layout: wgpu::BindGroupLayout,
     fade_prepare: wgpu::ComputePipeline,
     fade_prepare_layout: wgpu::BindGroupLayout,
+    fade_alpha: wgpu::ComputePipeline,
+    fade_alpha_layout: wgpu::BindGroupLayout,
     fade_params: wgpu::Buffer,
+    fade_empty_alpha: wgpu::Buffer,
     fade_sources: VecDeque<(EmoteRasterFrame, wgpu::Buffer)>,
     fade_outputs: Vec<Arc<wgpu::Buffer>>,
     atlases: VecDeque<CachedAtlas>,
@@ -757,7 +1069,7 @@ impl EmoteRaster {
             label: Some("CS2 E-mote spans"),
             source: wgpu::ShaderSource::Wgsl(include_str!("gpu_emote.wgsl").into()),
         });
-        let pipeline = |entry, layout, constants| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let pipeline = |entry, layout: Option<&wgpu::PipelineLayout>, constants: &[(&str, f64)]| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry), module: &module, entry_point: Some(entry),
             layout,
             compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
@@ -800,19 +1112,22 @@ impl EmoteRaster {
         let fade = pipeline("surface_fade", None, &[]);
         let fade_expand = pipeline("surface_expand", None, &[]);
         let fade_prepare = pipeline("surface_prepare", None, &[]);
+        let fade_alpha = pipeline("surface_alpha", None, &[]);
         #[cfg(target_os = "android")]
-        let preview_pipelines = {
+        let preview_enabled = true;
+        #[cfg(windows)]
+        let preview_enabled = std::env::var_os("CS2_REPLAY_EMOTE_PREVIEW").is_some_and(|value| value == "1");
+        let preview_pipelines = preview_enabled.then(|| {
             let layout = |group| device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None, bind_group_layouts: &[group], push_constant_ranges: &[],
             });
             let constants = &[("track_repairs", 0.0)];
-            Some((
+            let pack_layout = layout(&pack.get_bind_group_layout(0));
+            (
                 pipeline("sprite", Some(&sprite_pipeline_layout), constants),
-                pipeline("pack", Some(&layout(&pack.get_bind_group_layout(0))), constants),
-            ))
-        };
-        #[cfg(not(target_os = "android"))]
-        let preview_pipelines = None;
+                pipeline("pack", Some(&pack_layout), constants),
+            )
+        });
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
             bail!("compile E-mote shader: {error}");
         }
@@ -823,7 +1138,9 @@ impl EmoteRaster {
             fade_layout: fade.get_bind_group_layout(0), fade,
             fade_expand_layout: fade_expand.get_bind_group_layout(0), fade_expand,
             fade_prepare_layout: fade_prepare.get_bind_group_layout(0), fade_prepare,
+            fade_alpha_layout: fade_alpha.get_bind_group_layout(0), fade_alpha,
             fade_params: source(32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            fade_empty_alpha: buffer(device, 4, TARGET),
             fade_sources: VecDeque::new(), fade_outputs: Vec::new(),
             atlases: VecDeque::new(), atlas_bytes: 0,
             commands: source(4, UPLOAD), batch_info: source(4, UPLOAD),
@@ -872,18 +1189,48 @@ impl EmoteRaster {
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
         owner: &Arc<CpuMotionModel>, source: &CpuTexture,
     ) -> Result<wgpu::TextureView> {
+        let atlas = self.atlas_storage(device, owner, source, false)?
+            .context("E-mote atlas allocation was declined")?;
+        atlas.used_by_draw = true;
+        let extent = atlas.texture.size();
+        if atlas.uploaded_rows < extent.height {
+            let started = Instant::now();
+            let pixels = source.upload_pixels().0;
+            let bytes = atlas.upload(queue, pixels, pixels.len());
+            report(&format!("emote_atlas_demand_bytes={bytes} write_us={}", started.elapsed().as_micros()));
+        }
+        Ok(atlas.view.clone())
+    }
+
+    fn stage_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        model: &Arc<CpuMotionModel>,
+    ) -> Result<usize> {
+        for texture in model.textures.values() {
+            let Some(atlas) = self.atlas_storage(device, model, texture, true)? else { return Ok(0) };
+            let bytes = atlas.upload(queue, texture.upload_pixels().0, ATLAS_STAGE_BYTES);
+            if bytes != 0 {
+                return Ok(bytes);
+            }
+        }
+        Ok(0)
+    }
+
+    fn atlas_storage(
+        &mut self, device: &wgpu::Device, owner: &Arc<CpuMotionModel>, source: &CpuTexture,
+        preloading: bool,
+    ) -> Result<Option<&mut CachedAtlas>> {
         let identity = std::ptr::from_ref(source) as usize;
         let owner_id = Arc::downgrade(owner);
         if let Some(index) = self.atlases.iter().position(|entry|
             entry.identity == identity && Weak::ptr_eq(&entry.owner, &owner_id))
         {
             let entry = self.atlases.remove(index).unwrap();
-            let view = entry.view.clone();
             self.atlases.push_back(entry);
-            return Ok(view);
+            return Ok(self.atlases.back_mut());
         }
         let limit = device.limits().max_texture_dimension_2d as usize;
-        let bytes = source.rgba.len();
+        let (pixels, _) = source.upload_pixels();
+        let bytes = pixels.len();
         if source.width.max(source.height) > limit || source.width.min(source.height) == 0
             || source.width * source.height * 4 != bytes || bytes > ATLAS_BYTES
         {
@@ -894,8 +1241,13 @@ impl EmoteRaster {
             if !keep { self.atlas_bytes -= entry.bytes; }
             keep
         });
+        // Speculation must leave resident draw textures in the cache.
+        if preloading && self.atlas_bytes + bytes > ATLAS_BYTES {
+            return Ok(None);
+        }
         while self.atlas_bytes + bytes > ATLAS_BYTES {
-            self.atlas_bytes -= self.atlases.pop_front().unwrap().bytes;
+            let index = self.atlases.iter().position(|atlas| !atlas.used_by_draw).unwrap_or(0);
+            self.atlas_bytes -= self.atlases.remove(index).unwrap().bytes;
         }
         let size = wgpu::Extent3d {
             width: source.width as u32, height: source.height as u32, depth_or_array_layers: 1,
@@ -906,13 +1258,10 @@ impl EmoteRaster {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(texture.as_image_copy(), &source.rgba, wgpu::TexelCopyBufferLayout {
-            offset: 0, bytes_per_row: Some(size.width * 4), rows_per_image: Some(size.height),
-        }, size);
         let view = texture.create_view(&Default::default());
         self.atlas_bytes += bytes;
-        self.atlases.push_back(CachedAtlas { owner: owner_id, identity, bytes, view: view.clone() });
-        Ok(view)
+        self.atlases.push_back(CachedAtlas { owner: owner_id, identity, bytes, view, texture, uploaded_rows: 0, used_by_draw: false });
+        Ok(self.atlases.back_mut())
     }
 
     fn finish_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
@@ -1063,8 +1412,8 @@ impl EmoteRaster {
         let color_bytes = u64::from(count) * 4;
         #[cfg(target_os = "android")]
         let preview = batching() && !super::android_property(c"debug.cs2.emote_preview", |value| value == b"0").unwrap_or(false);
-        #[cfg(not(target_os = "android"))]
-        let preview = false;
+        #[cfg(windows)]
+        let preview = batching();
         let (sprite, pack, flag_bytes) = match self.preview_pipelines.as_ref().filter(|_| preview) {
             Some((sprite, pack)) => (sprite.clone(), pack.clone(), 0),
             None => (self.sprite.clone(), self.pack.clone(), u64::from(count.div_ceil(32)) * 4),
@@ -1202,7 +1551,7 @@ impl EmoteRaster {
                 width, bottom - y, [x as i32, y as i32],
                 Arc::new(DevicePose {
                     buffer: self.rgba.clone(), device: device.clone(), queue: queue.clone(),
-                    bytes: color_bytes, failed: failed.clone(),
+                    bytes: color_bytes, failed: failed.clone(), fade_alpha: None,
                 }),
             )?);
         }
@@ -1218,7 +1567,7 @@ impl EmoteRaster {
                 width, bottom - y, [x as i32, y as i32],
                 Arc::new(DevicePose {
                     buffer: self.rgba.clone(), device: device.clone(), queue: queue.clone(),
-                    bytes: color_bytes, failed: failed.clone(),
+                    bytes: color_bytes, failed: failed.clone(), fade_alpha: None,
                 }),
             )?;
             let draws = own_draws(draws);
@@ -1328,7 +1677,7 @@ impl EmoteRaster {
             [x as i32, y as i32],
             Arc::new(DevicePose {
                 buffer: self.rgba.clone(), device: device.clone(), queue: queue.clone(),
-                bytes: color_bytes, failed: failed.clone(),
+                bytes: color_bytes, failed: failed.clone(), fade_alpha: None,
             }),
         )?)
     }
@@ -1414,10 +1763,7 @@ impl Raster {
         Ok(true)
     }
 
-    pub(super) fn render_emote(
-        &mut self, player: &CpuPlayer, viewport: CpuViewport,
-        variables: &BTreeMap<String, f64>, allow_warnings: bool,
-    ) -> Result<EmoteRasterFrame> {
+    fn ensure_emote(&mut self) -> Result<()> {
         if self.failed.load(Ordering::Relaxed) { bail!("E-mote device unavailable"); }
         if self.emote_initialization_failed { bail!("E-mote shader initialization failed"); }
         if self.emote.is_none() {
@@ -1426,6 +1772,14 @@ impl Raster {
             })?;
             self.emote = Some(renderer);
         }
+        Ok(())
+    }
+
+    pub(super) fn render_emote(
+        &mut self, player: &CpuPlayer, viewport: CpuViewport,
+        variables: &BTreeMap<String, f64>, allow_warnings: bool,
+    ) -> Result<EmoteRasterFrame> {
+        self.ensure_emote()?;
         let mut frame = self.emote.as_mut().unwrap().render(&self.device, &self.queue, player, viewport, variables, allow_warnings, &self.failed)?;
         if self.failed.load(Ordering::Relaxed) { bail!("E-mote device failed during draw"); }
         if !super::emote_device_blend_requested() {
@@ -1465,7 +1819,7 @@ mod tests {
         let crop = Arc::new(buffer(&raster.device, old_rgba.len() as u64, TARGET));
         raster.queue.write_buffer(&crop, 0, &old_rgba);
         let cpu_old = EmoteRasterFrame::new(3, 1, [-1, 1], old_rgba)?.into_viewport([4, 3])?;
-        let old = raster.bind_fade_output([3, 1], [-1, 1], crop, 12).unwrap();
+        let old = raster.bind_fade_output([3, 1], [-1, 1], crop, 12, None).unwrap();
         RASTER.with_borrow_mut(|slot| *slot = Some(raster));
         let expanded = expand_emote_surface(&old, [4, 3]).context("device surface expand")?;
         assert!(expanded.device().is_some());
@@ -1475,10 +1829,15 @@ mod tests {
             if !transparent {
                 new_rgba[4..8].copy_from_slice(&[120, 222, 31, 87]);
             }
-            let next = EmoteRasterFrame::new(4, 3, [0, 0], new_rgba.clone())?;
-            let (old_adjusted, new_adjusted, all_zero_alpha) =
-                prepare_emote_surfaces(&expanded, &next).context("device fade endpoint preparation")?;
-            assert_eq!(all_zero_alpha, transparent);
+            let device_next = RASTER.with_borrow(|slot| {
+                let raster = slot.as_ref().unwrap();
+                let pixels = Arc::new(buffer(&raster.device, new_rgba.len() as u64, TARGET));
+                raster.queue.write_buffer(&pixels, 0, &new_rgba);
+                raster.bind_fade_output([4, 3], [0, 0], pixels, new_rgba.len() as u64, None)
+            }).context("resident incoming frame")?;
+            let (old_adjusted, new_adjusted, alpha_class) =
+                prepare_emote_surfaces(&expanded, &device_next).context("device fade endpoint preparation")?;
+            assert_eq!(alpha_class, None);
             assert!(old_adjusted.device().is_some() && new_adjusted.device().is_some());
             let mut expected_old = cpu_old.rgba().to_vec();
             for (prior, next) in expected_old.chunks_exact_mut(4).zip(new_rgba.chunks_exact_mut(4)) {
@@ -1490,7 +1849,7 @@ mod tests {
                 }
             }
             for weight in [1, 128, 255] {
-                let mixed = mix_emote_surfaces(&old_adjusted, &new_adjusted, weight, transparent)
+                let mixed = mix_emote_surfaces(&old_adjusted, &new_adjusted, weight, alpha_class)
                     .context("device fade mix")?;
                 let expected: Vec<_> = expected_old.iter().zip(&new_rgba).enumerate()
                     .map(|(i, (&old, &new))| {
@@ -1521,6 +1880,18 @@ mod tests {
         let resource = EmoteResource::decode(&bytes)?;
         let mut player = CpuPlayer::new(CpuMotionModel::load(&resource)?);
         let mut raster = Raster::new()?;
+        raster.ensure_emote()?;
+        let atlas = player.model.textures.values().next().context("fixture atlas")?;
+        assert!(atlas.is_bgra());
+        let mut staged = 0;
+        loop {
+            let bytes = raster.emote.as_mut().unwrap().stage_atlas(&raster.device, &raster.queue, &player.model)?;
+            if bytes == 0 { break; }
+            assert!(bytes <= ATLAS_STAGE_BYTES);
+            staged += bytes;
+            raster.queue.submit([]);
+        }
+        assert_eq!(staged, atlas.upload_pixels().0.len());
         let viewport = CpuViewport {
             width: 1280, height: 720, origin_x: 640.0, origin_y: 600.0,
             scale: 1.0, time_units_per_frame: 1.0,

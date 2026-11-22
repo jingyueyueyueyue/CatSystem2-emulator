@@ -7667,6 +7667,8 @@ impl HeadlessPlayer {
             // All LoggingHost and VM borrows have returned at this safe point.
             self.service_object_graph_request().context("service object graph transaction")?;
             if self.frame_phase == PlayerFramePhase::Start {
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            self.data_services.ordinary.stage_preloaded_model();
             self.apply_pending_host_input().context("consume queued platform input")?;
             self.particle_frame_cursor = None;
             self.state.clock.frame = self.state.clock.frame.saturating_add(1);

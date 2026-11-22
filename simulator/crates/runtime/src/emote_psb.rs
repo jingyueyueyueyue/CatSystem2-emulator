@@ -77,6 +77,23 @@ pub struct PsbDocument {
 }
 
 impl PsbDocument {
+    pub(super) fn estimated_storage_bytes(&self) -> usize {
+        fn value_heap_bytes(value: &PsbValue) -> usize {
+            match value {
+                PsbValue::String(value) => value.capacity(),
+                PsbValue::Integers(values) => values.capacity() * size_of::<u32>(),
+                PsbValue::List(values) => values.capacity() * size_of::<PsbValue>()
+                    + values.iter().map(value_heap_bytes).sum::<usize>(),
+                PsbValue::Object(values) => values.iter().map(|(key, value)|
+                    key.capacity() + size_of::<(String, PsbValue)>() * 2 + value_heap_bytes(value)
+                ).sum(),
+                _ => 0,
+            }
+        }
+        self.bytes.capacity() + value_heap_bytes(&self.root)
+            + (self.chunks.capacity() + self.extra_chunks.capacity()) * size_of::<(usize, usize)>()
+    }
+
     #[cfg(test)]
     pub(super) fn from_test_root(root: PsbValue) -> Self {
         Self { version: 2, recovered_header_key: None, value_count: 0, root,
@@ -85,10 +102,13 @@ impl PsbDocument {
     }
 
     pub fn from_resource(resource: &EmoteResource) -> Result<Self> {
-        Self::parse(resource.bytes())
+        Self::parse_shared(resource.bytes.clone())
     }
 
     pub(super) fn matches_resource(&self, resource: &EmoteResource) -> bool {
+        if Arc::ptr_eq(&self.bytes, &resource.bytes) {
+            return true;
+        }
         let source = resource.bytes();
         if source.len() != self.bytes.len() {
             return false;
@@ -103,6 +123,14 @@ impl PsbDocument {
     }
 
     pub fn parse(input: &[u8]) -> Result<Self> {
+        if input.len() > MAX_PSB_BYTES {
+            return Err(invalid("PSB signature/size"));
+        }
+        Self::parse_shared(Arc::new(input.to_vec()))
+    }
+
+    fn parse_shared(mut bytes: Arc<Vec<u8>>) -> Result<Self> {
+        let input = bytes.as_slice();
         if input.len() < 40 || input.len() > MAX_PSB_BYTES || !input.starts_with(b"PSB\0") {
             return Err(invalid("PSB signature/size"));
         }
@@ -116,9 +144,9 @@ impl PsbDocument {
         if input.len() < header_size {
             return Err(invalid("PSB header truncated"));
         }
-        let mut bytes = input.to_vec();
-        let original_length = u32_at(&bytes, 8)?;
-        let mut encrypted_header = None;
+        let original_length = u32_at(input, 8)?;
+        let mut header = [0; 56];
+        header[..header_size].copy_from_slice(&input[..header_size]);
         let key = if original_length != header_size as u32 {
             // First encrypted DWORD is the known canonical header length.
             // Invert y = seed XOR seed>>19, then validate every structural
@@ -127,12 +155,7 @@ impl PsbDocument {
             let y = original_length ^ header_size as u32 ^ a ^ (a >> 8);
             let seed = y ^ (y >> 19);
             let mut cipher = HeaderCipher::new(seed);
-            // Keep the original header for exact source comparisons without
-            // retaining a second copy of the PSB.
-            let mut original = [0; 48];
-            original[..header_size - 8].copy_from_slice(&bytes[8..header_size]);
-            encrypted_header = Some((original, header_size));
-            for byte in &mut bytes[8..header_size] {
+            for byte in &mut header[8..header_size] {
                 *byte ^= cipher.byte();
             }
             Some(seed)
@@ -141,7 +164,7 @@ impl PsbDocument {
         };
         let mut h = [0u32; 12];
         for (index, word) in h.iter_mut().enumerate().take((header_size - 8) / 4) {
-            *word = u32_at(&bytes, 8 + 4 * index)?;
+            *word = u32_at(&header, 8 + 4 * index)?;
         }
         if h[0] != header_size as u32 || h[1] != header_size as u32 {
             return Err(invalid("PSB decrypted header length/names offset"));
@@ -150,14 +173,27 @@ impl PsbDocument {
             return Err(invalid("PSB section offset"));
         }
         if version >= 3 {
-            let mut check = bytes[8..40].to_vec();
+            let mut check = header[8..40].to_vec();
             if version == 4 {
-                check.extend_from_slice(&bytes[44..56]);
+                check.extend_from_slice(&header[44..56]);
             }
             if adler32(&check) != h[8] {
                 return Err(invalid("PSB header Adler32"));
             }
         }
+        // Usual sections refer only to bytes after the header. Retain the
+        // previous decrypted-byte semantics for offsets into the header itself.
+        let encrypted_header = if key.is_some() && h[1..8].iter()
+            .chain(h[9..12].iter().take(if version == 4 { 3 } else { 0 }))
+            .any(|&offset| (offset as usize) < header_size)
+        {
+            let mut original = [0; 48];
+            original[..header_size - 8].copy_from_slice(&bytes[8..header_size]);
+            Arc::make_mut(&mut bytes)[8..header_size].copy_from_slice(&header[8..header_size]);
+            Some((original, header_size))
+        } else {
+            None
+        };
         let (bases, next) = packed_array(&bytes, h[1] as usize)?;
         let (parents, next) = packed_array(&bytes, next)?;
         let (indices, _) = packed_array(&bytes, next)?;
@@ -217,7 +253,7 @@ impl PsbDocument {
             names: &names,
             strings: &strings,
             count: 0,
-            active: BTreeSet::new(),
+            active: Vec::with_capacity(16),
         };
         let root = reader.value(h[7] as usize, 0)?;
         let value_count = reader.count;
@@ -226,7 +262,7 @@ impl PsbDocument {
             recovered_header_key: key,
             value_count,
             root,
-            bytes: Arc::new(bytes),
+            bytes,
             encrypted_header,
             chunks,
             extra_chunks,
@@ -234,6 +270,14 @@ impl PsbDocument {
     }
 
     pub fn resource(&self, value: &PsbValue) -> Result<&[u8]> {
+        Ok(&self.bytes[self.resource_range(value)?])
+    }
+
+    pub(super) fn resource_backing(&self) -> Arc<Vec<u8>> {
+        self.bytes.clone()
+    }
+
+    pub(super) fn resource_range(&self, value: &PsbValue) -> Result<std::ops::Range<usize>> {
         let PsbValue::Resource { extra, index } = value else {
             return Err(invalid("expected PSB chunk reference"));
         };
@@ -245,9 +289,10 @@ impl PsbDocument {
         let &(start, len) = table
             .get(*index)
             .ok_or_else(|| invalid("PSB chunk index"))?;
-        self.bytes
-            .get(start..start + len)
-            .ok_or_else(|| invalid("PSB chunk bounds"))
+        let end = start.checked_add(len)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| invalid("PSB chunk bounds"))?;
+        Ok(start..end)
     }
 }
 
@@ -325,10 +370,14 @@ fn packed_array(bytes: &[u8], pos: usize) -> Result<(Vec<u32>, usize)> {
     if count > MAX_ARRAY {
         return Err(invalid("array limit"));
     }
-    let mut values = Vec::with_capacity(count);
-    for i in 0..count {
-        values.push(uint(bytes, start + i * width, width)? as u32);
-    }
+    let entries = &bytes[start..end];
+    let values = match width {
+        1 => entries.iter().copied().map(u32::from).collect(),
+        2 => entries.as_chunks::<2>().0.iter().map(|&entry| u32::from(u16::from_le_bytes(entry))).collect(),
+        3 => entries.as_chunks::<3>().0.iter().map(|&[a, b, c]| u32::from_le_bytes([a, b, c, 0])).collect(),
+        4 => entries.as_chunks::<4>().0.iter().copied().map(u32::from_le_bytes).collect(),
+        _ => unreachable!("packed array width was validated"),
+    };
     Ok((values, end))
 }
 
@@ -368,19 +417,26 @@ struct Reader<'a> {
     names: &'a [String],
     strings: &'a [String],
     count: usize,
-    active: BTreeSet<usize>,
+    active: Vec<usize>,
 }
 
 impl Reader<'_> {
     fn value(&mut self, pos: usize, depth: usize) -> Result<PsbValue> {
         self.count += 1;
-        if self.count > MAX_VALUES || depth > 128 || !self.active.insert(pos) {
+        if self.count > MAX_VALUES || depth > 128 {
             return Err(invalid("PSB value budget/cycle"));
         }
         let tag = *self
             .bytes
             .get(pos)
             .ok_or_else(|| invalid("PSB value offset"))?;
+        let recursive = matches!(tag, 32 | 33);
+        if recursive {
+            if self.active.contains(&pos) {
+                return Err(invalid("PSB value budget/cycle"));
+            }
+            self.active.push(pos);
+        }
         let p = pos + 1;
         let result = match tag {
             0 | 1 => PsbValue::Null,
@@ -448,7 +504,7 @@ impl Reader<'_> {
             }
             _ => return Err(invalid("unknown PSB value tag")),
         };
-        self.active.remove(&pos);
+        if recursive { self.active.pop(); }
         Ok(result)
     }
 }

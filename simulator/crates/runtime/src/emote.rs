@@ -196,7 +196,7 @@ pub struct PsbHeader {
 pub struct EmoteResource {
     pub header: PsbHeader,
     pub psz_reserved: Option<u32>,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 /// Identity of the archive payload which won resource routing, together with
@@ -261,10 +261,9 @@ impl EmoteResource {
             output
                 .try_reserve_exact(capacity)
                 .map_err(|_| EmoteError::Capacity)?;
-            output.resize(capacity, 0);
             let mut decoder = Decompress::new(true);
             let status = decoder
-                .decompress(&input[16..], &mut output, FlushDecompress::Finish)
+                .decompress_vec(&input[16..], &mut output, FlushDecompress::Finish)
                 .map_err(|_| EmoteError::Decompression)?;
             if status != Status::StreamEnd
                 || decoder.total_in() != compressed as u64
@@ -272,7 +271,6 @@ impl EmoteResource {
             {
                 return Err(EmoteError::Decompression);
             }
-            output.truncate(expanded);
             (output, Some(word(input, 12)?))
         } else {
             if input.len() > MAX_PSB_BYTES {
@@ -295,7 +293,7 @@ impl EmoteResource {
         Ok(Self {
             header,
             psz_reserved,
-            bytes,
+            bytes: Arc::new(bytes),
         })
     }
 
@@ -576,6 +574,10 @@ pub trait EmoteBackend: Send {
             reason: "backend has no M2 manager receiver",
         })
     }
+    fn uses_unfiltered_m2_texture(&self, _task: u32) -> bool {
+        false
+    }
+
     fn cached_m2_model(
         &self, _task: u32, _name: &[u8], _version: &EmoteArchiveVersion,
     ) -> Option<Arc<CpuMotionModel>> {
@@ -895,6 +897,10 @@ impl EmoteServices {
             .ok_or(EmoteError::UnknownTask(task))?
             .successful_resource_imports = imports;
         Ok(())
+    }
+
+    pub fn uses_unfiltered_m2_texture(&self, task: u32) -> bool {
+        self.backend.as_ref().is_some_and(|backend| backend.uses_unfiltered_m2_texture(task))
     }
 
     pub fn cached_m2_model(
@@ -1224,6 +1230,12 @@ mod tests {
         trailing[4..8].copy_from_slice(&length.to_le_bytes());
         assert!(matches!(
             EmoteResource::decode(&trailing),
+            Err(EmoteError::Decompression)
+        ));
+        let mut bad_checksum = psz(body);
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            EmoteResource::decode(&bad_checksum),
             Err(EmoteError::Decompression)
         ));
     }

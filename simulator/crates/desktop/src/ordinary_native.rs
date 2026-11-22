@@ -371,6 +371,19 @@ impl OrdinaryNativeServices {
         self.preloads.cached_with_source(name)
     }
 
+    pub(super) fn take_preloaded_model(
+        &mut self, version: &cs2_runtime::emote::EmoteArchiveVersion,
+    ) -> Option<std::sync::Arc<cs2_runtime::emote::CpuMotionModel>> {
+        self.preloads.take_model(version)
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn stage_preloaded_model(&mut self) {
+        if let Some(model) = self.preloads.ready_model() {
+            super::gpu_raster::stage_emote_model(model);
+        }
+    }
+
     pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.preloads.predecode_image(bytes); }
 
     pub(super) fn take_predecoded_image(&mut self, bytes: &[u8], id: u32) -> Option<cs2_renderer::RgbaFrame> {

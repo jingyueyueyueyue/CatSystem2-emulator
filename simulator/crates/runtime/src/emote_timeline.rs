@@ -7,7 +7,10 @@
 //! shortest turn. Nonlinear ccc/acc/zcc/scc/occ and cp remain diagnostic.
 
 use super::{EmoteError, PsbValue, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 ///One parser-created reference holder per physical layer/instance path.
 ///36321 creates its player once;41b83 releases the selected motion on hide.
@@ -174,8 +177,8 @@ impl CpuReferenceTimelines {
 }
 
 #[derive(Debug, Clone)]
-pub struct CpuTimelineSample {
-    pub content: Option<PsbValue>,
+pub struct CpuTimelineSample<T = PsbValue> {
+    pub content: Option<T>,
     ///41057 subtracts the selected key's start, not its next boundary.
     pub frame_begin: Option<f32>,
     pub interpolated: bool,
@@ -295,58 +298,251 @@ pub(super) fn frame_opacity(content: &PsbValue) -> Result<u8> {
     Ok(value as u8)
 }
 
-fn layer_keyframes(layer: &PsbValue, time: f32) -> Result<(Option<&PsbValue>, Option<&PsbValue>)> {
-    if !time.is_finite() {
-        return Err(invalid("non-finite frame time"));
-    }
-    let frames = layer
-        .get("frameList")
-        .and_then(PsbValue::list)
-        .ok_or_else(|| invalid("frameList must be a list"))?;
-    let mut previous = None;
-    let mut next = None;
-    let mut last = f32::NEG_INFINITY;
-    for (index, frame) in frames.iter().enumerate() {
-        let at = number(frame, "time", 0.0)?;
-        if at < last {
+#[derive(Debug, Clone, Copy)]
+struct KeyHeader {
+    time: f32,
+    kind: u8,
+}
+
+impl KeyHeader {
+    fn read(frame: &PsbValue, last: f32) -> Result<Self> {
+        let time = number(frame, "time", 0.0)?;
+        if time < last {
             return Err(invalid("unsorted frameList"));
         }
-        last = at;
         let kind = number(frame, "type", 2.0)?;
         if !matches!(kind, 0.0 | 2.0 | 3.0) {
             return Err(invalid("unsupported frameList interpolation type"));
         }
+        Ok(Self { time, kind: kind as u8 })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LayerKey<'a> {
+    header: KeyHeader,
+    frame: &'a PsbValue,
+}
+
+type LayerKeys<'a> = (Option<LayerKey<'a>>, Option<LayerKey<'a>>);
+
+fn layer_frames(layer: &PsbValue) -> Result<&[PsbValue]> {
+    layer.get("frameList").and_then(PsbValue::list)
+        .ok_or_else(|| invalid("frameList must be a list"))
+}
+
+fn layer_keyframes(layer: &PsbValue, time: f32) -> Result<LayerKeys<'_>> {
+    if !time.is_finite() {
+        return Err(invalid("non-finite frame time"));
+    }
+    let frames = layer_frames(layer)?;
+    let mut previous = None;
+    let mut next = None;
+    let mut last = f32::NEG_INFINITY;
+    for (index, frame) in frames.iter().enumerate() {
+        let header = KeyHeader::read(frame, last)?;
+        last = header.time;
+        let key = LayerKey { header, frame };
         //The last record is the next-boundary sentinel, never the current
         //sample.3bc40/3bc50 clamps random seek to count-2;3c845 and3bf27
         //stop forward object/parameter cursors there. Actual NEKO layers
         //end in type0: selecting it as current erased the model at its end.
         if frames.len() >= 2 && index == frames.len() - 1 {
             if next.is_none() {
-                next = Some(frame);
+                next = Some(key);
             }
-        } else if at <= time {
-            previous = Some(frame);
+        } else if header.time <= time {
+            previous = Some(key);
         } else if next.is_none() {
-            next = Some(frame);
+            next = Some(key);
         }
     }
     Ok((previous, next))
 }
 
-pub(super) fn visible_layer_key(layer: &PsbValue, time: f64) -> Result<Option<(&PsbValue, f32)>> {
-    let (previous, _) = layer_keyframes(layer, time as f32)?;
+#[derive(Debug, Default)]
+pub(super) struct LayerTimelines {
+    layers: HashMap<usize, IndexedLayer>,
+    stencils: HashMap<usize, OnceLock<Result<Vec<super::CpuStencilBinding>>>>,
+}
+
+#[derive(Debug)]
+struct IndexedLayer {
+    headers: Result<Vec<KeyHeader>>,
+    cursor: AtomicUsize,
+}
+
+impl LayerTimelines {
+    pub(super) fn prepare(root: &PsbValue) -> Self {
+        let mut timelines = Self::default();
+        if let Some(objects) = root.get("object").and_then(PsbValue::object) {
+            for object in objects.values() {
+                if let Some(motions) = object.get("motion").and_then(PsbValue::object) {
+                    for motion in motions.values() {
+                        timelines.prepare_layers(motion.get("layer"));
+                        timelines.stencils.insert(motion as *const PsbValue as usize, OnceLock::new());
+                    }
+                }
+            }
+        }
+        timelines
+    }
+
+    pub(super) fn stencil_bindings(
+        &self, motion: &PsbValue,
+    ) -> Result<Cow<'_, [super::CpuStencilBinding]>> {
+        let Some(bindings) = self.stencils.get(&(motion as *const PsbValue as usize)) else {
+            return super::resolve_emote_stencil_bindings(motion).map(Cow::Owned);
+        };
+        bindings.get_or_init(|| super::resolve_emote_stencil_bindings(motion))
+            .as_deref().map(Cow::Borrowed).map_err(Clone::clone)
+    }
+
+    fn prepare_layers(&mut self, layers: Option<&PsbValue>) {
+        let Some(layers) = layers.and_then(PsbValue::list) else { return };
+        for layer in layers {
+            self.layers.insert(layer as *const PsbValue as usize, IndexedLayer {
+                headers: key_headers(layer),
+                cursor: AtomicUsize::new(0),
+            });
+            self.prepare_layers(layer.get("children"));
+        }
+    }
+
+    fn keyframes<'a>(
+        &self, layer: &'a PsbValue, time: f32,
+    ) -> Result<LayerKeys<'a>> {
+        if !time.is_finite() {
+            return Err(invalid("non-finite frame time"));
+        }
+        let Some(index) = self.layers.get(&(layer as *const PsbValue as usize)) else {
+            return layer_keyframes(layer, time);
+        };
+        // Errors discovered during preparation are reported when the layer is sampled.
+        let headers = index.headers.as_ref().map_err(Clone::clone)?;
+        let frames = layer_frames(layer)?;
+        // The sentinel can end interpolation but cannot become the current frame.
+        let current_count = headers.len() - usize::from(headers.len() >= 2);
+        let boundary = index.boundary(&headers[..current_count], time);
+        let key = |i: usize| LayerKey { header: headers[i], frame: &frames[i] };
+        Ok((boundary.checked_sub(1).map(key), (boundary < frames.len()).then(|| key(boundary))))
+    }
+}
+
+fn key_headers(layer: &PsbValue) -> Result<Vec<KeyHeader>> {
+    let frames = layer_frames(layer)?;
+    let mut headers = Vec::with_capacity(frames.len());
+    let mut last = f32::NEG_INFINITY;
+    for frame in frames {
+        let header = KeyHeader::read(frame, last)?;
+        headers.push(header);
+        last = header.time;
+    }
+    Ok(headers)
+}
+
+impl IndexedLayer {
+    fn boundary(&self, headers: &[KeyHeader], time: f32) -> usize {
+        let cursor = self.cursor.load(Ordering::Relaxed);
+        let contains = |at: usize| {
+            (at == 0 || headers[at - 1].time <= time)
+                && (at == headers.len() || time < headers[at].time)
+        };
+        if contains(cursor) {
+            return cursor;
+        }
+        let next = cursor + 1;
+        let boundary = if next <= headers.len() && contains(next) {
+            next
+        } else {
+            headers.partition_point(|header| header.time <= time)
+        };
+        self.cursor.store(boundary, Ordering::Relaxed);
+        boundary
+    }
+}
+
+#[cfg(test)]
+mod layer_index_tests {
+    use super::*;
+
+    fn object(fields: impl IntoIterator<Item = (&'static str, PsbValue)>) -> PsbValue {
+        PsbValue::Object(fields.into_iter().map(|(key, value)| (key.to_owned(), value)).collect())
+    }
+
+    fn frame(time: i64, kind: i64, coordinate: i64) -> PsbValue {
+        object([
+            ("time", PsbValue::Integer(time)),
+            ("type", PsbValue::Integer(kind)),
+            ("content", object([("zx", PsbValue::Integer(coordinate))])),
+        ])
+    }
+
+    #[test]
+    fn indexed_layers_match_linear_sampling_after_seeks_and_ends() -> Result<()> {
+        let root = object([("object", object([("actor", object([("motion", object([("idle",
+            object([("layer", PsbValue::List(vec![
+                object([("frameList", PsbValue::List(vec![
+                    frame(0, 2, 1), frame(2, 0, 2), frame(2, 3, 3),
+                    frame(4, 2, 6), frame(6, 0, 9),
+                ]))]),
+                object([("frameList", PsbValue::List(vec![frame(2, 2, 3)]))]),
+                object([("frameList", PsbValue::List(vec![]))]),
+                object([("frameList", PsbValue::List(vec![frame(2, 2, 3), frame(1, 0, 0)]))]),
+                object([("frameList", PsbValue::List(vec![frame(2, 1, 3)]))]),
+            ]))]))]))]))]))]);
+        let layers = root.get("object").unwrap().get("actor").unwrap()
+            .get("motion").unwrap().get("idle").unwrap().get("layer").unwrap().list().unwrap();
+        let prepared = LayerTimelines::prepare(&root);
+        assert_eq!(prepared.layers.len(), layers.len());
+        for layer in &layers[..3] {
+            for time in [-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 20.0, 3.5, 1.0, -1.0, 2.0] {
+                let (previous, next) = prepared.keyframes(layer, time)?;
+                let indexed = sample_emote_keys(previous, next, time)?;
+                let linear = sample_emote_layer(layer, f64::from(time))?;
+                assert_eq!(indexed.content.as_deref(), linear.content.as_ref(), "time {time}");
+                assert_eq!(indexed.frame_begin, linear.frame_begin, "time {time}");
+                assert_eq!(indexed.interpolated, linear.interpolated, "time {time}");
+                assert_eq!(indexed.warnings, linear.warnings, "time {time}");
+            }
+        }
+        for (time, expected) in [(2.0, 3.0), (6.0, 6.0), (20.0, 6.0)] {
+            let (previous, _) = prepared.keyframes(&layers[0], time)?;
+            let (content, _) = visible_layer_key(previous)?.expect("layer is visible");
+            assert_eq!(content.get("zx").and_then(PsbValue::number), Some(expected));
+        }
+        for layer in &layers[3..] {
+            assert_eq!(
+                prepared.keyframes(layer, 0.0).unwrap_err(),
+                layer_keyframes(layer, 0.0).unwrap_err(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn lookup_layer_keyframes<'a>(
+    layer: &'a PsbValue, time: f32, timelines: Option<&LayerTimelines>,
+) -> Result<LayerKeys<'a>> {
+    match timelines {
+        Some(timelines) => timelines.keyframes(layer, time),
+        None => layer_keyframes(layer, time),
+    }
+}
+
+pub(super) fn visible_layer_key(previous: Option<LayerKey<'_>>) -> Result<Option<(&PsbValue, f32)>> {
     previous.map(visible_frame_content).transpose().map(Option::flatten)
 }
 
-fn visible_frame_content(frame: &PsbValue) -> Result<Option<(&PsbValue, f32)>> {
-    if number(frame, "type", 2.0)? == 0.0 {
+fn visible_frame_content(key: LayerKey<'_>) -> Result<Option<(&PsbValue, f32)>> {
+    if key.header.kind == 0 {
         return Ok(None);
     }
-    let content = frame.get("content").ok_or_else(|| invalid("visible frame lacks content"))?;
+    let content = key.frame.get("content").ok_or_else(|| invalid("visible frame lacks content"))?;
     if content.object().is_none() {
         return Err(invalid("frame content must be an object"));
     }
-    Ok(Some((content, number(frame, "time", 0.0)?)))
+    Ok(Some((content, key.header.time)))
 }
 
 /// Samples the actual frameList layout. It never interpolates into type0.
@@ -355,6 +551,18 @@ fn visible_frame_content(frame: &PsbValue) -> Result<Option<(&PsbValue, f32)>> {
 pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSample> {
     let time = time as f32;
     let (previous, next) = layer_keyframes(layer, time)?;
+    let sample = sample_emote_keys(previous, next, time)?;
+    Ok(CpuTimelineSample {
+        content: sample.content.map(Cow::into_owned),
+        frame_begin: sample.frame_begin,
+        interpolated: sample.interpolated,
+        warnings: sample.warnings,
+    })
+}
+
+pub(super) fn sample_emote_keys<'a>(
+    previous: Option<LayerKey<'a>>, next: Option<LayerKey<'a>>, time: f32,
+) -> Result<CpuTimelineSample<Cow<'a, PsbValue>>> {
     let mut sample = CpuTimelineSample {
         content: None,
         frame_begin: None,
@@ -364,27 +572,27 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
     let Some(a) = previous else {
         return Ok(sample);
     };
-    sample.frame_begin = Some(number(a, "time", 0.0)?);
+    sample.frame_begin = Some(a.header.time);
     let Some((start, begin)) = visible_frame_content(a)? else {
         return Ok(sample);
     };
     let fields = start.object().unwrap();
-    if number(a, "type", 2.0)? != 3.0 {
-        sample.content = Some(start.clone());
+    if a.header.kind != 3 {
+        sample.content = Some(Cow::Borrowed(start));
         return Ok(sample);
     }
     let Some(b) = next else {
-        sample.content = Some(start.clone());
+        sample.content = Some(Cow::Borrowed(start));
         return Ok(sample);
     };
-    if number(b, "type", 2.0)? == 0.0 {
-        sample.content = Some(start.clone());
+    if b.header.kind == 0 {
+        sample.content = Some(Cow::Borrowed(start));
         return Ok(sample);
     }
-    let end = b
+    let end = b.frame
         .get("content")
         .ok_or_else(|| invalid("visible next frame lacks content"))?;
-    let finish = number(b, "time", begin)?;
+    let finish = b.header.time;
     if finish <= begin {
         return Err(invalid("empty interpolation interval"));
     }
@@ -399,7 +607,7 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
     let ratio = (elapsed / (finish - begin)).clamp(0.0, 1.0);
     // At a keyframe, no interpolation/easing is needed and exact raw values win.
     if ratio == 0.0 {
-        sample.content = Some(start.clone());
+        sample.content = Some(Cow::Borrowed(start));
         return Ok(sample);
     }
     let mut map = fields.clone();
@@ -531,7 +739,7 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
                 .push("timeline corner color endpoint layout is not recovered".into());
         }
     }
-    sample.content = Some(PsbValue::Object(map));
+    sample.content = Some(Cow::Owned(PsbValue::Object(map)));
     sample.interpolated = true;
     Ok(sample)
 }
