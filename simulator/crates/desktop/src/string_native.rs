@@ -574,7 +574,7 @@ impl LoggingHost<'_> {
         if !source_resolves {
             return Ok(NativeReturn::Value(0));
         }
-        let codec = origins.argument_source_encoding(task, source, vm);
+        let codec = origins.sourced_vm_string(task, source, vm).map(|(_, codec)| codec);
         let mut words = Vec::new();
         split_parenthesized_table(&mut ParenthesizedTable {
             vm, source, separators: None,
@@ -782,6 +782,18 @@ impl LoggingHost<'_> {
                 let replacement = read_u32(&packet, 12)?;
                 let old_length = string_length(vm, old)?;
                 let replacement_length = string_length(vm, replacement)?;
+                let task = self.current_task_id;
+                let origins = &mut self.data_services.cst_text_origins;
+                // A low ASCII marker cannot be the trailing byte of a multibyte
+                // character. Compare the result to check live buffer aliasing.
+                let old_byte = string_byte(vm, old)?;
+                let sourced = origins.sourced_vm_string(task, source, vm)
+                    .filter(|_| old_length == 1 && old_byte < 0x40)
+                    .and_then(|(input, codec)| {
+                        let replacement = vm.read(replacement, replacement_length).ok()?;
+                        replacement.is_ascii().then(|| (input, replacement, codec))
+                    });
+                origins.invalidate_returned(task, target);
                 // 5ff603 clears output after reading both lengths, before the
                 // first source search. This matters to real in-place buffers.
                 vm.write(target, &[0])?;
@@ -822,6 +834,15 @@ impl LoggingHost<'_> {
                     return Err(native_state_error("native45 output exceeds storage limit"));
                 }
                 copy_string_words(vm, string_address(target, output)?, suffix, length + 1)?;
+                if let Some((input, replacement, codec)) = sourced
+                    && let Ok(bytes) = vm.read_string(target)
+                    && !bytes.is_ascii()
+                    && input.iter().flat_map(|byte| {
+                        if *byte == old_byte { replacement.as_slice() } else { std::slice::from_ref(byte) }
+                    }).eq(&bytes)
+                {
+                    origins.record(task, target, &bytes, codec);
+                }
                 Ok(NativeReturn::Continue)
             }
             _ => unreachable!(),

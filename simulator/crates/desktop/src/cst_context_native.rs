@@ -561,11 +561,13 @@ impl CstTextOrigins {
         self.returned_origin(task, address, bytes).map(|origin| origin.codec)
     }
 
-    pub(super) fn argument_source_encoding(&self, task: u32, address: u32, vm: &Vm) -> Option<ScriptTextEncoding> {
+    pub(super) fn sourced_vm_string(&self, task: u32, address: u32, vm: &Vm) -> Option<(Vec<u8>, ScriptTextEncoding)> {
         if !self.returned.iter().any(|(key, _)| *key == (task, address)) {
             return None;
         }
-        self.returned(task, address, &vm.read_string(address).ok()?)
+        let bytes = vm.read_string(address).ok()?;
+        let codec = self.returned(task, address, &bytes)?;
+        Some((bytes, codec))
     }
 
     pub(super) fn returned_body(&self, task: u32, address: u32, bytes: &[u8]) -> Option<&[CstBodySource]> {
@@ -2483,15 +2485,26 @@ mod source_encoding_tests {
             vm.write(scene_name, b"com01_selC.cst\0")?;
             assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
             let label = 0x8000_0800;
+            let command = 0x8000_0c00;
+            let marker = 0x8000_1000;
+            let replacement = 0x8000_1010;
+            vm.write(marker, b"$\0")?;
+            vm.write(replacement, b"0x\0")?;
             for (row, expected) in ["\u{6211}\u{5c31}\u{662f}\u{6211}", "\u{4e0d}\u{77e5}\u{9053}", "\u{2026}\u{2026}\u{5207}\u{90a3}"].into_iter().enumerate() {
                 let id = 700 + row as u32;
                 host.call(327, &args(&[handle, destination, 0, 2 + row as u32]), &mut vm)?;
                 host.call(278, &args(&[destination]), &mut vm)?;
-                assert_eq!(host.call(519, &args(&[label, destination, 2]), &mut vm)?, NativeReturn::Value(1));
+                host.call(45, &args(&[command, destination, marker, replacement]), &mut vm)?;
+                assert_eq!(host.call(519, &args(&[label, command, 2]), &mut vm)?, NativeReturn::Value(1));
                 host.call(276, &args(&[id, label]), &mut vm)?;
                 let bytes = &host.string_values[&id];
-                assert_eq!(host.data_services.cst_text_origins.shared(id, bytes), Some(ScriptTextEncoding::Gbk));
-                assert_eq!(decode_cst_dialogue(bytes, ScriptTextEncoding::Gbk)?, expected);
+                let origin = host.data_services.cst_text_origins.shared(id, bytes);
+                assert_eq!(origin, Some(ScriptTextEncoding::Gbk));
+                let expression = format!("$str{id}");
+                assert_eq!(super::super::fes_text::decode_sourced_text(
+                    expression.as_bytes(), bytes, ScriptTextEncoding::Gbk, ScriptTextEncoding::Cp932,
+                    false, |_| (bytes.as_slice(), origin),
+                )?.as_deref(), Some(expected));
             }
             for (filename, kind) in [(b"com01_selC.cst\0".as_slice(), 0x30), (b"BAD_02.cst\0", 0x20)] {
                 vm.write(scene_name, filename)?;
