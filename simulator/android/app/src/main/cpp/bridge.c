@@ -26,7 +26,7 @@ typedef struct {
     uint64_t phase_ns[PERF_PHASES];
 } HostFrameTiming;
 
-extern uint64_t cs2_android_open_profiled_v3(const char *, const char *, int32_t, HostFrameTiming *);
+extern uint64_t cs2_android_open_profiled_v4(const char *, const char *, int32_t, int32_t, HostFrameTiming *);
 extern int32_t cs2_android_close(uint64_t);
 extern int32_t cs2_android_step_profiled_v4(uint64_t, uint32_t, HostFrameTiming *, const char **,
                                            uint64_t, uint64_t, const char **);
@@ -235,7 +235,7 @@ static char *path_bytes(JNIEnv *env, jbyteArray bytes) {
     return value;
 }
 
-JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray game, jbyteArray saves) {
+JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray game, jbyteArray saves, jint language) {
     UNUSED_TYPES;
     const uint64_t start = perf_enabled() ? perf_now_ns() : 0;
     char story_value[PROP_VALUE_MAX];
@@ -245,7 +245,7 @@ JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray gam
     uint64_t handle = 0;
     HostFrameTiming timing = {0};
     if (game_path != NULL && save_path != NULL) {
-        handle = cs2_android_open_profiled_v3(game_path, save_path, story, start ? &timing : NULL);
+        handle = cs2_android_open_profiled_v4(game_path, save_path, story, language, start ? &timing : NULL);
     }
     free(game_path);
     free(save_path);

@@ -2391,7 +2391,7 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
     let Some(list) = host.data_services.tasks.fes.platform.lists.get(&id) else {
         return Ok(());
     };
-    let is_utate = host.css_task_sha() == Some(super::css_model::UTATE_SHA);
+    let legacy_list = is_legacy_list_pe(host.css_task_sha());
     let mut layers = Vec::new();
     for ((target, key), entry) in host.data_services.list_native.entries.iter() {
         if *target != id || matches!(entry.source, Source::Empty) {
@@ -2420,7 +2420,7 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
             options.scale_y = entry.scale[1];
             options.rotation_radians = entry.rotation;
             options.pivot = entry.base;
-        } else if is_utate && source.metadata().bit_depth == 32
+        } else if legacy_list && source.metadata().bit_depth == 32
             && host.data_services.image_control_values.get(&wrapper) == Some(&4)
         {
             options.blend_mode = cs2_renderer::BlendMode::ListAlphaFromAlpha;

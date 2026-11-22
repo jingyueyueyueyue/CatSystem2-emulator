@@ -236,7 +236,7 @@ class PlayerActivity : PlayerEngineActivity() {
     companion object {
         init { System.loadLibrary("cs2_android_bridge") }
 
-        @JvmStatic external fun nativeOpen(game: ByteArray, saves: ByteArray): Long
+        @JvmStatic external fun nativeOpen(game: ByteArray, saves: ByteArray, language: Int): Long
         @JvmStatic external fun nativeClose(handle: Long): Int
         @JvmStatic external fun nativeStep(handle: Long, budget: Int): Int
         @JvmStatic external fun nativeSize(handle: Long, axis: Int): Int

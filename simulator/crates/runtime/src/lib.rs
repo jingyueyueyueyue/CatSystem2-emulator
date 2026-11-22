@@ -149,7 +149,11 @@ impl GameRoot {
     }
 
     pub fn scan(&self) -> RuntimeResult<GameScan> {
-        let resources = ResourceIndex::scan(&self.path)?;
+        self.scan_with_language(resource_router::GameLanguage::Automatic)
+    }
+
+    pub fn scan_with_language(&self, language: resource_router::GameLanguage) -> RuntimeResult<GameScan> {
+        let resources = ResourceIndex::scan_with_language(&self.path, language)?;
         let engine = EngineFingerprint::detect(&self.path, &resources)?;
         let config_candidates = resources.config_candidates();
         let diagnostics = resources.diagnostics().to_vec();

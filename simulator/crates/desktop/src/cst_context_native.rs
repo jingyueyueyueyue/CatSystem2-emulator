@@ -561,6 +561,13 @@ impl CstTextOrigins {
         self.returned_origin(task, address, bytes).map(|origin| origin.codec)
     }
 
+    pub(super) fn argument_source_encoding(&self, task: u32, address: u32, vm: &Vm) -> Option<ScriptTextEncoding> {
+        if !self.returned.iter().any(|(key, _)| *key == (task, address)) {
+            return None;
+        }
+        self.returned(task, address, &vm.read_string(address).ok()?)
+    }
+
     pub(super) fn returned_body(&self, task: u32, address: u32, bytes: &[u8]) -> Option<&[CstBodySource]> {
         let origin = self.returned_origin(task, address, bytes)?;
         self.body_is_current(&origin.body).then_some(origin.body.as_slice())
@@ -1733,6 +1740,11 @@ impl LoggingHost<'_> {
                     });
                 }
             }
+        } else if record.kind == 0x30 && !text.is_ascii() {
+            // Legacy scripts also extract visible labels from CST commands.
+            self.data_services.cst_text_origins.record_with_body(
+                self.current_task_id, target, text, codec, Vec::new(),
+            );
         } else {
             self.data_services.cst_text_origins.invalidate_returned(self.current_task_id, target);
         }
@@ -2468,6 +2480,19 @@ mod source_encoding_tests {
             )?.as_deref(), Some(expected));
             host.read_cst_record(1037, &read_args, &mut vm)?;
             assert_eq!(vm.read_string(destination)?, expected.as_bytes());
+            vm.write(scene_name, b"com01_selC.cst\0")?;
+            assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
+            let label = 0x8000_0800;
+            for (row, expected) in ["\u{6211}\u{5c31}\u{662f}\u{6211}", "\u{4e0d}\u{77e5}\u{9053}", "\u{2026}\u{2026}\u{5207}\u{90a3}"].into_iter().enumerate() {
+                let id = 700 + row as u32;
+                host.call(327, &args(&[handle, destination, 0, 2 + row as u32]), &mut vm)?;
+                host.call(278, &args(&[destination]), &mut vm)?;
+                assert_eq!(host.call(519, &args(&[label, destination, 2]), &mut vm)?, NativeReturn::Value(1));
+                host.call(276, &args(&[id, label]), &mut vm)?;
+                let bytes = &host.string_values[&id];
+                assert_eq!(host.data_services.cst_text_origins.shared(id, bytes), Some(ScriptTextEncoding::Gbk));
+                assert_eq!(decode_cst_dialogue(bytes, ScriptTextEncoding::Gbk)?, expected);
+            }
             for (filename, kind) in [(b"com01_selC.cst\0".as_slice(), 0x30), (b"BAD_02.cst\0", 0x20)] {
                 vm.write(scene_name, filename)?;
                 assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
@@ -2485,6 +2510,16 @@ mod source_encoding_tests {
                 host.read_cst_record(1037, &args(&[handle, destination, input as u32, ordinal as u32]), &mut vm)?;
                 assert_eq!(vm.read_string(destination)?, expected.as_bytes());
             }
+            Ok(())
+        })?;
+        let mut japanese = crate::HeadlessPlayer::open_with_game_language(
+            player.scan.resources.root(), Path::new(&profile).join("island-japanese"),
+            cs2_runtime::resource_router::GameLanguage::Japanese,
+        )?;
+        japanese.with_host(|host| {
+            let (_, winner) = host.cst_resource_with_source(b"scene", b"com01_selC.cst")?.unwrap();
+            assert!(matches!(winner.source.location, ResourceLocation::Archive { path, .. }
+                if path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("scene.int"))));
             Ok(())
         })
     }

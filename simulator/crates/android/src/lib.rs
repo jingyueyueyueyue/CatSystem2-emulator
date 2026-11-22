@@ -10,6 +10,7 @@ use std::time::Instant;
 use cs2_desktop::{HeadlessPlayer, HostFrameTiming, HostPerfDetails};
 use cs2_runtime::{InputEvent, InputKey};
 use cs2_runtime::message_object::MessageTextInputEvent;
+use cs2_runtime::resource_router::GameLanguage;
 
 #[derive(Default)]
 struct Sessions {
@@ -206,11 +207,15 @@ unsafe fn path(value: *const c_char) -> Result<String, String> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_char, story: i32) -> u64 {
+    unsafe { open_game(game, saves, story, GameLanguage::Automatic) }
+}
+
+unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, language: GameLanguage) -> u64 {
     call(0, |sessions| {
         let game = unsafe { path(game)? };
         let saves = unsafe { path(saves)? };
         HeadlessPlayer::enable_host_gpu_raster();
-        let mut player = HeadlessPlayer::open_with_save_root(&game, &saves)
+        let mut player = HeadlessPlayer::open_with_game_language(&game, &saves, language)
             .map_err(|error| format!("Open game: {error:#}"))?;
         player.disable_script_evidence_capture();
         player.enable_host_window_requests();
@@ -250,10 +255,15 @@ pub unsafe extern "C" fn cs2_android_gpu_timing(sequence: *mut u64, elapsed_ns: 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cs2_android_open_profiled_v3(
-    game: *const c_char, saves: *const c_char, story: i32, timing: *mut HostFrameTiming,
+pub unsafe extern "C" fn cs2_android_open_profiled_v4(
+    game: *const c_char, saves: *const c_char, story: i32, language: i32, timing: *mut HostFrameTiming,
 ) -> u64 {
-    let open = || unsafe { cs2_android_open(game, saves, story) };
+    let language = match language {
+        1 => GameLanguage::Japanese,
+        2 => GameLanguage::Localized,
+        _ => GameLanguage::Automatic,
+    };
+    let open = || unsafe { open_game(game, saves, story, language) };
     if let Some(timing) = unsafe { timing.as_mut() } {
         let (id, sample) = HostFrameTiming::capture(open);
         *timing = sample;

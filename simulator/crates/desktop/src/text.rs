@@ -90,6 +90,7 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
         }));
     let mut seen = BTreeSet::new();
     for name in names {
+        if !use_resource_font(resources, &name) { continue; }
         let extension = Path::new(&name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -153,6 +154,16 @@ pub(super) fn load_font(resources: &ResourceIndex) -> Vec<LoadedFont> {
         }
     }
     fonts
+}
+
+pub(super) fn use_resource_font(resources: &ResourceIndex, name: &str) -> bool {
+    if resources.game_language() != cs2_runtime::resource_router::GameLanguage::Japanese {
+        return true;
+    }
+    let Some(name) = Path::new(name).file_name().and_then(|name| name.to_str()) else { return true; };
+    !["WenQuanYi_msgothic.ttf", "WenQuanYi_msgothic.otf", "WenQuanYi_CNJP.ttf",
+        "UtateMeguriSimplifiedChinese.otf", "HatsumiraSimplifiedChinese.ttf", "simhei_CNJP.ttf"]
+        .iter().any(|translation| name.eq_ignore_ascii_case(translation))
 }
 
 /// Real installed paths, in deterministic fallback order. The CPU message

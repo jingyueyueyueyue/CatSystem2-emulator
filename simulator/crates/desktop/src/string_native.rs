@@ -568,9 +568,13 @@ impl LoggingHost<'_> {
         // 5a54b7 runs even when the source pointer is unresolved. An aliased
         // destination therefore changes the bytes which the parser observes.
         vm.write(target, &[0])?;
+        let task = self.current_task_id;
+        let origins = &mut self.data_services.cst_text_origins;
+        origins.invalidate_returned(task, target);
         if !source_resolves {
             return Ok(NativeReturn::Value(0));
         }
+        let codec = origins.argument_source_encoding(task, source, vm);
         let mut words = Vec::new();
         split_parenthesized_table(&mut ParenthesizedTable {
             vm, source, separators: None,
@@ -599,10 +603,14 @@ impl LoggingHost<'_> {
             // No second zero is written for an empty/missing item.
             return Ok(NativeReturn::Value(0));
         }
-        for (offset, &byte) in words[selected..selected + length].iter().enumerate() {
+        let text = &words[selected..selected + length];
+        for (offset, &byte) in text.iter().enumerate() {
             vm.write(string_address(target, offset)?, &[byte])?;
         }
         vm.write(string_address(target, length)?, &[0, 0])?;
+        if let Some(codec) = codec && !text.is_ascii() {
+            origins.record(task, target, text, codec);
+        }
         Ok(NativeReturn::Value(1))
     }
 

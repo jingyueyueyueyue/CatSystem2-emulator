@@ -160,6 +160,15 @@ final class GameLibrary {
         return games;
     }
 
+    int language(Entry game) {
+        int language = settings.getInt("language." + game.key, 0);
+        return language >= 0 && language <= 2 ? language : 0;
+    }
+
+    void setLanguage(Entry game, int language) {
+        settings.edit().putInt("language." + game.key, language).apply();
+    }
+
     void adoptPreviousImport(SharedPreferences previous) {
         String game = previous.getString("game", null);
         String saves = previous.getString("saves", null);

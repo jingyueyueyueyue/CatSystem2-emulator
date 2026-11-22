@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use cs2_formats::ConfigXml;
 use cs2_runtime::language::{LanguageChangeRequest, LanguageState, LanguageTarget};
-use cs2_runtime::resource_router::ResourceMode;
+use cs2_runtime::resource_router::{GameLanguage, ResourceMode};
 use cs2_runtime::{ResourceIndex, ResourceLocation, RuntimeError};
 
 use super::{HeadlessPlayer, load_fes_media_image};
@@ -97,6 +97,21 @@ impl HeadlessPlayer {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+            }
+            let languages = &mut self.data_services.language.languages;
+            let preferred = match self.scan.resources.game_language() {
+                GameLanguage::Automatic => None,
+                GameLanguage::Japanese => languages.prefixes.iter().position(|prefix| {
+                    prefix.is_empty() || [b"ja".as_slice(), b"jp"].iter().any(|name| prefix.eq_ignore_ascii_case(name))
+                }),
+                GameLanguage::Localized => languages.prefixes.iter().position(|prefix| {
+                    [b"cn".as_slice(), b"zh", b"chs", b"zh-cn", b"zh-hans"].iter()
+                        .any(|name| prefix.eq_ignore_ascii_case(name))
+                }),
+            };
+            if let Some(index) = preferred {
+                languages.primary_index = index as u32;
+                languages.message_index = index as u32;
             }
         } else if let Some(startup) = &startup {
             self.data_services.language.platform.configuration.title =

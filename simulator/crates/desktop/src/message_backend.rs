@@ -616,7 +616,7 @@ impl DesktopMessageDevice {
                     .map(|entry| entry.name.replace('\\', "/"))
             }))
             .filter(|name| {
-                std::path::Path::new(name)
+                super::text::use_resource_font(resources, name) && std::path::Path::new(name)
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| {

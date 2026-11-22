@@ -336,10 +336,10 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                 launch((GameLibrary.Entry)parent.getItemAtPosition(position), false);
             }
         });
-        if (isDebuggable(this)) gameShelf.setOnItemLongClickListener((parent, view, position, id) -> {
+        gameShelf.setOnItemLongClickListener((parent, view, position, id) -> {
             if (gameShelf.getAdapter().isEnabled(position) && !importing.get()
                     && launchingTitle == null && !endingGame) {
-                confirmIsolatedLaunch((GameLibrary.Entry)parent.getItemAtPosition(position));
+                showGameLanguage((GameLibrary.Entry)parent.getItemAtPosition(position));
             }
             return true;
         });
@@ -594,6 +594,21 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             .show();
     }
 
+    private void showGameLanguage(GameLibrary.Entry entry) {
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+            .setTitle(entry.title + " · 语种")
+            .setSingleChoiceItems(new String[] {"自动", "日语原文", "本地汉化"}, library.language(entry),
+                (window, language) -> {
+                    library.setLanguage(entry, language);
+                    window.dismiss();
+                })
+            .setNegativeButton("关闭", null);
+        if (isDebuggable(this)) {
+            dialog.setNeutralButton("隔离启动", (window, which) -> confirmIsolatedLaunch(entry));
+        }
+        dialog.show();
+    }
+
     private void launch(GameLibrary.Entry entry, boolean isolated) {
         if (importing.get() || launchingTitle != null || endingGame) return;
         if (isolated && !isDebuggable(this)) return;
@@ -738,14 +753,15 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                 String mode = isolated ? "isolated" : "standard";
                 String details = " mode=" + mode + " key=" + entry.key + " game=" + game.getAbsolutePath()
                     + " saves=" + saves.getAbsolutePath();
+                int language = library.language(entry);
                 session = nativeOpen(game.getAbsolutePath().getBytes(StandardCharsets.UTF_8),
-                    saves.getAbsolutePath().getBytes(StandardCharsets.UTF_8));
+                    saves.getAbsolutePath().getBytes(StandardCharsets.UTF_8), language);
                 if (session == 0) {
                     IOException error = new IOException(nativeErrorText());
                     logLibraryIssue(isolated ? "launch-isolated" : "launch", "native-open" + details, entry, error);
                     throw error;
                 }
-                android.util.Log.i("CS2Player", "Opened " + game);
+                android.util.Log.i("CS2Player", "Opened " + game + " language=" + language);
                 if (isolated) {
                     String record = "library phase=launch stage=native-open result=opened" + details;
                     android.util.Log.i("CS2Player", record);

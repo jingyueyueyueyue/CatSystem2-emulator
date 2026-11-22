@@ -18,6 +18,29 @@ const ISLAND_TEXT_ARCHIVES: [((&str, u64, &str), (&str, u64, &str)); 2] = [
     ),
 ];
 
+// CST encodings of verified translation archives. The original archives can
+// have the same filenames, so the encoding must follow the actual source.
+const GBK_SCENE_ARCHIVES: [(&str, u64, &str); 3] = [
+    ("scene.int", 1_404_734, "1c0f5ab05cb0df54d6ac7e9a1ea451c43930eb0c51712c7fbd7203ba53fb0042"),
+    ("update01.int", 3_826_793, "2b8367abd2628ed6f533a9fedfa528124296bb8369f4adfe48c4347dfe8652e9"),
+    ("update05.int", 1_185_840, "3849fda950a7425a778eaeaceace3248195b2c8d6543c29ecf7047181f6c28ef"),
+];
+const DAYDREAM_PATCH: (&str, u64, &str) = (
+    "update03.int", 28_078_220, "cac79038baad0a266ce1e1ca75143285f2b09ad895e7b1af1af3a61df807c0f9",
+);
+const GLYPH_PATCHES: [(&str, u64, &str); 2] = [
+    ("update00.int", 3_028_489, "c7465d70274449232d3e6161f0eefdac3af4dc28351746030b20c834456da974"),
+    ("update02.int", 1_339_656, "d0bab21e300ed168cc822297c4805ef054272b50380ab4c81fbb7b25f37e043e"),
+];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameLanguage {
+    #[default]
+    Automatic,
+    Japanese,
+    Localized,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ResourceMode { File = 1, Archive = 2, LooseFirst = 3, ArchiveFirst = 4 }
@@ -473,7 +496,9 @@ impl ResourceRouter {
                     config.integer(&[b"document", b"INT", format!("need{need:02}").as_bytes()], -1) == slot
                 }) { return Err(error("required startup INT registration failed")); }
             }
-            builder.bind_island_translation();
+            if index.game_language() != GameLanguage::Japanese {
+                builder.bind_island_translation();
+            }
         } else {
             // For configuration-less tooling, expose actual mounts in stable
             // inventory order. This is an explicit host policy, not proof of
@@ -493,11 +518,33 @@ impl ResourceRouter {
         builder.router.patches = patches.into_iter().filter(|(_, _, entry)| entry.is_readable())
             .map(|(_, archive, entry)| ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() }).collect();
         builder.bind_localization_patches()?;
+        // This patch replaced the base scene archive on disk. Keep its codec
+        // even in Japanese mode so the remaining installed text is readable.
+        if let Some(archive) = builder.verified_archive(GBK_SCENE_ARCHIVES[0]) {
+            builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
+        }
+        if index.game_language() == GameLanguage::Japanese {
+            let disabled = GBK_SCENE_ARCHIVES.into_iter().skip(1).chain(GLYPH_PATCHES).chain([DAYDREAM_PATCH])
+                .filter_map(|patch| builder.verified_archive(patch)).collect::<Vec<_>>();
+            builder.router.patches.retain(|mount| !disabled.contains(&mount.archive));
+            return Ok(builder.router);
+        }
+        let labyrinth_patch = base.join(crate::resource::LABYRINTH_PATCH);
+        if let Some((archive, entry)) = index.archives().iter().enumerate()
+            .find(|(_, entry)| entry.is_readable() && physical_path_equal(&entry.path, &labyrinth_patch))
+        {
+            builder.router.patches.insert(0, ArchiveMount {
+                archive, path: entry.path.to_string_lossy().encode_utf16().collect(),
+            });
+            builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
+        }
+        for fingerprint in GBK_SCENE_ARCHIVES.into_iter().skip(1) {
+            if let Some(archive) = builder.verified_archive(fingerprint) {
+                builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
+            }
+        }
         // The CST members of this exact Daydream patch use GBK.
-        builder.router.daydream_gbk_scene_archive = builder.verified_archive((
-            "update03.int", 28_078_220,
-            "cac79038baad0a266ce1e1ca75143285f2b09ad895e7b1af1af3a61df807c0f9",
-        ));
+        builder.router.daydream_gbk_scene_archive = builder.verified_archive(DAYDREAM_PATCH);
 
         Ok(builder.router)
     }
@@ -528,6 +575,7 @@ impl MountBuilder<'_> {
         }
         let manifest: LocalizationManifest = serde_json::from_slice(&bytes)
             .map_err(|cause| error(&format!("cs2-localization.json: {cause}")))?;
+        let use_translation = self.index.game_language() != GameLanguage::Japanese;
         let mut patches = Vec::with_capacity(manifest.patches.len());
         for patch in manifest.patches {
             let name = Path::new(&patch.archive);
@@ -545,13 +593,14 @@ impl MountBuilder<'_> {
                 return Err(error(&format!("cs2-localization.json: duplicate archive {}", patch.archive)));
             }
             patches.push(ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() });
-            if let Some(encoding) = patch.scene_encoding {
+            if use_translation && let Some(encoding) = patch.scene_encoding {
                 self.router.localized_scene_encodings.push((archive, encoding));
             }
         }
         // Declared patches come first. Keep the original update order for the fallback.
         self.router.patches.retain(|existing|
             !patches.iter().any(|mount| mount.archive == existing.archive));
+        if !use_translation { return Ok(()); }
         patches.append(&mut self.router.patches);
         self.router.patches = patches;
         Ok(())
@@ -793,6 +842,12 @@ mod localization_manifest_tests {
         let serialized = serde_json::to_vec(router).unwrap();
         assert_eq!(serde_json::from_slice::<ResourceRouter>(&serialized).unwrap(), *router);
         drop(index);
+        let japanese = crate::ResourceIndex::scan_with_language(&root, GameLanguage::Japanese).unwrap();
+        assert_eq!(japanese.read_mode("scene.int/opening.cst", mode).unwrap().unwrap(), b"Japanese update");
+        drop(japanese);
+        let localized = crate::ResourceIndex::scan_with_language(&root, GameLanguage::Localized).unwrap();
+        assert_eq!(localized.read_mode("scene.int/opening.cst", mode).unwrap().unwrap(), b"translated");
+        drop(localized);
         fs::remove_dir_all(root).unwrap();
     }
 }

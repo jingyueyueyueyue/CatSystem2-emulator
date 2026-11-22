@@ -12,7 +12,11 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use crate::resource_router::{MAX_ARCHIVE_KEY_BYTES, MAX_PATH_UNITS, ResourceMode, ResourceRouter, RoutedResource, directory_key, encode_wide_name, wide_query_key};
+use crate::resource_router::{GameLanguage, MAX_ARCHIVE_KEY_BYTES, MAX_PATH_UNITS, ResourceMode, ResourceRouter, RoutedResource, directory_key, encode_wide_name, wide_query_key};
+
+#[path = "resource_labyrinth.rs"]
+mod labyrinth;
+pub(crate) use labyrinth::LABYRINTH_PATCH;
 
 const KIF_HEADER_SIZE: u64 = 8;
 const KIF_STANDARD_ENTRY_SIZE: u64 = 72;
@@ -411,6 +415,8 @@ pub struct ResourceIndex {
     #[serde(default)]
     archive_name_seeds: Vec<u32>,
     #[serde(default)]
+    game_language: GameLanguage,
+    #[serde(default)]
     routing: Option<ResourceRouter>,
     #[serde(default)]
     routing_base: PathBuf,
@@ -549,6 +555,10 @@ impl ResourceIndex {
     }
 
     pub fn scan(root: impl AsRef<Path>) -> RuntimeResult<Self> {
+        Self::scan_with_language(root, GameLanguage::Automatic)
+    }
+
+    pub fn scan_with_language(root: impl AsRef<Path>, language: GameLanguage) -> RuntimeResult<Self> {
         let root = root.as_ref().to_path_buf();
         if !root.is_dir() {
             return Err(RuntimeError::MissingGameDirectory(root));
@@ -557,7 +567,7 @@ impl ResourceIndex {
         collect_files(&root, &mut paths)?;
         paths.sort_by_key(|path| path_sort_key(path));
         let name_seeds = find_archive_name_seeds(&root, &paths);
-        Self::scan_with_name_seeds(root, &name_seeds)
+        Self::scan_internal(root, &name_seeds, language)
     }
 
     pub fn scan_with_name_seed(
@@ -573,6 +583,10 @@ impl ResourceIndex {
     /// produces a valid directory; this supports coexisting localized/runtime
     /// executable variants without changing the explicit single-seed API.
     pub fn scan_with_name_seeds(root: impl AsRef<Path>, name_seeds: &[u32]) -> RuntimeResult<Self> {
+        Self::scan_internal(root, name_seeds, GameLanguage::Automatic)
+    }
+
+    fn scan_internal(root: impl AsRef<Path>, name_seeds: &[u32], game_language: GameLanguage) -> RuntimeResult<Self> {
         let root = root.as_ref().to_path_buf();
         if !root.is_dir() {
             return Err(RuntimeError::MissingGameDirectory(root));
@@ -599,6 +613,7 @@ impl ResourceIndex {
             diagnostics: Vec::new(),
             archive_name_seed: name_seeds.first().copied(),
             archive_name_seeds: name_seeds.clone(),
+            game_language,
             routing: None,
             routing_base: PathBuf::new(),
             routing_startup: None,
@@ -649,12 +664,18 @@ impl ResourceIndex {
                 }
             }
 
-            if path
+            let archive = if path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("int"))
             {
-                let archive = parse_archive(&path, relative_path, &name_seeds)?;
+                Some(parse_archive(&path, relative_path, &name_seeds)?)
+            } else if path.file_name().is_some_and(|name| name.eq_ignore_ascii_case(LABYRINTH_PATCH)) {
+                labyrinth::scan(&path, relative_path, size)?
+            } else {
+                None
+            };
+            if let Some(archive) = archive {
                 for entry in &archive.entries {
                     let archive_priority = archive_priority(&archive.path);
                     let candidate = ResourceCandidate {
@@ -721,6 +742,10 @@ impl ResourceIndex {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn game_language(&self) -> GameLanguage {
+        self.game_language
     }
 
     pub fn files(&self) -> &[DirectoryFile] {

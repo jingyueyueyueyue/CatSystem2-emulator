@@ -7128,7 +7128,7 @@ pub struct HeadlessPlayer {
 
 impl HeadlessPlayer {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_internal(path.as_ref(), None)
+        Self::open_internal(path.as_ref(), None, cs2_runtime::resource_router::GameLanguage::Automatic)
     }
 
     /// Use a caller-owned save directory for this player only. Android hosts
@@ -7137,13 +7137,19 @@ impl HeadlessPlayer {
     pub fn open_with_save_root(
         path: impl AsRef<Path>, save_root: impl AsRef<Path>,
     ) -> Result<Self> {
-        Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()))
+        Self::open_with_game_language(path, save_root, cs2_runtime::resource_router::GameLanguage::Automatic)
     }
 
-    fn open_internal(path: &Path, save_root: Option<PathBuf>) -> Result<Self> {
+    pub fn open_with_game_language(
+        path: impl AsRef<Path>, save_root: impl AsRef<Path>, language: cs2_runtime::resource_router::GameLanguage,
+    ) -> Result<Self> {
+        Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()), language)
+    }
+
+    fn open_internal(path: &Path, save_root: Option<PathBuf>, language: cs2_runtime::resource_router::GameLanguage) -> Result<Self> {
         let (root, scan) = measure_host_operation(HostPhase::OpenScan, || -> Result<_> {
             let root = GameRoot::open(path).context("open game directory")?;
-            let scan = root.scan().context("scan game directory")?;
+            let scan = root.scan_with_language(language).context("scan game directory")?;
             Ok((root, scan))
         })?;
         let _timing = measure_host_phase(HostPhase::OpenInitialize);

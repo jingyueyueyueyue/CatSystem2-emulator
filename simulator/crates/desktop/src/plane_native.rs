@@ -2023,7 +2023,13 @@ impl LoggingHost<'_> {
                 .is_some_and(|pixel| {
                     self.data_services.image_wrapper_pixels.get(&source_id) == Some(pixel)
                 });
-        let top_down = [self.is_list_output_wrapper(source_id), self.is_list_output_wrapper(target_id)];
+        // Campanella's message task crops the bottom of the full-screen skin
+        // into a shorter list texture using top-origin image coordinates.
+        let message_skin = self.css_task_sha() == Some(super::particle_external::CAMPANELLA_SHA)
+            && self.scene_nodes.get(&self.current_task_id)
+                .is_some_and(|node| node.kind == 12 && node.name == "meswnd");
+        let top_down = [source_id, target_id]
+            .map(|handle| message_skin || self.is_list_output_wrapper(handle));
         let updated = copy_wrapper(target, source, to, from, shared_pixels, top_down)?;
         if let Some(updated) = updated {
             self.replace_image_wrapper_pixels(target_id, updated)?;

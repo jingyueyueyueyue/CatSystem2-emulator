@@ -708,7 +708,8 @@ impl LoggingHost<'_> {
             None => {
                 // Keep the precise read/directory failure. Only successful
                 // identity decisions are derived cached state.
-                let enabled = island_patch::identify(self.resources)?;
+                let enabled = self.resources.game_language() != cs2_runtime::resource_router::GameLanguage::Japanese
+                    && island_patch::identify(self.resources)?;
                 self.data_services.image_manager.island_patch_enabled = Some(enabled);
                 enabled
             }
