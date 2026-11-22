@@ -605,6 +605,10 @@ impl WavAudioHost {
             let (finished_sender, finished) = mpsc::channel();
             let retained_prepared = prepared.clone();
             let worker_timing = audio_profile::active();
+            // Sound effects have a synchronous, nonfatal startup-timeout
+            // path in native157. Voice/BGM errors can use the worker result.
+            let acknowledge_start_request = cfg!(target_os = "android")
+                && matches!(request.channel, AudioChannel::Bgm | AudioChannel::Voice);
             let worker = {
                 let _timing = Stage::Spawn.begin();
                 thread::Builder::new()
@@ -627,6 +631,7 @@ impl WavAudioHost {
                                     command_receiver,
                                     started_sender,
                                     None,
+                                    acknowledge_start_request,
                                     #[cfg(target_os = "android")]
                                     standby,
                                 )
@@ -791,6 +796,21 @@ mod pcm_worker {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
 
+    fn activate_and_acknowledge(
+        output: &mut dyn MovieAudioOutput,
+        paused: bool,
+        acknowledge_start_request: bool,
+        started: &mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>,
+    ) -> cs2_runtime::RuntimeResult<bool> {
+        let mut acknowledge = || started.send(Ok(())).is_ok();
+        if acknowledge_start_request && !paused {
+            output.start_with_acknowledgement(&mut acknowledge)
+        } else {
+            output.pause(paused)?;
+            Ok(acknowledge())
+        }
+    }
+
     pub(super) fn run_playback(
         prepared: Arc<PreparedAudio>,
         resource: &str,
@@ -801,6 +821,7 @@ mod pcm_worker {
         commands: mpsc::Receiver<WavWorkerCommand>,
         started: mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>,
         saved: Option<super::checkpoint::WorkerState>,
+        acknowledge_start_request: bool,
         #[cfg(target_os = "android")] standby: Option<crate::audio_android::Standby>,
     ) -> cs2_runtime::RuntimeResult<()> {
         let sample_rate = prepared.probe.sample_rate;
@@ -895,9 +916,14 @@ mod pcm_worker {
         let mut paused = saved.as_ref().is_some_and(|s| s.paused);
         let mut restore_hold = restoring;
         let mut capture_hold = false;
-        output.pause(initial_suspended || paused || restore_hold)?;
+        let acknowledged = activate_and_acknowledge(
+            &mut output,
+            initial_suspended || paused || restore_hold,
+            acknowledge_start_request,
+            &started,
+        )?;
         audio_profile::clear();
-        if started.send(Ok(())).is_err() {
+        if !acknowledged {
             return output.stop();
         }
         let mut suspended = initial_suspended;
@@ -1018,6 +1044,67 @@ mod pcm_worker {
         match error {
             RuntimeError::AudioStartTimeout(cause) => RuntimeError::AudioStartTimeout(cause.clone()),
             _ => RuntimeError::Host(error.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use cs2_runtime::RuntimeResult;
+
+        struct TestOutput {
+            paused: Option<bool>,
+            startup: mpsc::Receiver<RuntimeResult<()>>,
+            reject_request: bool,
+        }
+
+        impl MovieAudioOutput for TestOutput {
+            fn submit(&mut self, _: &[i16]) -> RuntimeResult<bool> { unreachable!() }
+            fn position_seconds(&mut self) -> RuntimeResult<f64> { unreachable!() }
+            fn drained(&mut self) -> RuntimeResult<bool> { unreachable!() }
+            fn stop(&mut self) -> RuntimeResult<()> { unreachable!() }
+
+            fn pause(&mut self, paused: bool) -> RuntimeResult<()> {
+                assert!(matches!(self.startup.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                self.paused = Some(paused);
+                Ok(())
+            }
+
+            fn start_with_acknowledgement(&mut self, acknowledge: &mut dyn FnMut() -> bool) -> RuntimeResult<bool> {
+                if self.reject_request {
+                    return Err(RuntimeError::Host("request rejected".into()));
+                }
+                assert!(acknowledge());
+                self.startup.try_recv().expect("acknowledge before confirming device")?;
+                Err(RuntimeError::AudioStartTimeout("device never confirmed".into()))
+            }
+        }
+
+        #[test]
+        fn startup_acknowledges_accepted_request_and_keeps_device_error() {
+            for reject_request in [false, true] {
+                let (started, startup) = mpsc::sync_channel(1);
+                let mut output = TestOutput { paused: None, startup, reject_request };
+                let result = activate_and_acknowledge(&mut output, false, true, &started);
+                if reject_request {
+                    assert!(matches!(result, Err(RuntimeError::Host(cause)) if cause == "request rejected"));
+                    assert!(matches!(output.startup.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                } else {
+                    assert!(matches!(result, Err(RuntimeError::AudioStartTimeout(cause)) if cause == "device never confirmed"));
+                }
+                assert_eq!(output.paused, None);
+            }
+        }
+
+        #[test]
+        fn startup_preserves_suspended_and_synchronous_paths() {
+            for (paused, early_ack) in [(true, true), (false, false)] {
+                let (started, startup) = mpsc::sync_channel(1);
+                let mut output = TestOutput { paused: None, startup, reject_request: false };
+                assert!(activate_and_acknowledge(&mut output, paused, early_ack, &started).unwrap());
+                output.startup.try_recv().unwrap().unwrap();
+                assert_eq!(output.paused, Some(paused));
+            }
         }
     }
 }

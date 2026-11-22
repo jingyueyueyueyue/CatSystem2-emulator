@@ -7,6 +7,7 @@
 use super::psb::{PsbDocument, PsbValue};
 use super::{
     CpuBezierPatch, CpuM2LipBinding, CpuM2LipCurve, CpuM2LipSidecarKind, CpuM2LiveOwner, CpuM2Load,
+    CpuM2ModelSource, EmoteArchiveVersion,
     CpuM2TimedVariables, CpuMeshGrid, CpuNative907State, CpuOriginalTaskClock, CpuStencilBuffer,
     CpuStencilWrite, CpuVariableTimelineInfo, CpuVariableTimelines, EmoteBackend, EmoteBuffer,
     EmoteCommand, EmoteError, EmoteOperation, EmotePlaybackInfo, EmoteRasterFrame, EmoteReply,
@@ -458,17 +459,21 @@ impl CpuPlayer {
         Ok(variables)
     }
     pub fn advance_frames(&mut self, delta: f32) -> Result<()> {
+        let mut next = self.clone();
+        next.advance_frames_in_place(delta)?;
+        *self = next;
+        Ok(())
+    }
+
+    fn advance_frames_in_place(&mut self, delta: f32) -> Result<()> {
         let frame = self.frame as f32 + delta;
         if !frame.is_finite() {
             return Err(unsupported("motion time overflow"));
         }
-        let mut next = self.clone();
-        next.variable_timelines.advance(delta)?;
-        next.consume_controller_targets()?;
-        next.m2_timed_variables
-            .advance(delta, &mut next.variables)?;
-        next.frame = f64::from(frame);
-        *self = next;
+        self.variable_timelines.advance(delta)?;
+        self.consume_controller_targets()?;
+        self.m2_timed_variables.advance(delta, &mut self.variables)?;
+        self.frame = f64::from(frame);
         Ok(())
     }
 
@@ -512,8 +517,19 @@ impl CpuPlayer {
     ///It builds no pixels and runs no M2 controller a second time. The host's
     ///advance integration owns this call; draw does not invent missed ticks.
     pub fn update_reference_timelines(&mut self) -> Result<()> {
+        let references = self.reference_timelines.clone();
+        self.update_reference_timelines_with(references)
+    }
+
+    fn update_reference_timelines_in_place(&mut self) -> Result<()> {
+        let references = std::mem::take(&mut self.reference_timelines);
+        self.update_reference_timelines_with(references)
+    }
+
+    fn update_reference_timelines_with(
+        &mut self, mut references: super::timeline::CpuReferenceTimelines,
+    ) -> Result<()> {
         let variables = self.effective_variables()?;
-        let mut references = self.reference_timelines.clone();
         references.begin(&self.object, &self.motion);
         let mut target = CpuDrawTarget::default();
         let mut context = RenderContext {
@@ -522,7 +538,7 @@ impl CpuPlayer {
                                     scale: 1.0, time_units_per_frame: 1.0 },
             target: &mut target, warnings: BTreeSet::new(), layers: 0, triangles: 0,
             active: BTreeSet::new(), references,
-            reference_path: Vec::new(), reference_update: true,
+            reference_path: Vec::new(), reference_update: true, reference_tick_current: false,
             reference_raw_time: self.frame,
         };
         if self.enabled {
@@ -591,6 +607,7 @@ impl CpuPlayer {
     ) -> Result<EmoteDrawDiagnostics> {
         let mut references = self.reference_timelines.clone();
         references.begin(&self.object, &self.motion);
+        let reference_tick_current = references.has_tick(self.frame as f32, variables);
         let mut context = RenderContext {
             player: self,
             variables,
@@ -603,6 +620,7 @@ impl CpuPlayer {
             references,
             reference_path: Vec::new(),
             reference_update: false,
+            reference_tick_current,
             reference_raw_time: self.frame,
         };
         // A static initial pose cannot stand in for an enabled controller,
@@ -832,6 +850,7 @@ struct RenderContext<'a, T> {
     references: super::timeline::CpuReferenceTimelines,
     reference_path: Vec<usize>,
     reference_update: bool,
+    reference_tick_current: bool,
     ///Caller player+100, distinct from sampled+104.41087 uses the raw
     ///clock when selecting a new reference on an unparameterized layer.
     reference_raw_time: f64,
@@ -943,8 +962,7 @@ impl<T: EmoteDrawTarget> RenderContext<'_, T> {
             if loop_time >= 0.0 || mask != 0.0 {
                 return Err(unsupported("reference loop/nonzero motion flags outside recovered actual resource family"));
             }
-            if parameter.is_none() && !self.reference_update
-                && !self.references.has_tick(self.player.frame as f32, self.variables)
+            if parameter.is_none() && !self.reference_update && !self.reference_tick_current
             {
                 self.warnings.insert(
                     "ordinary reference owner requires update_reference_timelines after each player tick".into());
@@ -1063,13 +1081,17 @@ impl<T: EmoteDrawTarget> RenderContext<'_, T> {
         }
         self.bind_references(&mut pending)?;
         let bindings = super::resolve_emote_stencil_bindings(motion)?;
-        let order = if self.reference_update {
-            //Native player update visits physical references even if their
-            //motion currently emits no primitive in the priority schedule.
-            (0..pending.len()).collect()
-        } else {
-            priority_order(motion, frame, pending.len())?
-        };
+        if self.reference_update {
+            // The clock update visits physical references in reverse order.
+            // It has no primitive ranges or stencil chains to publish.
+            for draw in pending.iter().rev().flatten() {
+                self.collect_reference(draw, &[], primitives)?;
+            }
+            self.active.remove(&(object.to_owned(), name.to_owned()));
+            self.reference_raw_time = previous_raw;
+            return Ok(Vec::new());
+        }
+        let order = priority_order(motion, frame, pending.len())?;
         let scope = Arc::new(MotionPrimitives {
             pending: pending.into_iter().map(|draw| draw.map(Arc::new)).collect(),
             bindings,
@@ -1103,26 +1125,10 @@ impl<T: EmoteDrawTarget> RenderContext<'_, T> {
                 //group primitive that same tail. Being an active owner does
                 //not add this group to its referenced content's color chain;
                 //its physical children below still receive it in layer().
-                if let Some(reference) = &draw.reference {
-                    let previous = std::mem::replace(&mut self.reference_path, reference.path.clone());
-                    let caller_raw = std::mem::replace(&mut self.reference_raw_time, reference.raw_frame);
-                    let result = self.collect_motion(
-                        &reference.object,
-                        &reference.motion,
-                        reference.frame,
-                        draw.transform,
-                        &draw.motion_parent_warps,
-                        draw.depth + 1,
-                        &scopes,
-                        primitives,
-                    );
-                    self.reference_path = previous;
-                    self.reference_raw_time = caller_raw;
-                    let range = result?;
-                    captured.extend(range.iter().cloned());
-                    ranges[index] = range;
-                }
-            } else if !self.reference_update {
+                let range = self.collect_reference(draw, &scopes, primitives)?;
+                captured.extend(range.iter().cloned());
+                ranges[index] = range;
+            } else {
                 //44e2a appends the actual primitive to a caller's capture,
                 //including blank/type12 entries.50d0 filters nontextured
                 //entries at consumption; it does not invent their bounds.
@@ -1133,7 +1139,7 @@ impl<T: EmoteDrawTarget> RenderContext<'_, T> {
                 }
             }
         }
-        if !self.reference_update {
+        {
             //44f30 visits composite owners after reference capture.44f69
             //clears the SAME range, inserts its own primitive, then4501b
             //copies each source group's CURRENT range. Preserve source order
@@ -1174,6 +1180,22 @@ impl<T: EmoteDrawTarget> RenderContext<'_, T> {
         self.active.remove(&(object.to_owned(), name.to_owned()));
         self.reference_raw_time = previous_raw;
         Ok(captured)
+    }
+
+    fn collect_reference(
+        &mut self, draw: &DrawLayer, stencils: &[OwnedStencilScope],
+        primitives: &mut Vec<ColorPrimitive>,
+    ) -> Result<Vec<Arc<DrawLayer>>> {
+        let Some(reference) = &draw.reference else { return Ok(Vec::new()); };
+        let previous = std::mem::replace(&mut self.reference_path, reference.path.clone());
+        let caller_raw = std::mem::replace(&mut self.reference_raw_time, reference.raw_frame);
+        let result = self.collect_motion(
+            &reference.object, &reference.motion, reference.frame, draw.transform,
+            &draw.motion_parent_warps, draw.depth + 1, stencils, primitives,
+        );
+        self.reference_path = previous;
+        self.reference_raw_time = caller_raw;
+        result
     }
 
     fn layer(
@@ -1218,11 +1240,33 @@ impl<T: EmoteDrawTarget> RenderContext<'_, T> {
         }
         let parameter_time = self.bound_parameter_clock(layer, params)?;
         let at = parameter_time.unwrap_or(time);
+        if self.reference_update {
+            // References inherit the physical layer path and clocks here.
+            // Their geometry and stencil inputs are only consumed at draw time.
+            let Some((content, frame_begin)) = super::timeline::visible_layer_key(layer, at)? else {
+                return hide_children(layer, pending);
+            };
+            if kind == 3 {
+                pending[preorder_index] = Some(DrawLayer {
+                    kind, content: content.clone(), transform: parent, warps: Vec::new(),
+                    motion_parent_warps: Vec::new(), mesh_owner: self.layers,
+                    time: parameter_time.unwrap_or(self.reference_raw_time),
+                    frame_begin,
+                    reference: None, depth, mesh_grid: None, stencil_owners: Vec::new(),
+                });
+            }
+            if let Some(children) = layer.get("children").and_then(PsbValue::list) {
+                for child in children {
+                    self.layer(child, time, parent, motion_opacity, &[], &[], params,
+                        depth + 1, &[], pending)?;
+                }
+            }
+            return Ok(());
+        }
         let sample = sample_emote_layer(layer, at)?;
         self.warnings.extend(sample.warnings);
         let Some(mut content) = sample.content else {
-            hide_children(layer, pending)?;
-            return Ok(());
+            return hide_children(layer, pending);
         };
         if kind == 12 && string(&content, "src") != Some("blank") {
             self.warnings.insert(
@@ -1812,7 +1856,31 @@ pub struct EmoteSpriteMesh<'a> {
     grid: CpuMeshGrid,
 }
 
+pub struct OwnedEmoteSpriteMesh {
+    source: String,
+    opacity: f64,
+    vertices: Vec<[f64; 4]>,
+    grid: CpuMeshGrid,
+}
+
+impl OwnedEmoteSpriteMesh {
+    pub fn restore<'a>(self, model: &'a CpuMotionModel) -> Result<EmoteSpriteMesh<'a>> {
+        let (source, texture) = model.textures.get_key_value(&self.source)
+            .ok_or_else(|| unsupported("E-mote draw texture does not belong to model"))?;
+        Ok(EmoteSpriteMesh {
+            source, texture, opacity: self.opacity, vertices: self.vertices, grid: self.grid,
+        })
+    }
+}
+
 impl EmoteSpriteMesh<'_> {
+    pub fn into_owned(self) -> OwnedEmoteSpriteMesh {
+        OwnedEmoteSpriteMesh {
+            source: self.source.to_owned(), opacity: self.opacity,
+            vertices: self.vertices, grid: self.grid,
+        }
+    }
+
     /// Keep evaluated geometry and borrow its texture from the shared model.
     pub fn retain<'a>(self, model: &'a CpuMotionModel) -> Result<EmoteSpriteMesh<'a>> {
         let (source, texture) = model.textures.get_key_value(self.source)
@@ -1888,33 +1956,82 @@ pub struct CpuDrawTarget<'a> {
     columns: Option<&'a [Vec<usize>]>,
 }
 
+#[derive(Default)]
+pub struct EmoteRepairScratch {
+    pixels: Vec<u8>,
+    corrections: Vec<u32>,
+}
+
+impl EmoteRepairScratch {
+    pub fn corrections(&self) -> &[u32] { &self.corrections }
+}
+
 /// Apply the reference rasterizer to selected pixels of an evaluated pose.
 /// Each row contains sorted, unique viewport X coordinates.
 pub fn repair_emote_raster(
     viewport: CpuViewport,
     rows: &[Vec<usize>],
+    output_origin: [u32; 2],
+    output_width: u32,
+    scratch: &mut EmoteRepairScratch,
     draw: impl FnOnce(&mut CpuDrawTarget<'_>) -> Result<()>,
-) -> Result<EmoteRasterFrame> {
+) -> Result<()> {
     viewport.check()?;
-    if rows.len() != viewport.height as usize || rows.iter().any(|row|
+    if rows.len() != viewport.height as usize || output_width == 0 || rows.iter().enumerate().any(|(y, row)|
         row.last().is_some_and(|&last| last >= viewport.width as usize)
-            || row.windows(2).any(|pair| pair[0] >= pair[1]))
+            || row.windows(2).any(|pair| pair[0] >= pair[1])
+            || !row.is_empty() && y < output_origin[1] as usize
+            || row.iter().any(|&x| x < output_origin[0] as usize
+                || x - output_origin[0] as usize >= output_width as usize))
     {
         return Err(unsupported("invalid E-mote raster repair coordinates"));
     }
+    let bytes = viewport.width as usize * viewport.height as usize * 4;
+    scratch.pixels.resize(bytes, 0);
+    for (y, row) in rows.iter().enumerate() {
+        for &x in row {
+            let offset = (y * viewport.width as usize + x) * 4;
+            scratch.pixels[offset..offset + 4].fill(0);
+        }
+    }
+    scratch.corrections.clear();
+    let count = rows.iter().map(Vec::len).sum::<usize>();
+    scratch.corrections.try_reserve_exact(count * 2).map_err(|_| EmoteError::Capacity)?;
     let mut target = CpuDrawTarget {
-        pixels: vec![0; viewport.width as usize * viewport.height as usize * 4],
-        sampled_pixels: 0,
-        columns: Some(rows),
+        pixels: std::mem::take(&mut scratch.pixels), sampled_pixels: 0, columns: Some(rows),
     };
-    draw(&mut target)?;
-    EmoteRasterFrame::new(viewport.width, viewport.height, [0, 0], target.pixels)
+    let result = draw(&mut target);
+    if result.is_ok() {
+        for (y, row) in rows.iter().enumerate() {
+            for &x in row {
+                let local_y = y - output_origin[1] as usize;
+                let local_x = x - output_origin[0] as usize;
+                let offset = (y * viewport.width as usize + x) * 4;
+                let dst = local_y * output_width as usize + local_x;
+                scratch.corrections.extend([
+                    dst as u32,
+                    u32::from_le_bytes(target.pixels[offset..offset + 4].try_into().unwrap()),
+                ]);
+            }
+        }
+    }
+    for (y, row) in rows.iter().enumerate() {
+        for &x in row {
+            let offset = (y * viewport.width as usize + x) * 4;
+            target.pixels[offset..offset + 4].fill(0);
+        }
+    }
+    scratch.pixels = target.pixels;
+    result
 }
 
 impl EmoteDrawTarget for CpuDrawTarget<'_> {
     type Stencil = CpuStencilBuffer;
 
     fn new_stencil(&mut self, viewport: CpuViewport, clear: u8) -> Result<Self::Stencil> {
+        if self.columns.is_some() {
+            return CpuStencilBuffer::new_sparse(viewport.width, viewport.height, clear);
+        }
         let mut plane = CpuStencilBuffer::new(viewport.width, viewport.height)?;
         plane.clear(clear);
         Ok(plane)
@@ -2031,28 +2148,29 @@ fn accelerated_scanline(
             let edge = row - dy * (x as f64 - origin);
             edge > 0.0 || (edge == 0.0 && inclusive)
         };
-        let left_inside = inside(start);
-        let right_inside = inside(end - 1);
-        if left_inside == right_inside {
-            if !left_inside {
-                return start..start;
-            }
+        let left_inside = dy > 0.0;
+        let outside_edge = if left_inside { end - 1 } else { start };
+        if inside(outside_edge) {
             continue;
         }
+        let inside_edge = if left_inside { start } else { end - 1 };
+        if dy == 0.0 || !inside(inside_edge) {
+            return start..start;
+        }
         let before = |x| inside(x) == left_inside;
-        let boundary = if end - start >= 12 {
-            // Locate the crossing, then recheck both sides with the original
-            // predicate. Near ties and extreme coordinates retain bisection.
-            let estimate = ((row * reciprocal + origin) as usize).clamp(start, end - 1);
-            if before(estimate) && estimate + 1 < end && !before(estimate + 1) {
+        // Verify both sides of the analytic crossing with the exact edge
+        // predicate. This also handles inclusive edges and rounding ties.
+        let estimate = ((row * reciprocal + origin) as usize).clamp(start + 1, end - 1);
+        let boundary = if before(estimate) {
+            if estimate + 1 < end && !before(estimate + 1) {
                 estimate + 1
-            } else if !before(estimate) && estimate > start && before(estimate - 1) {
-                estimate
             } else {
-                scanline_boundary(start + 1, end, before)
+                scanline_boundary(estimate + 1, end, before)
             }
+        } else if before(estimate - 1) {
+            estimate
         } else {
-            scanline_boundary(start + 1, end, before)
+            scanline_boundary(start + 1, estimate, before)
         };
         if left_inside {
             end = boundary;
@@ -2101,13 +2219,13 @@ pub fn visit_emote_texture_spans(
     });
     let edges = [(vertices[1], vertices[2]), (vertices[2], vertices[0]), (vertices[0], vertices[1])];
     let inclusive = edges.map(|(a, b)| b[1] < a[1] || (b[1] == a[1] && b[0] > a[0]));
-    let reciprocal_dy =
-        (size[0] >= 640).then(|| edges.map(|(a, b)| (b[1] - a[1]).recip()));
+    let edge_steps = edges.map(|(a, b)| (a[0], a[1], b[0] - a[0], b[1] - a[1]));
+    let reciprocal_dy = (size[0] >= 640).then(|| edge_steps.map(|(_, _, _, dy)| dy.recip()));
     let step = [2, 3].map(|axis| (0..3).map(|i| {
         (edges[i].0[1] - edges[i].1[1]) / area * vertices[i][axis]
     }).sum());
     for y in bounds[1].clone() {
-        let row_edges = edges.map(|(a, b)| ((b[0] - a[0]) * (y as f64 - a[1]), a[0], b[1] - a[1]));
+        let row_edges = edge_steps.map(|(x0, y0, dx, dy)| (dx * (y as f64 - y0), x0, dy));
         let run = if let Some(reciprocal_dy) = reciprocal_dy {
             accelerated_scanline(bounds[0].start, bounds[0].end, row_edges, reciprocal_dy, inclusive)
         } else {
@@ -2379,6 +2497,8 @@ struct CpuTask {
     raster_cache: Option<CachedRaster>,
     resource_name: Vec<u8>,
     resource_generation: u64,
+    archive_version: Option<EmoteArchiveVersion>,
+    resource_filter: u32,
     /// Constructor237d90 explicitly initializes M2Plane+388 toffffffff.
     base_argb: u32,
     /// None means the919 override has not been received. Resource replacement
@@ -2408,6 +2528,8 @@ impl CpuTask {
             raster_cache: None,
             resource_name: Vec::new(),
             resource_generation: 0,
+            archive_version: None,
+            resource_filter: 0,
             base_argb: 0xffffffff,
             color_percentages: None,
             original_clock: CpuOriginalTaskClock::default(),
@@ -2530,6 +2652,16 @@ impl CpuTask {
 /// Host raster fallback returns None without committing any partial image.
 type HostRasterizer = fn(&CpuPlayer, CpuViewport, &BTreeMap<String, f64>) -> Option<EmoteRasterFrame>;
 
+struct ArchivedModel {
+    version: EmoteArchiveVersion,
+    filter: u32,
+    model: Weak<CpuMotionModel>,
+}
+
+fn normalized_texture_filter(raw: u32) -> u32 {
+    if matches!(raw, 1..=3) { raw } else { 0 }
+}
+
 pub struct CpuEmoteBackend {
     pub viewport: CpuViewport,
     players: BTreeMap<u32, CpuTask>,
@@ -2537,8 +2669,12 @@ pub struct CpuEmoteBackend {
     mesh_quality_scale: f32,
     original_task_clock: bool,
     models: BTreeMap<(Vec<u8>, u32), Vec<Weak<CpuMotionModel>>>,
+    archived_models: Vec<ArchivedModel>,
     raster_scratch: Vec<u8>,
     rasterizer: Option<HostRasterizer>,
+    surface_mixer: Option<super::EmoteSurfaceMixer>,
+    surface_prepare: Option<super::EmoteSurfacePrepare>,
+    surface_expand: Option<super::EmoteSurfaceExpand>,
 }
 impl CpuEmoteBackend {
     pub fn new(viewport: CpuViewport) -> Result<Self> {
@@ -2550,8 +2686,12 @@ impl CpuEmoteBackend {
             mesh_quality_scale: 1.0,
             original_task_clock: false,
             models: BTreeMap::new(),
+            archived_models: Vec::new(),
             raster_scratch: Vec::new(),
             rasterizer: None,
+            surface_mixer: None,
+            surface_prepare: None,
+            surface_expand: None,
         })
     }
     /// Byte-proven174040->driver3540->12bb0 clock path. The host passes
@@ -2573,13 +2713,22 @@ impl CpuEmoteBackend {
     pub fn set_resources(&mut self, resources: Box<dyn CpuEmoteResources>) {
         self.resources = Some(resources);
     }
+    pub fn set_surface_gpu(
+        &mut self, mixer: super::EmoteSurfaceMixer, prepare: super::EmoteSurfacePrepare,
+        expand: super::EmoteSurfaceExpand,
+    ) {
+        self.surface_mixer = Some(mixer);
+        self.surface_prepare = Some(prepare);
+        self.surface_expand = Some(expand);
+    }
+
     fn shared_model(
         &mut self,
         name: &[u8],
         resource: &EmoteResource,
         texture_filter_raw: u32,
     ) -> Result<Arc<CpuMotionModel>> {
-        let filter = if matches!(texture_filter_raw, 1..=3) { texture_filter_raw } else { 0 };
+        let filter = normalized_texture_filter(texture_filter_raw);
         let key = (name.to_vec(), filter);
         // Compare the source only for live candidates with this name and filter.
         // The parsed model already owns the bytes needed for the comparison.
@@ -2658,7 +2807,13 @@ impl CpuEmoteBackend {
         let state = self.players.get(&task).ok_or(EmoteError::UnknownTask(task))?;
         if let Some(frame) = state.surface.capture() {
             // Blend endpoints share the logical viewport; steady presented frames may stay cropped.
-            return frame.clone().into_viewport([self.viewport.width, self.viewport.height]);
+            let size = [self.viewport.width, self.viewport.height];
+            if state.tint_argb() == 0xffff_ffff
+                && let Some(result) = self.surface_expand.and_then(|expand| expand(frame, size))
+            {
+                return Ok(result);
+            }
+            return frame.clone().into_viewport(size);
         }
         self.model_preview(task)?.into_strict()
     }
@@ -2669,7 +2824,9 @@ impl CpuEmoteBackend {
     fn prepare_m2_surface_update(&mut self, task: u32, now: u32) -> Result<bool> {
         let (pending, enabled, needs_capture) = {
             let state = self.players.get_mut(&task).ok_or(EmoteError::UnknownTask(task))?;
-            if state.surface.hold(now) { return Ok(true); }
+            // Tinted frames need CPU pixels for the manager's final quad modulation.
+            let mixer = self.surface_mixer.filter(|_| state.tint_argb() == 0xffff_ffff);
+            if state.surface.hold(now, mixer) { return Ok(true); }
             (state.surface.pending(), state.surface.capture_enabled(state.surface_enabled()),
                 state.surface.needs_capture())
         };
@@ -2811,6 +2968,8 @@ impl EmoteBackend for CpuEmoteBackend {
         state.player = Some(player);
         state.resource_name = name.to_vec();
         state.resource_generation = generation;
+        state.archive_version = None;
+        state.resource_filter = normalized_texture_filter(filter);
         // This API creates a new CPU player. Original170be0 initializes the
         // clock on each player, not once for the containing M2Plane task.
         // A future M2 manager reuse path must retain that player's own clock.
@@ -2828,9 +2987,13 @@ impl EmoteBackend for CpuEmoteBackend {
         &mut self,
         task: u32,
         name: &[u8],
-        resource: Option<&EmoteResource>,
+        source: CpuM2ModelSource<'_>,
         load: CpuM2Load,
     ) -> Result<()> {
+        let (resource, shared, version) = match source {
+            CpuM2ModelSource::Decoded(resource, version) => (Some(resource), None, version),
+            CpuM2ModelSource::Shared(model, version) => (None, Some(model), Some(version)),
+        };
         let state = self
             .players
             .get(&task)
@@ -2840,6 +3003,7 @@ impl EmoteBackend for CpuEmoteBackend {
         }
         let same_resource = state.resource_name == name && state.player.as_ref().is_some_and(|player| {
             resource.is_none_or(|source| player.model.document.matches_resource(source))
+                && shared.as_ref().is_none_or(|model| Arc::ptr_eq(&player.model, model))
         });
         let same_profile = state.m2_profile == load.profile_alias_cp932
             && state.m2_player_name == load.player_name_cp932;
@@ -2854,6 +3018,9 @@ impl EmoteBackend for CpuEmoteBackend {
                 .as_ref()
                 .is_some_and(|o| o.selected_patterns == selection);
         if unchanged {
+            if let Some(version) = version {
+                self.players.get_mut(&task).unwrap().archive_version = Some(version);
+            }
             //17a990/171d50/172610 preserve player, clock, active timelines and
             //blink timestamps when the complete current selection is equal.
             return Ok(());
@@ -2922,6 +3089,8 @@ impl EmoteBackend for CpuEmoteBackend {
                 .as_ref()
                 .ok_or_else(|| unsupported("M2 reused player missing"))?
                 .clone()
+        } else if let Some(shared) = shared {
+            CpuPlayer::from_shared_model(shared)
         } else {
             let shared = self.shared_model(
                 name,
@@ -3040,6 +3209,10 @@ impl EmoteBackend for CpuEmoteBackend {
         state.player = Some(player);
         state.resource_name = name.to_vec();
         state.resource_generation = generation;
+        if !same_resource {
+            state.resource_filter = normalized_texture_filter(texture_filter_raw);
+        }
+        state.archive_version = version.clone();
         //The170be0 M2 wrapper/clock survives driver-resource replacement.
         state.m2_owner = Some(owner);
         //Retain the snapshot on a failed import; drop it only after publish.
@@ -3054,7 +3227,32 @@ impl EmoteBackend for CpuEmoteBackend {
         if let Some((duration, frame)) = previous_surface {
             state.surface.request(Some(duration), frame, true);
         }
+        if let Some(version) = version {
+            let model = Arc::downgrade(&state.player.as_ref().unwrap().model);
+            let filter = state.resource_filter;
+            self.archived_models.retain(|entry| {
+                entry.model.strong_count() != 0
+                    && !(entry.filter == filter && (entry.version == version
+                        || Weak::ptr_eq(&entry.model, &model)))
+            });
+            self.archived_models.push(ArchivedModel { version, filter, model });
+        }
         Ok(())
+    }
+
+    fn cached_m2_model(
+        &self, task: u32, name: &[u8], version: &EmoteArchiveVersion,
+    ) -> Option<Arc<CpuMotionModel>> {
+        let state = self.players.get(&task)?;
+        // The filter command applies on the next rebuild, so the current
+        // task can keep its model even after staging a different filter.
+        if state.resource_name == name && let Some(player) = state.player.as_ref() {
+            return (state.archive_version.as_ref() == Some(version)).then(|| player.model.clone());
+        }
+        let filter = normalized_texture_filter(state.texture_filter_raw);
+        self.archived_models.iter()
+            .filter(|entry| entry.filter == filter && &entry.version == version)
+            .find_map(|entry| entry.model.upgrade())
     }
     fn command(&mut self, task: u32, command: &EmoteCommand) -> Result<EmoteReply> {
         if !self.players.contains_key(&task) {
@@ -3464,7 +3662,7 @@ impl EmoteBackend for CpuEmoteBackend {
                 &p.model.document.root, &current, &mut p.variables, &action_targets,
             )?;
         }
-        p.advance_frames(step)?;
+        p.advance_frames_in_place(step)?;
         if surface_pending && surface_enabled {
             if let Some(owner) = next_owner.as_mut() {
                 let current = p.controller_variables()?;
@@ -3473,14 +3671,15 @@ impl EmoteBackend for CpuEmoteBackend {
         }
         //Commit reference clocks on every complete driver update, even when
         //this tick has no draw or only captures a manager surface.
-        p.update_reference_timelines()?;
+        p.update_reference_timelines_in_place()?;
         let mut surface = state.surface.clone();
         if surface_pending {
             if next_owner.as_ref().is_some_and(|owner|
                 !owner.pending_effects.is_empty() || owner.sidecar_diagnostics().next().is_some()) {
                 return Err(unsupported("M2 surface capture requires complete live owner pixels"));
             }
-            surface.begin(p.render_strict(self.viewport)?, surface_enabled)?;
+            let prepare = self.surface_prepare.filter(|_| state.tint_argb() == 0xffff_ffff);
+            surface.begin(p.render_strict(self.viewport)?, surface_enabled, prepare)?;
         }
         state.player = Some(player);
         state.m2_owner = next_owner;
@@ -3601,6 +3800,16 @@ impl EmoteBackend for CpuEmoteBackend {
         result?;
         Ok(records.len())
     }
+    fn scene_raster_player(&self, task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
+        if !self.can_defer_scene_raster(task) { return None; }
+        let state = self.players.get(&task)?;
+        if state.surface.frame().is_some() { return None; }
+        Some((state.player.as_ref()?, self.viewport))
+    }
+    fn can_defer_scene_raster(&self, task: u32) -> bool {
+        self.rasterizer.is_some()
+            && self.players.get(&task).is_some_and(|state| state.tint_argb() == 0xffff_ffff)
+    }
     fn render_rgba(&mut self, task: u32) -> Result<EmoteRasterFrame> {
         let state = self.players.get_mut(&task).ok_or_else(|| unsupported("E-mote player resource is not loaded"))?;
         let mut captured = state.render_model(self.viewport, &mut self.raster_scratch, self.rasterizer)?;
@@ -3708,6 +3917,24 @@ impl EmoteBackend for CpuEmoteBackend {
 mod tests {
     use super::*;
 
+    #[test]
+    fn accelerated_scanline_preserves_coverage_at_crossings() {
+        for width in [1, 2, 7, 64, 1280] {
+            for dy in [-3.1_f64, -1.0, -1e-14, 0.0, 1e-14, 1.0, 3.1] {
+                for origin in [-1e12_f64, -0.5, 3.0, width as f64 - 0.5, 1e12] {
+                    for inclusive in [false, true] {
+                        let edges = [(4.0, origin, dy), (5.0, 1.0, -dy), (1.0, 0.0, 0.0)];
+                        let reciprocals = edges.map(|(_, _, slope)| slope.recip());
+                        let rules = [inclusive; 3];
+                        let expected = raster_scanline(0, width, edges, rules);
+                        let actual = accelerated_scanline(0, width, edges, reciprocals, rules);
+                        assert!(actual.eq(expected), "width={width}, dy={dy}, origin={origin}, inclusive={inclusive}");
+                    }
+                }
+            }
+        }
+    }
+
     fn object<const N: usize>(fields: [(&str, PsbValue); N]) -> PsbValue {
         PsbValue::Object(fields.into_iter().map(|(name, value)| (name.into(), value)).collect())
     }
@@ -3747,6 +3974,63 @@ mod tests {
         backend.create_task(1)?;
         backend.players.get_mut(&1).unwrap().player = Some(CpuPlayer::new(model));
         Ok(backend)
+    }
+
+    #[test]
+    fn m2_archive_model_lookup_requires_live_source_and_matching_filter() -> Result<()> {
+        use crate::{ResourceCandidate, ResourceLocation};
+        let path = std::env::temp_dir().join(format!("cs2-emote-archive-cache-{}", std::process::id()));
+        let archive = ResourceCandidate {
+            name: "actor.psz".into(),
+            size: 3,
+            priority: 0,
+            location: ResourceLocation::Archive {
+                path: path.clone(), offset: 0, size: 3, name_seed: None, payload_key: None,
+            },
+        };
+        std::fs::write(&path, b"PSZ").unwrap();
+        let version = EmoteArchiveVersion::observe(&archive).unwrap();
+        std::fs::write(&path, b"PSZ changed").unwrap();
+        let changed = EmoteArchiveVersion::observe(&archive).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_ne!(version, changed);
+
+        let mut backend = backend()?;
+        backend.create_task(2)?;
+        let actor = backend.players.get_mut(&1).unwrap();
+        actor.resource_name = b"actor.psz".to_vec();
+        actor.archive_version = Some(version.clone());
+        let model = Arc::downgrade(actor.player.as_ref().unwrap().shared_motion_model());
+        backend.archived_models.push(ArchivedModel { version: version.clone(), filter: 0, model });
+
+        assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_some());
+        assert!(backend.cached_m2_model(2, b"actor.psz", &changed).is_none());
+        backend.players.get_mut(&2).unwrap().texture_filter_raw = 2;
+        assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_none());
+        backend.players.get_mut(&1).unwrap().texture_filter_raw = 2;
+        assert!(backend.cached_m2_model(1, b"actor.psz", &version).is_some());
+        backend.release_task(1)?;
+        backend.players.get_mut(&2).unwrap().texture_filter_raw = 0;
+        assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn repair_allows_empty_rows_outside_a_positive_origin_crop() -> Result<()> {
+        let viewport = CpuViewport {
+            width: 4, height: 6, origin_x: 0.0, origin_y: 0.0,
+            scale: 1.0, time_units_per_frame: 1.0,
+        };
+        let mut rows = vec![Vec::new(); 6];
+        rows[2] = vec![1, 2];
+        let mut scratch = EmoteRepairScratch::default();
+        repair_emote_raster(viewport, &rows, [1, 2], 2, &mut scratch, |_| Ok(()))?;
+        assert_eq!(scratch.corrections(), [0, 0, 1, 0]);
+        rows[1] = vec![1];
+        assert!(repair_emote_raster(
+            viewport, &rows, [1, 2], 2, &mut scratch, |_| Ok(()),
+        ).is_err());
+        Ok(())
     }
 
     #[test]
@@ -3825,8 +4109,8 @@ mod tests {
         let mut surface = backend.players.get(&1).unwrap().surface.clone();
         surface.request(Some(30), captured, false);
         let next = EmoteRasterFrame::new(3, 2, [0, 0], vec![0; 24])?;
-        surface.begin(next, true)?;
-        assert!(surface.hold(0));
+        surface.begin(next, true, None)?;
+        assert!(surface.hold(0, None));
         assert_eq!(surface.frame().unwrap().origin(), [0, 0]);
         assert!(Arc::ptr_eq(
             &presented.pixels,

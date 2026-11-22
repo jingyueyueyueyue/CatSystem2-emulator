@@ -164,11 +164,13 @@ impl HeadlessPlayer {
     /// The caller must hold a live ANativeWindow. The presenter acquires its own
     /// reference before retaining a surface.
     #[cfg(target_os = "android")]
-    pub unsafe fn present_android_surface(&self, window: std::ptr::NonNull<std::ffi::c_void>) -> i32 {
+    pub unsafe fn present_android_surface(
+        &self, window: std::ptr::NonNull<std::ffi::c_void>, session: u64, input_mono_us: &[(u64, u64)],
+    ) -> i32 {
         #[cfg(feature = "gpu-raster")]
-        return super::gpu_raster::present_canvas(window, &self.canvas);
+        return super::gpu_raster::present_canvas(window, &self.canvas, session, input_mono_us);
         #[cfg(not(feature = "gpu-raster"))]
-        { let _ = window; 1 }
+        { let _ = (window, input_mono_us); 1 }
     }
 
     #[cfg(target_os = "android")]
@@ -329,6 +331,11 @@ impl HeadlessPlayer {
                 anyhow::bail!("platform input queue exceeds 4096 events");
             }
             self.data_services.pending_host_input.push_back(event);
+            return Ok(());
+        }
+        if let InputEvent::KeyDown(InputKey::MouseButton(button)) = &event
+            && self.state.input.mouse_button_pressed(*button)
+        {
             return Ok(());
         }
         let focus = if let InputEvent::FocusChanged(value) = &event { Some(*value) } else { None };

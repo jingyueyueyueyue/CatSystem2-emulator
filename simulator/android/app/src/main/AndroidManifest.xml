@@ -11,6 +11,7 @@
             android:authorities="${applicationId}.gamefiles"
             android:exported="false" android:grantUriPermissions="true" />
         <activity android:name=".PlayerActivity" android:exported="true"
+            android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:screenOrientation="sensorLandscape">
             <intent-filter>

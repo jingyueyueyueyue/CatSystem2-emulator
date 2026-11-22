@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use cs2_renderer::RgbaFrame;
 
 use super::super::check_work;
+use super::super::pixels::effect_workers;
 
 const ONE: u32 = 1 << 15;
 
@@ -39,15 +40,17 @@ pub(super) fn expand_blocks(
     let columns = block_axis(source.width(), size[0], block, false)?;
     let rows = block_axis(source.height(), size[1], block, true)?;
     let mut output = vec![0; size[0] as usize * size[1] as usize * 4];
-    for (y, &sy) in rows.iter().enumerate() {
-        for (x, &sx) in columns.iter().enumerate() {
-            let from = (sy as usize * source.width() as usize + sx as usize) * 4;
-            let to = (y * size[0] as usize + x) * 4;
-            output[to..to + 3].copy_from_slice(&source.pixels()[from..from + 3]);
+    let stride = source.width() as usize * 4;
+    let workers = effect_workers(size[0], size[1], u64::from(size[0]) * u64::from(size[1]));
+    cs2_renderer::draw_pixel_rows(&mut output, size[0] as usize * 4, 0, workers, |row, y| {
+        let input = &source.pixels()[rows[y as usize] as usize * stride..][..stride];
+        let input = input.as_chunks::<4>().0;
+        for (out, &x) in row.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
+            let [r, g, b, _] = input[x as usize];
             // Both A8R8G8B8 and X8R8G8B8 format32 branches OR 0xff000000.
-            output[to + 3] = 255;
+            *out = [r, g, b, 255];
         }
-    }
+    });
     Ok(RgbaFrame::from_rgba8(size[0], size[1], output)?)
 }
 
@@ -64,7 +67,8 @@ fn block_axis(source: u32, destination: u32, block: u32, vertical: bool) -> Resu
             break;
         }
         let count = if vertical {
-            let nominal = sample.checked_mul(block)
+            let nominal = sample
+                .checked_mul(block)
                 .context("hard mosaic row guard overflows its DWORD extent")?;
             block.min(destination.saturating_sub(nominal))
         } else {
@@ -101,7 +105,11 @@ pub(super) fn resize(
     }
     if from == size {
         // Equal dimensions select the format4->4 row-copy receiver.
-        return Ok(RgbaFrame::from_rgba8(size[0], size[1], source.pixels().to_vec())?);
+        return Ok(RgbaFrame::from_rgba8(
+            size[0],
+            size[1],
+            source.pixels().to_vec(),
+        )?);
     }
     let length = size[0] as usize * size[1] as usize * 4;
     let mut output = match previous {
@@ -134,39 +142,38 @@ fn pixel(source: &RgbaFrame, x: u32, y: u32) -> [u8; 4] {
 
 fn bilinear(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> Result<()> {
     let from = [source.width(), source.height()];
-    let step: [u32; 2] = std::array::from_fn(|axis| {
-        ((u64::from(from[axis]) << 15) / u64::from(size[axis])) as u32
-    });
     // Native signed SHL/IDIV must have a positive numerator. Report an
     // unsupported arithmetic extent instead of silently widening its ABI.
     if from.iter().any(|&value| value > (i32::MAX as u32 >> 15)) {
         bail!("frame effect resampling source exceeds its signed fixed-point extent");
     }
-    for y in 0..size[1] {
-        let sy = y.checked_mul(step[1]).context("frame effect vertical sample overflow")?;
-        for x in 0..size[0] {
-            let sx = x.checked_mul(step[0]).context("frame effect horizontal sample overflow")?;
-            let [ix, iy] = [sx >> 15, sy >> 15];
-            if ix >= from[0] || iy >= from[1] {
-                bail!("frame effect fixed-point sample is outside its source");
-            }
-            let first = pixel(source, ix, iy);
+    let columns = fixed_axis(from[0], size[0])?;
+    let rows = fixed_axis(from[1], size[1])?;
+    let stride = from[0] as usize;
+    let input = source.pixels().as_chunks::<4>().0;
+    let workers = effect_workers(size[0], size[1], u64::from(size[0]) * u64::from(size[1]));
+    cs2_renderer::draw_pixel_rows(output, size[0] as usize * 4, 0, workers, |row, y| {
+        let (iy, fy) = rows[y as usize];
+        let top = &input[iy * stride..][..stride];
+        let bottom = (iy + 1 < from[1] as usize).then(|| &input[(iy + 1) * stride..][..stride]);
+        for (out, &(ix, fx)) in row.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
+            let first = top[ix];
             // The fourth sample deliberately repeats first when either axis
             // reaches its last texel; it is not independently clamped XY.
             let samples = [
                 first,
-                if ix + 1 < from[0] { pixel(source, ix + 1, iy) } else { first },
-                if iy + 1 < from[1] { pixel(source, ix, iy + 1) } else { first },
-                if ix + 1 < from[0] && iy + 1 < from[1] {
-                    pixel(source, ix + 1, iy + 1)
-                } else { first },
+                top.get(ix + 1).copied().unwrap_or(first),
+                bottom.map_or(first, |line| line[ix]),
+                bottom
+                    .and_then(|line| line.get(ix + 1))
+                    .copied()
+                    .unwrap_or(first),
             ];
             let alpha_sum: u32 = samples.iter().map(|sample| u32::from(sample[3])).sum();
             if alpha_sum == 0 {
                 // This leaves the actual retained destination unchanged.
                 continue;
             }
-            let [fx, fy] = [sx & (ONE - 1), sy & (ONE - 1)];
             // Every product truncates before the channel sum, then the sum
             // truncates again. A floating interpolation changes low bits.
             let weights = [
@@ -175,19 +182,37 @@ fn bilinear(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> Result<()>
                 ((ONE - fx) * fy) >> 15,
                 (fx * fy) >> 15,
             ];
-            let at = (y as usize * size[0] as usize + x as usize) * 4;
-            for channel in 0..4 {
-                output[at + channel] = if channel == 3 && alpha_sum == 4 * 255 {
+            for (channel, dest) in out.iter_mut().enumerate() {
+                *dest = if channel == 3 && alpha_sum == 4 * 255 {
                     255
                 } else {
-                    (samples.iter().zip(weights).map(|(sample, weight)| {
-                        u32::from(sample[channel]) * weight
-                    }).sum::<u32>() >> 15) as u8
+                    (samples
+                        .iter()
+                        .zip(weights)
+                        .map(|(sample, weight)| u32::from(sample[channel]) * weight)
+                        .sum::<u32>()
+                        >> 15) as u8
                 };
             }
         }
-    }
+    });
     Ok(())
+}
+
+fn fixed_axis(source: u32, destination: u32) -> Result<Vec<(usize, u32)>> {
+    let step = ((u64::from(source) << 15) / u64::from(destination)) as u32;
+    let last = (destination - 1)
+        .checked_mul(step)
+        .context("frame effect fixed-point sample overflow")?;
+    if last >> 15 >= source {
+        bail!("frame effect fixed-point sample is outside its source");
+    }
+    Ok((0..destination)
+        .map(|i| {
+            let sample = i * step;
+            ((sample >> 15) as usize, sample & (ONE - 1))
+        })
+        .collect())
 }
 
 fn box_scale_v401(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> Result<()> {
@@ -200,7 +225,9 @@ fn box_scale_v401(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> Resu
         for x in 0..size[0] {
             let right = signed_boundary(x + 1, from[0], size[0])?;
             let width = right.saturating_sub(left).max(1);
-            let count = width.checked_mul(height).filter(|&value| value <= i32::MAX as u32)
+            let count = width
+                .checked_mul(height)
+                .filter(|&value| value <= i32::MAX as u32)
                 .context("frame effect box sample count exceeds signed division")?;
             if left + width > from[0] || top + height > from[1] {
                 bail!("frame effect box sample is outside its source");
@@ -225,7 +252,9 @@ fn box_scale_v401(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> Resu
 }
 
 fn signed_boundary(index: u32, source: u32, destination: u32) -> Result<u32> {
-    let numerator = index.checked_mul(source).filter(|&value| value <= i32::MAX as u32)
+    let numerator = index
+        .checked_mul(source)
+        .filter(|&value| value <= i32::MAX as u32)
         .context("legacy frame effect box boundary exceeds signed arithmetic")?;
     Ok(numerator / destination)
 }
@@ -236,7 +265,8 @@ fn box_scale_yukikoi(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> R
     // this uses a fixed truncated kernel and separately rounded origins.
     let ratio: [f32; 2] = std::array::from_fn(|axis| from[axis] as f32 / size[axis] as f32);
     let kernel: [u32; 2] = std::array::from_fn(|axis| (ratio[axis].trunc() as u32).max(1));
-    let count = kernel[0].checked_mul(kernel[1])
+    let count = kernel[0]
+        .checked_mul(kernel[1])
         .context("frame effect box sample count overflow")?;
     for y in 0..size[1] {
         let top = (y as f32 * ratio[1]).trunc() as u32;
@@ -263,4 +293,43 @@ fn box_scale_yukikoi(source: &RgbaFrame, size: [u32; 2], output: &mut [u8]) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bilinear_keeps_transparent_destination_and_original_edge_samples() -> Result<()> {
+        let source = RgbaFrame::from_rgba8(
+            2,
+            2,
+            vec![
+                55, 60, 65, 0, 80, 90, 100, 255, 120, 130, 140, 0, 160, 170, 180, 0,
+            ],
+        )?;
+        let previous = RgbaFrame::from_rgba8(4, 4, [11, 22, 33, 44].repeat(16))?;
+        let actual = resize(&source, [4, 4], Some(&previous), Profile::V401)?;
+        let at = |x: usize, y: usize| &actual.pixels()[(y * 4 + x) * 4..][..4];
+        assert_eq!(at(1, 1), [103, 112, 121, 63]);
+        assert_eq!(at(3, 1), [100, 110, 120, 191]);
+        assert_eq!(at(1, 3), [11, 22, 33, 44]);
+        Ok(())
+    }
+
+    #[test]
+    fn large_hard_mosaic_uses_original_block_axes_and_opaque_alpha() -> Result<()> {
+        let source = RgbaFrame::from_rgba8(
+            3,
+            3,
+            (0..9).flat_map(|i| [i, i + 10, i + 20, i + 30]).collect(),
+        )?;
+        let actual = expand_blocks(&source, [1024, 640], 512, Profile::Yukikoi)?;
+        let at = |x: usize, y: usize| &actual.pixels()[(y * 1024 + x) * 4..][..4];
+        assert_eq!(at(255, 255), [0, 10, 20, 255]);
+        assert_eq!(at(256, 256), [4, 14, 24, 255]);
+        assert_eq!(at(767, 383), [4, 14, 24, 255]);
+        assert_eq!(at(768, 384), [8, 18, 28, 255]);
+        Ok(())
+    }
 }

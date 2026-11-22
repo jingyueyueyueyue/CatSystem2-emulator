@@ -39,7 +39,7 @@
 | 场景合成总入口 | `simulator/crates/desktop/src/lib.rs:8103` | CPU 画布，`HostPhase::Compose` 分段计时 |
 | 前缀层合成与脏区 | `simulator/crates/desktop/src/scene_compositor.rs:70` | 128×64 瓦片；层身份目前含像素指针判等，命中条件不满足时整幅拷贝 |
 | 平面合批 | `simulator/crates/desktop/src/plane_native.rs:2324` | 无纹理三角形走 GPU；带纹理变换平面先进入 `sampled_plane` |
-| 带纹理平面回退 | `simulator/crates/desktop/src/plane_native.rs:2393` | CPU 栅格出整画布尺寸透明中间图，再作为源交给 GPU；实际读回可只覆盖目标区域 |
+| 带纹理平面回退 | `simulator/crates/desktop/src/plane_native.rs` `sampled_plane` | 对暂不能直接 GPU 化的几何保留 CPU f64 采样；中间图按投影与 clip 裁剪后交给 GPU；动态顶点仍会使缓存失效 |
 | GPU 栅格算子 | `simulator/crates/desktop/src/gpu_raster.rs:839` | 计算着色器；重叠区域保持 dispatch 顺序，批末仍有同步映射路径 |
 | 设备帧读回 | `simulator/crates/desktop/src/gpu_raster.rs:515` | `map_async` + `poll(Wait)`，250 ms 超时；`DeviceFrame` 每次申请读回缓冲 |
 | 画布设备态 | `simulator/crates/renderer/src/lib.rs:1189` | `Device` 同时保留完整 CPU 像素和设备源；`set_device_pixels` 当前会同步取得完整像素，失败返回错误 |
@@ -47,7 +47,7 @@
 | E-mote 光栅 | `simulator/crates/runtime/src/emote_cpu.rs:1885` | CPU 逐三角形，f64 覆盖/插值和双线性采样 |
 | Android 呈现 | `simulator/crates/desktop/src/gpu_raster_present.rs:247` | 已能直接消费同 device 的 `frame_on_device` |
 | 桌面呈现 | `simulator/crates/desktop/src/lib.rs:9115` | 窗口持有自己的 device/queue，每帧 `write_texture` 整幅上传后画全屏三角形 |
-| 行并行 | `simulator/crates/renderer/src/raster.rs:164` | 每次调用 `thread::scope` 创建至多 3 个附加线程，调用线程共同参与 |
+| 行并行与有界任务池 | `simulator/crates/renderer/src/row_pool.rs` | 至多 4 个参与者；Android 行绘制及大面积 SourceOver 行混合使用常驻池；E-mote 准备默认 1 线程，2/4 仅作实验；嵌套或创建失败时串行回退 |
 
 主线的 E-mote 仍是 CPU 路径。性能 worktree 的候选已经实现 CPU 扫描线准备、GPU 着色/模板/混合和稀疏像素校正；三类实现不能共用一套“现状”数字。
 
@@ -114,7 +114,7 @@
 | --- | --- | --- |
 | KCS 脚本 / 任务调度 | 不做通用投机并行 | 世界状态和副作用保持原时序，CPU 主线程 |
 | E-mote 控制器与时间线求值 | 条件并行 | 先证明角色间无共享可变状态；片内保序，CPU |
-| E-mote 扫描线 / 命令准备 | 已有多线程候选 | 按有序部件分片、按原顺序合并；CPU 常驻工作池 |
+| E-mote 扫描线 / 命令准备 | scoped 多线程已验证 | 按有序部件分片、按原顺序合并；支持 1/2/4 线程对照，保持容量溢出回退；常驻池候选未通过完整 perf 像素门禁 |
 | E-mote 着色、模板、混合 | 可外移 | 混合候选先保留 CPU 覆盖校正；GPU |
 | E-mote 完整网格光栅 | 可选外移 | 覆盖、采样、透明边缘和遮罩通过契约后启用；GPU |
 | 平面 / 图像合成 | 编码可分片，提交保序 | 重叠绘制不并行改变顺序；单 queue |

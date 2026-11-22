@@ -73,12 +73,38 @@ pub struct ResourceRouter {
     island_chinese_fes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     daydream_gbk_scene_archive: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    localized_scene_encodings: Vec<(usize, LocalizedSceneEncoding)>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalizedSceneEncoding {
+    Cp932,
+    Gbk,
+    Utf8,
+}
+
+const LOCALIZATION_MANIFEST: &str = "cs2-localization.json";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalizationManifest {
+    patches: Vec<LocalizationPatch>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalizationPatch {
+    archive: String,
+    scene_encoding: Option<LocalizedSceneEncoding>,
 }
 
 impl Default for ResourceRouter {
     fn default() -> Self {
         Self { slots: vec![ResourceSlot::default(); 256], groups: Vec::new(), patches: Vec::new(),
-            island_chinese_scene: None, island_chinese_fes: None, daydream_gbk_scene_archive: None }
+            island_chinese_scene: None, island_chinese_fes: None, daydream_gbk_scene_archive: None,
+            localized_scene_encodings: Vec::new() }
     }
 }
 
@@ -118,6 +144,13 @@ impl ResourceRouter {
 
     pub fn is_daydream_gbk_scene_archive(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
         Self::matches_archive(self.daydream_gbk_scene_archive, index, path)
+    }
+
+    pub fn localized_scene_encoding(
+        &self, index: &crate::ResourceIndex, path: &Path,
+    ) -> Option<LocalizedSceneEncoding> {
+        self.localized_scene_encodings.iter().find_map(|&(archive, encoding)|
+            Self::matches_archive(Some(archive), index, path).then_some(encoding))
     }
 
     fn matches_archive(archive: Option<usize>, index: &crate::ResourceIndex, path: &Path) -> bool {
@@ -459,6 +492,7 @@ impl ResourceRouter {
         patches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         builder.router.patches = patches.into_iter().filter(|(_, _, entry)| entry.is_readable())
             .map(|(_, archive, entry)| ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() }).collect();
+        builder.bind_localization_patches()?;
         // The CST members of this exact Daydream patch use GBK.
         builder.router.daydream_gbk_scene_archive = builder.verified_archive((
             "update03.int", 28_078_220,
@@ -478,6 +512,51 @@ struct MountBuilder<'a> {
 }
 
 impl MountBuilder<'_> {
+    fn bind_localization_patches(&mut self) -> RuntimeResult<()> {
+        let relative = self.base.join(LOCALIZATION_MANIFEST);
+        if !self.index.files().iter().any(|file| file.relative_path == relative) {
+            return Ok(());
+        }
+        let path = self.index.root().join(relative);
+        let read_error = |source| RuntimeError::Io { path: path.clone(), source };
+        const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path).map_err(read_error)?
+            .take((MAX_MANIFEST_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(read_error)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(error("cs2-localization.json exceeds 64 KiB"));
+        }
+        let manifest: LocalizationManifest = serde_json::from_slice(&bytes)
+            .map_err(|cause| error(&format!("cs2-localization.json: {cause}")))?;
+        let mut patches = Vec::with_capacity(manifest.patches.len());
+        for patch in manifest.patches {
+            let name = Path::new(&patch.archive);
+            if name.file_name() != Some(name.as_os_str())
+                || patch.archive.contains(['/', '\\', ':', '\0'])
+                || !name.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("int"))
+            {
+                return Err(error("cs2-localization.json requires a local .int archive filename"));
+            }
+            let relative = self.base.join(name);
+            let (archive, entry) = self.index.archives().iter().enumerate()
+                .find(|(_, entry)| physical_path_equal(&entry.path, &relative) && entry.is_readable())
+                .ok_or_else(|| error(&format!("cs2-localization.json: unreadable archive {}", patch.archive)))?;
+            if patches.iter().any(|mount: &ArchiveMount| mount.archive == archive) {
+                return Err(error(&format!("cs2-localization.json: duplicate archive {}", patch.archive)));
+            }
+            patches.push(ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() });
+            if let Some(encoding) = patch.scene_encoding {
+                self.router.localized_scene_encodings.push((archive, encoding));
+            }
+        }
+        // Declared patches come first. Keep the original update order for the fallback.
+        self.router.patches.retain(|existing|
+            !patches.iter().any(|mount| mount.archive == existing.archive));
+        patches.append(&mut self.router.patches);
+        self.router.patches = patches;
+        Ok(())
+    }
+
     fn bind_island_translation(&mut self) {
         for (original, translated) in ISLAND_TEXT_ARCHIVES {
             let Some(chinese) = self.verified_archive(translated) else { continue; };
@@ -670,5 +749,50 @@ mod island_translation_tests {
             }
         }
         assert!(!router.is_island_chinese_scene(&index, &index.root().join("scene.int")));
+    }
+}
+
+#[cfg(test)]
+mod localization_manifest_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_archive(path: &Path, name: &[u8], payload: &[u8]) {
+        let mut bytes = vec![0; 80];
+        bytes[..8].copy_from_slice(b"KIF\0\x01\0\0\0");
+        bytes[8..8 + name.len()].copy_from_slice(name);
+        bytes[72..76].copy_from_slice(&80u32.to_le_bytes());
+        bytes[76..80].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn declared_patch_overlays_original_updates_and_tags_only_its_own_scenes() {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-localization-{timestamp}"));
+        fs::create_dir(&root).unwrap();
+        write_archive(&root.join("scene.int"), b"start.cst", b"original");
+        write_archive(&root.join("update01.int"), b"opening.cst", b"Japanese update");
+        write_archive(&root.join("translation.int"), b"opening.cst", b"translated");
+        let mode = ResourceMode::LooseFirst;
+        let index = crate::ResourceIndex::scan(&root).unwrap();
+        assert_eq!(index.read_mode("scene.int/opening.cst", mode).unwrap().unwrap(), b"Japanese update");
+        drop(index);
+
+        fs::write(root.join(LOCALIZATION_MANIFEST),
+            br#"{"patches":[{"archive":"translation.int","scene_encoding":"gbk"}]}"#).unwrap();
+        let index = crate::ResourceIndex::scan(&root).unwrap();
+        assert_eq!(index.read_mode("scene.int/opening.cst", mode).unwrap().unwrap(), b"translated");
+        assert_eq!(index.read_mode("scene.int/start.cst", mode).unwrap().unwrap(), b"original");
+        let router = index.resource_router().unwrap();
+        assert_eq!(router.localized_scene_encoding(&index, &root.join("translation.int")),
+            Some(LocalizedSceneEncoding::Gbk));
+        assert_eq!(router.localized_scene_encoding(&index, &root.join("scene.int")), None);
+        let serialized = serde_json::to_vec(router).unwrap();
+        assert_eq!(serde_json::from_slice::<ResourceRouter>(&serialized).unwrap(), *router);
+        drop(index);
+        fs::remove_dir_all(root).unwrap();
     }
 }

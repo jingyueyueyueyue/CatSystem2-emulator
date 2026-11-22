@@ -1,11 +1,11 @@
-//! Shared raster operations for the CPU-owned logical canvas.
+//! Shared raster operations for the logical canvas.
 //!
-//! Each dispatch writes a clipped rectangle of the canvas. Keep the original
-//! pixels until readback succeeds so callers can retry on the CPU.
+//! Ordered draws can retain a device-owned frame until an actual CPU consumer
+//! requests it. The packed path keeps recovery pixels until readback succeeds.
 
 use anyhow::{Context, Result, bail};
-use cs2_renderer::{BlendMode, Canvas, CanvasReadback, FrameAsset, FramePixelIdentity, ImageDrawOptions, RgbaFrame, ScaleFilter};
-use std::cell::RefCell;
+use cs2_renderer::{BlendMode, Canvas, CanvasReadback, FrameAsset, FramePixelIdentity, ImageDrawOptions, Rect, RgbaFrame, ScaleFilter};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}, mpsc};
 use std::time::Duration;
@@ -22,15 +22,45 @@ pub(super) use present::{candidate as surface_candidate, detach, display_stats, 
 #[path = "gpu_emote.rs"]
 mod emote_raster;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RasterStatus {
+    NotCreated,
+    Ready,
+    Disabled,
+    InitializationFailed,
+}
+
 thread_local! {
     static RASTER: RefCell<Option<Raster>> = const { RefCell::new(None) };
+    static RASTER_STATUS: Cell<RasterStatus> = const { Cell::new(RasterStatus::NotCreated) };
+}
+
+fn set_raster_status(status: RasterStatus) {
+    RASTER_STATUS.with(|current| current.set(status));
+}
+
+fn missing_emote_raster_reason(status: RasterStatus) -> &'static str {
+    match status {
+        RasterStatus::NotCreated => "Raster has not been created",
+        RasterStatus::Ready => "Raster slot is empty despite ready status",
+        RasterStatus::Disabled => "Raster is disabled or was discarded after a device error",
+        RasterStatus::InitializationFailed => "Raster initialization failed",
+    }
+}
+
+pub(super) fn emote_missing_raster_reason() -> &'static str {
+    RASTER_STATUS.with(|status| missing_emote_raster_reason(status.get()))
 }
 
 pub(super) fn enable() {
     RASTER.with_borrow_mut(|slot| {
         *slot = match Raster::new() {
-            Ok(raster) => Some(raster),
+            Ok(raster) => {
+                set_raster_status(RasterStatus::Ready);
+                Some(raster)
+            }
             Err(error) => {
+                set_raster_status(RasterStatus::InitializationFailed);
                 report(&format!("backend=cpu reason={error:#}"));
                 None
             }
@@ -41,6 +71,7 @@ pub(super) fn enable() {
 #[cfg(windows)]
 pub(super) fn disable() {
     let raster = RASTER.with_borrow_mut(Option::take);
+    set_raster_status(RasterStatus::Disabled);
     drop(raster);
 }
 
@@ -48,7 +79,18 @@ pub(super) fn available() -> bool {
     RASTER.with_borrow(|slot| slot.is_some())
 }
 
-pub(super) use emote_raster::draw_emote;
+pub(super) use emote_raster::{
+    begin_emote_batch, blend_emote, draw_emote, expand_emote_surface, mix_emote_surfaces,
+    prepare_emote_poses, prepare_emote_surfaces,
+};
+
+pub(super) fn textured_planes_requested() -> bool {
+    // Device sampling uses f32. Keep the f64 path available for pixel comparisons.
+    #[cfg(target_os = "android")]
+    return !android_property(c"debug.cs2.textured_planes", |value| value == b"0").unwrap_or(false);
+    #[cfg(windows)]
+    return std::env::var("CS2_GPU_TEXTURED_PLANES").as_deref() == Ok("1");
+}
 
 #[cfg(windows)]
 pub(super) fn emote_requested() -> bool {
@@ -58,6 +100,28 @@ pub(super) fn emote_requested() -> bool {
 #[cfg(target_os = "android")]
 pub(super) fn emote_requested() -> bool {
     !android_property(c"debug.cs2.emote_gpu", |value| value == b"0").unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn emote_device_blend_requested() -> bool {
+    std::env::var_os("CS2_EMOTE_DEVICE_BLEND").is_some_and(|value| value == "1")
+}
+
+#[cfg(target_os = "android")]
+fn emote_device_blend_requested() -> bool {
+    !android_property(c"debug.cs2.emote_device_blend", |value| value == b"0").unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub(super) fn emote_batch_requested() -> bool {
+    std::env::var_os("CS2_EMOTE_BATCH").is_some_and(|value| value == "1")
+        && emote_device_blend_requested()
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn emote_batch_requested() -> bool {
+    available() && emote_device_blend_requested()
+        && !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false)
 }
 
 #[cfg(target_os = "android")]
@@ -109,12 +173,12 @@ pub(super) fn retain_rasterized_frame(frame: &RgbaFrame) {
 }
 
 #[cfg(windows)]
-fn report(message: &str) {
+pub(super) fn report(message: &str) {
     eprintln!("CS2Gpu {message}");
 }
 
 #[cfg(target_os = "android")]
-fn report(message: &str) {
+pub(super) fn report(message: &str) {
     #[link(name = "log")]
     unsafe extern "C" {
         fn __android_log_write(priority: std::ffi::c_int, tag: *const std::ffi::c_char,
@@ -161,7 +225,7 @@ impl RasterRect {
 
 #[derive(Clone, Copy)]
 pub(super) enum Draw<'a> {
-    PlaneSpan { source_origin: [u32; 2], opacity: u8, multiply: bool },
+    PlaneSpan { source_origin: [u32; 2], opacity: u8, blend: BlendMode },
     PlaneTriangles { vertices: &'a [[[f32; 6]; 3]], source_origin: [u32; 2], argb: u32, blend: BlendMode },
     ListSpan { source_origin: [u32; 2], width: u32, left_halo: bool, opacity: u32 },
     ListAffine { inverse: [i32; 4], offset: [i32; 2], base: [i32; 2],
@@ -170,6 +234,7 @@ pub(super) enum Draw<'a> {
     ImageSpan { source_origin: [u32; 2], opacity: u8 },
     DiffuseFrame { alpha: u8 },
     Wipe { mask: &'a RgbaFrame, step: WipeStep },
+    EffectSpans { taps: &'a [([i32; 2], u8)] },
 }
 
 #[derive(Clone, Copy)]
@@ -179,6 +244,11 @@ pub(super) struct RasterJob<'a> {
     /// Some(None) is the viewport with no overflow tiles.
     pub(super) atlas: Option<Option<&'a VramOverflow>>,
     pub(super) operation: Draw<'a>,
+}
+
+enum RasterOutput {
+    Canvas,
+    CpuPixels,
 }
 
 fn blend_code(mode: BlendMode) -> u32 {
@@ -207,6 +277,7 @@ impl Draw<'_> {
             Self::ImageSpan { .. } => "image_span",
             Self::DiffuseFrame { .. } => "transition_diffuse",
             Self::Wipe { .. } => "transition_wipe",
+            Self::EffectSpans { .. } => "effect_spans",
         }
     }
 
@@ -220,14 +291,15 @@ impl Draw<'_> {
             Self::ImageSpan { .. } => 5,
             Self::DiffuseFrame { .. } => 6,
             Self::Wipe { .. } => 7,
+            Self::EffectSpans { .. } => 8,
         }
     }
 
     fn append_args(self, args: &mut Vec<u32>) {
         match self {
-            Self::PlaneSpan { source_origin, opacity, multiply } => {
+            Self::PlaneSpan { source_origin, opacity, blend } => {
                 args.extend(source_origin);
-                args.extend([u32::from(opacity), u32::from(multiply)]);
+                args.extend([u32::from(opacity), blend_code(blend)]);
             }
             Self::PlaneTriangles { vertices, source_origin, argb, blend } => {
                 args.extend([argb, blend_code(blend), vertices.len() as u32]);
@@ -252,6 +324,12 @@ impl Draw<'_> {
                 WipeStep::Hard(threshold) => [0, threshold],
                 WipeStep::Soft(progress) => [1, progress as u32],
             }),
+            Self::EffectSpans { taps } => {
+                args.push(taps.len() as u32);
+                for &([x, y], alpha) in taps {
+                    args.extend([x as u32, y as u32, u32::from(alpha)]);
+                }
+            }
         }
     }
 }
@@ -269,15 +347,19 @@ pub(super) fn draw_job(target: &mut Canvas, job: RasterJob<'_>) -> bool {
     let min_area = match operation {
         Draw::PlaneSpan { .. } | Draw::ListSpan { .. } | Draw::Copy { .. }
         | Draw::ImageSpan { .. } | Draw::DiffuseFrame { .. } | Draw::Wipe { .. } => 128 * 1024,
-        Draw::PlaneTriangles { .. } | Draw::ListAffine { .. } => 32 * 1024,
+        Draw::PlaneTriangles { .. } | Draw::ListAffine { .. } | Draw::EffectSpans { .. } => 32 * 1024,
     };
     let area = u64::from(rect.size[0]) * u64::from(rect.size[1]);
+    let device_continuation = device_frame(target).is_some();
+    #[cfg(target_os = "android")]
+    let device_continuation = device_continuation
+        && !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false);
     let list = match operation {
         Draw::ListSpan { .. } => Some((GpuDecision::SpanGpu, GpuDecision::SpanSmall)),
         Draw::ListAffine { .. } => Some((GpuDecision::AffineGpu, GpuDecision::AffineSmall)),
         _ => None,
     };
-    if area < min_area {
+    if area < min_area && !device_continuation {
         if let Some((_, reason)) = list { list_gpu_decision(reason, area); }
         return false;
     }
@@ -291,7 +373,7 @@ pub(super) fn draw_job(target: &mut Canvas, job: RasterJob<'_>) -> bool {
         };
         let label = operation.label();
         let code = operation.code();
-        match raster.draw_jobs(target, &[rect], &[job], false) {
+        match raster.draw_jobs(target, &[rect], &[job], RasterOutput::Canvas, false) {
             Ok(true) => {
                 if let Some((reason, _)) = list { list_gpu_decision(reason, area); }
                 if !raster.reported[code] {
@@ -307,6 +389,7 @@ pub(super) fn draw_job(target: &mut Canvas, job: RasterJob<'_>) -> bool {
             Err(error) => {
                 note(GpuDecision::DispatchFailed);
                 report(&format!("draw={label} backend=cpu reason={error:#}"));
+                set_raster_status(RasterStatus::Disabled);
                 *slot = None;
                 false
             }
@@ -352,11 +435,15 @@ pub(super) fn draw_image(canvas: &mut Canvas, frame: &RgbaFrame, options: &Image
 
 /// Draw a complete ordered image-list pass using a shared device target.
 pub(super) fn draw_list_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> bool {
-    if !(2..=1024).contains(&draws.len()) {
+    let continuation = device_frame(canvas).is_some();
+    #[cfg(target_os = "android")]
+    let continuation = continuation
+        && !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false);
+    if draws.is_empty() || draws.len() > 1024 || (!continuation && draws.len() < 2) {
         return false;
     }
     let (area, pixels) = group_bounds(draws);
-    if pixels < 192 * 1024 { return false; }
+    if pixels < 192 * 1024 && !continuation { return false; }
     let packed;
     let regions = if area.pixels() > 2 * pixels {
         packed = pack_dirty_regions(draws);
@@ -367,7 +454,8 @@ pub(super) fn draw_list_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> b
     };
     RASTER.with_borrow_mut(|slot| {
         let Some(raster) = slot.as_mut() else { return false };
-        match raster.draw_jobs(canvas, regions, draws, false) {
+        // The list store immediately commits CPU pixels and copies dirty areas to VRAM.
+        match raster.draw_jobs(canvas, regions, draws, RasterOutput::CpuPixels, false) {
             Ok(true) => {
                 for RasterJob { rect, operation, .. } in draws {
                     let decision = match operation {
@@ -385,6 +473,7 @@ pub(super) fn draw_list_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> b
             Ok(false) => false,
             Err(error) => {
                 report(&format!("draw=list_span_batch backend=cpu reason={error:#}"));
+                set_raster_status(RasterStatus::Disabled);
                 *slot = None;
                 false
             }
@@ -440,7 +529,7 @@ pub(super) fn draw_plane_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> 
     };
     RASTER.with_borrow_mut(|slot| {
         let Some(raster) = slot.as_mut() else { return false };
-        match raster.draw_jobs(canvas, regions, draws, true) {
+        match raster.draw_jobs(canvas, regions, draws, RasterOutput::Canvas, true) {
             Ok(true) => {
                 if !raster.reported_plane_group {
                     report(&format!("draw=plane_group backend={} layers={}", raster.backend, draws.len()));
@@ -451,6 +540,7 @@ pub(super) fn draw_plane_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> 
             Ok(false) => false,
             Err(error) => {
                 report(&format!("draw=plane_group backend=cpu reason={error:#}"));
+                set_raster_status(RasterStatus::Disabled);
                 *slot = None;
                 false
             }
@@ -467,6 +557,9 @@ struct Raster {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+    device_blend: wgpu::ComputePipeline,
+    device_blend_layout: wgpu::BindGroupLayout,
+    device_blend_params: wgpu::Buffer,
     empty_source: wgpu::TextureView,
     empty_atlas: wgpu::TextureView,
     empty_page_table: wgpu::Buffer,
@@ -486,7 +579,7 @@ struct Raster {
     previous_planes: Option<CompletedPlanes>,
     failed: Arc<AtomicBool>,
     backend: wgpu::Backend,
-    reported: [bool; 8],
+    reported: [bool; 9],
     reported_batch: bool,
     reported_plane_group: bool,
     reported_atlas_fallback: bool,
@@ -550,7 +643,16 @@ struct DeviceFrame {
 }
 
 impl CanvasReadback for DeviceFrame {
+    #[track_caller]
     fn read_rgba(&self, output: &mut [u8]) -> bool {
+        self.read_rgba_at(output, std::panic::Location::caller())
+    }
+
+    fn read_rgba_at(&self, output: &mut [u8], location: &'static std::panic::Location) -> bool {
+        static LOCATIONS: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+        if let Ok(mut locations) = LOCATIONS.lock() && locations.insert(location.to_string()) {
+            report(&format!("device_barrier bytes={} caller={location}", self.size[0] * self.size[1] * 4));
+        }
         if self.failed.load(Ordering::Relaxed) { return false; }
         let size = self.size.into_iter().map(u64::from).product::<u64>() * 4;
         if output.len() as u64 != size { return false; }
@@ -660,10 +762,20 @@ impl Raster {
             compilation_options: Default::default(),
             cache: None,
         });
+        let device_blend = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("CS2 device pose blend"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("device_span"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
             bail!("compile raster shader: {error}");
         }
         let layout = pipeline.get_bind_group_layout(0);
+        let device_blend_layout = device_blend.get_bind_group_layout(0);
+        let device_blend_params = buffer(&device, 48, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let source = rgba_texture(&device, [1; 2]).create_view(&Default::default());
         let empty_atlas = atlas_array(&device, 1).create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
@@ -682,11 +794,12 @@ impl Raster {
         });
         report(&format!("backend={} adapter={}", info.backend, info.name));
         Ok(Self {
-            device, queue, pipeline, layout, empty_source: source, empty_atlas, empty_page_table,
+            device, queue, pipeline, layout, device_blend, device_blend_layout, device_blend_params,
+            empty_source: source, empty_atlas, empty_page_table,
             sources: VecDeque::new(), source_bytes: 0,
             target, args_buffer, readback, timing, atlas: None, full_target: None,
             emote: None, reported_emote_result: None, emote_initialization_failed: false,
-            scratch: Vec::new(), previous_planes: None, failed, backend: info.backend, reported: [false; 8],
+            scratch: Vec::new(), previous_planes: None, failed, backend: info.backend, reported: [false; 9],
             spares: Vec::new(), reported_atlas_fallback: false,
             #[cfg(all(test, windows))]
             test_direct_output: false,
@@ -706,7 +819,8 @@ impl Raster {
         #[cfg(all(test, windows))]
         if self.test_direct_output { return true; }
         #[cfg(target_os = "android")]
-        if self.presenter.is_some() { return true; }
+        return !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false);
+        #[allow(unreachable_code)]
         false
     }
 
@@ -877,13 +991,16 @@ impl Raster {
 
     fn draw_jobs(
         &mut self, canvas: &mut Canvas, regions: &[RasterRect], draws: &[RasterJob<'_>],
-        retain_result: bool,
+        output: RasterOutput, retain_result: bool,
     ) -> Result<bool> {
         self.full_target = None;
         if self.failed.load(Ordering::Relaxed) {
             bail!("raster device is unavailable");
         }
         let bounds = RasterRect { origin: [0; 2], size: [canvas.width(), canvas.height()] };
+        let direct = matches!(output, RasterOutput::Canvas) && self.direct_output_enabled();
+        let full_region = [bounds];
+        let regions = if direct { full_region.as_slice() } else { regions };
         let mut target_size = 0u64;
         let mut offsets = Vec::with_capacity(regions.len());
         for region in regions {
@@ -951,8 +1068,6 @@ impl Raster {
         let target_rect = regions[0];
         let [first, row_size] = byte_range(target_rect, stride);
         let retain_result = retain_result && regions.len() == 1 && target_size <= 16 * 1024 * 1024;
-        let direct = regions == [bounds] && self.direct_output_enabled()
-            && (retain_result || draws.iter().all(|job| matches!(job.operation, Draw::DiffuseFrame { .. } | Draw::Wipe { .. })));
         let previous_device = direct.then(|| device_frame(canvas))
             .flatten().filter(|frame| Arc::ptr_eq(&frame.failed, &self.failed))
             .map(|frame| (frame.revision, frame.buffer.clone()));
@@ -1075,6 +1190,19 @@ impl Raster {
             pass.dispatch_workgroups(groups_x, groups_y, jobs);
             first_job = end_job;
         }
+        if direct {
+            self.queue.submit(Some(encoder.finish()));
+            let frame = self.publish_device_frame(bounds.size);
+            canvas.set_deferred_device_pixels(frame);
+            if let Some((before, seed)) = seed {
+                self.previous_planes = Some(CompletedPlanes {
+                    area: target_rect, before, before_revision, seed, parameters,
+                    after: CompletedOutput::Device(canvas.clone()),
+                    inputs: draws.iter().zip(atlas_versions).map(|(job, version)| (job.source.cloned(), version)).collect(),
+                });
+            }
+            return Ok(true);
+        }
         encoder.copy_buffer_to_buffer(&self.target, 0, &self.readback, 0, target_size);
         let map_size = if let Some(timing) = self.timing.as_ref().filter(|_| !direct) {
             encoder.resolve_query_set(&timing.queries, 0..2, &timing.resolve, 0);
@@ -1083,8 +1211,7 @@ impl Raster {
         } else {
             target_size
         };
-        let kind = if direct { ReadbackKind::Device } else { ReadbackKind::Packed };
-        let measurement = ReadbackTimer::start(kind, map_size);
+        let measurement = ReadbackTimer::start(ReadbackKind::Packed, map_size);
         let submission = self.queue.submit(Some(encoder.finish()));
         let slice = self.readback.slice(..map_size);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -1102,30 +1229,7 @@ impl Raster {
             });
         if let Err(error) = ready {
             self.readback.unmap();
-            if direct {
-                self.failed.store(true, Ordering::Relaxed);
-                report("device_frame_readback_failed");
-            }
             return Err(error);
-        }
-        if direct {
-            static NEXT_FRAME: AtomicU64 = AtomicU64::new(1);
-            let frame = Arc::new(DeviceFrame {
-                revision: NEXT_FRAME.fetch_add(1, Ordering::Relaxed), size: bounds.size,
-                buffer: self.target.clone(), device: self.device.clone(), queue: self.queue.clone(),
-                failed: self.failed.clone(),
-            });
-            let attached = canvas.set_verified_device_pixels(frame, &slice.get_mapped_range());
-            self.readback.unmap();
-            attached?;
-            if let Some(measurement) = measurement { measurement.complete(); }
-            if let Some((before, seed)) = seed {
-                self.previous_planes = Some(CompletedPlanes {
-                    area: target_rect, before, before_revision, seed, parameters, after: CompletedOutput::Device(canvas.clone()),
-                    inputs: draws.iter().zip(atlas_versions).map(|(job, version)| (job.source.cloned(), version)).collect(),
-                });
-            }
-            return Ok(true);
         }
         {
             let output = slice.get_mapped_range();
@@ -1157,6 +1261,15 @@ impl Raster {
             self.full_target = Some((bounds.size, canvas.pixels().as_ptr() as usize));
         }
         Ok(true)
+    }
+
+    fn publish_device_frame(&self, size: [u32; 2]) -> Arc<DeviceFrame> {
+        static NEXT_FRAME: AtomicU64 = AtomicU64::new(1);
+        Arc::new(DeviceFrame {
+            revision: NEXT_FRAME.fetch_add(1, Ordering::Relaxed), size,
+            buffer: self.target.clone(), device: self.device.clone(), queue: self.queue.clone(),
+            failed: self.failed.clone(),
+        })
     }
 
     fn ensure_target_size(&mut self, size: u64) {
@@ -1310,6 +1423,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_emote_raster_reason_distinguishes_lifecycle_states() {
+        assert_eq!(
+            missing_emote_raster_reason(RasterStatus::NotCreated),
+            "Raster has not been created"
+        );
+        assert_eq!(
+            missing_emote_raster_reason(RasterStatus::InitializationFailed),
+            "Raster initialization failed"
+        );
+        assert!(missing_emote_raster_reason(RasterStatus::Disabled).contains("disabled"));
+        assert!(missing_emote_raster_reason(RasterStatus::Ready).contains("empty"));
+    }
+
+    #[test]
     #[ignore = "requires a DX12 adapter"]
     fn direct_draw_keeps_verified_pixels_across_layers() -> Result<()> {
         let mut raster = Raster::new()?;
@@ -1322,9 +1449,9 @@ mod tests {
             let jobs = [RasterJob { rect, source: Some(&source), atlas: None,
                 operation: Draw::DiffuseFrame { alpha } }];
             raster.test_direct_output = false;
-            assert!(raster.draw_jobs(&mut packed, &[rect], &jobs, false)?);
+            assert!(raster.draw_jobs(&mut packed, &[rect], &jobs, RasterOutput::CpuPixels, false)?);
             raster.test_direct_output = true;
-            assert!(raster.draw_jobs(&mut direct, &[rect], &jobs, false)?);
+            assert!(raster.draw_jobs(&mut direct, &[rect], &jobs, RasterOutput::Canvas, false)?);
             assert_eq!(packed.pixels(), direct.pixels());
             let frame = device_frame(&direct).context("missing direct output")?;
             assert_ne!(previous, Some(frame.revision));
@@ -1333,6 +1460,50 @@ mod tests {
             assert!(frame.read_rgba(&mut pixels));
             assert_eq!(pixels, direct.pixels());
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn small_device_plane_matches_cpu_for_every_blend_mode() -> Result<()> {
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let background: Vec<u8> = (0..64 * 64).flat_map(|index| {
+            let value = index as u8;
+            [value, value.wrapping_add(29), value.wrapping_add(61), match index % 4 { 0 => 0, 1 => 255, _ => 191 }]
+        }).collect();
+        let source_rgba: Vec<u8> = (0..16 * 16).flat_map(|index| {
+            let value = index as u8;
+            [value.wrapping_add(17), value.wrapping_add(43), value, [0, 1, 128, 255][index % 4]]
+        }).collect();
+        let background_frame = RgbaFrame::from_rgba8(64, 64, background.clone())?;
+        let source = RgbaFrame::from_rgba8(16, 16, source_rgba)?;
+        let full = RasterRect { origin: [0; 2], size: [64, 64] };
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        for blend in [
+            BlendMode::SourceOver, BlendMode::AddSource, BlendMode::AddDestination,
+            BlendMode::Multiply, BlendMode::InvertDestination, BlendMode::AddMultiply,
+            BlendMode::ListAlphaFromRed, BlendMode::ListAlphaFromGreen,
+            BlendMode::ListAlphaFromBlue, BlendMode::ListAlphaFromAlpha,
+        ] {
+            let mut expected = Canvas::from_rgba8(64, 64, background.clone())?;
+            let mut actual = expected.clone();
+            let seed = [RasterJob { rect: full, source: Some(&background_frame), atlas: None,
+                operation: Draw::Copy { source_origin: [0; 2] } }];
+            assert!(RASTER.with_borrow_mut(|slot| slot.as_mut().unwrap()
+                .draw_jobs(&mut actual, &[full], &seed, RasterOutput::Canvas, false))?);
+            let rect = RasterRect { origin: [3, 5], size: [16, 16] };
+            assert!(draw_job(&mut actual, RasterJob { rect, source: Some(&source), atlas: None,
+                operation: Draw::PlaneSpan { source_origin: [0; 2], opacity: 173, blend } }));
+            // The reference applies the same opacity before the integer blend.
+            expected = Canvas::from_rgba8(64, 64, background.clone())?;
+            let modulated: Vec<u8> = source.pixels().chunks_exact(4).flat_map(|pixel| {
+                [pixel[0], pixel[1], pixel[2], ((u32::from(pixel[3]) * 173) / 255) as u8]
+            }).collect();
+            expected.blend_rgba_rows(Rect::new(3, 5, 16, 16), &modulated, 16 * 4, blend)?;
+            assert_eq!(actual.pixels(), expected.pixels(), "{blend:?}");
+        }
+        RASTER.with_borrow_mut(Option::take);
         Ok(())
     }
 }

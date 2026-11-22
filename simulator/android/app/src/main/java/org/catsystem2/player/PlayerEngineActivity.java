@@ -85,7 +85,6 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private static final int SELECT_GAME = 1;
     private static final int EXPORT_DIAGNOSTICS = 2;
     private static final int GAME_TICK_HZ = 60;
-    private static final long MAX_CATCH_UP_MS = 4_000 / GAME_TICK_HZ;
     private static final int FRAME_CHANGED = 1;
     private static final int FRAME_UNCHANGED = 4;
     private static final int GAME_MENU_EFFECT_SETTINGS = 40027;
@@ -130,6 +129,8 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private AudioFocusRequest audioFocus;
     private volatile int logicalWidth;
     private volatile int logicalHeight;
+    private int activePointerId = -1;
+    private long pointerDownTime;
     private int pointerButton;
     // UI-owned inspectors. Their actions are posted back to the engine owner.
     private long messageUiSession;
@@ -659,7 +660,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         gameReady = false;
         hidePlaybackControls();
         logicalWidth = logicalHeight = 0;
-        pointerButton = 0;
+        activePointerId = -1;
         gamePointer.hide();
         gamePointer.setCursorVisible(true);
         PointerIcon cursor = PointerIcon.getSystemIcon(this, PointerIcon.TYPE_DEFAULT);
@@ -965,10 +966,20 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                     hasFrame = framePending = true;
                 }
                 if (state == FRAME_CHANGED || state == FRAME_UNCHANGED) {
-                    long planned = clockOrigin + ++completedFrames * 1000 / GAME_TICK_HZ;
-                    nextFrame = Math.max(planned, SystemClock.uptimeMillis() - MAX_CATCH_UP_MS);
-                    clockOrigin += nextFrame - planned;
                     if (framePending) presentFrame(target);
+                    if (framePending) {
+                        scheduleFrame();
+                        return;
+                    }
+                    long planned = clockOrigin + ++completedFrames * 1000 / GAME_TICK_HZ;
+                    long now = SystemClock.uptimeMillis();
+                    if (now - planned >= 1000 / GAME_TICK_HZ) {
+                        // Reset after falling a whole tick behind. The scheduler runs
+                        // a late frame immediately while keeping short delays out of the clock.
+                        clockOrigin += now - planned;
+                        planned = now;
+                    }
+                    nextFrame = planned;
                 } else {
                     // Script budget continuation stays at the same game tick.
                     nextFrame = SystemClock.uptimeMillis() + 1;
@@ -1712,29 +1723,54 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
 
     private boolean touch(View view, MotionEvent event) {
         long handle = inputSession();
-        if (handle == 0 || logicalWidth <= 0 || view.getWidth() <= 0 || view.getHeight() <= 0) return true;
-        gamePointer.hide();
-        int x = Math.max(0, Math.min(logicalWidth - 1, (int)(event.getX() * logicalWidth / view.getWidth())));
-        int y = Math.max(0, Math.min(logicalHeight - 1, (int)(event.getY() * logicalHeight / view.getHeight())));
+        if (handle == 0 || paused || logicalWidth <= 0 || view.getWidth() <= 0 || view.getHeight() <= 0) return true;
         int action = event.getActionMasked();
-        if (action == MotionEvent.ACTION_DOWN) {
+        boolean down = action == MotionEvent.ACTION_DOWN;
+        boolean cancelled = action == MotionEvent.ACTION_CANCEL;
+        boolean up = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP;
+        int index = event.getActionIndex();
+        if (down) {
+            if (activePointerId != -1 && pointerDownTime == event.getDownTime()) return true;
+            activePointerId = event.getPointerId(index);
+            pointerDownTime = event.getDownTime();
             pointerButton = (event.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0 ? 1 : 0;
+        } else if (activePointerId == -1 || pointerDownTime != event.getDownTime()) {
+            return true;
+        } else if (up) {
+            if (event.getPointerId(index) != activePointerId) return true;
+        } else if (action == MotionEvent.ACTION_MOVE) {
+            index = event.findPointerIndex(activePointerId);
+            if (index < 0) return true;
+        } else if (!cancelled) {
+            return true;
         }
+        gamePointer.hide();
         int button = pointerButton;
-        boolean primaryDown = action == MotionEvent.ACTION_DOWN && button == 0;
-        long uiSampleNs = primaryDown ? System.nanoTime() : 0;
-        long eventToUiMs = primaryDown ? Math.max(0, SystemClock.uptimeMillis() - event.getEventTime()) : 0;
-        worker.post(() -> {
-            if (session != handle || paused) return;
-            nativeInput(session, 0, x, y);
-            if (primaryDown) {
-                long uiToWorkerUs = (System.nanoTime() - uiSampleNs) / 1000;
-                nativeTimedPrimaryDown(session, eventToUiMs, uiToWorkerUs);
-            } else if (action == MotionEvent.ACTION_DOWN) {
-                nativeInput(session, 1, button, 0);
-            }
-            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) nativeInput(session, 2, button, 0);
-        });
+        boolean primaryDown = down && button == 0;
+        long eventToUiMs = primaryDown ? Math.max(0, SystemClock.uptimeMillis() - event.getEventTime()) : -1;
+        long inputUiMonoUs = primaryDown ? System.nanoTime() / 1000 : 0;
+        if (primaryDown) {
+            android.util.Log.i("CS2Perf", "primary_down_ui session=" + handle
+                + " input_ui_mono_us=" + inputUiMonoUs + " event_to_ui_ms=" + eventToUiMs);
+        }
+        int result = 0;
+        if (!cancelled) {
+            int x = Math.max(0, Math.min(logicalWidth - 1, (int)(event.getX(index) * logicalWidth / view.getWidth())));
+            int y = Math.max(0, Math.min(logicalHeight - 1, (int)(event.getY(index) * logicalHeight / view.getHeight())));
+            result = nativeEnqueueInput(handle, 0, x, y, -1, 0);
+        }
+        if (down) {
+            result |= nativeEnqueueInput(handle, 1, button, 0, eventToUiMs, inputUiMonoUs);
+        }
+        if (up || cancelled) {
+            activePointerId = -1;
+            result |= nativeEnqueueInput(handle, 2, button, 0, -1, 0);
+        }
+        if (result < 0) {
+            worker.post(() -> {
+                if (session == handle) stopWithError("触摸输入队列失败", new IOException("Android input mailbox rejected an event"));
+            });
+        }
         return true;
     }
 
@@ -2601,6 +2637,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     }
     @Override protected void onPause() {
         paused = true;
+        activePointerId = -1;
         endGameKeyboard(true);
         if (tweetHost != null) tweetHost.paused();
         if (audioManager != null && audioFocus != null) {

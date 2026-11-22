@@ -2,10 +2,11 @@
 //! The small NDK JNI bridge borrows Surface pixels; no original game code is
 //! loaded. Failed operations retain their diagnostic and return an error.
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
+use std::time::Instant;
 use cs2_desktop::{HeadlessPlayer, HostFrameTiming, HostPerfDetails};
 use cs2_runtime::{InputEvent, InputKey};
 use cs2_runtime::message_object::MessageTextInputEvent;
@@ -125,6 +126,57 @@ impl StoryTrace {
     }
 }
 
+struct PendingInput {
+    kind: u32,
+    a: i32,
+    b: i32,
+    input_id: u64,
+    input_mono_us: u64,
+    event_to_ui_ms: i64,
+    enqueued: Instant,
+}
+
+struct ConsumedInput {
+    input_id: u64,
+    input_mono_us: u64,
+    event_to_ui_ms: i64,
+    ui_to_worker_us: u64,
+}
+
+#[derive(Default)]
+struct InputQueues {
+    pending: BTreeMap<u64, VecDeque<PendingInput>>,
+    consumed: BTreeMap<u64, VecDeque<ConsumedInput>>,
+    photon_pending: BTreeMap<u64, VecDeque<(u64, u64)>>,
+}
+
+static INPUT_QUEUES: Mutex<InputQueues> = Mutex::new(InputQueues {
+    pending: BTreeMap::new(), consumed: BTreeMap::new(), photon_pending: BTreeMap::new(),
+});
+
+#[cfg(target_os = "android")]
+fn input_report(message: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: std::ffi::c_int, tag: *const c_char, text: *const c_char) -> std::ffi::c_int;
+    }
+    if let Ok(message) = CString::new(message) {
+        unsafe { __android_log_write(4, c"CS2Perf".as_ptr(), message.as_ptr()); }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn input_report(_message: &str) {}
+
+fn resolve_inputs_without_present(id: u64, reason: &str) {
+    let Ok(mut queues) = INPUT_QUEUES.lock() else { return };
+    if let Some(inputs) = queues.photon_pending.remove(&id) {
+        for (input_id, input) in inputs {
+            input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason={reason}"));
+        }
+    }
+}
+
 thread_local! {
     static SESSIONS: RefCell<Sessions> = RefCell::new(Sessions::default());
 }
@@ -220,6 +272,15 @@ pub extern "C" fn cs2_android_close(id: u64) -> i32 {
         sessions.story_traces.remove(&id);
         sessions.message_revisions.remove(&id);
         sessions.scene_revisions.remove(&id);
+        if let Ok(mut queues) = INPUT_QUEUES.lock() {
+            queues.pending.remove(&id);
+            queues.consumed.remove(&id);
+            if let Some(inputs) = queues.photon_pending.remove(&id) {
+                for (input_id, input) in inputs {
+                    input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason=close"));
+                }
+            }
+        }
         Ok(0)
     })
 }
@@ -491,6 +552,72 @@ pub extern "C" fn cs2_android_message_list_action(
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_enqueue_input(
+    id: u64, kind: u32, a: i32, b: i32, input_mono_us: u64, event_to_ui_ms: i64, input_id: u64,
+) -> i32 {
+    if !matches!(kind, 0..=2) { return -1; }
+    let Ok(mut queues) = INPUT_QUEUES.lock() else { return -1 };
+    let pending = queues.pending.entry(id).or_default();
+    if kind == 0 && let Some(last) = pending.back_mut() && last.kind == 0 {
+        last.a = a;
+        last.b = b;
+        last.enqueued = Instant::now();
+        return 0;
+    }
+    if pending.len() >= 4096 {
+        return if kind == 0 { 0 } else { -2 };
+    }
+    pending.push_back(PendingInput {
+        kind, a, b, input_id, input_mono_us, event_to_ui_ms, enqueued: Instant::now(),
+    });
+    0
+}
+
+fn drain_pending_input(id: u64, player: &mut HeadlessPlayer) -> Result<(), String> {
+    let pending = INPUT_QUEUES.lock().map_err(|_| "Android input mailbox is poisoned")?
+        .pending.remove(&id);
+    let Some(events) = pending else { return Ok(()) };
+    for event in events {
+        apply_input(player, event.kind, event.a, event.b)?;
+        if event.kind == 1 && event.a == 0 && event.input_mono_us != 0 {
+            let mut queues = INPUT_QUEUES.lock().map_err(|_| "Android input mailbox is poisoned")?;
+            let consumed = queues.consumed.entry(id).or_default();
+            if consumed.len() == 64 { consumed.pop_front(); }
+            consumed.push_back(ConsumedInput {
+                input_id: event.input_id,
+                input_mono_us: event.input_mono_us,
+                event_to_ui_ms: event.event_to_ui_ms,
+                ui_to_worker_us: event.enqueued.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            });
+            let pending = queues.photon_pending.entry(id).or_default();
+            if pending.len() == 64
+                && let Some((input_id, input)) = pending.pop_front()
+            {
+                input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason=queue_overflow"));
+            }
+            pending.push_back((event.input_id, event.input_mono_us));
+        }
+    }
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_take_consumed_input(
+    id: u64, input_id: *mut u64, input_mono_us: *mut u64, event_to_ui_ms: *mut i64, ui_to_worker_us: *mut u64,
+) -> i32 {
+    if input_id.is_null() || input_mono_us.is_null() || event_to_ui_ms.is_null() || ui_to_worker_us.is_null() { return -1 }
+    let Ok(mut queues) = INPUT_QUEUES.lock() else { return -1 };
+    let Some(event) = queues.consumed.get_mut(&id).and_then(VecDeque::pop_front) else { return 0 };
+    unsafe {
+        *input_id = event.input_id;
+        *input_mono_us = event.input_mono_us;
+        *event_to_ui_ms = event.event_to_ui_ms;
+        *ui_to_worker_us = event.ui_to_worker_us;
+    }
+    1
+}
+
 /// The optional story row is borrowed from the session; consume it before the next native call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cs2_android_step_profiled_v4(
@@ -507,6 +634,7 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
     });
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
+        drain_pending_input(id, player)?;
         let step = if let Some(timing) = unsafe { timing.as_mut() } {
             let mut advance = || HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
             let (result, sample) = if let Some(output) = detail_rows {
@@ -560,6 +688,11 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
         } else {
             FRAME_CHANGED
         };
+        if result == FRAME_UNCHANGED {
+            resolve_inputs_without_present(id, "unchanged");
+        } else if result == 2 {
+            resolve_inputs_without_present(id, "quit");
+        }
         if completed {
             if let (Some(output), Some(trace)) = (story_row, sessions.story_traces.get_mut(&id)) {
                 *output = trace.observe(player.host_story_trace()).map_or(std::ptr::null(), CStr::as_ptr);
@@ -749,48 +882,61 @@ pub unsafe extern "C" fn cs2_android_take_clipboard_wide(
     })
 }
 
+fn apply_input(player: &mut HeadlessPlayer, kind: u32, a: i32, b: i32) -> Result<(), String> {
+    let event = match kind {
+        0 => InputEvent::MouseMove { x: a, y: b },
+        1 | 2 => {
+            let key = InputKey::MouseButton(u8::try_from(a).map_err(|_| "Invalid pointer button")?);
+            if kind == 1 { InputEvent::KeyDown(key) } else { InputEvent::KeyUp(key) }
+        }
+        3 | 4 => {
+            player.apply_host_text_key(a as u32, kind == 3)
+                .map_err(|error| format!("Text key: {error:#}"))?;
+            return Ok(());
+        }
+        5 => {
+            player.set_host_paused(a == 0).map_err(|error| format!("Pause host: {error:#}"))?;
+            player.apply_host_text_input(MessageTextInputEvent::Focus(a != 0))
+                .map_err(|error| format!("Input focus: {error:#}"))?;
+            return Ok(());
+        }
+        6 => InputEvent::KeyDown(InputKey::MouseWheel(a)),
+        7 => InputEvent::QuitRequested,
+        8 => {
+            player.set_audio_suspended(a != 0).map_err(|error| format!("Audio focus: {error:#}"))?;
+            return Ok(());
+        }
+        9 | 10 => {
+            player.apply_host_text_input(if kind == 9 {
+                MessageTextInputEvent::ImeEnabled(a != 0)
+            } else { MessageTextInputEvent::Cancel })
+                .map_err(|error| format!("IME mode: {error:#}"))?;
+            return Ok(());
+        }
+        11 => {
+            player.apply_host_text_input(MessageTextInputEvent::Focus(a != 0))
+                .map_err(|error| format!("Window focus: {error:#}"))?;
+            return Ok(());
+        }
+        _ => return Err("Unknown Android input kind".into()),
+    };
+    player.apply_host_input(event).map_err(|error| format!("Input: {error:#}"))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cs2_android_input(id: u64, kind: u32, a: i32, b: i32) -> i32 {
+    if kind == 5 && a == 0 && let Ok(mut queues) = INPUT_QUEUES.lock() {
+        queues.pending.remove(&id);
+        queues.consumed.remove(&id);
+        if let Some(inputs) = queues.photon_pending.remove(&id) {
+            for (input_id, input) in inputs {
+                input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason=pause"));
+            }
+        }
+    }
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
-        let event = match kind {
-            0 => InputEvent::MouseMove { x: a, y: b },
-            1 | 2 => {
-                let key = InputKey::MouseButton(u8::try_from(a).map_err(|_| "Invalid pointer button")?);
-                if kind == 1 { InputEvent::KeyDown(key) } else { InputEvent::KeyUp(key) }
-            }
-            3 | 4 => {
-                player.apply_host_text_key(a as u32, kind == 3)
-                    .map_err(|error| format!("Text key: {error:#}"))?;
-                return Ok(0);
-            }
-            5 => {
-                player.set_host_paused(a == 0).map_err(|error| format!("Pause host: {error:#}"))?;
-                player.apply_host_text_input(MessageTextInputEvent::Focus(a != 0))
-                    .map_err(|error| format!("Input focus: {error:#}"))?;
-                return Ok(0);
-            }
-            6 => InputEvent::KeyDown(InputKey::MouseWheel(a)),
-            7 => InputEvent::QuitRequested,
-            8 => {
-                player.set_audio_suspended(a != 0).map_err(|error| format!("Audio focus: {error:#}"))?;
-                return Ok(0);
-            }
-            9 | 10 => {
-                player.apply_host_text_input(if kind == 9 {
-                    MessageTextInputEvent::ImeEnabled(a != 0)
-                } else { MessageTextInputEvent::Cancel })
-                    .map_err(|error| format!("IME mode: {error:#}"))?;
-                return Ok(0);
-            }
-            11 => {
-                player.apply_host_text_input(MessageTextInputEvent::Focus(a != 0))
-                    .map_err(|error| format!("Window focus: {error:#}"))?;
-                return Ok(0);
-            }
-            _ => return Err("Unknown Android input kind".into()),
-        };
-        player.apply_host_input(event).map_err(|error| format!("Input: {error:#}"))?;
+        apply_input(player, kind, a, b)?;
         Ok(0)
     })
 }
@@ -862,11 +1008,25 @@ pub extern "C" fn cs2_android_vulkan_candidate(window: *mut std::ffi::c_void) ->
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cs2_android_present_vulkan(id: u64, window: *mut std::ffi::c_void) -> i32 {
-    call(-1, |sessions| {
+    let mut inputs = INPUT_QUEUES.lock().ok()
+        .and_then(|mut queues| queues.photon_pending.remove(&id))
+        .map(Vec::from).unwrap_or_default();
+    let result = call(-1, |sessions| {
         let player = sessions.players.get(&id).ok_or("Android session is absent")?;
         let Some(window) = std::ptr::NonNull::new(window) else { return Ok(-2) };
-        Ok(unsafe { player.present_android_surface(window) })
-    })
+        Ok(unsafe { player.present_android_surface(window, id, &inputs) })
+    });
+    if result == -2 && !inputs.is_empty() {
+        if let Ok(mut queues) = INPUT_QUEUES.lock() {
+            inputs.extend(queues.photon_pending.remove(&id).into_iter().flatten());
+            queues.photon_pending.insert(id, VecDeque::from(inputs));
+        }
+    } else if result != 0 {
+        for (input_id, input) in inputs {
+            input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason=vulkan_unavailable"));
+        }
+    }
+    result
 }
 
 #[cfg(target_os = "android")]

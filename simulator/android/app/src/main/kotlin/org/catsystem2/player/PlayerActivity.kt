@@ -260,6 +260,7 @@ class PlayerActivity : PlayerEngineActivity() {
         @JvmStatic external fun nativeDialog(handle: Long): ByteArray?
         @JvmStatic external fun nativeDialogResult(handle: Long, request: Long, shown: Int): Int
         @JvmStatic external fun nativeInput(handle: Long, kind: Int, a: Int, b: Int): Int
+        @JvmStatic external fun nativeEnqueueInput(handle: Long, kind: Int, a: Int, b: Int, eventToUiMs: Long, inputUiMonoUs: Long): Int
         @JvmStatic external fun nativeTimedPrimaryDown(handle: Long, eventToUiMs: Long, uiToWorkerUs: Long): Int
         @JvmStatic external fun nativeText(handle: Long, kind: Int, text: ByteArray, start: Int, end: Int): Int
         @JvmStatic external fun nativePresent(handle: Long, surface: Surface): Int

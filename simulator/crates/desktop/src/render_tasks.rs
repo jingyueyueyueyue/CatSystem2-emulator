@@ -1111,13 +1111,11 @@ fn render_sampled_range(
     check_work(task.size)?;
     render_chain(tasks, surfaces, preceding, destination, lower, from, draw, depth + 1)?;
     let mut middle = Canvas::new(task.size[0], task.size[1])?;
-    middle.clear(if task.kind == 37 {
-        Color::rgba(0, 0, 0, 255)
-    } else {
-        Color::TRANSPARENT
-    });
+    if task.kind == 37 {
+        middle.clear(Color::rgba(0, 0, 0, 255));
+    }
     render_chain(tasks, surfaces, preceding, &mut middle, from, to, draw, depth + 1)?;
-    let source = snapshot(&middle)?;
+    let source = middle.into_frame();
     match task.kind {
         35 => {
             let previous = if task.fresh_feedback { None } else {
@@ -1175,12 +1173,11 @@ fn prepare_mask(task: &mut RenderTask) -> Result<()> {
     check_work(task.size)?;
     // The original independent mask is scaled to the render surface.
     let mut target = Canvas::new(task.size[0], task.size[1])?;
-    target.clear(Color::TRANSPARENT);
     let mut options = ImageDrawOptions::new(Point::new(0, 0));
     options.scale_x = task.size[0] as f32 / mask.width() as f32;
     options.scale_y = task.size[1] as f32 / mask.height() as f32;
     target.copy_frame(mask, &options)?;
-    task.mask = Some(snapshot(&target)?);
+    task.mask = Some(target.into_frame());
     Ok(())
 }
 
@@ -1270,17 +1267,10 @@ fn apply_wipe_step(task: &mut RenderTask, step: WipeStep) -> Result<()> {
     Ok(())
 }
 
-fn snapshot(canvas: &Canvas) -> Result<RgbaFrame> {
-    Ok(RgbaFrame::from_rgba8(
-        canvas.width(),
-        canvas.height(),
-        canvas.pixels().to_vec(),
-    )?)
-}
 fn black_frame(size: [u32; 2]) -> Result<RgbaFrame> {
     let mut canvas = Canvas::new(size[0], size[1])?;
     canvas.clear(Color::rgba(0, 0, 0, 255));
-    snapshot(&canvas)
+    Ok(canvas.into_frame())
 }
 fn check_work(size: [u32; 2]) -> Result<()> {
     let size = (size[0] as usize)

@@ -106,8 +106,10 @@ impl Geometry {
                     let tilt =
                         relative[0].hypot(relative[1]) / radius * std::f32::consts::FRAC_PI_4;
                     let direction = relative[0].atan2(-relative[1]);
-                    let mut velocity =
-                        rotate_z(rotate_x([0., 0., random() * speed], tilt), direction);
+                    let mut velocity = rotate_z(
+                        rotate_x([0., 0., random() * speed], tilt.sin_cos()),
+                        direction.sin_cos(),
+                    );
                     // The receiver flattens the initial radial velocity after
                     // transforming it; only shard rotation creates local Z.
                     velocity[2] = 0.;
@@ -166,14 +168,9 @@ impl Geometry {
             }
             // Increment the retained matrix in X/Y/Z order. Summing Euler
             // angles changes the result after the second render call.
+            let [x, y, z] = fragment.angular.map(|angular| (angular * delta).sin_cos());
             for row in &mut fragment.rotation {
-                *row = rotate_z(
-                    rotate_y(
-                        rotate_x(*row, fragment.angular[0] * delta),
-                        fragment.angular[1] * delta,
-                    ),
-                    fragment.angular[2] * delta,
-                );
+                *row = rotate_z(rotate_y(rotate_x(*row, x), y), z);
             }
         }
         for triangle in &mut self.triangles {
@@ -298,15 +295,12 @@ fn value(words: &[u32], index: usize) -> Result<f32> {
     Ok(value)
 }
 
-fn rotate_x([x, y, z]: [f32; 3], angle: f32) -> [f32; 3] {
-    let (sin, cos) = angle.sin_cos();
+fn rotate_x([x, y, z]: [f32; 3], (sin, cos): (f32, f32)) -> [f32; 3] {
     [x, y * cos + z * sin, z * cos - y * sin]
 }
-fn rotate_y([x, y, z]: [f32; 3], angle: f32) -> [f32; 3] {
-    let (sin, cos) = angle.sin_cos();
+fn rotate_y([x, y, z]: [f32; 3], (sin, cos): (f32, f32)) -> [f32; 3] {
     [x * cos - z * sin, y, z * cos + x * sin]
 }
-fn rotate_z([x, y, z]: [f32; 3], angle: f32) -> [f32; 3] {
-    let (sin, cos) = angle.sin_cos();
+fn rotate_z([x, y, z]: [f32; 3], (sin, cos): (f32, f32)) -> [f32; 3] {
     [x * cos + y * sin, y * cos - x * sin, z]
 }

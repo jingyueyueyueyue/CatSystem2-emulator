@@ -56,6 +56,8 @@ extern int32_t cs2_android_tweet_count(const uint8_t *, size_t, const uint8_t *,
 extern int32_t cs2_android_dialog(uint64_t, const uint8_t **, size_t *);
 extern int32_t cs2_android_dialog_result(uint64_t, uint64_t, int32_t);
 extern int32_t cs2_android_input(uint64_t, uint32_t, int32_t, int32_t);
+extern int32_t cs2_android_enqueue_input(uint64_t, uint32_t, int32_t, int32_t, uint64_t, int64_t, uint64_t);
+extern int32_t cs2_android_take_consumed_input(uint64_t, uint64_t *, uint64_t *, int64_t *, uint64_t *);
 extern int32_t cs2_android_text(uint64_t, uint32_t, const uint8_t *, size_t, int32_t, int32_t);
 extern int32_t cs2_android_copy_frame(uint64_t, uint8_t *, int32_t, int32_t, int32_t);
 extern int32_t cs2_android_frame_posted(uint64_t);
@@ -86,6 +88,7 @@ typedef struct {
     uint64_t last_post_ns;
     uint64_t post_sequence;
     uint64_t frame_sequence;
+    uint64_t input_sequence;
     PerfTick tick;
     size_t log_size;
     size_t log_rows;
@@ -289,6 +292,17 @@ JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, j
         timed ? &sample : NULL, &story_row, perf.frame_sequence + 1, perf.tick.step_calls + 1,
         timed ? &details : NULL);
     const uint64_t finished = start ? perf_now_ns() : 0;
+    if (timed) {
+        uint64_t input_mono_us = 0, ui_to_worker_us = 0, input_id = 0;
+        int64_t event_to_ui_ms = 0;
+        while (cs2_android_take_consumed_input((uint64_t)handle, &input_id, &input_mono_us,
+                   &event_to_ui_ms, &ui_to_worker_us) == 1) {
+            __android_log_print(ANDROID_LOG_INFO, PERF_TAG, "primary_down_timing session=%" PRIu64
+                                " input_id=%" PRIu64 " input_mono_us=%" PRIu64 " event_to_ui_ms=%" PRId64
+                                " ui_to_worker_us=%" PRIu64, (uint64_t)handle, input_id, input_mono_us,
+                                event_to_ui_ms, ui_to_worker_us);
+        }
+    }
     if (hud_enabled) {
         hud.tick_work_ns += finished - start;
         if (result == FRAME_CHANGED || result == FRAME_UNCHANGED) {
@@ -561,6 +575,23 @@ JNIEXPORT jint JNICALL JNI(nativeInput)(
 ) {
     (void)env; UNUSED_TYPES;
     return dispatch_input(handle, kind, a, b, -1, -1);
+}
+JNIEXPORT jint JNICALL JNI(nativeEnqueueInput)(
+    JNIEnv *env, jclass type, jlong handle, jint kind, jint a, jint b, jlong event_to_ui_ms,
+    jlong input_ui_mono_us
+) {
+    (void)env; UNUSED_TYPES;
+    uint64_t input_mono_us = 0, input_id = 0;
+    if (perf.handle && perf.handle == (uint64_t)handle && kind == 1 && a == 0) {
+        const uint64_t jni_mono_us = perf_now_ns() / 1000;
+        input_mono_us = input_ui_mono_us > 0 ? (uint64_t)input_ui_mono_us : jni_mono_us;
+        input_id = ++perf.input_sequence;
+        __android_log_print(ANDROID_LOG_INFO, PERF_TAG, "primary_down session=%" PRIu64
+                            " input_id=%" PRIu64 " input_mono_us=%" PRIu64 " ui_to_jni_us=%" PRIu64,
+                            perf.handle, input_id, input_mono_us, jni_mono_us - input_mono_us);
+    }
+    return cs2_android_enqueue_input((uint64_t)handle, (uint32_t)kind, (int32_t)a, (int32_t)b,
+                                     input_mono_us, (int64_t)event_to_ui_ms, input_id);
 }
 JNIEXPORT jint JNICALL JNI(nativeTimedPrimaryDown)(
     JNIEnv *env, jclass type, jlong handle, jlong event_to_ui_ms, jlong ui_to_worker_us

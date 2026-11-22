@@ -689,7 +689,13 @@ impl LoggingHost<'_> {
     /// Keep one host-aware dispatcher for all three producers.
     pub(super) fn decode_managed_image_frame(&mut self, bytes: &[u8], id: u32)
         -> Result<Option<RgbaFrame>> {
-        let Some(frame) = decode_image_frame(bytes, id)? else { return Ok(None); };
+        let frame = match self.data_services.ordinary.take_predecoded_image(bytes, id) {
+            Some(frame) => frame,
+            None => {
+                let Some(frame) = decode_image_frame(bytes, id)? else { return Ok(None); };
+                frame
+            }
+        };
         if !bytes.starts_with(b"HG-3") { return Ok(Some(frame)); }
         self.apply_managed_hg3_patch(bytes, id, None, frame).map(Some)
     }

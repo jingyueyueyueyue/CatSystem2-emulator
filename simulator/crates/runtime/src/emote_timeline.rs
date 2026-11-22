@@ -295,11 +295,7 @@ pub(super) fn frame_opacity(content: &PsbValue) -> Result<u8> {
     Ok(value as u8)
 }
 
-/// Samples the actual frameList layout. It never interpolates into type0.
-/// Source/icon/blend/flip remain from the preceding frame until the boundary.
-/// Returned warnings flow into render_strict; they are never silently dropped.
-pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSample> {
-    let time = time as f32;
+fn layer_keyframes(layer: &PsbValue, time: f32) -> Result<(Option<&PsbValue>, Option<&PsbValue>)> {
     if !time.is_finite() {
         return Err(invalid("non-finite frame time"));
     }
@@ -334,6 +330,31 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
             next = Some(frame);
         }
     }
+    Ok((previous, next))
+}
+
+pub(super) fn visible_layer_key(layer: &PsbValue, time: f64) -> Result<Option<(&PsbValue, f32)>> {
+    let (previous, _) = layer_keyframes(layer, time as f32)?;
+    previous.map(visible_frame_content).transpose().map(Option::flatten)
+}
+
+fn visible_frame_content(frame: &PsbValue) -> Result<Option<(&PsbValue, f32)>> {
+    if number(frame, "type", 2.0)? == 0.0 {
+        return Ok(None);
+    }
+    let content = frame.get("content").ok_or_else(|| invalid("visible frame lacks content"))?;
+    if content.object().is_none() {
+        return Err(invalid("frame content must be an object"));
+    }
+    Ok(Some((content, number(frame, "time", 0.0)?)))
+}
+
+/// Samples the actual frameList layout. It never interpolates into type0.
+/// Source/icon/blend/flip remain from the preceding frame until the boundary.
+/// Returned warnings flow into render_strict; they are never silently dropped.
+pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSample> {
+    let time = time as f32;
+    let (previous, next) = layer_keyframes(layer, time)?;
     let mut sample = CpuTimelineSample {
         content: None,
         frame_begin: None,
@@ -344,30 +365,25 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
         return Ok(sample);
     };
     sample.frame_begin = Some(number(a, "time", 0.0)?);
-    if number(a, "type", 2.0)? == 0.0 {
+    let Some((start, begin)) = visible_frame_content(a)? else {
         return Ok(sample);
-    }
-    let start = a
-        .get("content")
-        .ok_or_else(|| invalid("visible frame lacks content"))?;
-    let mut map = start
-        .object()
-        .ok_or_else(|| invalid("frame content must be an object"))?
-        .clone();
-    sample.content = Some(start.clone());
+    };
+    let fields = start.object().unwrap();
     if number(a, "type", 2.0)? != 3.0 {
+        sample.content = Some(start.clone());
         return Ok(sample);
     }
     let Some(b) = next else {
+        sample.content = Some(start.clone());
         return Ok(sample);
     };
     if number(b, "type", 2.0)? == 0.0 {
+        sample.content = Some(start.clone());
         return Ok(sample);
     }
     let end = b
         .get("content")
         .ok_or_else(|| invalid("visible next frame lacks content"))?;
-    let begin = number(a, "time", 0.0)?;
     let finish = number(b, "time", begin)?;
     if finish <= begin {
         return Err(invalid("empty interpolation interval"));
@@ -383,8 +399,10 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
     let ratio = (elapsed / (finish - begin)).clamp(0.0, 1.0);
     // At a keyframe, no interpolation/easing is needed and exact raw values win.
     if ratio == 0.0 {
+        sample.content = Some(start.clone());
         return Ok(sample);
     }
+    let mut map = fields.clone();
     for key in ["ccc", "acc", "zcc", "scc", "occ", "cp"] {
         if nonlinear(start.get(key)) {
             sample

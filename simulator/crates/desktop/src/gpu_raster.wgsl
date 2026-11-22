@@ -80,7 +80,7 @@ fn plane_span(dst: vec4u, point: vec2u) -> vec4u {
     }
     var src = sample_source(point + origin);
     src.a = (src.a * jobs[job].args[9]) / 255u;
-    return blend_canvas(dst, src, select(0u, 3u, jobs[job].args[10] != 0u));
+    return blend_canvas(dst, src, jobs[job].args[10]);
 }
 
 struct Vertex {
@@ -233,7 +233,7 @@ fn raster(@builtin(global_invocation_id) id: vec3u) {
             let sample = vec4u(sample_source(id.xy).rgb, alpha);
             result = (sample * alpha + dst * (255u - alpha) + 127u) / 255u;
         }
-        default: {
+        case 7u: {
             let step = jobs[job].args[8];
             let blue = textureLoad(wipe_mask, vec2i(id.xy), 0).b;
             var sample = sample_source(id.xy);
@@ -244,6 +244,47 @@ fn raster(@builtin(global_invocation_id) id: vec3u) {
             }
             result = (sample * sample.a + dst * (255u - sample.a) + 127u) / 255u;
         }
+        case 8u: {
+            result = dst;
+            let extent = vec2i(i32(jobs[job].args[5]), i32(jobs[job].args[6]));
+            for (var tap = 0u; tap < jobs[job].args[7]; tap += 1u) {
+                let arg = 8u + tap * 3u;
+                let position = vec2i(id.xy) - vec2i(arg_i(arg), arg_i(arg + 1u));
+                if any(position < vec2i(0)) || any(position >= extent) { continue; }
+                var sample = sample_source(vec2u(position));
+                sample.a = (sample.a * jobs[job].args[arg + 2u] + 127u) / 255u;
+                result = (sample * sample.a + result * (255u - sample.a) + 127u) / 255u;
+            }
+        }
+        default: { result = dst; }
     }
     pixels[index] = pack(result);
+}
+
+
+struct DeviceSpan {
+    target_origin: vec2u,
+    target_size: vec2u,
+    source_origin: vec2i,
+    source_size: vec2u,
+    canvas_width: u32,
+    blend: u32,
+    padding: vec2u,
+}
+@group(0) @binding(0) var<storage, read_write> device_target: array<u32>;
+@group(0) @binding(1) var<storage, read> device_source: array<u32>;
+@group(0) @binding(2) var<uniform> span_params: DeviceSpan;
+
+@compute @workgroup_size(8, 8)
+fn device_span(@builtin(global_invocation_id) id: vec3u) {
+    if any(id.xy >= span_params.target_size) { return; }
+    let target_point = id.xy + span_params.target_origin;
+    let source = vec2i(target_point) - span_params.source_origin;
+    var sample = vec4u(0u);
+    if all(source >= vec2i(0)) && all(vec2u(source) < span_params.source_size) {
+        let point = vec2u(source);
+        sample = unpack(device_source[point.y * span_params.source_size.x + point.x]);
+    }
+    let index = target_point.y * span_params.canvas_width + target_point.x;
+    device_target[index] = pack(blend_canvas(unpack(device_target[index]), sample, span_params.blend));
 }

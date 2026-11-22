@@ -11,13 +11,20 @@ thread_local! {
     static DISPLAY_STATS_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
+struct PendingDisplay {
+    session: u64,
+    id: u32,
+    submitted_ns: u64,
+    inputs: Vec<(u64, u64)>,
+}
+
 struct DisplayTiming {
     api: Option<ash::google::display_timing::Device>,
     generation: u64,
     next_id: u32,
     frames_since_poll: u8,
     last_poll_ns: u64,
-    pending: VecDeque<(u32, u64)>,
+    pending: VecDeque<PendingDisplay>,
     displayed: u64,
     latest_ns: u64,
     queue_to_display_ns: u64,
@@ -47,7 +54,9 @@ impl DisplayTiming {
     fn reset(&mut self) {
         static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        self.pending.clear();
+        for pending in self.pending.drain(..) {
+            unresolved_inputs(&pending, "surface_reset");
+        }
         self.frames_since_poll = 0;
         self.last_poll_ns = 0;
         self.displayed = 0;
@@ -61,26 +70,39 @@ impl DisplayTiming {
         self.api.is_some() && !self.query_failed
     }
 
-    fn on_submit(&mut self, surface: &wgpu::Surface<'_>) {
-        if !self.supported() || !DISPLAY_STATS_ENABLED.with(Cell::get) { return; }
+    fn on_submit(&mut self, surface: &wgpu::Surface<'_>, session: u64, inputs: &[(u64, u64)]) {
+        if !self.supported() {
+            unresolved_direct(session, inputs, "display_timing_unsupported");
+            return;
+        }
+        if inputs.is_empty() && !DISPLAY_STATS_ENABLED.with(Cell::get) { return }
         self.frames_since_poll += 1;
         let now = monotonic_ns();
         // Bound the interval at low submission rates as well as the frame count.
         if self.frames_since_poll >= 4 || now.saturating_sub(self.last_poll_ns) >= 100_000_000 {
             self.poll(surface);
         }
-        if self.query_failed { return; }
-        let Some(hal) = (unsafe { surface.as_hal::<wgpu::hal::api::Vulkan>() }) else { return; };
+        if self.query_failed {
+            unresolved_direct(session, inputs, "display_timing_query_failed");
+            return;
+        }
+        let Some(hal) = (unsafe { surface.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+            unresolved_direct(session, inputs, "non_vulkan_surface");
+            return;
+        };
         let id = self.next_id;
         self.next_id = id.wrapping_add(1).max(1);
         // The acquired surface frame keeps this swapchain configured. Zero
         // desired time tags the frame without requesting a scheduling delay.
         hal.set_next_present_time(ash::vk::PresentTimeGOOGLE::default().present_id(id));
         if self.pending.len() == 32 {
-            self.pending.pop_front();
+            let pending = self.pending.pop_front().unwrap();
+            unresolved_inputs(&pending, "present_queue_overflow");
             self.unresolved += 1;
         }
-        self.pending.push_back((id, monotonic_ns()));
+        self.pending.push_back(PendingDisplay {
+            session, id, submitted_ns: monotonic_ns(), inputs: inputs.to_vec(),
+        });
     }
 
     fn poll(&mut self, surface: &wgpu::Surface<'_>) {
@@ -94,26 +116,30 @@ impl DisplayTiming {
         match result {
             Ok(rows) => {
                 for row in rows {
-                    let Some(index) = self.pending.iter().position(|(id, _)| *id == row.present_id) else { continue; };
+                    let Some(index) = self.pending.iter().position(|pending| pending.id == row.present_id) else { continue; };
                     if row.actual_present_time == 0 { continue; }
-                    let (_, submitted_ns) = self.pending.remove(index).unwrap();
+                    let pending = self.pending.remove(index).unwrap();
                     self.displayed += 1;
                     if row.actual_present_time > self.latest_ns {
                         self.latest_ns = row.actual_present_time;
-                        self.queue_to_display_ns = row.actual_present_time.saturating_sub(submitted_ns);
+                        self.queue_to_display_ns = row.actual_present_time.saturating_sub(pending.submitted_ns);
                     }
+                    displayed_inputs(&pending, row.actual_present_time);
                 }
             }
             Err(error) => {
                 self.unresolved += self.pending.len() as u64;
-                self.pending.clear();
+                for pending in self.pending.drain(..) {
+                    unresolved_inputs(&pending, "display_timing_query_failed");
+                }
                 self.query_failed = true;
                 report(&format!("vulkan_display_timing=query_failed reason={error}"));
             }
         }
         let now = monotonic_ns();
-        while self.pending.front().is_some_and(|(_, submitted)| now.saturating_sub(*submitted) > 2_500_000_000) {
-            self.pending.pop_front();
+        while self.pending.front().is_some_and(|pending| now.saturating_sub(pending.submitted_ns) > 2_500_000_000) {
+            let pending = self.pending.pop_front().unwrap();
+            unresolved_inputs(&pending, "present_timeout");
             self.unresolved += 1;
         }
     }
@@ -131,6 +157,47 @@ fn monotonic_ns() -> u64 {
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } != 0 { return 0; }
     let now = unsafe { now.assume_init() };
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+}
+
+fn photon_report(message: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: std::ffi::c_int, tag: *const std::ffi::c_char,
+            text: *const std::ffi::c_char) -> std::ffi::c_int;
+    }
+    if let Ok(message) = std::ffi::CString::new(message) {
+        unsafe { __android_log_write(4, c"CS2Perf".as_ptr(), message.as_ptr()); }
+    }
+}
+
+fn unresolved_direct(session: u64, inputs: &[(u64, u64)], reason: &str) {
+    for &(input_id, input) in inputs {
+        photon_report(&format!(
+            "input_photon_unresolved session={session} input_id={input_id} input_mono_us={input} reason={reason}"
+        ));
+    }
+}
+
+fn unresolved_inputs(pending: &PendingDisplay, reason: &str) {
+    unresolved_direct(pending.session, &pending.inputs, reason);
+}
+
+fn displayed_inputs(pending: &PendingDisplay, actual_present_ns: u64) {
+    let submit_to_photon_us = actual_present_ns.saturating_sub(pending.submitted_ns) / 1000;
+    for &(input_id, input) in &pending.inputs {
+        let Some(input_ns) = input.checked_mul(1000) else {
+            unresolved_direct(pending.session, &[(input_id, input)], "clock_overflow");
+            continue;
+        };
+        if actual_present_ns < input_ns {
+            unresolved_direct(pending.session, &[(input_id, input)], "clock_order");
+            continue;
+        }
+        photon_report(&format!(
+            "input_photon session={} input_id={input_id} input_mono_us={input} present_id={} actual_present_ns={actual_present_ns} input_to_photon_us={} submit_to_photon_us={submit_to_photon_us}",
+            pending.session, pending.id, (actual_present_ns - input_ns) / 1000,
+        ));
+    }
 }
 
 #[link(name = "android")]
@@ -219,7 +286,7 @@ impl Presenter {
         Ok(Self { surface, window, pipeline, layout, logical_buffer, uniforms, config, display_timing })
     }
 
-    fn render(&mut self, raster: &Raster, canvas: &Canvas) -> Result<bool> {
+    fn render(&mut self, raster: &Raster, canvas: &Canvas, session: u64, inputs: &[(u64, u64)]) -> Result<bool> {
         let Some([width, height]) = Self::size(self.window.0) else { return Ok(false) };
         if [width, height] != [self.config.width, self.config.height] {
             self.config.width = width;
@@ -280,7 +347,7 @@ impl Presenter {
             pass.draw(0..3, 0..1);
         }
         raster.queue.submit(Some(encoder.finish()));
-        self.display_timing.on_submit(&self.surface);
+        self.display_timing.on_submit(&self.surface, session, inputs);
         frame.present();
         Ok(true)
     }
@@ -315,7 +382,9 @@ pub(crate) fn candidate(window: NonNull<c_void>) -> bool {
     })
 }
 
-pub(crate) fn present_canvas(window: NonNull<c_void>, canvas: &Canvas) -> i32 {
+pub(crate) fn present_canvas(
+    window: NonNull<c_void>, canvas: &Canvas, session: u64, input_mono_us: &[(u64, u64)],
+) -> i32 {
     RASTER.with_borrow_mut(|slot| {
         let Some(raster) = slot.as_mut() else { return 1 };
         if raster.failed.load(Ordering::Relaxed) || raster.failed_window == Some(window.as_ptr() as usize) {
@@ -328,7 +397,7 @@ pub(crate) fn present_canvas(window: NonNull<c_void>, canvas: &Canvas) -> i32 {
                 let Some(size) = Presenter::size(window) else { return Ok(false) };
                 presenter = Some(Presenter::new(raster, window, size)?);
             }
-            presenter.as_mut().unwrap().render(raster, canvas)
+            presenter.as_mut().unwrap().render(raster, canvas, session, input_mono_us)
         })();
         match result {
             Ok(posted) => {

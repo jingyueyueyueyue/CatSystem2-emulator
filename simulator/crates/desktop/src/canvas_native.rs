@@ -291,7 +291,7 @@ pub(super) struct CanvasNativeState {
     split_row: u32,
     tiles: Vec<Option<Tile>>,
     view: Option<(MoviePlaneProjection, BTreeMap<u32, PlaneCamera>)>,
-    pub(super) offscreen: Option<RgbaFrame>,
+    offscreen: Option<Canvas>,
 }
 
 impl CanvasNativeState {
@@ -853,14 +853,10 @@ impl LoggingHost<'_> {
                         .as_ref()
                         .map_or(surface_size, |buffer| [buffer.width(), buffer.height()]);
                     let mut output = Canvas::new(size[0], size[1])?;
-                    output.clear(Color::TRANSPARENT);
                     let [lower, upper] = depth.unwrap();
                     self.draw_scene_depth_range(&mut output, lower, upper)?;
-                    self.data_services.canvas_native.offscreen = Some(RgbaFrame::from_rgba8(
-                        output.width(),
-                        output.height(),
-                        output.pixels().to_vec(),
-                    )?);
+                    // The graph snapshot is the sole pixel consumer of this capture.
+                    self.data_services.canvas_native.offscreen = Some(output);
                 }
                 _ => bail!("canvas native {index} has no contract"),
             }

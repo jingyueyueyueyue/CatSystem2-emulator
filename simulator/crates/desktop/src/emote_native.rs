@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use cs2_renderer::{BlendMode, Canvas, Rect};
@@ -14,11 +14,13 @@ use cs2_runtime::ResourceIndex;
 use cs2_runtime::emote::{
     CpuEmoteBackend, CpuEmoteResources, CpuM2ActionConfig, CpuM2Config, CpuM2ControllerConfig,
     CpuM2DifferenceTransform, CpuM2LipBinding, CpuM2LipSidecarKind, CpuM2Load, CpuM2LoadSpec,
+    CpuM2ModelSource, EmoteArchiveVersion,
     CpuM2ProfileSelection, CpuM2ResetBankSeeds, CpuM2SplineConfig, CpuViewport, EmoteBatchValue, EmoteBuffer,
     EmoteCommand, EmoteDispatchShape, EmoteError, EmoteNativeDescriptor, EmotePacking,
     EmoteRasterFrame, EmoteReply, EmoteResource, EmoteServices, EmoteTick, NEKOPARA_PE_SHA256,
     emote_native_descriptor,
 };
+use cs2_runtime::resource_router::ResourceMode;
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
 use super::{LoggingHost, expand_kcs_format};
@@ -26,6 +28,7 @@ use super::perf_detail::SlowTask;
 
 const MAX_FORMAT_BYTES: usize = 4095;
 const MAX_BATCH_ENTRIES: usize = 1_000_000;
+const EMOTE_BLEND_PARALLEL_PIXELS: usize = 128 * 1024;
 
 #[path = "emote_geometry.rs"]
 mod geometry;
@@ -205,7 +208,7 @@ pub(super) struct EmoteM2ResourcePlan {
     pub(super) difference_transforms: Vec<(Vec<u8>, CpuM2DifferenceTransform)>,
     pub(super) config_files: BTreeMap<Vec<u8>, CpuM2Config>,
     pub(super) resource_name: Vec<u8>,
-    pub(super) resource: Option<EmoteResource>,
+    resource_category: Vec<u8>,
     pub(super) controller_config: CpuM2ControllerConfig,
     pub(super) secondary_config: CpuM2ControllerConfig,
     pub(super) reset_bank_seeds: CpuM2ResetBankSeeds,
@@ -223,7 +226,6 @@ pub(super) fn load_m2_resource_plan(
         startup_config_name,
         formatted_spec,
         None,
-        None,
     )
 }
 
@@ -232,7 +234,6 @@ fn load_m2_resource_plan_impl(
     startup_config_category: &[u8],
     startup_config_name: &[u8],
     formatted_spec: &[u8],
-    reusable_resource_name: Option<&[u8]>,
     task: Option<u32>,
 ) -> std::result::Result<EmoteM2ResourcePlan, EmoteError> {
     fn read(
@@ -343,25 +344,13 @@ fn load_m2_resource_plan_impl(
     resource_name.push(b'.');
     resource_name.extend_from_slice(&extension);
     drop(config_timer);
-    //17a990 preserves an already loaded resource with the same name. Avoid
-    //reading/inflating a68MiB PSB for every script pattern/timeline change.
-    let resource = if reusable_resource_name == Some(resource_name.as_slice()) {
-        None
-    } else {
-        let packed = {
-            let _timing = task.map(|id| SlowTask::new(id, || 54, "emote_psz_read").named(&resource_name, None));
-            read(resources, archive_category, &resource_name)?
-        };
-        let _timing = task.map(|id| SlowTask::new(id, || 54, "emote_psz_decode").named(&resource_name, None));
-        Some(EmoteResource::decode(&packed)?)
-    };
     Ok(EmoteM2ResourcePlan {
         load_spec,
         selection,
         difference_transforms: differences,
         config_files: configs,
         resource_name,
-        resource,
+        resource_category: archive_category.to_vec(),
         controller_config,
         secondary_config,
         reset_bank_seeds,
@@ -420,6 +409,7 @@ pub(super) struct EmoteNativeServices {
     material_settings: settings::M2Settings,
     spline_config: Arc<CpuM2SplineConfig>,
     action_config: Arc<CpuM2ActionConfig>,
+    prepared_frames: BTreeMap<u32, EmoteRasterFrame>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -799,6 +789,11 @@ impl EmoteNativeServices {
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         if crate::gpu_raster::emote_requested() {
             backend.set_rasterizer(crate::gpu_raster::draw_emote);
+            backend.set_surface_gpu(
+                crate::gpu_raster::mix_emote_surfaces,
+                crate::gpu_raster::prepare_emote_surfaces,
+                crate::gpu_raster::expand_emote_surface,
+            );
         }
         self.state.set_backend(Box::new(backend)).map_err(error)?;
         self.target_size = Some(size);
@@ -819,16 +814,51 @@ impl EmoteNativeServices {
         spec: &[u8],
         mode: u32,
     ) -> Result<NativeReturn> {
-        let current_name = self.state.playback_info(task).ok().map(|i| i.resource_name);
         let plan = load_m2_resource_plan_impl(
             resources,
             b"m2config",
             b"m2view.cnf",
             spec,
-            current_name.as_deref(),
             Some(task),
         )
         .map_err(error)?;
+        let (name, _, invalid) = encoding_rs::SHIFT_JIS.decode(&plan.resource_name);
+        if invalid || plan.resource_name.is_empty() || plan.resource_name.len() > MAX_FORMAT_BYTES
+            || plan.resource_name.contains(&0)
+        {
+            return Err(error(EmoteError::InvalidResource("M2 resource name")));
+        }
+        let names = resources.category_names(&plan.resource_category, &name)
+            .map_err(|cause| error(EmoteError::Backend(cause.to_string())))?;
+        let mut candidate = None;
+        for name in &names {
+            candidate = resources.resolve_mode_candidate(name, ResourceMode::LooseFirst)
+                .map_err(|cause| error(EmoteError::Backend(cause.to_string())))?;
+            if candidate.is_some() { break; }
+        }
+        let candidate = candidate.ok_or_else(|| error(EmoteError::Backend(format!(
+            "resource not found: {}", names.join(" | ")
+        ))))?;
+        let mut version = EmoteArchiveVersion::observe(candidate);
+        let cached = version.as_ref().and_then(|version| {
+            self.state.cached_m2_model(task, &plan.resource_name, version)
+        });
+        let decoded;
+        let source = if let Some((model, version)) = cached.zip(version.clone()) {
+            CpuM2ModelSource::Shared(model, version)
+        } else {
+            let packed = {
+                let _timing = SlowTask::new(task, || 54, "emote_psz_read").named(&plan.resource_name, None);
+                resources.read_candidate(candidate)
+                    .map_err(|cause| error(EmoteError::Backend(cause.to_string())))?
+            };
+            if version.is_some() && version != EmoteArchiveVersion::observe(candidate) {
+                version = None;
+            }
+            let _timing = SlowTask::new(task, || 54, "emote_psz_decode").named(&plan.resource_name, None);
+            decoded = EmoteResource::decode(&packed).map_err(error)?;
+            CpuM2ModelSource::Decoded(&decoded, version)
+        };
         let mut secondary_variables = plan.secondary_config.default_variables().map_err(error)?;
         let secondary_force_defaults = secondary_variables.clone();
         for (dimension, label) in plan
@@ -878,7 +908,7 @@ impl EmoteNativeServices {
         };
         {
             let _timing = SlowTask::new(task, || 54, "emote_m2_import").named(&plan.resource_name, None);
-            self.state.import_m2_resource(task, &plan.resource_name, plan.resource.as_ref(), load)
+            self.state.import_m2_resource(task, &plan.resource_name, source, load)
                 .map_err(error)?;
         }
         let placement = self.placements.entry(task).or_default();
@@ -912,8 +942,37 @@ impl EmoteNativeServices {
             ));
         }
         self.state.set_base_argb(node.id, node.color)?;
-        self.draw(node.id, canvas)?;
+        if let Some(frame) = self.prepared_frames.remove(&node.id) {
+            self.submit_frame(node.id, canvas, frame)?;
+        } else {
+            self.draw(node.id, canvas)?;
+        }
         Ok(true)
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn prepare_scene_tasks<'a>(
+        &mut self, nodes: impl IntoIterator<Item = &'a super::SceneNode>, size: [u32; 2],
+    ) -> std::result::Result<(), EmoteError> {
+        self.prepared_frames.clear();
+        let mut tasks = Vec::new();
+        for node in nodes {
+            let Some(state) = self.state.state(node.id) else { continue };
+            if state.successful_resource_imports == 0 || node.color != 0xffff_ffff { continue }
+            self.state.set_base_argb(node.id, node.color)?;
+            if self.state.can_defer_scene_raster(node.id) {
+                tasks.push(node.id);
+            }
+        }
+        if tasks.len() > 1 {
+            let players: Vec<_> = tasks.iter().filter_map(|&task| self.state.scene_raster_player(task)).collect();
+            super::gpu_raster::prepare_emote_poses(&players);
+        }
+        for task in tasks {
+            let frame = self.render_frame(task, size)?;
+            self.prepared_frames.insert(task, frame);
+        }
+        Ok(())
     }
 
     /// Covers the whole36-slot complex family, including explicit diagnostics.
@@ -1134,24 +1193,26 @@ impl EmoteNativeServices {
         Ok(NativeReturn::Continue)
     }
 
-    /// Render an actual evaluated frame, then submit its RGBA into the same CPU
-    /// canvas used by other objects. Never substitute a static or empty frame.
-    pub(super) fn draw(
-        &mut self,
-        resolved_target: u32,
-        canvas: &mut Canvas,
-    ) -> std::result::Result<usize, EmoteError> {
+    fn render_frame(
+        &mut self, resolved_target: u32, size: [u32; 2],
+    ) -> std::result::Result<EmoteRasterFrame, EmoteError> {
         let frame = {
             let _timing = SlowTask::new(resolved_target, || 54, "emote_render_rgba");
             self.state.render_rgba(resolved_target)?
         };
         let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
-        let frame = if blend == BlendMode::SourceOver {
-            frame
+        if blend == BlendMode::SourceOver || frame.device().is_some() {
+            Ok(frame)
         } else {
             // Other blend modes can depend on transparent pixels outside the pose bounds.
-            frame.into_viewport([canvas.width(), canvas.height()])?
-        };
+            frame.into_viewport(size)
+        }
+    }
+
+    fn submit_frame(
+        &mut self, resolved_target: u32, canvas: &mut Canvas, frame: EmoteRasterFrame,
+    ) -> std::result::Result<usize, EmoteError> {
+        let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
         let submitted = {
             let _timing = SlowTask::new(resolved_target, || 54, "emote_blend");
             submit_rgba(canvas, &frame, blend)?
@@ -1160,6 +1221,17 @@ impl EmoteNativeServices {
             self.state.record_pixel_submission(resolved_target)?;
         }
         Ok(submitted)
+    }
+
+    /// Render an actual evaluated frame, then blend its device or CPU pixels
+    /// into the scene canvas. Never substitute a static or empty frame.
+    pub(super) fn draw(
+        &mut self,
+        resolved_target: u32,
+        canvas: &mut Canvas,
+    ) -> std::result::Result<usize, EmoteError> {
+        let frame = self.render_frame(resolved_target, [canvas.width(), canvas.height()])?;
+        self.submit_frame(resolved_target, canvas, frame)
     }
 }
 
@@ -1316,10 +1388,26 @@ fn error(error: EmoteError) -> ScriptError {
     super::native_state_error_owned(error.to_string())
 }
 
+fn emote_blend_workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |count| count.get()).min(4)
+    })
+}
+
 pub(super) fn submit_rgba(
     canvas: &mut Canvas,
     frame: &EmoteRasterFrame,
     blend: BlendMode,
+) -> std::result::Result<usize, EmoteError> {
+    submit_rgba_with_workers(canvas, frame, blend, emote_blend_workers())
+}
+
+fn submit_rgba_with_workers(
+    canvas: &mut Canvas,
+    frame: &EmoteRasterFrame,
+    blend: BlendMode,
+    workers: usize,
 ) -> std::result::Result<usize, EmoteError> {
     let [origin_x, origin_y] = frame.origin();
     let left = i64::from(origin_x).max(0);
@@ -1330,6 +1418,12 @@ pub(super) fn submit_rgba(
         return Ok(0);
     }
     let submitted = ((right - left) * (bottom - top)) as usize;
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if crate::gpu_raster::blend_emote(canvas, frame, blend)
+        .map_err(|error| EmoteError::Backend(error.to_string()))?
+    {
+        return Ok(submitted);
+    }
     let source_over = blend == BlendMode::SourceOver;
     let (left, top, right, bottom) = if source_over {
         let Some([first_x, first_y, end_x, end_y]) = frame.alpha_bounds() else {
@@ -1355,7 +1449,16 @@ pub(super) fn submit_rgba(
     let source_x = (left - i64::from(origin_x)) as usize;
     let source_y = (top - i64::from(origin_y)) as usize;
     let offset = source_y * stride + source_x * 4;
-    canvas.blend_rgba_rows(target, &frame.rgba()[offset..], stride, blend)
+    let area = target.width as usize * target.height as usize;
+    let workers = if source_over
+        && area >= EMOTE_BLEND_PARALLEL_PIXELS
+        && target.height >= 16
+    {
+        workers
+    } else {
+        1
+    };
+    canvas.blend_rgba_rows_with_workers(target, &frame.rgba()[offset..], stride, blend, workers)
         .map_err(|error| EmoteError::Backend(error.to_string()))?;
     Ok(submitted)
 }
@@ -1391,6 +1494,76 @@ mod tests {
             }
             assert_eq!(submit_rgba(&mut fast, &frame, blend).unwrap(), 6);
             assert_eq!(fast.pixels(), reference.pixels());
+        }
+    }
+
+    #[test]
+    fn large_source_over_submission_matches_serial_with_clipped_transparent_edges() {
+        const FRAME_WIDTH: usize = 514;
+        const FRAME_HEIGHT: usize = 258;
+        const CANVAS_WIDTH: usize = 512;
+        const CANVAS_HEIGHT: usize = 256;
+        let mut rgba = Vec::with_capacity(FRAME_WIDTH * FRAME_HEIGHT * 4);
+        for y in 0..FRAME_HEIGHT {
+            for x in 0..FRAME_WIDTH {
+                let value = (x * 17 + y * 31) as u8;
+                let alpha = match (x + y) % 7 {
+                    0 => 0,
+                    1 => 255,
+                    _ => value,
+                };
+                rgba.extend_from_slice(&[value, value.wrapping_add(3), value.wrapping_add(9), alpha]);
+            }
+        }
+        let frame = EmoteRasterFrame::new(
+            FRAME_WIDTH as u32,
+            FRAME_HEIGHT as u32,
+            [-1, -1],
+            rgba,
+        )
+        .unwrap();
+        let background: Vec<u8> = (0..CANVAS_WIDTH * CANVAS_HEIGHT)
+            .flat_map(|index| {
+                let value = index as u8;
+                [value, value.wrapping_add(11), value.wrapping_add(23), 200]
+            })
+            .collect();
+        let mut reference = Canvas::from_rgba8(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32, background.clone())
+            .unwrap();
+        for y in 0..CANVAS_HEIGHT {
+            for x in 0..CANVAS_WIDTH {
+                let source = ((y + 1) * FRAME_WIDTH + x + 1) * 4;
+                let [red, green, blue, alpha] = frame.rgba()[source..source + 4] else {
+                    unreachable!()
+                };
+                reference
+                    .blend_pixel_with_mode(
+                        x as i32,
+                        y as i32,
+                        Color::rgba(red, green, blue, alpha),
+                        BlendMode::SourceOver,
+                    )
+                    .unwrap();
+            }
+        }
+        for workers in [1, 2, 4] {
+            let mut actual = Canvas::from_rgba8(
+                CANVAS_WIDTH as u32,
+                CANVAS_HEIGHT as u32,
+                background.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                submit_rgba_with_workers(
+                    &mut actual,
+                    &frame,
+                    BlendMode::SourceOver,
+                    workers,
+                )
+                .unwrap(),
+                CANVAS_WIDTH * CANVAS_HEIGHT
+            );
+            assert_eq!(actual.pixels(), reference.pixels(), "workers={workers}");
         }
     }
 

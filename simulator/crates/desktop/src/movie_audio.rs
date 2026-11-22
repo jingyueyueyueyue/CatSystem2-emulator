@@ -15,6 +15,13 @@ pub trait MovieAudioOutput: Send {
     }
     fn drained(&mut self) -> RuntimeResult<bool>;
     fn pause(&mut self, paused: bool) -> RuntimeResult<()>;
+    /// A worker may acknowledge a start once its primed device accepts the
+    /// request. Device confirmation and any subsequent error stay with the
+    /// worker. False means the caller is gone and the worker can stop.
+    fn start_with_acknowledgement(&mut self, acknowledge: &mut dyn FnMut() -> bool) -> RuntimeResult<bool> {
+        self.pause(false)?;
+        Ok(acknowledge())
+    }
     fn stop(&mut self) -> RuntimeResult<()>;
 }
 

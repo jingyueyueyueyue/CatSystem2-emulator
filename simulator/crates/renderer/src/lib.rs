@@ -20,6 +20,8 @@ mod image_surface;
 mod raster;
 mod row_pool;
 pub use raster::draw_pixel_rows;
+#[doc(hidden)]
+pub use row_pool::parallel_for_each;
 mod text_cache;
 pub use capture::encode_capture_bmp;
 
@@ -1182,32 +1184,142 @@ pub struct Canvas {
 /// Optional device output for a canvas. The platform implementation and its
 /// resource stay alive while the game still owns this logical frame.
 pub trait CanvasReadback: std::any::Any + std::fmt::Debug + Send + Sync {
+    #[track_caller]
     fn read_rgba(&self, output: &mut [u8]) -> bool;
+    #[doc(hidden)]
+    fn read_rgba_at(&self, output: &mut [u8], _location: &'static std::panic::Location) -> bool {
+        self.read_rgba(output)
+    }
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[derive(Debug, Clone)]
 enum CanvasPixels {
     Cpu(Vec<u8>),
-    Device {
-        pixels: Arc<Vec<u8>>,
-        source: Arc<dyn CanvasReadback>,
-    },
+    Device(Arc<DevicePixels>),
+}
+
+#[derive(Debug)]
+struct DevicePixels {
+    pixels: OnceLock<Vec<u8>>,
+    source: Arc<dyn CanvasReadback>,
+    bytes: usize,
+    recycled: std::sync::Mutex<Vec<u8>>,
+}
+
+impl DevicePixels {
+    fn new(source: Arc<dyn CanvasReadback>, pixels: Option<Vec<u8>>, bytes: usize) -> Self {
+        Self {
+            pixels: pixels.map_or_else(OnceLock::new, OnceLock::from), source, bytes,
+            recycled: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_recycled(mut self, pixels: Vec<u8>) -> Self {
+        *self.recycled.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()) = pixels;
+        self
+    }
+
+    fn take_recycled(&self) -> Vec<u8> {
+        let mut recycled = self.recycled.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *recycled)
+    }
+
+    #[track_caller]
+    fn pixels(&self) -> &[u8] {
+        let location = std::panic::Location::caller();
+        self.pixels.get_or_init(|| {
+            let mut pixels = self.take_recycled();
+            pixels.resize(self.bytes, 0);
+            if !self.source.read_rgba_at(&mut pixels, location) {
+                panic!("device pixel readback failed; rebuild the frame instead of using stale pixels");
+            }
+            pixels
+        })
+    }
+
+    #[track_caller]
+    fn into_vec(self) -> Vec<u8> {
+        self.pixels();
+        self.pixels.into_inner().unwrap()
+    }
 }
 
 impl CanvasPixels {
+    #[track_caller]
     fn make_cpu(&mut self) -> &mut Vec<u8> {
-        if let Self::Device { pixels, .. } = self {
-            *self = Self::Cpu(Arc::unwrap_or_clone(std::mem::take(pixels)));
+        if matches!(self, Self::Device(_)) {
+            let current = std::mem::replace(self, Self::Cpu(Vec::new()));
+            let Self::Device(pixels) = current else { unreachable!() };
+            *self = Self::Cpu(match Arc::try_unwrap(pixels) {
+                Ok(pixels) => pixels.into_vec(),
+                Err(pixels) => {
+                    let mut output = pixels.take_recycled();
+                    if let Some(cached) = pixels.pixels.get() {
+                        output.clear();
+                        output.extend_from_slice(cached);
+                    } else {
+                        output.resize(pixels.bytes, 0);
+                        if !pixels.source.read_rgba_at(&mut output, std::panic::Location::caller()) {
+                            panic!("device pixel readback failed; rebuild the frame instead of using stale pixels");
+                        }
+                    }
+                    output
+                }
+            });
         }
         let Self::Cpu(pixels) = self else { unreachable!() };
         pixels
     }
 
+    fn overwrite(&mut self) -> &mut Vec<u8> {
+        if matches!(self, Self::Device(_)) {
+            let current = std::mem::replace(self, Self::Cpu(Vec::new()));
+            let Self::Device(pixels) = current else { unreachable!() };
+            *self = Self::Cpu(match Arc::try_unwrap(pixels) {
+                Ok(pixels) => {
+                    let bytes = pixels.bytes;
+                    let recycled = pixels.recycled.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut output = pixels.pixels.into_inner().unwrap_or(recycled);
+                    output.resize(bytes, 0);
+                    output
+                }
+                Err(pixels) => {
+                    let mut output = pixels.take_recycled();
+                    output.resize(pixels.bytes, 0);
+                    output
+                }
+            });
+        }
+        let Self::Cpu(pixels) = self else { unreachable!() };
+        pixels
+    }
+
+    fn take_for_recycle(&mut self) -> Vec<u8> {
+        let current = std::mem::replace(self, Self::Cpu(Vec::new()));
+        match current {
+            Self::Cpu(pixels) => pixels,
+            Self::Device(pixels) => match Arc::try_unwrap(pixels) {
+                Ok(pixels) => {
+                    let mut recycled = pixels.recycled.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if recycled.is_empty() {
+                        recycled = pixels.pixels.into_inner().unwrap_or_default();
+                    }
+                    recycled
+                }
+                Err(pixels) => pixels.take_recycled(),
+            },
+        }
+    }
+
+    #[track_caller]
     fn into_vec(self) -> Vec<u8> {
         match self {
             Self::Cpu(pixels) => pixels,
-            Self::Device { pixels, .. } => Arc::unwrap_or_clone(pixels),
+            Self::Device(pixels) => match Arc::try_unwrap(pixels) {
+                Ok(pixels) => pixels.into_vec(),
+                Err(pixels) => pixels.pixels().to_vec(),
+            },
         }
     }
 }
@@ -1215,15 +1327,17 @@ impl CanvasPixels {
 impl Deref for CanvasPixels {
     type Target = [u8];
 
+    #[track_caller]
     fn deref(&self) -> &[u8] {
         match self {
             Self::Cpu(pixels) => pixels,
-            Self::Device { pixels, .. } => pixels,
+            Self::Device(pixels) => pixels.pixels(),
         }
     }
 }
 
 impl std::ops::DerefMut for CanvasPixels {
+    #[track_caller]
     fn deref_mut(&mut self) -> &mut [u8] {
         self.make_cpu()
     }
@@ -1277,10 +1391,15 @@ impl Canvas {
         (self.width, self.height)
     }
 
+    #[track_caller]
     pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+        match &self.pixels {
+            CanvasPixels::Cpu(pixels) => pixels,
+            CanvasPixels::Device(pixels) => pixels.pixels(),
+        }
     }
 
+    #[track_caller]
     pub fn pixels_mut(&mut self) -> &mut [u8] {
         &mut self.pixels
     }
@@ -1295,7 +1414,7 @@ impl Canvas {
         if !source.read_rgba(&mut pixels) {
             return Err(RendererError::DeviceReadbackFailed);
         }
-        self.pixels = CanvasPixels::Device { pixels: Arc::new(pixels), source };
+        self.pixels = CanvasPixels::Device(Arc::new(DevicePixels::new(source, Some(pixels), bytes)));
         Ok(())
     }
 
@@ -1312,13 +1431,22 @@ impl Canvas {
         let mut verified = Vec::new();
         verified.try_reserve_exact(bytes).map_err(|_| RendererError::AllocationFailed { bytes })?;
         verified.extend_from_slice(pixels);
-        self.pixels = CanvasPixels::Device { pixels: Arc::new(verified), source };
+        self.pixels = CanvasPixels::Device(Arc::new(DevicePixels::new(source, Some(verified), bytes)));
         Ok(())
+    }
+
+    /// Keep the frame on the device until a CPU consumer actually asks for it.
+    pub fn set_deferred_device_pixels(&mut self, source: Arc<dyn CanvasReadback>) {
+        let bytes = rgba_len(self.width, self.height).unwrap();
+        let recycled = self.pixels.take_for_recycle();
+        self.pixels = CanvasPixels::Device(Arc::new(
+            DevicePixels::new(source, None, bytes).with_recycled(recycled),
+        ));
     }
 
     pub fn device_pixels(&self) -> Option<&dyn CanvasReadback> {
         match &self.pixels {
-            CanvasPixels::Device { source, .. } => Some(&**source),
+            CanvasPixels::Device(pixels) => Some(&*pixels.source),
             CanvasPixels::Cpu(_) => None,
         }
     }
@@ -1335,7 +1463,7 @@ impl Canvas {
     }
 
     pub fn clear(&mut self, color: Color) {
-        self.pixels.as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
+        self.pixels.overwrite().as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> Result<Color> {
@@ -1397,6 +1525,19 @@ impl Canvas {
         stride: usize,
         mode: BlendMode,
     ) -> Result<()> {
+        self.blend_rgba_rows_with_workers(rect, rows, stride, mode, 1)
+    }
+
+    /// Blends independent destination rows with an optional worker budget.
+    /// SourceOver may run in parallel; other modes retain serial submission.
+    pub fn blend_rgba_rows_with_workers(
+        &mut self,
+        rect: Rect,
+        rows: &[u8],
+        stride: usize,
+        mode: BlendMode,
+        workers: usize,
+    ) -> Result<()> {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
         }
@@ -1412,13 +1553,16 @@ impl Canvas {
             return Err(RendererError::InvalidEffectParameter { name: "RGBA row source" });
         }
         let target_stride = self.width as usize * 4;
-        let target_offset = rect.y as usize * target_stride + rect.x as usize * 4;
-        let pixels = &mut self.pixels[target_offset..];
-        for row in 0..height {
-            let target_start = row * target_stride;
-            let source_start = row * stride;
-            let target = &mut pixels[target_start..target_start + row_bytes];
+        let first_target_row = rect.y as usize;
+        let target = &mut self.pixels[first_target_row * target_stride
+            ..(first_target_row + height) * target_stride];
+        let workers = if mode == BlendMode::SourceOver { workers } else { 1 };
+        let left = rect.x as usize * 4;
+        let source_top = rect.y as usize;
+        raster::draw_pixel_rows(target, target_stride, rect.y as u32, workers, |target, y| {
+            let source_start = (y as usize - source_top) * stride;
             let source = &rows[source_start..source_start + row_bytes];
+            let target = &mut target[left..left + row_bytes];
             let pairs = target.as_chunks_mut::<4>().0.iter_mut().zip(source.as_chunks::<4>().0);
             if mode == BlendMode::SourceOver {
                 for (destination, source) in pairs {
@@ -1433,7 +1577,7 @@ impl Canvas {
                     blend_special(destination, source, mode);
                 }
             }
-        }
+        });
         Ok(())
     }
 

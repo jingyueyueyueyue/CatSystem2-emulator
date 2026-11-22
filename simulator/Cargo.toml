@@ -40,7 +40,21 @@ strip = "symbols"
 inherits = "dev"
 opt-level = 1
 debug = 0
+debug-assertions = false
+overflow-checks = false
+incremental = false
 lto = "off"
+strip = "debuginfo"
+
+[profile.perf]
+inherits = "release"
+opt-level = 3
+debug = 0
+debug-assertions = false
+overflow-checks = false
+incremental = false
+lto = "thin"
+codegen-units = 16
 strip = "debuginfo"
 
 [profile.playthrough.package.cs2-renderer]
@@ -51,6 +65,9 @@ opt-level = 3
 inherits = "dev"
 opt-level = 1
 debug = 1
+debug-assertions = false
+overflow-checks = false
+incremental = false
 lto = false
 codegen-units = 16
 panic = "abort"

@@ -148,6 +148,10 @@ impl crate::movie_audio::MovieAudioOutput for TrackedOutput {
         let _timing = crate::perf_detail::audio::Stage::Activate.begin();
         self.output.pause(value)
     }
+    fn start_with_acknowledgement(&mut self, acknowledge: &mut dyn FnMut() -> bool) -> cs2_runtime::RuntimeResult<bool> {
+        let _timing = crate::perf_detail::audio::Stage::Activate.begin();
+        self.output.start_with_acknowledgement(acknowledge)
+    }
     fn stop(&mut self) -> cs2_runtime::RuntimeResult<()> { self.output.stop() }
 }
 
@@ -320,7 +324,7 @@ impl WavAudioHost {
             let worker = thread::Builder::new().name(format!("cs2-pcm-restore-{id}")).spawn(move || {
                 let startup_error = started.clone();
                 let result = super::pcm_worker::run_playback(
-                    source, &worker_resource, controls, 0, saved.loop_spec, suspended, rx, started, Some(saved),
+                    source, &worker_resource, controls, 0, saved.loop_spec, suspended, rx, started, Some(saved), false,
                     #[cfg(target_os = "android")]
                     None,
                 );

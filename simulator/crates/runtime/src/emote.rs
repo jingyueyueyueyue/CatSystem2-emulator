@@ -5,9 +5,11 @@
 //! unsupported features. No blank-frame or constant-success backend exists.
 //! Evidence: reports/recovery_A_20261116_emote.json.
 
-use std::{collections::BTreeMap, fmt, sync::{Arc, OnceLock}};
+use std::{collections::BTreeMap, fmt, fs, sync::{Arc, OnceLock}, time::SystemTime};
 
 use flate2::{Decompress, FlushDecompress, Status};
+
+use crate::{ResourceCandidate, ResourceLocation};
 
 #[path = "emote_clamp.rs"]
 mod clamp;
@@ -61,6 +63,7 @@ mod psb;
 mod stencil;
 #[path = "emote_surface.rs"]
 mod surface;
+pub use surface::{EmoteSurfaceExpand, EmoteSurfaceMixer, EmoteSurfacePrepare};
 #[path = "emote_texture.rs"]
 mod texture;
 #[path = "emote_timeline.rs"]
@@ -75,7 +78,7 @@ pub use control::{
 pub use cpu::{
     CpuEmoteBackend, CpuEmoteResources, CpuMotionModel, CpuPlayer, CpuTexture, CpuViewport,
     DiagnosticFrame, EmoteDrawDiagnostics, EmoteDrawTarget, EmoteSpriteMesh, EmoteSpritePass,
-    EmoteTextureSpan, decode_rgba_rle, rasterize_emote_stencil_triangle, repair_emote_raster,
+    EmoteRepairScratch, EmoteTextureSpan, OwnedEmoteSpriteMesh, decode_rgba_rle, rasterize_emote_stencil_triangle, repair_emote_raster,
     visit_emote_texture_spans,
 };
 pub use dispatch::{
@@ -194,6 +197,45 @@ pub struct EmoteResource {
     pub header: PsbHeader,
     pub psz_reserved: Option<u32>,
     bytes: Vec<u8>,
+}
+
+/// Identity of the archive payload which won resource routing, together with
+/// the filesystem version observed around its successful decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmoteArchiveVersion {
+    location: ResourceLocation,
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+impl EmoteArchiveVersion {
+    pub fn observe(candidate: &ResourceCandidate) -> Option<Self> {
+        let ResourceLocation::Archive { path, offset, size, .. } = &candidate.location else {
+            return None;
+        };
+        let metadata = fs::metadata(path).ok()?;
+        if !metadata.is_file() || offset.checked_add(*size)? > metadata.len() {
+            return None;
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            location: candidate.location.clone(),
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            inode: (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+pub enum CpuM2ModelSource<'a> {
+    Decoded(&'a EmoteResource, Option<EmoteArchiveVersion>),
+    Shared(Arc<CpuMotionModel>, EmoteArchiveVersion),
 }
 
 impl EmoteResource {
@@ -350,6 +392,12 @@ pub struct EmoteServiceStatus {
     pub live_tasks: usize,
 }
 
+/// A device-backed pose uses the same dimensions as its CPU materialization.
+pub trait EmoteDeviceReadback: std::any::Any + fmt::Debug + Send + Sync {
+    fn read_rgba(&self, output: &mut [u8]) -> bool;
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Actual evaluated and rasterized pixels. There is no default/empty frame.
 #[derive(Debug, Clone)]
 pub struct EmoteRasterFrame {
@@ -361,25 +409,44 @@ pub struct EmoteRasterFrame {
 
 #[derive(Debug, Clone)]
 struct EmotePixels {
-    rgba: Vec<u8>,
+    rgba: OnceLock<Vec<u8>>,
+    device: Option<Arc<dyn EmoteDeviceReadback>>,
     alpha_bounds: OnceLock<Option<[u32; 4]>>,
 }
 
 impl EmoteRasterFrame {
-    pub fn new(width: u32, height: u32, origin: [i32; 2], rgba: Vec<u8>) -> Result<Self> {
-        let size = (width as usize)
+    fn frame_bytes(width: u32, height: u32) -> Result<usize> {
+        (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
-            .filter(|&n| n <= MAX_FRAME_BYTES)
-            .ok_or(EmoteError::InvalidFrame)?;
-        if width == 0 || height == 0 || rgba.len() != size {
+            .filter(|&n| n <= MAX_FRAME_BYTES && width != 0 && height != 0)
+            .ok_or(EmoteError::InvalidFrame)
+    }
+
+    pub fn new(width: u32, height: u32, origin: [i32; 2], rgba: Vec<u8>) -> Result<Self> {
+        let size = Self::frame_bytes(width, height)?;
+        if rgba.len() != size {
             return Err(EmoteError::InvalidFrame);
         }
         Ok(Self {
             width,
             height,
             origin,
-            pixels: Arc::new(EmotePixels { rgba, alpha_bounds: OnceLock::new() }),
+            pixels: Arc::new(EmotePixels {
+                rgba: OnceLock::from(rgba), device: None, alpha_bounds: OnceLock::new(),
+            }),
+        })
+    }
+
+    pub fn from_device(
+        width: u32, height: u32, origin: [i32; 2], device: Arc<dyn EmoteDeviceReadback>,
+    ) -> Result<Self> {
+        Self::frame_bytes(width, height)?;
+        Ok(Self {
+            width, height, origin,
+            pixels: Arc::new(EmotePixels {
+                rgba: OnceLock::new(), device: Some(device), alpha_bounds: OnceLock::new(),
+            }),
         })
     }
 
@@ -392,8 +459,21 @@ impl EmoteRasterFrame {
     pub fn origin(&self) -> [i32; 2] {
         self.origin
     }
+    pub fn device(&self) -> Option<&dyn EmoteDeviceReadback> {
+        self.pixels.device.as_deref()
+    }
+    pub fn shares_pixels(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pixels, &other.pixels)
+    }
     pub fn rgba(&self) -> &[u8] {
-        &self.pixels.rgba
+        self.pixels.rgba.get_or_init(|| {
+            let size = Self::frame_bytes(self.width, self.height).unwrap();
+            let mut rgba = vec![0; size];
+            if !self.pixels.device.as_ref().is_some_and(|device| device.read_rgba(&mut rgba)) {
+                panic!("E-mote device readback failed; rebuild the pose instead of using stale pixels");
+            }
+            rgba
+        })
     }
 
     /// Return the original frame when possible, otherwise clip and pad it to a full viewport.
@@ -432,13 +512,15 @@ impl EmoteRasterFrame {
     }
 
     fn rgba_mut(&mut self) -> &mut [u8] {
+        self.rgba();
         let pixels = Arc::make_mut(&mut self.pixels);
+        pixels.device = None;
         pixels.alpha_bounds.take();
-        &mut pixels.rgba
+        pixels.rgba.get_mut().unwrap()
     }
 
     fn try_recycle(self) -> Option<Vec<u8>> {
-        Arc::try_unwrap(self.pixels).ok().map(|pixels| pixels.rgba)
+        Arc::try_unwrap(self.pixels).ok().and_then(|pixels| pixels.rgba.into_inner())
     }
 
     /// Nonzero-alpha bounds in local pixels, with exclusive right and bottom.
@@ -486,13 +568,18 @@ pub trait EmoteBackend: Send {
         &mut self,
         _task: u32,
         _name: &[u8],
-        _resource: Option<&EmoteResource>,
+        _source: CpuM2ModelSource<'_>,
         _load: CpuM2Load,
     ) -> Result<()> {
         Err(EmoteError::Unsupported {
             native: 906,
             reason: "backend has no M2 manager receiver",
         })
+    }
+    fn cached_m2_model(
+        &self, _task: u32, _name: &[u8], _version: &EmoteArchiveVersion,
+    ) -> Option<Arc<CpuMotionModel>> {
+        None
     }
     fn command(&mut self, task: u32, command: &EmoteCommand) -> Result<EmoteReply>;
     fn advance(&mut self, task: u32, tick: EmoteTick) -> Result<()>;
@@ -505,6 +592,12 @@ pub trait EmoteBackend: Send {
         self.advance(task, tick)
     }
     fn render_rgba(&mut self, task: u32) -> Result<EmoteRasterFrame>;
+    fn scene_raster_player(&self, _task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
+        None
+    }
+    fn can_defer_scene_raster(&self, _task: u32) -> bool {
+        false
+    }
     fn bind_m2_lip_curve(
         &mut self,
         _task: u32,
@@ -785,7 +878,7 @@ impl EmoteServices {
         &mut self,
         task: u32,
         name: &[u8],
-        resource: Option<&EmoteResource>,
+        source: CpuM2ModelSource<'_>,
         load: CpuM2Load,
     ) -> Result<()> {
         self.require_task(task)?;
@@ -796,12 +889,18 @@ impl EmoteServices {
         self.backend
             .as_mut()
             .ok_or(EmoteError::MissingBackend)?
-            .import_m2_resource(task, name, resource, load)?;
+            .import_m2_resource(task, name, source, load)?;
         self.tasks
             .get_mut(&task)
             .ok_or(EmoteError::UnknownTask(task))?
             .successful_resource_imports = imports;
         Ok(())
+    }
+
+    pub fn cached_m2_model(
+        &self, task: u32, name: &[u8], version: &EmoteArchiveVersion,
+    ) -> Option<Arc<CpuMotionModel>> {
+        self.backend.as_ref()?.cached_m2_model(task, name, version)
     }
 
     pub fn dispatch(&mut self, task: u32, command: &EmoteCommand) -> Result<EmoteReply> {
@@ -887,6 +986,14 @@ impl EmoteServices {
             .as_mut()
             .ok_or(EmoteError::MissingBackend)?
             .render_rgba(task)
+    }
+
+    pub fn scene_raster_player(&self, task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
+        self.backend.as_ref()?.scene_raster_player(task)
+    }
+
+    pub fn can_defer_scene_raster(&self, task: u32) -> bool {
+        self.backend.as_ref().is_some_and(|backend| backend.can_defer_scene_raster(task))
     }
 
     pub fn playback_info(&self, task: u32) -> Result<EmotePlaybackInfo> {

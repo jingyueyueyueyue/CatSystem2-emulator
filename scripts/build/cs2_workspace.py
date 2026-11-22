@@ -168,7 +168,10 @@ def build(environment: dict, tools: dict, release: bool, integration: bool = Fal
             shutil.copy2(ROOT / name, target)
         if source_snapshot(source_root)["sha256"] != expected["sha256"]:
             raise RuntimeError(f"Build inputs changed while staging the snapshot: {source_root}")
-    attempt = BuildAttempt(archive, integration, source_root=source_root)
+    attempt = BuildAttempt(
+        archive, integration, source_root=source_root,
+        build_scripts=[Path(__file__), ROOT / "scripts/build/android_workspace.py"],
+    )
     try:
         build_workspace(environment, tools, release, attempt, story_replay=story_replay, profile=profile)
     except Exception as error:
@@ -205,7 +208,7 @@ def story_replay_resource(cache: Path, environment: dict, tools: dict, attempt, 
 
 def build_workspace(environment: dict, tools: dict, release: bool, attempt,
                     *, story_replay: bool = False, profile: str | None = None) -> None:
-    from android_workspace import build_cache_directory
+    from android_workspace import archive_file, build_cache_directory
     if not tools.get("rustc", {}).get("meets_1_87"):
         raise RuntimeError("Rust 1.87 or later is required")
     if not all(tools.get(name, {}).get("available") for name in ("cargo", "rustc", "gcc")):
@@ -236,7 +239,8 @@ def build_workspace(environment: dict, tools: dict, release: bool, attempt,
     attempt.run("build", command, env=environment, cwd=simulator)
     profile_directory = profile or ("release" if release else "debug")
     binary = archive / artifact.name
-    shutil.copy2(target / triple / profile_directory / artifact, binary)
+    archive_file(target / triple / profile_directory / artifact, binary,
+                 immutable_cache=cache / "artifact-blobs")
     if story_replay:
         attempt.run("replay_identity", [str(binary), "--source-sha256"],
                     env=environment, cwd=simulator, timeout=30)
@@ -254,8 +258,8 @@ def main() -> None:
     parser.add_argument("phase", choices=["snapshot", "toolchain", "build"])
     profiles = parser.add_mutually_exclusive_group()
     profiles.add_argument("--release", action="store_true")
-    profiles.add_argument("--profile", choices=["playthrough"],
-                          help="Use the optimized no-LTO profile (requires build --integration --story-replay).")
+    profiles.add_argument("--profile", choices=["playthrough", "perf"],
+                          help="Use the named Cargo profile (requires build --integration --story-replay).")
     parser.add_argument("--integration", action="store_true",
                         help="Compile unfinished implementation for integration; retain separate source-bound artifacts.")
     parser.add_argument("--story-replay", action="store_true",
@@ -268,7 +272,7 @@ def main() -> None:
     if args.story_replay and (args.phase != "build" or not args.integration):
         parser.error("--story-replay requires build --integration")
     if args.profile and not args.story_replay:
-        parser.error("--profile playthrough requires build --integration --story-replay")
+        parser.error(f"--profile {args.profile} requires build --integration --story-replay")
     if args.freeze_source and not args.story_replay:
         parser.error("--freeze-source requires build --integration --story-replay")
     if args.integration and args.phase != "build":

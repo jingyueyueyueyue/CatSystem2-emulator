@@ -6476,7 +6476,9 @@ impl LoggingHost<'_> {
     }
 
     fn ordinary_motion_layout(&self) -> motion_vm::ExternalLayout {
-        if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA) {
+        if matches!(self.css_task_sha(),
+            Some(particle_external::CAMPANELLA_SHA | css_model::SHA))
+        {
             motion_vm::ExternalLayout::Campanella
         } else {
             motion_vm::ExternalLayout::Default
@@ -8128,6 +8130,7 @@ impl HeadlessPlayer {
         let previous_revision = self.scene_compositor.revision.take();
         let mut graphics_snapshot = self.scene_compositor.graphics_frame.take().filter(|buffer| {
             buffer.dimensions() == self.graphics_canvas.dimensions()
+                && self.graphics_canvas.device_pixels().is_none()
                 && buffer.pixels() == self.graphics_canvas.pixels()
         });
         let stale_movies = self
@@ -8335,6 +8338,26 @@ impl HeadlessPlayer {
             .data_services
             .planes
             .draw_order_with_depths(&self.scene_nodes, &drawable_depths);
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        let mut emote_batch = if gpu_raster::emote_batch_requested() {
+            let candidates: Vec<_> = nodes.iter().filter_map(|id| {
+                let node = self.scene_nodes.get(id)?;
+                if node.kind != 54 || !node.visible || !node.initialized { return None }
+                let depth = drawable_depths.get(id).copied().unwrap_or(node.position[2]);
+                (lower <= depth && depth < upper).then_some(node)
+            }).collect();
+            if candidates.is_empty() {
+                None
+            } else {
+                let _timing = measure_host_phase(HostPhase::ComposeEmote);
+                let batch = gpu_raster::begin_emote_batch().context("begin E-mote pose batch")?;
+                self.data_services.emote.prepare_scene_tasks(
+                    candidates, [self.canvas.width(), self.canvas.height()],
+                ).context("prepare batched E-mote poses")?;
+                batch.seal();
+                Some(batch)
+            }
+        } else { None };
         let mut scene_text = measure_host_operation(HostPhase::ComposeText, || {
             fes_text::scene_projections(&self.data_services, lower, upper)
         }).into_iter().peekable();
@@ -8399,6 +8422,11 @@ impl HeadlessPlayer {
                 }
             }
             let Some(node) = self.scene_nodes.get(&id) else { continue; };
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            if node.kind == 54 && let Some(batch) = emote_batch.take() {
+                let _timing = measure_host_phase(HostPhase::ComposeEmote);
+                batch.finish().context("finish batched E-mote poses")?;
+            }
             if self.data_services.emote.draw_scene_task(node, &mut self.canvas)
                 .context("compose strict E-mote CPU task")?
             {
@@ -8448,6 +8476,11 @@ impl HeadlessPlayer {
                 continue;
             }
             bail!("task {} type {} has no concrete drawable renderer", node.id, node.kind);
+        }
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        if let Some(batch) = emote_batch {
+            let _timing = measure_host_phase(HostPhase::ComposeEmote);
+            batch.finish().context("finish batched E-mote poses")?;
         }
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
@@ -13747,6 +13780,29 @@ mod tests {
         assert!(player.host_input_selection_routed());
         let driver = player.data_services.tasks.fes.runtime(owner).unwrap().driver.as_ref().unwrap();
         assert!(matches!(driver.interpreter.pending(), Some(cs2_script::FesEvent::Wait(20))));
+    }
+
+    #[test]
+    fn held_mouse_down_only_queues_one_click_and_fast_separate_taps_survive() {
+        let temp = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
+        let primary = InputKey::MouseButton(0);
+        player.apply_host_input(InputEvent::MouseMove { x: 12, y: 34 }).unwrap();
+        for event in [
+            InputEvent::KeyDown(primary),
+            InputEvent::KeyDown(primary),
+            InputEvent::KeyUp(primary),
+            InputEvent::KeyDown(primary),
+            InputEvent::KeyUp(primary),
+        ] {
+            player.apply_host_input(event).unwrap();
+        }
+        assert_eq!(player.pending_messages.into_iter().collect::<Vec<_>>(), [[2, 12, 34, 0]; 2]);
+        assert_eq!(
+            player.pending_fes_events.iter().map(|event| event.code).collect::<Vec<_>>(),
+            [2, 4, 2, 4],
+        );
+        assert!(!player.state.input.mouse_button_pressed(0));
     }
 
     #[test]

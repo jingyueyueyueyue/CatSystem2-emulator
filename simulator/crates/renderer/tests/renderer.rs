@@ -1,5 +1,5 @@
 use cs2_renderer::{
-    AlphaMask, AnimationFrameSelection, Canvas, Color, FrameFilter, FrameMetadata, FrameResources,
+    AlphaMask, AnimationFrameSelection, Canvas, CanvasReadback, Color, FrameFilter, FrameMetadata, FrameResources,
     FrameTransition, GlyphMask, ImageDrawOptions, Particle, ParticlePoint, ParticleSystem, Point,
     Rect, RenderCommand, RenderNode, RenderQueue, RendererError, RgbaFrame, RgbaFrameSet,
     TextEncoding, TextMarkup, TextSizePresets, TextStyle, TextToken, inspect_hg,
@@ -888,4 +888,51 @@ fn frame_resource_sets_release_all_animation_frames() {
     resources.release_all(handles.iter().copied()).unwrap();
     assert!(!resources.contains(handles[0]));
     assert!(!resources.contains(handles[1]));
+}
+
+
+#[derive(Debug)]
+struct TestCanvasReadback {
+    rgba: Vec<u8>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CanvasReadback for TestCanvasReadback {
+    fn read_rgba(&self, output: &mut [u8]) -> bool {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if output.len() != self.rgba.len() { return false; }
+        output.copy_from_slice(&self.rgba);
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+#[test]
+fn deferred_device_pixels_materialize_once_and_clear_skips_readback() {
+    use std::sync::{Arc, atomic::Ordering};
+
+    let source = Arc::new(TestCanvasReadback {
+        rgba: vec![20, 40, 60, 80],
+        calls: 0.into(),
+    });
+    let mut canvas = Canvas::from_rgba8(1, 1, vec![1, 2, 3, 4]).unwrap();
+    let allocation = canvas.pixels().as_ptr();
+    canvas.set_deferred_device_pixels(source.clone());
+    assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    assert!(canvas.device_pixels().is_some());
+    assert_eq!(canvas.pixels(), [20, 40, 60, 80]);
+    assert_eq!(canvas.clone().pixels(), [20, 40, 60, 80]);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+    canvas.clear(Color::rgba(5, 6, 7, 8));
+    assert_eq!(canvas.pixels(), [5, 6, 7, 8]);
+    assert_eq!(canvas.pixels().as_ptr(), allocation);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+    assert!(canvas.device_pixels().is_none());
+
+    canvas.set_deferred_device_pixels(source.clone());
+    canvas.clear(Color::rgba(9, 10, 11, 12));
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(canvas.pixels(), [9, 10, 11, 12]);
+    assert_eq!(canvas.pixels().as_ptr(), allocation);
 }

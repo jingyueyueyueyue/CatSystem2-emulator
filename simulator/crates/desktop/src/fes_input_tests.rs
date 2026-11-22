@@ -49,6 +49,22 @@ fn notify_left_press(driver: &mut FesScriptDriver, shared: &mut ExpressionState)
 }
 
 #[test]
+fn fresh_fes_dialog_waits_until_a_child_really_exits() -> Result<()> {
+    let (mut driver, mut shared) = driver(&[
+        b"if (_EXITCODE_==0)", b"exit 42", b"endif", b"wait 2", b"next START",
+    ]);
+    for frame in [10, 11] {
+        assert!(matches!(
+            driver.advance(frame, &mut shared, 32)?,
+            FesDriverEffect::Waiting { .. }
+        ));
+    }
+    driver.set_child_exit_code(0);
+    assert!(matches!(driver.advance(12, &mut shared, 32)?, FesDriverEffect::Exit(42)));
+    Ok(())
+}
+
+#[test]
 fn routed_click_reaches_next_title_poll_only_once() {
     let (mut driver, mut shared) = driver(&[b"if (_CLICK_L_==17)", b"exit 42", b"endif"]);
     assert!(matches!(

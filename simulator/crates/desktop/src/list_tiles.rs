@@ -447,7 +447,8 @@ fn compose_inner(
         let dirty_pixels: u64 = areas.iter().map(|r| u64::from(r.width) * u64::from(r.height)).sum();
         let pixels = u64::from(surface.size[0]) * u64::from(surface.size[1]);
         let cleared = covers_surface(&areas, surface.size);
-        let reused = if !cleared && canonical && unaliased && dirty_pixels <= pixels / 4 {
+        let clear_only = cleared && list.layers.is_empty();
+        let reused = if canonical && unaliased && (clear_only || (!cleared && dirty_pixels <= pixels / 4)) {
             match host.image_handles.remove(&handle).context("image-list output disappeared")?.try_into_canvas() {
                 Ok(canvas) => Some(canvas),
                 Err(frame) => {
@@ -460,7 +461,12 @@ fn compose_inner(
         };
         let reused_storage = reused.is_some();
         let mut canvas = match reused {
-            Some(canvas) => canvas,
+            Some(mut canvas) => {
+                if clear_only {
+                    canvas.pixels_mut().fill(0);
+                }
+                canvas
+            }
             None if cleared => Canvas::new(surface.size[0], surface.size[1])?,
             None => {
                 let old = &host.image_handles[&handle];
@@ -473,7 +479,7 @@ fn compose_inner(
                 }
             }
         };
-        let previous = reused_storage.then(|| save_dirty_pixels(&canvas, &areas));
+        let previous = (reused_storage && !clear_only).then(|| save_dirty_pixels(&canvas, &areas));
         if !cleared {
             for area in &areas {
                 for range in pixel_rows(canvas.width(), *area) {
@@ -482,10 +488,14 @@ fn compose_inner(
             }
         }
         list_detail.end_stage(0);
-        let rendered = draw_list_layers(host, id, list, &areas, &mut canvas);
+        // A fully covered empty list has no draw that could fail after
+        // clearing the reclaimed buffer, so it needs no rollback copy.
+        let rendered = if clear_only { Ok(false) } else {
+            draw_list_layers(host, id, list, &areas, &mut canvas)
+        };
         list_detail.end_stage(1);
-        if let Some(previous) = previous {
-            if rendered.is_err() {
+        if reused_storage {
+            if rendered.is_err() && let Some(previous) = previous {
                 restore_dirty_pixels(&mut canvas, &areas, &previous);
             }
             let frame = canvas.into_frame();
@@ -657,4 +667,51 @@ fn draw_list_layers_fallback(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_list_clear_reuses_only_exclusive_full_storage() -> Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-list-clear-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = player?;
+        player.with_host(|host| {
+            let id = host.create_task_object(15, host.current_task_id, b"clear test", b"")?;
+            host.initialize_fes_image_list(id, 8, 6)?;
+            let handle = host.data_services.tasks.fes.platform.lists[&id].output;
+            let seed = || RgbaFrame::from_rgba8(8, 6, [192, 124, 56, 0].repeat(48));
+
+            host.replace_image_wrapper_pixels(handle, seed()?)?;
+            let allocation = host.image_handles[&handle].pixels().as_ptr();
+            compose(host, id, true, None)?;
+            let frame = &host.image_handles[&handle];
+            assert_eq!(frame.pixels().as_ptr(), allocation);
+            assert_eq!(frame.pixels(), &[0; 8 * 6 * 4]);
+
+            host.replace_image_wrapper_pixels(handle, seed()?)?;
+            let retained = host.image_handles[&handle].clone();
+            let alias = host.share_image_wrapper(handle)?;
+            compose(host, id, true, Some(Rect::new(2, 1, 3, 2)))?;
+            let frame = &host.image_handles[&alias];
+            assert_eq!(frame.pixel(2, 1)?, cs2_renderer::Color::TRANSPARENT);
+            assert_eq!(frame.pixel(1, 1)?, cs2_renderer::Color::rgba(192, 124, 56, 0));
+            assert_eq!(retained.pixels(), seed()?.pixels());
+
+            let retained = frame.clone();
+            compose(host, id, true, None)?;
+            assert_eq!(host.image_handles[&handle].pixels(), &[0; 8 * 6 * 4]);
+            assert_eq!(host.image_handles[&alias].pixels(), &[0; 8 * 6 * 4]);
+            assert_eq!(retained.pixel(1, 1)?, cs2_renderer::Color::rgba(192, 124, 56, 0));
+            let snapshot = crate::image_manager::capture_frame(&host.image_handles[&handle]);
+            let saved = crate::image_manager::restore_frame(&snapshot)?;
+            assert_eq!(saved, host.image_handles[&handle]);
+            Ok(())
+        })
+    }
 }

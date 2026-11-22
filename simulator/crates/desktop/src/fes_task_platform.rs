@@ -1126,7 +1126,9 @@ fn apply_effect(
                 if kind.eq_ignore_ascii_case(b"PRELOAD") {
                     for line in &section.lines {
                         let name = host.text_encoding.decode(&line.bytes);
-                        read_fes_preload_image(host.resources, &name)?;
+                        if let Some(bytes) = read_fes_preload_image(host.resources, &name)? {
+                            host.data_services.ordinary.predecode_image(&bytes);
+                        }
                     }
                 }
             }

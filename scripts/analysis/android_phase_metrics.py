@@ -115,12 +115,12 @@ def append_session_metrics(result, log, session, rows, whole_session):
             'textured_group_rejects': sum(row['textured_group_rejects'] for row in gpu_rows),
             'textured_single_rejects': sum(row['textured_single_rejects'] for row in gpu_rows),
         }
-        for kind in ('device', 'packed'):
+        for kind in ('device', 'packed', 'emote'):
             fields = ('calls', 'failed', 'bytes')
             result['gpu_output'][kind] = {
-                **{field: sum(row[f'{kind}_{field}'] for row in gpu_rows) for field in fields},
-                'wall_per_sampled_step': summary([row[f'{kind}_us'] for row in gpu_rows
-                                                  if row[f'{kind}_calls']]),
+                **{field: sum(row.get(f'{kind}_{field}', 0) for row in gpu_rows) for field in fields},
+                'wall_per_sampled_step': summary([row.get(f'{kind}_us', 0) for row in gpu_rows
+                                                  if row.get(f'{kind}_calls', 0)]),
             }
     emote = {}
     for row in parse_named_rows(log, 'emote_gpu', session):
@@ -136,6 +136,7 @@ def append_session_metrics(result, log, session, rows, whole_session):
             'rows': len(emote_rows),
             'poses': sum(row['poses'] for row in emote_rows),
             'draws': sum(row['draws'] for row in emote_rows),
+            'batches': sum(row.get('batches', row['draws']) for row in emote_rows),
             'pixels': sum(row['pixels'] for row in emote_rows),
             'repaired': sum(row['repaired'] for row in emote_rows),
             'timings': {field: summary([row[field] for row in emote_rows]) for field in timings},

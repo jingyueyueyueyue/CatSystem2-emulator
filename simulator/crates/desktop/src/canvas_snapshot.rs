@@ -41,6 +41,31 @@ struct Snapshot {
 
 const OVERFLOW_TAG: &[u8] = b"CS2VRAM2\0";
 
+fn capture_offscreen(canvas: &Canvas) -> Result<ImageFrameSnapshot> {
+    let size = [canvas.width(), canvas.height()];
+    let rgba = if let Some(device) = canvas.device_pixels() {
+        let mut rgba = vec![0; size[0] as usize * size[1] as usize * 4];
+        if !device.read_rgba(&mut rgba) {
+            bail!("read offscreen canvas pixels for the saved graph");
+        }
+        rgba
+    } else {
+        canvas.pixels().to_vec()
+    };
+    Ok(ImageFrameSnapshot {
+        size,
+        rgba,
+        container: 0,
+        frame_id: None,
+        bit_depth: 32,
+        offset: [0; 2],
+        canvas_size: size,
+        base: [0; 2],
+        alpha_flag: 0,
+        attributes: BTreeMap::new(),
+    })
+}
+
 impl CanvasNativeState {
     pub(crate) fn graph_snapshot(&self, overflow: Option<&VramOverflow>) -> Result<Vec<u8>> {
         let state = Snapshot {
@@ -48,7 +73,7 @@ impl CanvasNativeState {
             active: self.active, size: self.size, tile: self.tile, grid: self.grid, areas: self.areas,
             split_row: self.split_row, tiles: self.tiles.clone(),
             view: self.view.as_ref().map(|(p, c)| ViewSnapshot::capture(p, c)),
-            offscreen: self.offscreen.as_ref().map(crate::image_manager::capture_frame),
+            offscreen: self.offscreen.as_ref().map(capture_offscreen).transpose()?,
         };
         if let Some(overflow) = overflow {
             let mut payload = OVERFLOW_TAG.to_vec();
@@ -91,9 +116,60 @@ impl CanvasNativeState {
             }
         }
         let view = s.view.as_ref().map(ViewSnapshot::restore).transpose()?;
-        let offscreen = s.offscreen.as_ref().map(crate::image_manager::restore_frame).transpose()?;
+        let offscreen = s.offscreen.as_ref().map(|saved| -> Result<Canvas> {
+            let frame = crate::image_manager::restore_frame(saved)?;
+            frame.try_into_canvas().map_err(|_| anyhow::anyhow!("saved offscreen canvas is empty"))
+        }).transpose()?;
         Ok((Self { initialized: s.initialized, mode: s.mode, enabled: s.enabled, active: s.active,
             size: s.size, tile: s.tile, grid: s.grid, areas: s.areas, split_row: s.split_row,
             tiles: s.tiles, view, offscreen }, overflow))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    #[derive(Debug)]
+    struct OffscreenReadback {
+        reads: Arc<AtomicUsize>,
+        rgba: [u8; 8],
+    }
+
+    impl cs2_renderer::CanvasReadback for OffscreenReadback {
+        fn read_rgba(&self, output: &mut [u8]) -> bool {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            output.copy_from_slice(&self.rgba);
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    #[test]
+    fn offscreen_capture_defers_readback_and_preserves_snapshot_bytes() -> Result<()> {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let rgba = [1, 2, 3, 4, 15, 16, 17, 18];
+        let mut offscreen = Canvas::new(2, 1)?;
+        offscreen.set_deferred_device_pixels(Arc::new(OffscreenReadback {
+            reads: reads.clone(),
+            rgba,
+        }));
+        let state = CanvasNativeState { offscreen: Some(offscreen), ..Default::default() };
+        assert!(state.graph_has_tile_state());
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+        let bytes = state.graph_snapshot(None)?;
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        let saved: Snapshot = wire::decode_component(&bytes)?;
+        let legacy = crate::image_manager::capture_frame(&RgbaFrame::from_rgba8(2, 1, rgba.to_vec())?);
+        assert_eq!(wire::encode_component(&saved.offscreen)?, wire::encode_component(&Some(legacy))?);
+
+        let (restored, overflow) = CanvasNativeState::prepare_graph_restore(&bytes, [2, 1])?;
+        assert!(overflow.is_none());
+        assert_eq!(restored.offscreen.as_ref().unwrap().pixels(), rgba);
+        assert_eq!(restored.graph_snapshot(None)?, bytes);
+        Ok(())
     }
 }

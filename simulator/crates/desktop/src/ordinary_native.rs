@@ -371,6 +371,12 @@ impl OrdinaryNativeServices {
         self.preloads.cached_with_source(name)
     }
 
+    pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.preloads.predecode_image(bytes); }
+
+    pub(super) fn take_predecoded_image(&mut self, bytes: &[u8], id: u32) -> Option<cs2_renderer::RgbaFrame> {
+        self.preloads.take_predecoded_image(bytes, id)
+    }
+
     fn allocate(&self, next_handle: &mut u32) -> Result<u32> {
         if self.sequences.len().saturating_add(self.image_data.len())
             .saturating_add(self.pair_tables.len()) >= 1_000_000 {

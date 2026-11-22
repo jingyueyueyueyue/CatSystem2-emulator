@@ -3,6 +3,12 @@
 
 use super::{EmoteError, EmoteRasterFrame, Result};
 
+pub type EmoteSurfaceMixer = fn(&EmoteRasterFrame, &EmoteRasterFrame, u32, bool)
+    -> Option<EmoteRasterFrame>;
+pub type EmoteSurfacePrepare = fn(&EmoteRasterFrame, &EmoteRasterFrame)
+    -> Option<(EmoteRasterFrame, EmoteRasterFrame, bool)>;
+pub type EmoteSurfaceExpand = fn(&EmoteRasterFrame, [u32; 2]) -> Option<EmoteRasterFrame>;
+
 #[derive(Clone)]
 struct Blend {
     old: EmoteRasterFrame,
@@ -18,9 +24,15 @@ impl Blend {
         now.wrapping_sub(self.start.unwrap_or(now)).min(self.duration) as f32
             / (self.duration as f32) < 1.0
     }
-    fn new(mut old: EmoteRasterFrame, mut new: EmoteRasterFrame, duration: u32) -> Result<Self> {
+    fn new(
+        mut old: EmoteRasterFrame, mut new: EmoteRasterFrame, duration: u32,
+        prepare: Option<EmoteSurfacePrepare>,
+    ) -> Result<Self> {
         if old.width != new.width || old.height != new.height || old.origin != new.origin {
             return Err(EmoteError::InvalidFrame);
+        }
+        if let Some((old, new, new_is_transparent)) = prepare.and_then(|prepare| prepare(&old, &new)) {
+            return Ok(Self { shown: old.clone(), old, new, new_is_transparent, duration, start: None });
         }
         // 19c8f0 runs at fraction zero. Fill only fully transparent RGB;
         // neither source's alpha changes. The OR uses the incoming alpha.
@@ -40,7 +52,7 @@ impl Blend {
 
     /// False at retirement permits the same host tick to continue into the
     /// real driver update. No driver/owner clock is advanced on a held tick.
-    fn hold(&mut self, now: u32) -> bool {
+    fn hold(&mut self, now: u32, mixer: Option<EmoteSurfaceMixer>) -> bool {
         // 17b7ca arms+24; 17ade4 replaces+30 on the first following update.
         let start = *self.start.get_or_insert(now);
         let elapsed = now.wrapping_sub(start).min(self.duration);
@@ -54,6 +66,17 @@ impl Blend {
         // 3a0320 truncates the finite nonnegative product to an integer.
         let new_weight = (fraction * 256.0_f32) as u32;
         let old_weight = 256 - new_weight;
+        if new_weight == 0 {
+            self.shown = self.old.clone();
+            return true;
+        }
+        if let Some(shown) = mixer.and_then(|mix| mix(&self.old, &self.new, new_weight, self.new_is_transparent)) {
+            self.shown = shown;
+            return true;
+        }
+        if self.shown.device().is_some() {
+            self.shown = self.old.clone();
+        }
         if self.new_is_transparent {
             // 19c7f0 preserves RGB rather than lerping toward black.
             for (out, old) in self.shown.rgba_mut().chunks_exact_mut(4)
@@ -169,7 +192,9 @@ impl CpuM2SurfaceOwner {
 
     pub(super) fn selection_loaded(&mut self) { self.blend = None; }
 
-    pub(super) fn begin(&mut self, next: EmoteRasterFrame, enabled: bool) -> Result<()> {
+    pub(super) fn begin(
+        &mut self, next: EmoteRasterFrame, enabled: bool, prepare: Option<EmoteSurfacePrepare>,
+    ) -> Result<()> {
         if self.needs_capture() {
             return Err(EmoteError::InvalidResource(
                 "M2 deferred surface request must capture before driver update",
@@ -177,7 +202,7 @@ impl CpuM2SurfaceOwner {
         }
         let Some(previous) = self.pending.as_ref() else { return Ok(()); };
         let blend = if enabled && self.duration != 0 {
-            Some(Blend::new(previous.clone(), next.clone(), self.duration)?)
+            Some(Blend::new(previous.clone(), next.clone(), self.duration, prepare)?)
         } else { None };
         self.pending = None;
         self.deferred_capture = false;
@@ -186,8 +211,8 @@ impl CpuM2SurfaceOwner {
         Ok(())
     }
 
-    pub(super) fn hold(&mut self, now: u32) -> bool {
-        let held = self.blend.as_mut().is_some_and(|blend| blend.hold(now));
+    pub(super) fn hold(&mut self, now: u32, mixer: Option<EmoteSurfaceMixer>) -> bool {
+        let held = self.blend.as_mut().is_some_and(|blend| blend.hold(now, mixer));
         if !held {
             if let Some(blend) = self.blend.take() {
                 if self.pending.is_some() { self.pending = Some(blend.new.clone()); }

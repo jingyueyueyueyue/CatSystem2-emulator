@@ -207,6 +207,7 @@ pub struct CpuStencilBuffer {
     width: u32,
     height: u32,
     values: Vec<u8>,
+    sparse: Option<(u8, Vec<Vec<(usize, u8)>>)>,
 }
 
 impl CpuStencilBuffer {
@@ -220,11 +221,43 @@ impl CpuStencilBuffer {
             .try_reserve_exact(size)
             .map_err(|_| EmoteError::Capacity)?;
         values.resize(size, 0);
+        Ok(Self { width, height, values, sparse: None })
+    }
+
+    pub(super) fn new_sparse(width: u32, height: u32, clear: u8) -> Result<Self> {
+        let size = (width as usize).checked_mul(height as usize)
+            .filter(|&n| n <= MAX_FRAME_BYTES / 4 && n != 0)
+            .ok_or(EmoteError::Capacity)?;
+        let _ = size;
         Ok(Self {
-            width,
-            height,
-            values,
+            width, height, values: Vec::new(),
+            sparse: Some((clear, vec![Vec::new(); height as usize])),
         })
+    }
+
+    fn get(&self, x: u32, y: u32) -> Option<u8> {
+        if x >= self.width || y >= self.height { return None }
+        if let Some((clear, rows)) = &self.sparse {
+            let row = &rows[y as usize];
+            return Some(row.binary_search_by_key(&(x as usize), |&(x, _)| x)
+                .map_or(*clear, |index| row[index].1));
+        }
+        Some(self.values[y as usize * self.width as usize + x as usize])
+    }
+
+    fn set(&mut self, x: u32, y: u32, value: u8) -> bool {
+        if x >= self.width || y >= self.height { return false }
+        if let Some((_, rows)) = &mut self.sparse {
+            let row = &mut rows[y as usize];
+            match row.binary_search_by_key(&(x as usize), |&(x, _)| x) {
+                Ok(index) => row[index].1 = value,
+                Err(index) => row.insert(index, (x as usize, value)),
+            }
+            return true;
+        }
+        let index = y as usize * self.width as usize + x as usize;
+        self.values[index] = value;
+        true
     }
 
     pub fn width(&self) -> u32 {
@@ -239,7 +272,12 @@ impl CpuStencilBuffer {
 
     /// Reference plane clear from the actual draw schedule, not from layer type.
     pub fn clear(&mut self, value: u8) {
-        self.values.fill(value);
+        if let Some((clear, rows)) = &mut self.sparse {
+            *clear = value;
+            for row in rows { row.clear(); }
+        } else {
+            self.values.fill(value);
+        }
     }
 
     /// Real texture-alpha mask update. Strict alpha GREATER64 and EQUAL ref,
@@ -268,14 +306,13 @@ impl CpuStencilBuffer {
                 if mask.rgba()[source + 3] <= 64 {
                     continue;
                 }
-                let index = y as usize * self.width as usize + x as usize;
-                if self.values[index] != reference {
+                if self.get(x as u32, y as u32) != Some(reference) {
                     continue;
                 }
-                self.values[index] = match operation {
+                self.set(x as u32, y as u32, match operation {
                     CpuStencilWrite::IncrementWrapping => reference.wrapping_add(1),
                     CpuStencilWrite::DecrementWrapping => reference.wrapping_sub(1),
-                };
+                });
                 written += 1;
             }
         }
@@ -292,24 +329,17 @@ impl CpuStencilBuffer {
         reference: u8,
         operation: CpuStencilWrite,
     ) -> bool {
-        if x >= self.width || y >= self.height || alpha <= 64 {
+        if alpha <= 64 || self.get(x, y) != Some(reference) {
             return false;
         }
-        let at = y as usize * self.width as usize + x as usize;
-        if self.values[at] != reference {
-            return false;
-        }
-        self.values[at] = match operation {
+        self.set(x, y, match operation {
             CpuStencilWrite::IncrementWrapping => reference.wrapping_add(1),
             CpuStencilWrite::DecrementWrapping => reference.wrapping_sub(1),
-        };
-        true
+        })
     }
 
     pub fn test_equal(&self, x: u32, y: u32, reference: u8) -> bool {
-        x < self.width
-            && y < self.height
-            && self.values[y as usize * self.width as usize + x as usize] == reference
+        self.get(x, y) == Some(reference)
     }
 
     /// EQUAL/KEEP-gated real straight-RGBA source-over pixels. The caller owns
@@ -339,10 +369,10 @@ impl CpuStencilBuffer {
                 if x < 0 || x >= i64::from(self.width) {
                     continue;
                 }
-                let index = y as usize * self.width as usize + x as usize;
-                if self.values[index] != reference {
+                if self.get(x as u32, y as u32) != Some(reference) {
                     continue;
                 }
+                let index = y as usize * self.width as usize + x as usize;
                 let src = (sy as usize * source.width() as usize + sx as usize) * 4;
                 let dst = index * 4;
                 let alpha = f64::from(source.rgba()[src + 3]) / 255.0;
@@ -364,5 +394,53 @@ impl CpuStencilBuffer {
             }
         }
         Ok(submitted)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_stencil_matches_dense_for_selected_fragments() {
+        for &(clear, operation) in &[
+            (0, CpuStencilWrite::IncrementWrapping),
+            (255, CpuStencilWrite::IncrementWrapping),
+            (0, CpuStencilWrite::DecrementWrapping),
+        ] {
+            let mut dense = CpuStencilBuffer::new(8, 4).unwrap();
+            dense.clear(clear);
+            let mut sparse = CpuStencilBuffer::new_sparse(8, 4, clear).unwrap();
+            for &(x, y, alpha) in &[
+                (0, 0, 65), (3, 1, 64), (7, 3, 255), (3, 1, 66), (8, 0, 255),
+            ] {
+                assert_eq!(
+                    sparse.write_fragment(x, y, alpha, clear, operation),
+                    dense.write_fragment(x, y, alpha, clear, operation),
+                );
+                for test_y in 0..4 {
+                    for test_x in 0..8 {
+                        for reference in [0, 1, 255] {
+                            assert_eq!(
+                                sparse.test_equal(test_x, test_y, reference),
+                                dense.test_equal(test_x, test_y, reference),
+                            );
+                        }
+                    }
+                }
+            }
+            sparse.clear(clear.wrapping_add(7));
+            dense.clear(clear.wrapping_add(7));
+            assert!(sparse.values().is_empty());
+            for y in 0..4 {
+                for x in 0..8 {
+                    assert_eq!(
+                        sparse.test_equal(x, y, clear.wrapping_add(7)),
+                        dense.test_equal(x, y, clear.wrapping_add(7)),
+                    );
+                }
+            }
+        }
     }
 }

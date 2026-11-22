@@ -29,11 +29,35 @@ def default_sdk() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / "AppData/Local/Android/Sdk"
 
 
-def source_snapshot(root: Path = ROOT) -> dict:
-    """Fingerprint build inputs, including assets, without generated outputs.
+def stable_file_info(path: Path) -> dict:
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"File changed while hashing: {path}")
+    return {"sha256": digest.hexdigest(), "size": after.st_size}
 
-    Metadata is compared between build steps as well as content: an edit and
-    revert during compilation must not turn a mixed build into a valid one.
+
+def build_script_snapshot(scripts: list[Path]) -> dict:
+    result = {}
+    for script in scripts:
+        path = script.resolve()
+        try:
+            name = path.relative_to(ROOT).as_posix()
+        except ValueError:
+            name = str(path)
+        result[name] = stable_file_info(path)
+    return result
+
+
+def source_snapshot(root: Path = ROOT) -> dict:
+    """Fingerprint runtime build inputs, excluding the build tooling itself.
+
+    Size and timestamps detect unstable reads. Only paths, sizes and content
+    hashes determine build identity, so touching a source does not stale it.
     """
     digest = hashlib.sha256()
     simulator = root / "simulator"
@@ -47,7 +71,6 @@ def source_snapshot(root: Path = ROOT) -> dict:
         "Cargo.toml", "Cargo.lock", "THIRD_PARTY.md", "rust-toolchain", "rust-toolchain.toml",
         ".cargo/config", ".cargo/config.toml",
     ] if (simulator / name).is_file())
-    paths.update((root / "scripts/build").glob("*.py"))
     files = {}
     for path in sorted(paths):
         before = path.stat()
@@ -59,11 +82,66 @@ def source_snapshot(root: Path = ROOT) -> dict:
         digest.update(name.encode("utf-8") + b"\0" + content + b"\0")
         files[name] = {"sha256": hashlib.sha256(content).hexdigest(),
                        "size": after.st_size, "mtime_ns": after.st_mtime_ns}
-    return {"schema": "cs2-build-inputs/v1", "sha256": digest.hexdigest(), "files": files}
+    return {"schema": "cs2-build-inputs/v2", "sha256": digest.hexdigest(), "files": files}
 
 
 def source_identity() -> str:
     return source_snapshot()["sha256"]
+
+
+def archive_file(source: Path, destination: Path, *, immutable_cache: Path | None = None) -> Path:
+    """Archive stable bytes without linking a mutable Cargo output to evidence."""
+    expected = stable_file_info(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if immutable_cache is not None:
+        immutable_cache.mkdir(parents=True, exist_ok=True)
+        blob = immutable_cache / f"{expected['sha256']}-{expected['size']}"
+        if os.path.lexists(blob):
+            if not blob.is_file() or stable_file_info(blob) != expected:
+                raise RuntimeError(f"Artifact blob has unexpected content: {blob}")
+        else:
+            temporary = immutable_cache / f".{blob.name}.{os.getpid()}.tmp"
+            try:
+                with temporary.open("xb"):
+                    pass
+                shutil.copy2(source, temporary)
+                if stable_file_info(temporary) != expected:
+                    raise RuntimeError(f"Artifact changed while entering immutable storage: {source}")
+                try:
+                    os.link(temporary, blob)
+                except FileExistsError:
+                    if stable_file_info(blob) != expected:
+                        raise RuntimeError(f"Concurrent artifact blob has different content: {blob}")
+            finally:
+                temporary.unlink(missing_ok=True)
+        source = blob
+
+    def verify_existing() -> Path:
+        if not destination.is_file() or stable_file_info(destination) != expected:
+            raise FileExistsError(f"Archive destination already exists with different content: {destination}")
+        return destination
+
+    if os.path.lexists(destination):
+        return verify_existing()
+    created = False
+    try:
+        try:
+            os.link(source, destination)
+            created = True
+        except FileExistsError:
+            return verify_existing()
+        except OSError:
+            with destination.open("xb"):
+                pass
+            created = True
+            shutil.copy2(source, destination)
+        if stable_file_info(destination) != expected:
+            raise RuntimeError(f"Archived file changed while linking/copying: {source}")
+        return destination
+    except Exception:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
 
 
 def ascii_workspace() -> Path:
@@ -141,6 +219,98 @@ def build_cache_directory(name: str, integration: bool, *, workspace_root: Path 
     return physical
 
 
+def staging_marker(staging: Path, output: Path, active: bool) -> None:
+    (staging / "workspace-attempt.json").write_text(json.dumps({
+        "schema": "cs2-android-staging/v1", "archive_output": str(output), "active": active,
+    }, indent=2) + "\n", encoding="utf-8")
+
+
+def finish_staging(staging: Path, output: Path) -> None:
+    marker = staging / "workspace-attempt.json"
+    if not marker.is_file():
+        return
+    try:
+        record = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    if record.get("archive_output") == str(output):
+        staging_marker(staging, output, False)
+
+
+def cleanup_attempt_staging(attempts: Path, archive_root: Path, keep: int = 2) -> list[Path]:
+    """Keep active/unknown attempts and the newest two completed copies."""
+    if not attempts.is_dir():
+        return []
+    lock = attempts / ".cleanup.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        return []
+    removed = []
+    try:
+        completed = []
+        for staging in attempts.iterdir():
+            if staging == lock or not staging.is_dir() or staging.is_symlink():
+                continue
+            marker_path = staging / "workspace-attempt.json"
+            marker = None
+            receipt_path = None
+            try:
+                if marker_path.is_file():
+                    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                    if marker.get("active") is not False:
+                        continue
+                    output = Path(marker["archive_output"])
+                    if output.name != staging.name:
+                        continue
+                    receipt_path = output / "build.json"
+                elif len(staging.name) >= 6 and staging.name[:6].isdigit():
+                    receipt_path = archive_root / f"{staging.name[:4]}-{staging.name[4:6]}" / staging.name / "build.json"
+                    workspace_receipt = ROOT / "archive" / f"{staging.name[:4]}-{staging.name[4:6]}" / staging.name / "build.json"
+                    if not receipt_path.is_file() and workspace_receipt.is_file():
+                        receipt_path = workspace_receipt
+                if receipt_path is None:
+                    continue
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                recorded_staging = Path(receipt["android_paths"]["staging"])
+                if recorded_staging.resolve() != staging.resolve():
+                    continue
+                if receipt.get("status") not in {
+                    "built", "failed", "source-changed-during-build", "diagnostic-mixed-source",
+                }:
+                    continue
+                finished = datetime.fromisoformat(receipt["finished_at"])
+                if finished.tzinfo is None:
+                    continue
+                completed.append((finished.timestamp(), staging.name, staging, receipt_path,
+                                  marker_path, marker, receipt))
+            except (OSError, UnicodeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+        completed.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        for _, _, staging, receipt_path, marker_path, marker, receipt in completed[keep:]:
+            try:
+                current = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if marker_path.is_file():
+                    current_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                    if current_marker.get("active") is not False:
+                        continue
+                elif marker is not None:
+                    continue
+                if (current.get("status"), current.get("finished_at")) != (
+                    receipt.get("status"), receipt.get("finished_at")
+                ):
+                    continue
+                if Path(current["android_paths"]["staging"]).resolve() != staging.resolve():
+                    continue
+                shutil.rmtree(staging)
+                removed.append(staging)
+            except (OSError, UnicodeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+        return removed
+    finally:
+        lock.rmdir()
+
+
 def build_report_path(integration: bool) -> Path:
     return ROOT / "reports" / ("android_integration_build.json" if integration else "android_build.json")
 
@@ -190,7 +360,8 @@ def host_c_compiler() -> Path:
 class BuildAttempt:
     """One source-bound attempt; never reuse a successful record for new bytes."""
 
-    def __init__(self, output: Path, integration: bool, *, source_root: Path = ROOT):
+    def __init__(self, output: Path, integration: bool, *, source_root: Path = ROOT,
+                 build_scripts: list[Path] | None = None):
         self.output = output
         self.integration = integration
         self.source_root = source_root
@@ -206,6 +377,7 @@ class BuildAttempt:
             "build_stage": "integration" if integration else "implementation-complete",
             "implementation_completion_verified": not integration, "completion_audit": audit,
             "source_before": self.source, "source_consistent": "error" not in self.source, "steps": [],
+            "build_scripts": build_script_snapshot(build_scripts or [Path(__file__)]),
             "original_game_executed": False, "tested": False,
         }
         self.write()
@@ -237,7 +409,14 @@ class BuildAttempt:
             return
         self.record["source_after"] = current
         before, after = self.source["files"], current["files"]
-        changed = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+
+        def content_identity(metadata: dict | None) -> dict | None:
+            if metadata is None:
+                return None
+            return {key: metadata.get(key) for key in ("sha256", "size")}
+
+        changed = sorted(name for name in before.keys() | after.keys()
+                         if content_identity(before.get(name)) != content_identity(after.get(name)))
         if changed:
             self.record.update(source_consistent=False, source_changed_at=stage,
                                changed_inputs=sorted(set(self.record.get("changed_inputs", [])) | set(changed)))
@@ -379,10 +558,31 @@ def gradle_wrapper_command(project: Path) -> list[str]:
     # are argv values, including paths with spaces and cmd metacharacters.
     return [str(java), "-jar", str(wrapper)]
 
+def media_plan_identity(plan: dict) -> str:
+    encoded = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def media_payload_info(prefix: Path, runtime_libraries: list[str]) -> dict:
+    libraries = {
+        name: stable_file_info(prefix / "lib" / name)
+        for name in runtime_libraries
+    }
+    notices_root = prefix / "notices"
+    notices = {
+        path.relative_to(notices_root).as_posix(): stable_file_info(path)
+        for path in sorted(notices_root.rglob("*")) if path.is_file()
+    }
+    required = {"COPYING.LGPLv2.1", "LICENSE.md", "RELEASE", "build-plan.json", "SOURCE-AND-LICENSE.txt"}
+    if not required <= notices.keys():
+        raise RuntimeError(f"Android media notices are incomplete: {sorted(required - notices.keys())}")
+    return {"libraries": libraries, "notices": notices}
+
+
 def build_media(sdk: Path, output: Path, env: dict, attempt: BuildAttempt,
-                staging: Path, msys: Path) -> tuple[Path, Path]:
-    """Build pinned media in the same explicit stage/source-bound attempt."""
-    prepare = attempt.source_root / "scripts/build/prepare_android_ffmpeg.py"
+                staging: Path, msys: Path, skip_media: bool = False) -> tuple[Path, Path]:
+    """Build pinned media or reuse a plan- and content-verified cached payload."""
+    prepare = ROOT / "scripts/build/prepare_android_ffmpeg.py"
     media = build_cache_directory("android", attempt.integration) / "ffmpeg"
     preparation = [
         sys.executable, "-B", "-X", "utf8", str(ascii_path(prepare)), "--prepare",
@@ -400,32 +600,63 @@ def build_media(sdk: Path, output: Path, env: dict, attempt: BuildAttempt,
     bash = msys / "usr/bin/bash.exe"
     if plan["build_stage"] != attempt.record["build_stage"]:
         raise RuntimeError("Prepared Android media belongs to another build stage")
-    script = ascii_path(Path(plan["build_script"])).as_posix()
-    if len(script) > 2 and script[1] == ":":
-        script = "/" + script[0].lower() + script[2:]
-    media_env = env.copy()
-    media_env["LANG"] = "C.UTF-8"
-    # GCC's cc1.exe lives outside bin and loads libwinpthread via PATH.
-    # The NDK ships an incompatible DLL with the same name.
-    media_env["PATH"] = os.pathsep.join([
-        str(Path(plan["host_c_compiler"]).parent), str(bash.parent),
-        media_env.get("PATH", ""),
-    ])
-    attempt.run("build-media", [str(bash), "--noprofile", "--norc", script], env=media_env, cwd=ROOT)
     prefix = Path(plan["install_prefix"])
+    plan_sha256 = media_plan_identity(plan)
+    manifest_path = media / f"media-cache-{plan_sha256}.json"
+    if skip_media:
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                "--skip-media found no verified FFmpeg payload for this source/toolchain/stage; "
+                "run without --skip-media once to establish the cache"
+            )
+        try:
+            cached = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if cached.get("schema") != "cs2-android-media-cache/v1" or cached.get("plan_sha256") != plan_sha256:
+                raise RuntimeError("media cache identity does not match its manifest")
+            payload = cached["payload"]
+            if media_payload_info(prefix, plan["runtime_libraries"]) != payload:
+                raise RuntimeError("media cache bytes or file set differ from its manifest")
+        except (OSError, UnicodeError, KeyError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"--skip-media cannot reuse the FFmpeg cache: {error}") from error
+    else:
+        script = ascii_path(Path(plan["build_script"])).as_posix()
+        if len(script) > 2 and script[1] == ":":
+            script = "/" + script[0].lower() + script[2:]
+        media_env = env.copy()
+        media_env["LANG"] = "C.UTF-8"
+        # GCC's cc1.exe lives outside bin and loads libwinpthread via PATH.
+        # The NDK ships an incompatible DLL with the same name.
+        media_env["PATH"] = os.pathsep.join([
+            str(Path(plan["host_c_compiler"]).parent), str(bash.parent),
+            media_env.get("PATH", ""),
+        ])
+        attempt.run("build-media", [str(bash), "--noprofile", "--norc", script], env=media_env, cwd=ROOT)
+        payload = media_payload_info(prefix, plan["runtime_libraries"])
+        manifest_path.write_text(json.dumps({
+            "schema": "cs2-android-media-cache/v1", "plan_sha256": plan_sha256, "payload": payload,
+        }, indent=2) + "\n", encoding="utf-8")
+    attempt.record["media_cache"] = {
+        "reused": skip_media, "plan_sha256": plan_sha256,
+        "manifest": str(manifest_path), "payload": payload,
+    }
+    attempt.write()
     libraries = staging / "media-libs/arm64-v8a"
     libraries.mkdir(parents=True, exist_ok=True)
     for name in plan["runtime_libraries"]:
         source = prefix / "lib" / name
-        if not source.is_file():
-            raise RuntimeError(f"Android media build is missing {name}")
         shutil.copy2(source.resolve(), libraries / name)
+        if stable_file_info(libraries / name) != payload["libraries"][name]:
+            raise RuntimeError(f"Android media cache changed while staging {name}")
     notices = staging / "media-notices/third-party/ffmpeg"
     notices.mkdir(parents=True, exist_ok=True)
     for name in ["COPYING.LGPLv2.1", "LICENSE.md", "RELEASE", "build-plan.json", "SOURCE-AND-LICENSE.txt"]:
         shutil.copy2(prefix / "notices" / name, notices / name)
+        if stable_file_info(notices / name) != payload["notices"][name]:
+            raise RuntimeError(f"Android media notice changed while staging {name}")
     # Keep exact source, adapter and rebuild instructions beside the APK.
     shutil.make_archive(str(output / "cs2-player-media-source"), "zip", prefix / "notices")
+    if media_payload_info(prefix, plan["runtime_libraries"]) != payload:
+        raise RuntimeError("Android media cache changed while archiving its source/notices")
     return libraries.parent, notices.parents[1]
 
 
@@ -447,25 +678,37 @@ def replay_source(receipt: Path) -> tuple[Path, str]:
     return ascii_path(Path(snapshot)), before
 
 
-def build(sdk: Path, integration: bool = False, *, replay_build: Path | None = None) -> Path:
+def build(sdk: Path, integration: bool = False, *, replay_build: Path | None = None,
+          skip_media: bool = False, profile: str | None = None) -> Path:
+    if profile is not None and (not integration or profile not in {"android-integration", "release", "perf"}):
+        raise ValueError("Android profile selection requires build --integration")
     source_root, expected_sha256 = replay_source(replay_build) if replay_build else (ROOT, None)
     archive_root = ROOT / "archive"
     if os.environ.get("CS2_BUILD_CACHE_ROOT"):
         archive_root = build_cache_directory("android", integration).parent / "archive"
     output = new_build_directory("android", integration, archive_root=archive_root)
-    attempt = BuildAttempt(output, integration, source_root=source_root)
+    attempt = BuildAttempt(
+        output, integration, source_root=source_root,
+        build_scripts=[Path(__file__), ROOT / "scripts/build/prepare_android_ffmpeg.py"],
+    )
     try:
         if replay_build:
             if attempt.source["sha256"] != expected_sha256:
                 raise RuntimeError(f"Frozen source no longer matches the PC build: {source_root}")
             attempt.record["paired_replay_build"] = str(replay_build.resolve())
-        return build_apk(sdk, output, attempt)
+        return build_apk(sdk, output, attempt, skip_media=skip_media, profile=profile)
     except Exception as error:
         attempt.fail(error)
         raise
+    finally:
+        cache = build_cache_directory("android", integration)
+        attempts = cache / "attempts"
+        finish_staging(attempts / output.name, output)
+        cleanup_attempt_staging(attempts, archive_root)
 
 
-def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
+def build_apk(sdk: Path, output: Path, attempt: BuildAttempt, *, skip_media: bool = False,
+              profile: str | None = None) -> Path:
     simulator = attempt.source_root / "simulator"
     ndk = ascii_path(sdk / "ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64")
     linker = ndk / "bin/aarch64-linux-android26-clang.cmd"
@@ -483,6 +726,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     target = cache / "target"
     staging = cache / "attempts" / output.name
     staging.mkdir(parents=True, exist_ok=False)
+    staging_marker(staging, output, True)
     # Gradle/CMake canonicalize project and imported-library paths too. Build
     # from a small source copy on physical ASCII storage, not the inward link.
     project = staging / "project"
@@ -504,7 +748,9 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     env["CS2_ANDROID_BUILD_ROOT"] = (staging / "app").as_posix()
     env["PATH"] = os.pathsep.join([str(host_cc.parent), str(Path.home() / ".cargo/bin"),
                                   str(ndk / "bin"), env.get("PATH", "")])
-    media_libraries, media_notices = build_media(sdk, output, env, attempt, staging, msys)
+    media_libraries, media_notices = build_media(
+        sdk, output, env, attempt, staging, msys, skip_media=skip_media,
+    )
     general_notices = media_notices / "third-party"
     shutil.copy2(simulator / "crates/runtime/src/javascript_LICENSE-MIT.txt",
                  general_notices / "Boa-LICENSE-MIT.txt")
@@ -517,7 +763,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
                  general_notices / "lewton-LICENSE.txt")
     env["CS2_ANDROID_MEDIA_LIBS"] = ascii_path(media_libraries).as_posix()
     env["CS2_ANDROID_MEDIA_NOTICES"] = ascii_path(media_notices).as_posix()
-    profile = "android-integration" if attempt.integration else "release"
+    profile = profile or ("android-integration" if attempt.integration else "release")
     attempt.record["cargo_profile"] = profile
     commands = [
         [str(Path.home() / ".cargo/bin/cargo.exe"), "build", "--locked", "--profile", profile,
@@ -534,7 +780,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     if not built_apk.is_file():
         raise RuntimeError("Gradle returned success without the expected APK")
     apk = output / "cs2-player.apk"
-    shutil.copy2(built_apk, apk)
+    archive_file(built_apk, apk)
     attempt.finish([apk, output / "cs2-player-media-source.zip",
                     libraries / "libcs2_android.so", *sorted((media_libraries / "arm64-v8a").glob("*.so"))])
     if attempt.record.get("paired_replay_build") and not attempt.record["source_consistent"]:
@@ -543,6 +789,7 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
         "apk": str(apk), "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
         "source_tree_sha256": attempt.source["sha256"], "abi": "arm64-v8a",
         "build_stage": attempt.record["build_stage"],
+        "cargo_profile": profile,
         "implementation_completion_verified": not attempt.integration,
         "source_consistent": attempt.record["source_consistent"], "provenance": str(output / "build.json"),
         "installed": False, "tested": False,
@@ -555,7 +802,105 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt) -> Path:
     return apk
 
 
-def install(sdk: Path, serial: str | None, integration: bool = False) -> None:
+def provenance_artifact(provenance: dict, receipt: Path, apk: Path) -> dict | None:
+    for name, metadata in provenance.get("artifacts", {}).items():
+        path = Path(name)
+        if not path.is_absolute():
+            path = receipt.parent / path
+        if path.resolve() == apk.resolve():
+            return metadata
+    return None
+
+
+def install_exploratory(sdk: Path, serial: str | None, integration: bool,
+                        apk_path: Path | None) -> None:
+    report_path = build_report_path(integration)
+    report = None
+    provenance = None
+    provenance_path = None
+    if apk_path is None:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        apk = Path(report["apk"])
+        provenance_path = Path(report["provenance"])
+    else:
+        apk = apk_path.expanduser()
+        candidate = apk.parent / "build.json"
+        if candidate.is_file():
+            provenance_path = candidate
+    if not apk.is_file():
+        raise RuntimeError(f"Exploratory APK does not exist: {apk}")
+    actual = stable_file_info(apk)
+    if provenance_path is not None:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        artifact = provenance_artifact(provenance, provenance_path, apk)
+        before = provenance.get("source_before", {}).get("sha256")
+        after = provenance.get("source_after", {}).get("sha256")
+        if (
+            provenance.get("schema") != "cs2-build-attempt/v1"
+            or provenance.get("status") != "built"
+            or provenance.get("source_consistent") is not True
+            or not before or before != after or artifact is None
+            or artifact.get("sha256") != actual["sha256"]
+            or artifact.get("size", actual["size"]) != actual["size"]
+        ):
+            raise RuntimeError("Exploratory APK does not match a successful, self-consistent sibling build.json")
+    if report is not None:
+        expected_stage = "integration" if integration else "implementation-complete"
+        if (
+            report.get("build_stage") != expected_stage
+            or provenance.get("build_stage") != expected_stage
+            or report.get("source_consistent") is not True
+            or report.get("source_tree_sha256") != before
+            or report.get("sha256") != actual["sha256"]
+        ):
+            raise RuntimeError("Latest Android report and its APK provenance are stale/inconsistent")
+    device = inventory(sdk, serial)
+    if not device["device"]:
+        raise RuntimeError("Select the connected tablet explicitly with --serial")
+    live_source = source_identity()
+    if stable_file_info(apk) != actual:
+        raise RuntimeError("Exploratory APK changed while preparing installation")
+    print(run([device["adb"], "-s", device["device"]["serial"], "install", "-r", str(apk)], timeout=300))
+    after_install_source = source_identity()
+    installation = {
+        "schema": "cs2-android-install/v1",
+        "exploratory": True,
+        "tested": False,
+        "installed": True,
+        "apk": str(apk),
+        "sha256": actual["sha256"],
+        "apk_sha256": actual["sha256"],
+        "apk_size": actual["size"],
+        "apk_provenance": str(provenance_path) if provenance_path else None,
+        "apk_provenance_verified": provenance is not None,
+        "apk_build_source_sha256": before if provenance is not None else None,
+        "apk_build_source_after_sha256": after if provenance is not None else None,
+        "apk_build_profile": (
+            provenance.get("cargo_profile") if provenance is not None else None
+        ) or (report.get("cargo_profile") if report is not None else None),
+        "build_stage": (
+            provenance.get("build_stage") if provenance is not None else None
+        ),
+        "installation_live_source_sha256": live_source,
+        "installation_live_source_after_sha256": after_install_source,
+        "installation_source_current": after_install_source == live_source,
+        "apk_matches_live_source": provenance is not None and before == live_source,
+        "device_serial": device["device"]["serial"],
+        "installed_at": BuildAttempt.now(),
+    }
+    if report is not None:
+        report.update(installation)
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    (apk.parent / "install.json").write_text(json.dumps(installation, indent=2) + "\n", encoding="utf-8")
+
+
+def install(sdk: Path, serial: str | None, integration: bool = False, *,
+            exploratory: bool = False, apk: Path | None = None) -> None:
+    if exploratory:
+        install_exploratory(sdk, serial, integration, apk)
+        return
+    if apk is not None:
+        raise RuntimeError("--apk requires explicit --exploratory")
     source = source_identity()
     if not integration:
         require_complete(source)
@@ -597,20 +942,37 @@ def main() -> None:
                         help="Build/install unfinished integration artifacts; does not assert implementation completion.")
     parser.add_argument("--replay-build", type=Path,
                         help="Build from the frozen source of this PC story_replay build.json.")
+    parser.add_argument("--profile", choices=["android-integration", "release", "perf"],
+                        help="With build --integration, select the Rust optimization/profile A/B configuration.")
+    parser.add_argument("--skip-media", action="store_true",
+                        help="Reuse only a plan- and hash-verified FFmpeg cache; fail if none is available.")
+    parser.add_argument("--exploratory", action="store_true",
+                        help="Install an archived APK without live-source equality; does not mark it tested.")
+    parser.add_argument("--apk", type=Path,
+                        help="With install --exploratory, use this APK and its sibling build.json when available.")
     args = parser.parse_args()
     if args.integration and args.phase == "inventory":
         parser.error("--integration applies only to build/install")
     if args.replay_build and (args.phase != "build" or not args.integration):
         parser.error("--replay-build requires build --integration")
+    if args.profile and (args.phase != "build" or not args.integration):
+        parser.error("--profile requires build --integration")
+    if args.skip_media and args.phase != "build":
+        parser.error("--skip-media applies only to build")
+    if args.exploratory and args.phase != "install":
+        parser.error("--exploratory applies only to install")
+    if args.apk and (args.phase != "install" or not args.exploratory):
+        parser.error("--apk requires install --exploratory")
     if args.phase in {"inventory", "build"}:
         (ROOT / "reports").mkdir(exist_ok=True)
     if args.phase == "inventory":
         print(json.dumps(inventory(args.sdk, args.serial), ensure_ascii=True, indent=2))
         return
     if args.phase == "build":
-        print(build(args.sdk, args.integration, replay_build=args.replay_build))
+        print(build(args.sdk, args.integration, replay_build=args.replay_build,
+                    skip_media=args.skip_media, profile=args.profile))
         return
-    install(args.sdk, args.serial, args.integration)
+    install(args.sdk, args.serial, args.integration, exploratory=args.exploratory, apk=args.apk)
 
 
 if __name__ == "__main__":

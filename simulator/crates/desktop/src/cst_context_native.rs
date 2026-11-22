@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cs2_formats::{ConfigXml, CstlTable};
 use cs2_runtime::{ResourceIndex, ResourceLocation};
-use cs2_runtime::resource_router::ResourceMode;
+use cs2_runtime::resource_router::{LocalizedSceneEncoding, ResourceMode};
 use cs2_script::{CstDocument, NativeReturn, Result, ScriptError, Vm};
 use cs2_script::cst_history::{HistorySnapshot, history_blocks, prepend_history_snapshot};
 
@@ -1314,7 +1314,9 @@ impl LoggingHost<'_> {
             let mut document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(bytes))?;
             let source_encoding = self.cst_scene_encoding_override(&resource);
             if let Some(source_encoding) = source_encoding {
-                require_gbk_records(&document)?;
+                if source_encoding == ScriptTextEncoding::Gbk {
+                    require_gbk_records(&document)?;
+                }
                 encoding = source_encoding;
             }
             match vm.program_code_sha256().filter(|_| {
@@ -1868,6 +1870,16 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn cst_scene_encoding_override(&self, resource: &SourcedResource) -> Option<ScriptTextEncoding> {
+        if let ResourceLocation::Archive { path, .. } = &resource.source.location
+            && let Some(encoding) = self.resources.resource_router()
+                .and_then(|router| router.localized_scene_encoding(self.resources, path))
+        {
+            return Some(match encoding {
+                LocalizedSceneEncoding::Cp932 => ScriptTextEncoding::Cp932,
+                LocalizedSceneEncoding::Gbk => ScriptTextEncoding::Gbk,
+                LocalizedSceneEncoding::Utf8 => ScriptTextEncoding::Utf8,
+            });
+        }
         let gbk_archive = matches!(&resource.source.location, ResourceLocation::Archive { path, .. }
             if self.resources.resource_router().is_some_and(|router|
                 router.is_island_chinese_scene(self.resources, path)

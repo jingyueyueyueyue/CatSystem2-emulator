@@ -172,7 +172,7 @@ pub fn draw_pixel_rows(
     let use_row_pool = *USE_ROW_POOL.get_or_init(|| {
         match std::env::var("CS2_RENDERER_ROW_POOL") {
             Ok(value) => value == "1",
-            Err(_) => false,
+            Err(_) => cfg!(target_os = "android"),
         }
     });
     if use_row_pool {
@@ -315,7 +315,48 @@ fn sampled_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlendMode, blend_special, sample_linear};
+    use crate::{BlendMode, Rect, blend_special, sample_linear};
+
+    #[test]
+    fn rgba_row_workers_match_serial_source_over() {
+        const WIDTH: usize = 258;
+        const HEIGHT: usize = 512;
+        let source: Vec<u8> = (0..WIDTH * HEIGHT)
+            .flat_map(|index| {
+                let value = index as u8;
+                let alpha = match index % 7 {
+                    0 => 0,
+                    1 => 255,
+                    _ => value,
+                };
+                [value, value.wrapping_add(3), value.wrapping_add(9), alpha]
+            })
+            .collect();
+        let background: Vec<u8> = (0..260 * 520)
+            .flat_map(|index| {
+                let value = index as u8;
+                [value, value.wrapping_add(11), value.wrapping_add(23), 200]
+            })
+            .collect();
+        let rect = Rect::new(1, 2, WIDTH as u32, HEIGHT as u32);
+        let mut expected = Canvas::from_rgba8(260, 520, background.clone()).unwrap();
+        expected
+            .blend_rgba_rows(rect, &source, WIDTH * 4, BlendMode::SourceOver)
+            .unwrap();
+        for workers in [2, 4] {
+            let mut actual = Canvas::from_rgba8(260, 520, background.clone()).unwrap();
+            actual
+                .blend_rgba_rows_with_workers(
+                    rect,
+                    &source,
+                    WIDTH * 4,
+                    BlendMode::SourceOver,
+                    workers,
+                )
+                .unwrap();
+            assert_eq!(actual.pixels(), expected.pixels(), "workers={workers}");
+        }
+    }
 
     #[test]
     fn special_blends_match_float_reference_for_every_channel_input() {

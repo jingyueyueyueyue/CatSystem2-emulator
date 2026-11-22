@@ -6,6 +6,9 @@ use cs2_script::{NativeReturn, Result, Vm};
 
 use super::{cp932_to_utf8, expand_kcs_format, native_state_error, read_u32};
 
+#[path = "image_predecode.rs"]
+mod images;
+
 const MAX_LIVE: usize = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
 
@@ -30,6 +33,7 @@ pub(super) struct ResourcePreloads {
     requests: Vec<Request>,
     completed_through: i32,
     bytes: usize,
+    images: images::ImagePredecode,
 }
 
 impl ResourcePreloads {
@@ -43,6 +47,12 @@ impl ResourcePreloads {
             .and_then(|request| request.resource.as_ref())
     }
 
+    pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.images.submit(bytes); }
+
+    pub(super) fn take_predecoded_image(&mut self, bytes: &[u8], id: u32) -> Option<cs2_renderer::RgbaFrame> {
+        self.images.take(bytes, id)
+    }
+
     pub(super) fn call(
         &mut self, index: u32, args: &[u8], vm: &Vm, resources: &ResourceIndex,
     ) -> Result<NativeReturn> {
@@ -51,6 +61,7 @@ impl ResourcePreloads {
             434 => {
                 if self.enabled == Some(true) {
                     self.requests.clear();
+                    self.images.clear();
                     self.bytes = 0;
                     self.completed_through = i32::MAX;
                 }
@@ -102,6 +113,9 @@ impl ResourcePreloads {
                         if request.attempted { continue; }
                         let resource = read_optional(resources, &request.name, MAX_LIVE - self.bytes)?;
                         let total = self.bytes + resource.as_ref().map_or(0, |resource| resource.bytes.capacity());
+                        if let Some(resource) = &resource {
+                            self.images.submit(&resource.bytes);
+                        }
                         request.resource = resource;
                         request.attempted = true;
                         self.bytes = total;

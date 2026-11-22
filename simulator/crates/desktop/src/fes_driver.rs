@@ -240,7 +240,7 @@ pub(crate) struct FesMediaNotificationScope {
 impl FesScriptDriver {
     pub(crate) fn new(document: &FesDocument) -> Result<Self> {
         let program = FesProgram::from_document(document)?;
-        Ok(Self {
+        let mut driver = Self {
             interpreter: FesInterpreter::new(program)?,
             adapter: FesRuntimeAdapter::new(),
             island_gbk_fes_source: false,
@@ -273,7 +273,10 @@ impl FesScriptDriver {
             media_statement: None,
             media_statement_result: None,
             notification_only: false,
-        })
+        };
+        // Zero is a completed child result. A fresh task has no such result.
+        driver.set_child_exit_code(-1);
+        Ok(driver)
     }
 
     pub(crate) fn is_island_gbk_fes_source(&self) -> bool {

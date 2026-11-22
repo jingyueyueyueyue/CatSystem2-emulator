@@ -18,8 +18,9 @@
 - `scripts/analysis/run_yukikoi_save_roundtrip.py --player <回放器>` 从 Yukikoi Melt 的右键菜单写普通槽，新进程从标题选 LOAD，只带入写出的槽文件，并记录确认和翻页。
 - `scripts/analysis/run_button_batch.py --player <回放器> --cases <清单>` 运行命名按钮用例。可以重复传入 `--cases`，各清单共用构建、资源限额和结果目录。清单 `pc_button_title_actions.json`、`pc_button_settings_actions.json`、`pc_button_save_panel_actions.json`、`pc_button_legacy_scroll_cases.json` 分别覆盖已登记的标题与确认、设置、存档页和滚动控件。
 - `scripts/analysis/review_button_captures.py <归档目录> --indices 1 2` 将已完成用例的前后截图并排输出到对应的运行目录，便于集中核对可见动作。
-- `scripts/convert/`：离线转换工作区已有游戏资源。`restore_pc_story_10_scene.py` 校验并生成 10 的 `scene.int`。
+- `scripts/convert/`：离线转换工作区已有游戏资源。`restore_pc_story_10_scene.py` 校验并生成 10 的 `scene.int`。`build_hatsumira_font.py` 根据 Windows UIF 配置生成《果つることなき未来より》的配套字体。
 - `simulator/crates/desktop/examples/story_replay.rs`：同一套引擎源码的 PC 回放入口。Windows 使用 `python scripts/build/cs2_workspace.py build --integration --story-replay` 构建，由正式流程接入 Common Controls 清单。
+- `scripts/analysis/replay_emote_performance.py` 用 `--player` 复用归档回放器，直接读取 `--game-root` 原游戏，只把 `--seed-profile` 中的配置/存档复制到隔离 profile；`--workers 1|2|4`、`--emote-gpu 0|1` 和 `--row-pool 0|1` 用于同场景对照，路线用 `--drop-input`／`--append-input` 显式调整，回执保存完整参数、产物身份和截图哈希。
 - 固定帧日志探针可同时使用 `capture-every:0` 和 `no-final-capture`；`inspect-log:` 记录合成层和等待状态，不保存画面。显式 `capture:` 或 `inspect:` 仍保留画面，按状态回放保留异常证据。使用 `story-events` 时可重复加 `trace-native:编号`，保留指定调用的原始参数。
 - 状态场景可用 `diagnostics` 数组附加 `trace-native:编号` 和 `inspect-log:帧号`。它们只记录调用、等待以及影片解码和合成时间戳，不改变输入时机；状态路线仍不接受固定帧按键或点按。`composited_pts` 是画布合成证据，不代表平板实际呈现。
 - 固定帧的 `require-hit:帧:区域` 必须对应同帧点击；实际命中的启用区域不符时停止并记为 `input_missed`，不会发出点击。
@@ -43,9 +44,10 @@
 - `reports/android_story_round1_20261119.md` 记录真机剧情分支、存读档、批次源码与 APK 身份；PC 诊断不计入真机验收。
 - `scripts/build/`：正式主流程；`cs2_workspace.py snapshot` 更新静态调用与工作量报告，`toolchain` 检查工具链；`build --integration` 用于当前整编，默认正式构建保留完整实现校验。
 - `scripts/build/android_workspace.py`：平板/SDK 盘点及 APK 构建安装；显式 `--integration` 接入当前未完成实现的平板验证，单独记录源码、日志和产物身份。
-- 同源验收先用 `cs2_workspace.py build --integration --story-replay --profile playthrough --freeze-source`，再用 `android_workspace.py build --integration --replay-build <PC构建的build.json>`。APK 构建核对 PC 回放器、冻结源码和构建回执；设置 `CS2_BUILD_CACHE_ROOT` 时两端产物均按日期归档到该物理盘。
+- 同源验收先用 `cs2_workspace.py build --integration --story-replay --profile perf --freeze-source`，再用 `android_workspace.py build --integration --profile perf --replay-build <PC构建的build.json>`。APK 构建核对 PC 回放器、冻结源码和构建回执；设置 `CS2_BUILD_CACHE_ROOT` 时两端产物均按日期归档到该物理盘。性能对照使用 `perf`（opt-level 3、thin LTO、无增量），快速功能迭代用 `playthrough`；Android 也可用 `--profile release` 做对照。
 - `scripts/build/sync_github_source.ps1`：将允许公开的引擎源码及相关工具同步到独立的 `CatSystem2-emulator` 签出，不自动提交或推送。
-- Android 整编使用 `android-integration` Cargo profile：关闭 LTO、并行生成代码，减少实际小修复的构建等待；正式发布仍使用 `release`。
+- Android 整编默认使用 `android-integration` Cargo profile，关闭增量、调试断言和溢出检查；正式发布仍使用 `release`。已有内容清单后可加 `--skip-media` 复用经计划与文件哈希验证的 FFmpeg 缓存。
+- 已归档 APK 可用 `android_workspace.py install --integration --serial <设备> --exploratory --apk <APK路径>` 原位复现；该通道校验实际 APK 与同目录回执、记录源码和 profile，不要求匹配当前源码，也不标记为已验收。省略 `--exploratory` 的正式安装继续执行严格的源码与产物闸门。
 - `resources/reference/`：固定版本的外部参考仓库、提交、许可证和使用边界。
 - `reports/`：样本清单、格式矩阵、接口账本、函数账本、Ghidra 状态和 CLI JSON schema。
 - `reports/workload_status_20261116.md`：按原版函数、调用槽位和完整游戏验收分别统计剩余量；不把静态覆盖率当作游戏完成率。
@@ -127,16 +129,33 @@
 - `archive/2026-11/20261118_integration/`：首次 Windows 整编日志及退出记录；后续整编按日期保存，不能作为完整游戏通过证明。
 - `archive/2026-11/20261118_12_native213_probe/`：样本 12 的 PC 表达式兼容补丁、隔离快照和对照测试；回放路径见批次报告。
 - `archive/2026-11/20261119_08_native257/`：样本 08 的 PC 图像列表短参数 ABI、基于 05 的候选补丁及独立回归；见[交接记录](archive/2026-11/20261119_08_native257/20261119_08_native257_handoff.md)。
-- `archive/build-cache/`：ASCII 工作区的默认本地构建缓存。Windows 中文路径工作区改用同卷的 `cs2-build-cache-<工作区标识>/`，供 GNU 链接器使用。历史 `archive/YYYY-MM/*_cache_ascii/` 是指向旧缓存的目录联接。
-- `CS2_BUILD_CACHE_ROOT`：可选的工作区专用物理缓存根，须为绝对 ASCII 路径（例如 `F:\CS2-build-cache`）。默认及自定义缓存均按构建任务和阶段跨日期复用。成品与逐次日志仍按日期归档，游戏资源由原目录提供。
+- `archive/build-cache/`：ASCII 工作区的默认本地构建缓存。Windows 中文路径工作区改用同卷的 `cs2-build-cache-<工作区标识>/`，供 GNU 链接器使用。历史 `archive/YYYY-MM/*_cache_ascii/` 是指向旧缓存的目录联接；停用联接和目标缓存可在构建全部结束后清理。
+- `CS2_BUILD_CACHE_ROOT`：可选的工作区专用物理缓存根，须为绝对 ASCII 路径（例如 `F:\CS2-build-cache`）。默认及自定义缓存均按构建任务和阶段跨日期复用。成品与逐次日志仍按日期归档，游戏资源由原目录提供；PC 成品先写入按内容哈希命名的不可变 blob，再硬链接到日期归档，避免后续 Cargo 原地写入修改历史产物；Android 已结束的 staging 只保留最近两份且不清空活跃或身份不明目录。
 - 并行修复期间可给 `cs2_workspace.py build --integration --story-replay` 加 `--freeze-source`。构建前将校验过的源码复制到物理缓存，构建回执记录副本路径和输入哈希。设置 `CS2_BUILD_CACHE_ROOT` 后，PC 回放器、构建回执和日志同存于该缓存根的 `archive/YYYY-MM/`。
-- Windows 上连续构建时，复用同一个缓存根和用户级 Cargo 依赖缓存。一次性探针可以用 `CARGO_INCREMENTAL=0` 控制缓存增长。构建停止后，可按需清理 Cargo `target` 下各 profile 的 `build`、`deps`、`incremental` 和 `.fingerprint`，下次构建会重建。
-- `D:\20261121_CS2-pending-delete` 和 `F:\20261121_CS2-pending-delete` 存放本次移出的停用 Cargo 产物、旧构建缓存和旧整编可执行文件。内部路径相对于原盘根，可按原路径恢复。归集在同盘完成，手动删除后释放空间。
+- Windows 上连续构建时，复用同一个缓存根和用户级 Cargo 依赖缓存。`playthrough`、`android-integration` 和 `perf` 均关闭增量；构建脚本哈希单独记录但不参与运行时源码身份，单纯 touch 也不使产物失效，真实内容变化仍会触发重建。构建停止后，可清理 Cargo `target` 下各 profile 的 `build`、`deps`、`incremental` 和 `.fingerprint`，下次构建会重建。
 - `archive/2026-11/source_blobs/`：静态接线统计实际读取的源码/输入字节，按哈希去重保存；用于并行修改期间重现候选绑定，不作为当前源码完成证明。
 - `games/`：本机游戏和 `cs2_full_v401` 基准样本。每个样本直接放在 `games/<原目录名>/`，不再按引擎或系列分层；保留各游戏内部的资源、补丁和存档结构，不随 APK 或源码发布。
 - `localization/`：本机汉化文件与变更记录。`campanella/` 存放《祝福的钟声》原版使用的 `update00.int` 和 `WenQuanYi_msgothic.ttf`，部署时两者放在原版游戏根目录，沿用原版 `cs2.exe` 和 `config/startup.xml`。
+- `localization/果つることなき未来より/`：存放现有汉化的简体字形映射字体及 OFL 许可证。将 `HatsumiraSimplifiedChinese.ttf` 放入游戏根目录并重新打开该游戏，CatSystem2 Player 会从游戏目录读取字体。
+- `localization/mirai-radio/`：存放《未来广播与人工鸽》的简中资源包和 `cs2-localization.json`。将两者放在汉化版游戏根目录，沿用 `cs2.exe`、原始资源与 `update01.int`。
+- `localization/djibril5/`：存放《战国天使吉布莉尔》的松散汉化剧情、导出表、启动配置和配套字体。汉化目录同时需要可读的原版 `scene.int`。
+- `localization/utatemeguri/`：存放《うたてめぐり》的 `update02.int`、替字表、由 `scripts/convert/build_hatsumira_font.py --profile utatemeguri` 生成的字体及 OFL 许可证。游戏从根目录读取补丁与字体。
 
 模拟器直接读取用户持有的游戏目录和 `.int` 归档，不启动、注入、代理或分发原始游戏 EXE、DLL、游戏资源和官方工具。
+
+### 补丁配置
+
+在汉化版游戏根目录放置 UTF-8 的 `cs2-localization.json`，可以声明任意同引擎的补丁归档。补丁按列表顺序优先查找，未覆盖的内容继续走原有 `updateNN.int`、松散文件和基础归档查找顺序。可选的 `scene_encoding` 支持 `cp932`、`gbk` 和 `utf8`，只作用于从该补丁读出的 CST。
+
+```json
+{
+  "patches": [
+    { "archive": "translation.int", "scene_encoding": "gbk" }
+  ]
+}
+```
+
+日文原版沿用自己的目录和原始文件。汉化版使用自己的游戏目录及所需补丁、字体或松散文件。两个目录可作为游戏库的独立条目共存。对仅通过清单启用且名称不属于 `updateNN.int` 的补丁，也可以移走清单后重新打开同一目录，恢复原有资源顺序。
 
 PC 剧情回放直接使用启动清单中的工作区原目录，同一版本只保留一份游戏资源；测试存档、配置、截图和日志写入独立的运行目录。诊断需要别名或改变资源解析时，记录映射或使用单文件替换，不复制整份游戏。Android 真机使用平板已导入的同版资源，更换 APK 不重复传游戏。
 

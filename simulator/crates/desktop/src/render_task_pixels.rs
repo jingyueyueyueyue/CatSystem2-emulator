@@ -2,9 +2,11 @@
 //! Coordinates remain in the original pretransformed pixel convention (-0.5
 //! at the upper left). Sampling uses the auxiliary power-of-two texture size.
 use anyhow::{Context, Result, bail};
-use cs2_renderer::{Canvas, Color, ImageDrawOptions, Point, RgbaFrame};
+use cs2_renderer::{Canvas, ImageDrawOptions, Point, RgbaFrame};
 
-use super::{MAX_WORK_BYTES, snapshot};
+use super::MAX_WORK_BYTES;
+
+const MAX_EXACT_QUAD_AREA: u32 = 1 << 23;
 
 #[derive(Clone, Copy)]
 struct Vertex {
@@ -72,9 +74,8 @@ pub(super) fn mosaic(
         }
     }
     let mut auxiliary = Canvas::new(width, height)?;
-    auxiliary.clear(Color::TRANSPARENT);
     draw_quad(&mut auxiliary, source, texture, small, 0xffff_ffff, false)?;
-    let auxiliary = snapshot(&auxiliary)?;
+    let auxiliary = auxiliary.into_frame();
     let mut enlarged = original;
     for (vertex, small) in enlarged.iter_mut().zip(small) {
         vertex.uv = [
@@ -125,7 +126,7 @@ pub(super) fn blur(
         }
         draw_quad(&mut output, previous, texture, vertices, words[19], false)?;
     }
-    snapshot(&output)
+    Ok(output.into_frame())
 }
 
 /// 004d2cc0/004d35b0: 49 full-screen translated quads, ordered by the
@@ -133,34 +134,67 @@ pub(super) fn blur(
 /// these are not per-pixel grayscale or radial-mask operations.
 pub(super) fn shade(target: &mut Canvas, source: &RgbaFrame, radius: Option<i32>) -> Result<()> {
     let texture = texture_size(source)?;
-    let mut offsets = Vec::with_capacity(49);
-    for y in -3i32..=3 {
-        for x in -3i32..=3 {
-            offsets.push((ring_index(x, y), x, y));
-        }
+    let taps = shade_taps(radius);
+    if exact_unit_quad(source) {
+        draw_unit_spans(target, source, &taps);
+        return Ok(());
     }
-    offsets.sort_unstable();
-    for (_, x, y) in offsets {
-        let alpha = if let Some(radius) = radius {
-            // The binary calculates distance from the first quad vertex,
-            // including the pretransformed half-pixel offset.
-            let px = x as f32 - 0.5;
-            let py = y as f32 - 0.5;
-            let squared = px * px + py * py;
-            let distance = (f64::from(squared).sqrt() as f32).min(radius as f32);
-            let value = ((radius as f32 - distance) * 255.) / radius as f32;
-            // x87's indefinite integer on NaN/overflow has low byte zero.
-            if !value.is_finite() {
-                0
+    shade_quads(target, source, texture, &taps)
+}
+
+fn shade_taps(radius: Option<i32>) -> Vec<([i32; 2], u8)> {
+    const OFFSETS: [(i32, i32, i32); 49] = shade_offsets();
+    OFFSETS
+        .into_iter()
+        .filter_map(|(_, x, y)| {
+            let alpha = if let Some(radius) = radius {
+                // The binary calculates distance from the first quad vertex,
+                // including the pretransformed half-pixel offset.
+                let px = x as f32 - 0.5;
+                let py = y as f32 - 0.5;
+                let squared = px * px + py * py;
+                let distance = (f64::from(squared).sqrt() as f32).min(radius as f32);
+                let value = ((radius as f32 - distance) * 255.) / radius as f32;
+                // x87's indefinite integer on NaN/overflow has low byte zero.
+                if !value.is_finite() {
+                    0
+                } else {
+                    (value.trunc() as i32) as u8
+                }
             } else {
-                (value.trunc() as i32) as u8
-            }
-        } else {
-            255
-        };
-        if alpha == 0 {
-            continue;
+                255
+            };
+            (alpha != 0).then_some(([x, y], alpha))
+        })
+        .collect()
+}
+
+const fn shade_offsets() -> [(i32, i32, i32); 49] {
+    let mut offsets = [(0, 0, 0); 49];
+    let mut i = 0;
+    while i < offsets.len() {
+        let x = i as i32 / 7 - 3;
+        let y = i as i32 % 7 - 3;
+        let index = ring_index(x, y);
+        let mut j = i;
+        // Iteration is already ordered by X and Y for equal ring indices.
+        while j > 0 && offsets[j - 1].0 > index {
+            offsets[j] = offsets[j - 1];
+            j -= 1;
         }
+        offsets[j] = (index, x, y);
+        i += 1;
+    }
+    offsets
+}
+
+fn shade_quads(
+    target: &mut Canvas,
+    source: &RgbaFrame,
+    texture: [u32; 2],
+    taps: &[([i32; 2], u8)],
+) -> Result<()> {
+    for &([x, y], alpha) in taps {
         let mut vertices = full_quad(source, texture);
         for vertex in &mut vertices {
             vertex.xy[0] += x as f32;
@@ -178,6 +212,120 @@ pub(super) fn shade(target: &mut Canvas, source: &RgbaFrame, radius: Option<i32>
     Ok(())
 }
 
+fn exact_unit_quad(source: &RgbaFrame) -> bool {
+    let (width, height) = source.dimensions();
+    (1..=4096).contains(&width)
+        && (1..=4096).contains(&height)
+        && width * height <= MAX_EXACT_QUAD_AREA
+}
+
+/// Integer-aligned translations of the logical source rectangle. Each row
+/// sees the original draw order and stays hot across all Shade taps.
+fn draw_unit_spans(target: &mut Canvas, source: &RgbaFrame, taps: &[([i32; 2], u8)]) {
+    if taps.is_empty() || target.width() == 0 || target.height() == 0 {
+        return;
+    }
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    {
+        use crate::gpu_raster::{Draw, RasterRect, draw};
+        let extent = std::array::from_fn::<_, 2, _>(|axis| {
+            taps.iter()
+                .map(|(offset, _)| offset[axis])
+                .max()
+                .unwrap_or(0)
+                .max(0) as u32
+        });
+        let size = [
+            target.width().min(source.width() + extent[0]),
+            target.height().min(source.height() + extent[1]),
+        ];
+        if draw(
+            target,
+            Some(source),
+            RasterRect {
+                origin: [0; 2],
+                size,
+            },
+            Draw::EffectSpans { taps },
+        ) {
+            return;
+        }
+    }
+    let width = target.width() as usize;
+    let (source_width, source_height) = source.dimensions();
+    let input = source.pixels();
+    let stride = source_width as usize * 4;
+    let spans: Vec<_> = taps
+        .iter()
+        .filter_map(|&([x, y], alpha)| {
+            let left = x.max(0) as usize;
+            let right = (x + source_width as i32).max(0).min(width as i32) as usize;
+            (left < right).then(|| {
+                (
+                    left * 4..right * 4,
+                    (left as i32 - x) as usize * 4,
+                    y,
+                    alpha,
+                )
+            })
+        })
+        .collect();
+    let workers = effect_workers(
+        source_width,
+        source_height,
+        u64::from(source_width) * u64::from(source_height) * spans.len() as u64,
+    );
+    cs2_renderer::draw_pixel_rows(target.pixels_mut(), width * 4, 0, workers, |row, y| {
+        for (range, start, offset_y, alpha) in &spans {
+            let sy = (y as i64 - i64::from(*offset_y)) as usize;
+            if sy >= source_height as usize {
+                continue;
+            }
+            let from = sy * stride + start;
+            blend_span(
+                &mut row[range.clone()],
+                &input[from..from + range.len()],
+                *alpha,
+            );
+        }
+    });
+}
+
+pub(super) fn effect_workers(width: u32, height: u32, pixels: u64) -> usize {
+    if width >= 128 && height >= 64 && pixels >= 512 * 1024 {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(4))
+    } else {
+        1
+    }
+}
+
+fn blend_span(target: &mut [u8], source: &[u8], opacity: u8) {
+    let opacity = u32::from(opacity);
+    for (out, src) in target
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(source.as_chunks::<4>().0)
+    {
+        let alpha = (u32::from(src[3]) * opacity + 127) / 255;
+        match alpha {
+            0 => {}
+            255 => out.copy_from_slice(src),
+            _ => {
+                for channel in 0..3 {
+                    out[channel] = blend_channel(src[channel].into(), out[channel], alpha);
+                }
+                out[3] = blend_channel(alpha, out[3], alpha);
+            }
+        }
+    }
+}
+
+#[inline]
+fn blend_channel(sample: u32, destination: u8, alpha: u32) -> u8 {
+    ((sample * alpha + u32::from(destination) * (255 - alpha) + 127) / 255) as u8
+}
+
 pub(super) fn composite(
     target: &mut Canvas,
     source: &RgbaFrame,
@@ -185,19 +333,28 @@ pub(super) fn composite(
     diffuse_alpha_only: bool,
 ) -> Result<()> {
     let size = texture_size(source)?;
-    const MAX_EXACT_HALF_PIXEL_AREA: u32 = 1 << 23;
+    if !diffuse_alpha_only && exact_unit_quad(source) {
+        if alpha != 0 {
+            draw_unit_spans(target, source, &[([0; 2], alpha)]);
+        }
+        return Ok(());
+    }
     if diffuse_alpha_only
         && target.dimensions() == (source.width(), source.height())
-        && (1..=4096).contains(&source.width())
-        && (1..=4096).contains(&source.height())
-        && source.width() * source.height() <= MAX_EXACT_HALF_PIXEL_AREA
+        && exact_unit_quad(source)
     {
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         if alpha > 0 && (alpha < 255 || target.device_pixels().is_some()) {
             use crate::gpu_raster::{Draw, RasterRect, draw};
-            if draw(target, Some(source), RasterRect { origin: [0; 2], size: [source.width(), source.height()] },
-                Draw::DiffuseFrame { alpha })
-            {
+            if draw(
+                target,
+                Some(source),
+                RasterRect {
+                    origin: [0; 2],
+                    size: [source.width(), source.height()],
+                },
+                Draw::DiffuseFrame { alpha },
+            ) {
                 return Ok(());
             }
         }
@@ -233,17 +390,19 @@ fn composite_unit_diffuse(target: &mut Canvas, source: &RgbaFrame, alpha: u8) {
             {
                 for channel in 0..3 {
                     destination[channel] = ((u16::from(sample[channel]) * factor
-                        + u16::from(destination[channel]) * inverse + 127) / 255) as u8;
+                        + u16::from(destination[channel]) * inverse
+                        + 127)
+                        / 255) as u8;
                 }
-                destination[3] = ((factor * factor + u16::from(destination[3]) * inverse + 127)
-                    / 255) as u8;
+                destination[3] =
+                    ((factor * factor + u16::from(destination[3]) * inverse + 127) / 255) as u8;
             }
         }
     }
 }
 
-fn ring_index(x: i32, y: i32) -> i32 {
-    let r = x.abs().max(y.abs());
+const fn ring_index(x: i32, y: i32) -> i32 {
+    let r = if x.abs() >= y.abs() { x.abs() } else { y.abs() };
     if r == 0 {
         return 0;
     }
@@ -388,25 +547,32 @@ fn triangle(
     let top = (minimum[1].ceil() as i32).max(0);
     let right = (maximum[0].floor() as i32).min(target.width() as i32 - 1);
     let bottom = (maximum[1].floor() as i32).min(target.height() as i32 - 1);
+    if left > right || top > bottom {
+        return Ok(());
+    }
     let colors = [
         (argb >> 16) as u8,
         (argb >> 8) as u8,
         argb as u8,
         (argb >> 24) as u8,
     ];
+    let edges = [0, 1, 2].map(|i| {
+        let a = vertices[(i + 1) % 3].xy;
+        let b = vertices[(i + 2) % 3].xy;
+        (a, [b[0] - a[0], b[1] - a[1]], top_left(a, b))
+    });
+    let stride = target.width() as usize * 4;
+    let pixels = target.pixels_mut();
     for y in top..=bottom {
+        let row = &mut pixels[y as usize * stride..][..stride];
+        let edges = edges
+            .map(|(a, delta, inclusive)| (a[0], delta[0] * (y as f32 - a[1]), delta[1], inclusive));
         for x in left..=right {
-            let point = [x as f32, y as f32];
-            let e = [
-                edge(vertices[1].xy, vertices[2].xy, point),
-                edge(vertices[2].xy, vertices[0].xy, point),
-                edge(vertices[0].xy, vertices[1].xy, point),
-            ];
-            let inside = e.iter().enumerate().all(|(index, &value)| {
-                value > 0.
-                    || (value == 0.
-                        && top_left(vertices[(index + 1) % 3].xy, vertices[(index + 2) % 3].xy))
-            });
+            let e = edges.map(|(start, base, slope, _)| base - slope * (x as f32 - start));
+            let inside = e
+                .iter()
+                .zip(edges)
+                .all(|(&value, (_, _, _, inclusive))| value > 0. || (value == 0. && inclusive));
             if !inside {
                 continue;
             }
@@ -438,8 +604,8 @@ fn triangle(
             }
             // D3D's fixed-function source-alpha factors apply to all four
             // channels. Canvas's Porter-Duff alpha would incorrectly keep A=255.
-            let index = ((y as usize) * target.width() as usize + x as usize) * 4;
-            let destination = &mut target.pixels_mut()[index..index + 4];
+            let index = x as usize * 4;
+            let destination = &mut row[index..index + 4];
             let alpha = u32::from(sample[3]);
             for channel in 0..4 {
                 destination[channel] = ((u32::from(sample[channel]) * alpha
@@ -463,8 +629,16 @@ fn sample_point(texture: &RgbaFrame, size: [u32; 2], uv: [f32; 2]) -> Result<[u8
     if uv.iter().any(|v| !v.is_finite()) {
         bail!("render texture coordinate is non-finite");
     }
-    let [x, y] = [0, 1]
-        .map(|axis| (uv[axis].rem_euclid(1.) * size[axis] as f32).floor() as u32 % size[axis]);
+    let [x, y] = [0, 1].map(|axis| {
+        let value = uv[axis];
+        let extent = size[axis];
+        if (0.0..1.0).contains(&value) {
+            // The cast rounds toward zero and the extent is a power of two.
+            (value * extent as f32) as u32
+        } else {
+            (value.rem_euclid(1.) * extent as f32).floor() as u32 % extent
+        }
+    });
     if x >= texture.width() || y >= texture.height() {
         return Ok([0; 4]);
     }
@@ -581,7 +755,55 @@ mod tests {
     #[test]
     fn retained_quad_fallback_matches_triangle_rgba() -> Result<()> {
         compare_composite(7, 5, 213, true, [4, 8])?;
-        compare_composite(7, 5, 213, false, [7, 5])?;
         compare_composite(4097, 1, 213, true, [4097, 1])
+    }
+
+    #[test]
+    fn texture_alpha_spans_match_triangle_rgba() -> Result<()> {
+        for alpha in [0, 1, 127, 254, 255] {
+            compare_composite(1280, 720, alpha, false, [1280, 720])?;
+            compare_composite(7, 5, alpha, false, [4, 8])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_shade_spans_match_triangle_rgba() -> Result<()> {
+        let source = RgbaFrame::from_rgba8(1280, 720, bytes(1280, 720, 17))?;
+        let texture = texture_size(&source)?;
+        for radius in [None, Some(-1), Some(0), Some(2), Some(7)] {
+            let mut expected = Canvas::from_rgba8(1277, 725, bytes(1277, 725, 9))?;
+            let mut actual = expected.clone();
+            shade_quads(&mut expected, &source, texture, &shade_taps(radius))?;
+            shade(&mut actual, &source, radius)?;
+            assert!(actual.pixels() == expected.pixels(), "radius={radius:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu-raster", windows))]
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn gpu_effect_spans_match_triangle_rgba() -> Result<()> {
+        use crate::gpu_raster::{Draw, RasterRect, available, draw, enable};
+        enable();
+        assert!(available());
+        let source = RgbaFrame::from_rgba8(320, 240, bytes(320, 240, 17))?;
+        let texture = texture_size(&source)?;
+        let mut expected = Canvas::from_rgba8(319, 244, bytes(319, 244, 9))?;
+        let mut actual = expected.clone();
+        let taps = shade_taps(Some(7));
+        shade_quads(&mut expected, &source, texture, &taps)?;
+        assert!(draw(
+            &mut actual,
+            Some(&source),
+            RasterRect {
+                origin: [0; 2],
+                size: [319, 243]
+            },
+            Draw::EffectSpans { taps: &taps },
+        ));
+        assert!(actual.pixels() == expected.pixels());
+        Ok(())
     }
 }

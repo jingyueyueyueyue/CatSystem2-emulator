@@ -1,10 +1,8 @@
 use std::{
     any::Any,
     cell::{Cell, RefCell},
-    iter::Enumerate,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     ptr::NonNull,
-    slice::ChunksMut,
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::{self, JoinHandle},
 };
@@ -31,29 +29,59 @@ pub(super) fn draw_pixel_rows(
 
     let rows = target.len() / stride;
     let workers = workers.clamp(1, 4).min(rows);
+    let band_rows = rows.div_ceil(workers);
+    parallel_for_each(
+        target.chunks_mut(band_rows * stride).enumerate(),
+        workers,
+        |(index, band)| {
+            process_rows(top + (index * band_rows) as u32, band, stride, &draw_row);
+        },
+    );
+}
+
+/// Run a bounded set of jobs with the calling thread and persistent workers.
+pub fn parallel_for_each<I, F>(jobs: I, workers: usize, work: F)
+where
+    I: Iterator + Send,
+    F: Fn(I::Item) + Sync,
+{
+    if jobs.size_hint().1 == Some(0) {
+        return;
+    }
+    let workers = workers.clamp(1, 4);
     if workers == 1 {
-        process_rows(top, target, stride, &draw_row);
+        process_jobs(jobs, &work);
         return;
     }
 
     // A nested call runs serially. In particular, this avoids borrowing POOL
     // recursively and avoids making a worker wait for work from its own pool.
     let Some(_active) = ActiveGuard::try_enter() else {
-        process_rows(top, target, stride, &draw_row);
+        process_jobs(jobs, &work);
         return;
     };
+    let mut jobs = Some(jobs);
     let executed = POOL
         .try_with(|pool| {
             let Ok(mut pool) = pool.try_borrow_mut() else {
                 return false;
             };
-            pool.execute(target, stride, top, workers, &draw_row)
+            pool.execute(&mut jobs, workers, &work)
         })
         .unwrap_or(false);
     if !executed {
         // This includes failure to create the first worker and unavailable
         // thread-local storage during thread destruction.
-        process_rows(top, target, stride, &draw_row);
+        process_jobs(jobs.take().unwrap(), &work);
+    }
+}
+
+fn process_jobs<I>(jobs: I, work: &(dyn Fn(I::Item) + Sync))
+where
+    I: Iterator,
+{
+    for job in jobs {
+        work(job);
     }
 }
 
@@ -105,14 +133,15 @@ impl RowPool {
         }
     }
 
-    fn execute(
+    fn execute<I>(
         &mut self,
-        target: &mut [u8],
-        stride: usize,
-        top: u32,
+        jobs: &mut Option<I>,
         workers: usize,
-        draw_row: &(dyn Fn(&mut [u8], u32) + Sync),
-    ) -> bool {
+        work: &(dyn Fn(I::Item) + Sync),
+    ) -> bool
+    where
+        I: Iterator + Send,
+    {
         debug_assert!((2..=4).contains(&workers));
         let requested = (workers - 1).min(MAX_EXTRA_WORKERS);
         self.ensure_workers(requested);
@@ -121,14 +150,9 @@ impl RowPool {
             return false;
         }
 
-        let rows = target.len() / stride;
-        let band_rows = rows.div_ceil(workers);
         let job = Job {
-            bands: Mutex::new(target.chunks_mut(band_rows * stride).enumerate()),
-            draw_row,
-            top,
-            stride,
-            band_rows,
+            jobs: Mutex::new(jobs.take().unwrap()),
+            work,
         };
 
         {
@@ -184,7 +208,7 @@ impl Drop for RowPool {
             state.stopping = true;
         }
         self.shared.start.notify_all();
-        // Each draw already waits for its workers. During Windows process
+        // Each execution already waits for its workers. During Windows process
         // shutdown, TLS destructors can run after other threads were killed
         // by the OS, so the handles must be dropped without joining them.
     }
@@ -261,58 +285,61 @@ fn worker_loop(shared: Arc<Shared>, index: usize) {
     }
 }
 
-struct Job<'a> {
-    bands: Mutex<Enumerate<ChunksMut<'a, u8>>>,
-    draw_row: &'a (dyn Fn(&mut [u8], u32) + Sync),
-    top: u32,
-    stride: usize,
-    band_rows: usize,
+struct Job<'a, I: Iterator> {
+    jobs: Mutex<I>,
+    work: &'a (dyn Fn(I::Item) + Sync),
 }
 
-impl Job<'_> {
+impl<I: Iterator> Job<'_, I> {
     fn work(&self) {
         loop {
-            let next = lock(&self.bands).next();
-            let Some((index, band)) = next else {
+            let next = lock(&self.jobs).next();
+            let Some(job) = next else {
                 break;
             };
-            process_rows(
-                self.top + (index * self.band_rows) as u32,
-                band,
-                self.stride,
-                self.draw_row,
-            );
+            (self.work)(job);
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct JobRef(NonNull<()>);
+struct JobRef {
+    pointer: NonNull<()>,
+    run: fn(NonNull<()>),
+}
 
 impl JobRef {
-    fn new(job: &Job<'_>) -> Self {
-        Self(NonNull::from(job).cast())
+    fn new<I: Iterator>(job: &Job<'_, I>) -> Self {
+        fn run<I: Iterator>(pointer: NonNull<()>) {
+            // SAFETY: JobRef is created from the Job on RowPool::execute's stack.
+            // execute waits for every participating worker to finish this job
+            // before clearing it or unwinding, including when the caller panics.
+            // Each worker calls run at most once for a generation.
+            let job = unsafe { &*pointer.cast::<Job<'_, I>>().as_ptr() };
+            job.work();
+        }
+        Self {
+            pointer: NonNull::from(job).cast(),
+            run: run::<I>,
+        }
     }
 
     fn run(self) {
-        // SAFETY: JobRef is created from the Job on RowPool::execute's stack.
-        // execute waits for every participating worker to finish this job
-        // before clearing it or unwinding, including when the caller panics.
-        // Each worker calls run at most once for a generation.
-        let job = unsafe { &*self.0.cast::<Job<'_>>().as_ptr() };
-        job.work();
+        (self.run)(self.pointer);
     }
 }
 
-// SAFETY: Job is shared between threads through a Mutex-protected band queue;
-// its callback is Sync and each queue item owns a disjoint mutable slice.
+// SAFETY: Job is shared between threads through a Mutex-protected job queue;
+// its callback is Sync and each iterator item is owned by one participant.
 // JobRef cannot outlive Job because execute waits for all participants before
 // returning or resuming a panic. Moving the pointer to a worker is therefore
 // equivalent to sharing &Job for that bounded interval.
 unsafe impl Send for JobRef {}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
@@ -323,7 +350,7 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
 
 #[cfg(test)]
 mod tests {
-    use super::{Arc, Mutex, RowPool, catch_unwind, draw_pixel_rows};
+    use super::{Arc, Mutex, RowPool, catch_unwind, draw_pixel_rows, parallel_for_each};
     use std::panic::AssertUnwindSafe;
 
     #[test]
@@ -336,6 +363,22 @@ mod tests {
             actual.fill(0);
             draw_pixel_rows(&mut actual, 4, 7, 4, draw);
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn parallel_jobs_match_serial_for_one_two_and_four_workers() {
+        for workers in [1, 2, 4] {
+            let mut actual = vec![0; 4 * 64];
+            parallel_for_each(actual.chunks_mut(4).enumerate(), workers, |(index, row)| {
+                row.fill(index as u8)
+            });
+            assert!(
+                actual
+                    .chunks_exact(4)
+                    .enumerate()
+                    .all(|(index, row)| { row.iter().all(|&byte| byte == index as u8) })
+            );
         }
     }
 
@@ -382,7 +425,8 @@ mod tests {
         let mut pool = RowPool::new();
         let shared = Arc::clone(&pool.shared);
         let mut target = vec![0; 4 * 16];
-        let _ = pool.execute(&mut target, 4, 0, 4, &|row, y| row.fill(y as u8));
+        let mut jobs = Some(target.chunks_mut(4));
+        let _ = pool.execute(&mut jobs, 4, &|row| row.fill(7));
         let workers = std::mem::take(&mut pool.workers);
         drop(pool);
         for worker in workers {

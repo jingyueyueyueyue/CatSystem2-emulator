@@ -62,8 +62,9 @@ impl HostPerfDetails {
             let collect = evaluate + prepare;
             let [scanlines, pack] = sample.collect_phases.map(|time| time.as_micros());
             let row = format!(
-                "emote_gpu session={session} frame={frame} call={call} poses={} draws={} pixels={} repaired={} collect_us={collect} evaluate_us={evaluate} prepare_us={prepare} scanlines_cpu_us={scanlines} pack_cpu_us={pack} encode_us={encode} readback_us={readback} repair_us={repair}",
-                sample.poses, sample.draws, sample.pixels, sample.repaired,
+                "emote_gpu session={session} frame={frame} call={call} poses={} draws={} batches={} pixels={} repaired={} sync_waits={} sync_poses={} collect_us={collect} evaluate_us={evaluate} prepare_us={prepare} scanlines_cpu_us={scanlines} pack_cpu_us={pack} encode_us={encode} readback_us={readback} repair_us={repair}",
+                sample.poses, sample.draws, sample.batches, sample.pixels, sample.repaired,
+                sample.sync_waits, sample.sync_poses,
             );
             append_row(&mut rows, &row);
         }
@@ -177,6 +178,7 @@ struct ReadbackSample {
 struct GpuOutputSample {
     device: ReadbackSample,
     packed: ReadbackSample,
+    emote: ReadbackSample,
     textured_group_rejects: u64,
     textured_single_rejects: u64,
 }
@@ -185,23 +187,27 @@ struct GpuOutputSample {
 struct EmoteGpuSample {
     poses: usize,
     draws: usize,
+    batches: usize,
     pixels: u64,
     repaired: usize,
+    sync_waits: usize,
+    sync_poses: usize,
     elapsed: [Duration; 5],
     collect_phases: [Duration; 2],
 }
 
 impl GpuOutputSample {
     fn row(&self, session: u64, frame: u64, call: u64) -> Option<String> {
-        if self.device.calls == 0 && self.packed.calls == 0
+        if self.device.calls == 0 && self.packed.calls == 0 && self.emote.calls == 0
             && self.textured_group_rejects == 0 && self.textured_single_rejects == 0
         {
             return None;
         }
         Some(format!(
-            "gpu_output session={session} frame={frame} call={call} device_calls={} device_failed={} device_bytes={} device_us={} packed_calls={} packed_failed={} packed_bytes={} packed_us={} textured_group_rejects={} textured_single_rejects={}",
+            "gpu_output session={session} frame={frame} call={call} device_calls={} device_failed={} device_bytes={} device_us={} packed_calls={} packed_failed={} packed_bytes={} packed_us={} emote_calls={} emote_failed={} emote_bytes={} emote_us={} textured_group_rejects={} textured_single_rejects={}",
             self.device.calls, self.device.failures, self.device.bytes, self.device.elapsed.as_micros(),
             self.packed.calls, self.packed.failures, self.packed.bytes, self.packed.elapsed.as_micros(),
+            self.emote.calls, self.emote.failures, self.emote.bytes, self.emote.elapsed.as_micros(),
             self.textured_group_rejects, self.textured_single_rejects,
         ))
     }
@@ -212,6 +218,7 @@ impl GpuOutputSample {
 pub(super) enum ReadbackKind {
     Device,
     Packed,
+    Emote,
 }
 
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -243,6 +250,7 @@ impl Drop for ReadbackTimer {
             let sample = match self.kind {
                 ReadbackKind::Device => &mut detail.gpu_output.device,
                 ReadbackKind::Packed => &mut detail.gpu_output.packed,
+                ReadbackKind::Emote => &mut detail.gpu_output.emote,
             };
             sample.calls += 1;
             sample.failures += u64::from(!self.success);
@@ -258,8 +266,19 @@ pub(super) fn emote_gpu_start() -> Option<Instant> {
 }
 
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_gpu_sync(poses: usize) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            detail.emote_gpu.sync_waits += 1;
+            detail.emote_gpu.sync_poses += poses;
+        }
+    });
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
 pub(super) fn emote_gpu_pose(
-    milestones: [Instant; 5], collect_phases: [Duration; 2], draws: usize, pixels: u64, repaired: usize,
+    milestones: [Instant; 5], collect_phases: [Duration; 2], draws: usize, batches: usize,
+    pixels: u64, repaired: usize,
 ) {
     let [start, evaluated, collected, encoded, downloaded] = milestones;
     let elapsed = [evaluated - start, collected - evaluated, encoded - collected, downloaded - encoded, downloaded.elapsed()];
@@ -268,6 +287,7 @@ pub(super) fn emote_gpu_pose(
             let sample = &mut detail.emote_gpu;
             sample.poses += 1;
             sample.draws += draws;
+            sample.batches += batches;
             sample.pixels += pixels;
             sample.repaired += repaired;
             for (total, phase) in sample.collect_phases.iter_mut().zip(collect_phases) {

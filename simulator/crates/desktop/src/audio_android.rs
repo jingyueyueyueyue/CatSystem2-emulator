@@ -340,6 +340,59 @@ impl Output {
         });
     }
 
+    fn start(&mut self, acknowledge: &mut dyn FnMut() -> bool) -> RuntimeResult<bool> {
+        let mut route = if self.started { "resume" } else { "cold" };
+        if let Some(staged) = self.staged_device.take() {
+            if let StagedDevice::Started(xruns) = staged
+                && self.can_activate_standby(xruns)
+            {
+                self.observe_start(0, "started");
+                self.pump()?;
+                let stream = self.validate_device()?;
+                if unsafe { AAudioStream_getXRunCount(stream.as_ptr()) } != xruns {
+                    // Programming PCM has already been offered. Restarting
+                    // it could duplicate an audible prefix, and the lost
+                    // device origin can no longer prove exact progress.
+                    let cause = "AAudio standby lost its device clock during activation".to_owned();
+                    self.failed = Some(cause.clone());
+                    return Err(cs2_runtime::RuntimeError::AudioStartTimeout(cause));
+                }
+                if !acknowledge() { return Ok(false); }
+                self.wait_state(STARTED, Some(0))?;
+                self.paused = false;
+                return Ok(true);
+            }
+            if !matches!(staged, StagedDevice::Open) || !self.can_activate_opened() {
+                // No program PCM has reached the expired or disconnected
+                // standby. Transfer the exact staged PCM to a fresh device.
+                let mut fresh = Self::open_pcm(self.rate, self.channels)?;
+                fresh.pending = std::mem::take(&mut self.pending);
+                fresh.pending_frames = self.pending_frames;
+                fresh.accepted_frames = self.accepted_frames;
+                drop(std::mem::replace(self, fresh));
+                route = "reopened";
+            } else {
+                route = "opened";
+            }
+        }
+        let stream = self.validate_device()?;
+        if !self.paused {
+            return Ok(acknowledge());
+        }
+        self.pump()?;
+        let (position, _) = self.counters()?;
+        self.observe_start(position, route);
+        {
+            let _timing = Stage::Request.begin();
+            check("request start", unsafe { AAudioStream_requestStart(stream.as_ptr()) })?;
+        }
+        if !acknowledge() { return Ok(false); }
+        self.wait_state(STARTED, Some(position))?;
+        self.started = true;
+        self.paused = false;
+        Ok(true)
+    }
+
     fn wait_state(&mut self, expected: i32, start_position: Option<u64>) -> RuntimeResult<()> {
         let _timing = Stage::Confirm.begin();
         let stream = self.validate_device()?;
@@ -481,68 +534,26 @@ impl MovieAudioOutput for Output {
     }
 
     fn pause(&mut self, paused: bool) -> RuntimeResult<()> {
-        if paused {
-            self.first_consumption = None;
+        if !paused {
+            return self.start(&mut || true).map(|_| ());
         }
-        if paused && self.staged_device.is_some() {
-            return Ok(());
-        }
-        let mut route = if self.started { "resume" } else { "cold" };
-        if let Some(staged) = self.staged_device.take() {
-            if let StagedDevice::Started(xruns) = staged
-                && self.can_activate_standby(xruns)
-            {
-                self.observe_start(0, "started");
-                self.pump()?;
-                let stream = self.validate_device()?;
-                if unsafe { AAudioStream_getXRunCount(stream.as_ptr()) } != xruns {
-                    // Programming PCM has already been offered. Restarting
-                    // it could duplicate an audible prefix, and the lost
-                    // device origin can no longer prove exact progress.
-                    let cause = "AAudio standby lost its device clock during activation".to_owned();
-                    self.failed = Some(cause.clone());
-                    return Err(cs2_runtime::RuntimeError::AudioStartTimeout(cause));
-                }
-                self.wait_state(STARTED, Some(0))?;
-                self.paused = false;
-                return Ok(());
-            }
-            if !matches!(staged, StagedDevice::Open) || !self.can_activate_opened() {
-                // No program PCM has reached the expired or disconnected
-                // standby. Transfer the exact staged PCM to a fresh device.
-                let mut fresh = Self::open_pcm(self.rate, self.channels)?;
-                fresh.pending = std::mem::take(&mut self.pending);
-                fresh.pending_frames = self.pending_frames;
-                fresh.accepted_frames = self.accepted_frames;
-                drop(std::mem::replace(self, fresh));
-                route = "reopened";
-            } else {
-                route = "opened";
-            }
-        }
+        self.first_consumption = None;
+        if self.staged_device.is_some() { return Ok(()); }
         let stream = self.validate_device()?;
-        if paused == self.paused {
+        if self.paused {
             return Ok(());
         }
-        if paused {
-            {
-                let _timing = Stage::Request.begin();
-                check("request pause", unsafe { AAudioStream_requestPause(stream.as_ptr()) })?;
-            }
-            self.wait_state(PAUSED, None)?;
-        } else {
-            self.pump()?;
-            let (position, _) = self.counters()?;
-            self.observe_start(position, route);
-            {
-                let _timing = Stage::Request.begin();
-                check("request start", unsafe { AAudioStream_requestStart(stream.as_ptr()) })?;
-            }
-            self.wait_state(STARTED, Some(position))?;
-            self.started = true;
+        {
+            let _timing = Stage::Request.begin();
+            check("request pause", unsafe { AAudioStream_requestPause(stream.as_ptr()) })?;
         }
-        self.paused = paused;
+        self.wait_state(PAUSED, None)?;
+        self.paused = true;
         Ok(())
+    }
+
+    fn start_with_acknowledgement(&mut self, acknowledge: &mut dyn FnMut() -> bool) -> RuntimeResult<bool> {
+        self.start(acknowledge)
     }
 
     fn stop(&mut self) -> RuntimeResult<()> {
