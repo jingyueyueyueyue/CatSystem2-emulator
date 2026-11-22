@@ -139,6 +139,29 @@ pub(crate) enum FesDriverEffect {
     Yield,
     ControlFlow(main_flow::controls_flow::Request),
     SharedStringWrite { destination: u32, source: Option<u32> },
+    // Appended so existing graph checkpoints keep their effect discriminants.
+    SendWithCallback {
+        message: [u32; 4],
+        parent: bool,
+        call: FesNamedBlockCall,
+        pending: Option<Box<FesSendCallback>>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
+#[serde(crate = "cs2_runtime::graph_serde")]
+pub(crate) struct FesNamedBlockCall {
+    pub(super) caller: u32,
+    pub(super) bank: u32,
+    pub(super) name: Vec<u8>,
+    pub(super) object: Option<FesDriverTarget>,
+}
+
+#[derive(Clone, Debug, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
+#[serde(crate = "cs2_runtime::graph_serde")]
+pub(crate) struct FesSendCallback {
+    pub(super) notifications: FesMediaNotificationScope,
+    pub(super) effect: Option<FesDriverEffect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]

@@ -4,6 +4,11 @@ use super::*;
 
 impl FesDriverEffect {
     pub(crate) fn checkpoint_object_notice(&self, name: &[u8], bank: i32, event: &[u8]) -> bool {
+        if let Self::SendWithCallback { pending: Some(work), .. } = self {
+            return work.notifications.checkpoint_object_notice(name, bank, event)
+                || work.effect.as_ref().is_some_and(|effect|
+                    effect.checkpoint_object_notice(name, bank, event));
+        }
         matches!(self, Self::ObjectEvent { target, event: actual, .. }
             if target.name == name && target.bank == bank && actual == event)
     }
@@ -12,6 +17,33 @@ impl FesDriverEffect {
         if let Self::ExecKcs { external: field, .. } | Self::ExecFes { external: field, .. } = self {
             if bind { *field = external.clone(); }
             else if !field.same_storage(external) { bail!("FES effect has a different external owner"); }
+        }
+        if let Self::SendWithCallback { pending: Some(work), .. } = self {
+            work.notifications.checkpoint_external(external, bind)?;
+            if let Some(effect) = &mut work.effect { effect.checkpoint_external(external, bind)?; }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint_nested_effect(&self) -> Option<&Self> {
+        if let Self::SendWithCallback { pending: Some(work), .. } = self {
+            return work.effect.as_ref();
+        }
+        None
+    }
+
+    pub(crate) fn validate_send_checkpoint(&self, driver: &FesScriptDriver) -> Result<()> {
+        if let Self::SendWithCallback { message, call, pending, .. } = self {
+            if message[0] != driver.task_id || call.name.len() > 63 || call.name.contains(&0)
+                || call.object.as_ref().is_some_and(|object| object.name.is_empty()
+                    || object.name.len() > 31 || object.name.contains(&0) || object.bank as u32 != call.bank)
+            {
+                bail!("FES send callback checkpoint metadata is invalid");
+            }
+            if let Some(work) = pending {
+                work.notifications.validate_checkpoint(driver)?;
+                if let Some(effect) = &work.effect { effect.validate_send_checkpoint(driver)?; }
+            }
         }
         Ok(())
     }

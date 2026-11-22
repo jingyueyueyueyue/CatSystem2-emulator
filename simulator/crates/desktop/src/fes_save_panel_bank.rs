@@ -260,6 +260,31 @@ impl FesSavePanelStore {
             }
             return Ok(true);
         }
+        if verb == b"getsavedate" {
+            let Some(bank) = bank.filter(|&bank| bank != -1) else { return Ok(true) };
+            let mut destinations = [0; 6];
+            for (index, destination) in destinations.iter_mut().enumerate() {
+                let Some(slot) = number(command, index + 2, driver, shared)? else { return Ok(true) };
+                *destination = slot as usize;
+            }
+            if let Some(panel) = self.banks.get(&(view.id, name.to_vec(), bank)) {
+                let date = panel.data.date();
+                for (destination, value) in destinations.into_iter().zip(date) {
+                    if let Some(slot) = shared.shared.get_mut(destination) {
+                        *slot = value as i32;
+                    }
+                }
+                if host.data_services.story_trace {
+                    let [year, month, day, hour, minute, second] = date;
+                    host.events.push(crate::LogicEvent {
+                        frame: host.frame,
+                        kind: "fes-savepanel-getsavedate".into(),
+                        detail: format!("owner={} bank={bank} date={year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02}", view.id),
+                    });
+                }
+            }
+            return Ok(true);
+        }
         if let Some(request) = PanelDataRequest::prepare(command, bank, driver, shared)? {
             if let Some(key) = bank.filter(|&bank| bank != -1)
                 .map(|bank| (view.id, name.to_vec(), bank)).filter(|key| self.banks.contains_key(key)) {

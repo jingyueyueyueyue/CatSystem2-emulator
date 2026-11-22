@@ -39,7 +39,7 @@ impl FesTaskStore {
         Ok(definition)
     }
 
-    /// Includes effects parked by nested BUTTON/lower notifications. It does
+    /// Includes effects parked by nested notifications and send callbacks. It does
     /// not include merely queued driver notices: those have not entered the
     /// bank consumer yet and cannot own a partially applied request.
     pub(crate) fn checkpoint_pending_effects(&self, owner: u32)
@@ -48,7 +48,8 @@ impl FesTaskStore {
             .context("bank continuation checkpoint has no owned FES object")?;
         Ok(object.pending_effect.iter().chain(&object.boundary)
             .chain(object.button_refresh.iter().filter_map(|work| work.pending_effect.as_ref()))
-            .chain(object.lower_notification.iter().filter_map(|work| work.pending_effect.as_ref())))
+            .chain(object.lower_notification.iter().filter_map(|work| work.pending_effect.as_ref()))
+            .flat_map(|effect| std::iter::successors(Some(effect), |effect| effect.checkpoint_nested_effect())))
     }
 
     pub(crate) fn checkpoint_bank_creation_pending(&self, owner: u32, name: &[u8], kind: &[u8]) -> bool {

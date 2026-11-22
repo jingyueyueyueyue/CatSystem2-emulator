@@ -392,6 +392,11 @@ impl FesTask {
             if let Some(scope) = self.lower_notification.as_ref().and_then(|notice| notice.notifications.as_ref()) {
                 scope.validate_checkpoint(driver)?;
             }
+            for effect in self.pending_effect.iter().chain(&self.boundary)
+                .chain(self.button_refresh.iter().filter_map(|work| work.pending_effect.as_ref()))
+                .chain(self.lower_notification.iter().filter_map(|work| work.pending_effect.as_ref())) {
+                effect.validate_send_checkpoint(driver)?;
+            }
         }
         Ok(())
     }

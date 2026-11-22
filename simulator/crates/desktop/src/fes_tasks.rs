@@ -9,7 +9,7 @@ use cs2_script::{
 
 use super::fes_driver::{
     FesChildKind, FesDriverEffect, FesDriverInput, FesDriverTarget, FesDriverWait,
-    FesMediaNotificationScope, FesScriptDriver,
+    FesMediaNotificationScope, FesNamedBlockCall, FesScriptDriver, FesSendCallback,
 };
 use super::native_tasks::NativeSubtreeContinuation;
 use super::{
@@ -209,6 +209,13 @@ pub(super) struct FesTaskStore {
     slots: BTreeMap<u32, FesSlot>,
     hooks: FesTaskHooks,
     pub(super) platform: super::fes_task_platform::FesTaskPlatform,
+    active_sends: BTreeMap<u32, ActiveFesSend>,
+}
+
+#[derive(Default)]
+struct ActiveFesSend {
+    receipt: Option<FesNamedBlockCall>,
+    requested: Option<FesNamedBlockCall>,
 }
 
 #[derive(Clone, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -1072,8 +1079,7 @@ impl LoggingHost<'_> {
                     })
                 } else { None };
                 let bank = object.as_ref().map_or(0, |object| object.bank as u32);
-                self.with_fes_task(id, |host, task|
-                    task.system_command_with_context(host, 343, bank, name, object, budget))?
+                self.call_fes_named_block(id, command.sender as u32, bank, name, object, budget)?
             }
             348 => self.with_fes_task(id, |host, object|
                 object.set_paused(host, command.data[1], budget))?,
@@ -1150,16 +1156,42 @@ impl LoggingHost<'_> {
             name: nul(&prefix).to_vec(), bank: bank as i32,
             default_group: None, value: -1,
         });
-        let done = self.with_fes_task(id, |host, object| {
-            object.system_command_with_context(
-                host, 343, bank, nul(&name), object_context, SYNC_BUDGET,
-            )
-        })?;
+        let done = self.call_fes_named_block(
+            id, self.current_task_id, bank, nul(&name), object_context, SYNC_BUDGET,
+        )?;
         Ok(if done {
             NativeReturn::Continue
         } else {
             NativeReturn::Retry
         })
+    }
+
+    fn call_fes_named_block(
+        &mut self,
+        id: u32,
+        caller: u32,
+        bank: u32,
+        name: &[u8],
+        object: Option<FesDriverTarget>,
+        budget: usize,
+    ) -> Result<bool> {
+        if let Some(send) = self.data_services.tasks.fes.active_sends.get_mut(&id) {
+            let call = FesNamedBlockCall { caller, bank, name: name.to_vec(), object };
+            if let Some(receipt) = &send.receipt {
+                if receipt != &call {
+                    return Err(native_state_error("FES send callback changed its call"));
+                }
+                send.receipt = None;
+                return Ok(true);
+            }
+            if send.requested.as_ref().is_some_and(|request| request != &call) {
+                return Err(native_state_error("FES send already has a pending callback"));
+            }
+            send.requested = Some(call);
+            return Ok(false);
+        }
+        self.with_fes_task(id, |host, task|
+            task.system_command_with_context(host, 343, bank, name, object, budget))
     }
 
     /// All three ordinary wrappers return status two without replacing a
@@ -1523,7 +1555,7 @@ impl FesTask {
                     self.lower_notification = None;
                     return Ok(true);
                 }
-                let effect = match pending {
+                let mut effect = match pending {
                     Some(effect) => effect,
                     None => with_expression(host, |_, shared|
                         driver.advance_media_notification(now as u64, shared))
@@ -1531,7 +1563,7 @@ impl FesTask {
                         .ok_or_else(|| native_state_error("FES input notification lost its cursor"))?,
                 };
                 sync_locals(host, self.id, &driver);
-                let result = self.effect(host, &mut runtime, &mut driver, &effect, now, budget - iteration);
+                let result = self.effect(host, &mut runtime, &mut driver, &mut effect, now, budget - iteration);
                 self.apply_data_commands(host, &mut driver);
                 match result {
                     Ok(EffectResult::Continue | EffectResult::Boundary | EffectResult::Yield) => {}
@@ -1591,7 +1623,7 @@ impl FesTask {
                     || (driver.has_media_notification_work()
                         && !driver.media_statement_result_ready())
                 {
-                    let effect = match pending {
+                    let mut effect = match pending {
                         Some(effect) => effect,
                         None => with_expression(host, |_, shared|
                             driver.advance_media_notification(now as u64, shared))
@@ -1599,7 +1631,7 @@ impl FesTask {
                             .ok_or_else(|| native_state_error("FES media notification lost its cursor"))?,
                     };
                     sync_locals(host, self.id, &driver);
-                    let outcome = self.effect(host, &mut runtime, &mut driver, &effect, now, remaining);
+                    let outcome = self.effect(host, &mut runtime, &mut driver, &mut effect, now, remaining);
                     self.apply_data_commands(host, &mut driver);
                     match outcome {
                         Ok(EffectResult::Continue | EffectResult::Boundary) => {}
@@ -1823,7 +1855,7 @@ impl FesTask {
                     self.system = None;
                     return Ok(true);
                 }
-                let effect = match self.pending_effect.take() {
+                let mut effect = match self.pending_effect.take() {
                     Some(effect) => effect,
                     None => with_expression(host, |_, shared| {
                         let _detail = super::perf_detail::SlowTask::new(self.id, || 34, "fes_interpreter");
@@ -1842,7 +1874,7 @@ impl FesTask {
                     continue;
                 }
                 let effect_result =
-                    self.effect(host, &mut runtime, &mut driver, &effect, now, budget - iteration);
+                    self.effect(host, &mut runtime, &mut driver, &mut effect, now, budget - iteration);
                 self.apply_data_commands(host, &mut driver);
                 if self.system.as_ref().unwrap().input.is_some()
                     && matches!(&effect, FesDriverEffect::ObjectEvent {
@@ -2415,7 +2447,7 @@ impl FesTask {
                 None
             };
             let finishing_boundary = resumed_boundary.is_some();
-            let effect = match resumed_boundary {
+            let mut effect = match resumed_boundary {
                 Some(effect) => effect,
                 None => match self.pending_effect.take() {
                     Some(effect) => effect,
@@ -2436,7 +2468,7 @@ impl FesTask {
             let result = if finishing_boundary {
                 Ok(EffectResult::Boundary)
             } else {
-                self.effect(host, runtime, driver, &effect, now, budget - iteration)
+                self.effect(host, runtime, driver, &mut effect, now, budget - iteration)
             };
             self.apply_data_commands(host, driver);
             match result {
@@ -2566,7 +2598,7 @@ impl FesTask {
         host: &mut LoggingHost<'_>,
         runtime: &mut FesRuntime,
         driver: &mut FesScriptDriver,
-        effect: &FesDriverEffect,
+        effect: &mut FesDriverEffect,
         now: u32,
         budget: usize,
     ) -> Result<EffectResult> {
@@ -2579,15 +2611,43 @@ impl FesTask {
             FesDriverEffect::ObjectEvent { event, .. } => ("fes_object_event", event, None),
             FesDriverEffect::Initialize { .. } => ("fes_initialize", &[], None),
             FesDriverEffect::ControlFlow(_) => ("fes_control_flow", &[], None),
-            FesDriverEffect::Send { .. } => ("fes_send", &[], None),
+            FesDriverEffect::Send { .. } | FesDriverEffect::SendWithCallback { .. } =>
+                ("fes_send", &[], None),
             _ => ("fes_effect_other", &[], None),
         };
         let timer = super::perf_detail::SlowTask::new(self.id, || 34, scope).named(name, offset);
-        let _detail = if let FesDriverEffect::Send { message, .. } = effect {
+        let _detail = if let FesDriverEffect::Send { message, .. }
+            | FesDriverEffect::SendWithCallback { message, .. } = effect {
             timer.code(message[1])
         } else { timer };
         let acknowledge_statement = driver.media_statement_effect_pending();
-        let result = self.effect_inner(host, runtime, driver, effect, now, budget);
+        let result = match effect {
+            FesDriverEffect::Send { message, parent } => {
+                let (message, parent) = (*message, *parent);
+                self.deliver_fes_send(host, driver, effect, message, parent, None)
+            }
+            FesDriverEffect::SendWithCallback { message, parent, call, pending } => {
+                if let Some(work) = pending {
+                    if self.advance_send_callback(host, runtime, driver, call, work, now, budget)? {
+                        let work = pending.take().unwrap();
+                        driver.end_media_notification_scope(work.notifications);
+                        if host.data_services.story_trace {
+                            host.events.push(LogicEvent {
+                                frame: host.frame,
+                                kind: "fes-send-callback".into(),
+                                detail: format!("owner={} caller={} block={} bank={}",
+                                    self.id, call.caller, String::from_utf8_lossy(&call.name), call.bank),
+                            });
+                        }
+                    }
+                    Ok(EffectResult::Pending)
+                } else {
+                    let (message, parent, receipt) = (*message, *parent, call.clone());
+                    self.deliver_fes_send(host, driver, effect, message, parent, Some(receipt))
+                }
+            }
+            _ => self.effect_inner(host, runtime, driver, effect, now, budget),
+        };
         if acknowledge_statement
             && matches!(&result, Ok(EffectResult::Continue | EffectResult::Boundary))
         {
@@ -2595,6 +2655,93 @@ impl FesTask {
                 .map_err(|error| host.fes_task_error(self.id, error))?;
         }
         result
+    }
+
+    fn deliver_fes_send(
+        &mut self,
+        host: &mut LoggingHost<'_>,
+        driver: &mut FesScriptDriver,
+        effect: &mut FesDriverEffect,
+        message: [u32; 4],
+        parent: bool,
+        receipt: Option<FesNamedBlockCall>,
+    ) -> Result<EffectResult> {
+        let target = if parent { host.task_parents.get(&self.id).copied() } else { self.child_kcs };
+        let Some(target) = target else { return Ok(EffectResult::Continue) };
+        // The ordinary VM can call 630 on this very FES task before send
+        // returns. Let the VM retain that instruction and run its request
+        // with the driver already held by this effect.
+        let std::collections::btree_map::Entry::Vacant(send) =
+            host.data_services.tasks.fes.active_sends.entry(self.id)
+        else {
+            return Err(native_state_error("FES send is already dispatching"));
+        };
+        send.insert(ActiveFesSend { receipt, requested: None });
+        let result = if let Some(send) = host.data_services.tasks.fes.hooks.send {
+            send(host, target, message).map_err(|error| host.fes_task_error(self.id, error))
+        } else {
+            host.send_fes_task_message(target, message)
+        };
+        let send = host.data_services.tasks.fes.active_sends.remove(&self.id).unwrap();
+        let done = result?;
+        if let Some(call) = send.requested {
+            if done {
+                return Err(native_state_error("FES send finished before its callback"));
+            }
+            let notifications = driver.begin_media_notification_scope();
+            let exists = driver.dispatch_system_block_with_context(&call.name, call.object.clone())
+                .map_err(|error| host.fes_task_error(self.id, error))?;
+            let pending = if exists {
+                Some(Box::new(FesSendCallback { notifications, effect: None }))
+            } else {
+                driver.end_media_notification_scope(notifications);
+                None
+            };
+            *effect = FesDriverEffect::SendWithCallback { message, parent, call, pending };
+        } else if send.receipt.is_none() {
+            *effect = FesDriverEffect::Send { message, parent };
+        } else if done {
+            return Err(native_state_error("FES send did not consume its callback receipt"));
+        }
+        Ok(if done { EffectResult::Continue } else { EffectResult::Pending })
+    }
+
+    fn advance_send_callback(
+        &mut self,
+        host: &mut LoggingHost<'_>,
+        runtime: &mut FesRuntime,
+        driver: &mut FesScriptDriver,
+        call: &FesNamedBlockCall,
+        work: &mut FesSendCallback,
+        now: u32,
+        budget: usize,
+    ) -> Result<bool> {
+        let bounded_block = (neko_message_notification(343, call.bank, &call.name, call.object.is_none())
+            && self.verified_neko_message_driver(host, driver)).then_some(call.name.as_slice());
+        for iteration in 0..budget {
+            let mut effect = match work.effect.take() {
+                Some(effect) => effect,
+                None if !driver.has_media_notification_work() => return Ok(true),
+                None => with_expression(host, |_, shared|
+                    driver.advance_system_notification(now as u64, shared, 1, bounded_block))
+                    .map_err(|error| host.fes_task_error(self.id, error))?,
+            };
+            sync_locals(host, self.id, driver);
+            let result = self.effect(host, runtime, driver, &mut effect, now, budget - iteration);
+            self.apply_data_commands(host, driver);
+            match result {
+                Ok(EffectResult::Continue | EffectResult::Boundary | EffectResult::Yield) => {}
+                Ok(EffectResult::Pending) => {
+                    work.effect = Some(effect);
+                    return Ok(false);
+                }
+                Err(error) => {
+                    work.effect = Some(effect);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn effect_inner(
@@ -2660,27 +2807,6 @@ impl FesTask {
                 }
                 driver.set_child_exit_code(-1);
                 Ok(EffectResult::Continue)
-            }
-            FesDriverEffect::Send { message, parent } => {
-                let target = if *parent {
-                    host.task_parents.get(&self.id).copied()
-                } else {
-                    self.child_kcs
-                };
-                let Some(target) = target else {
-                    return Ok(EffectResult::Continue);
-                };
-                let done = if let Some(send) = host.data_services.tasks.fes.hooks.send {
-                    send(host, target, *message)
-                        .map_err(|error| host.fes_task_error(self.id, error))?
-                } else {
-                    host.send_fes_task_message(target, *message)?
-                };
-                Ok(if done {
-                    EffectResult::Continue
-                } else {
-                    EffectResult::Pending
-                })
             }
             FesDriverEffect::Exit(value) => {
                 host.data_services
@@ -2985,7 +3111,7 @@ fn bounded_message_fes_identity(host: &LoggingHost<'_>) -> Option<(u64, &'static
 }
 
 fn neko_message_notification(key: u32, bank: u32, block: &[u8], context_free: bool) -> bool {
-    key == 343 && bank == 0 && context_free && block == b"MES_SETSTATE"
+    key == 343 && bank == 0 && context_free && matches!(block, b"MES_SETSTATE" | b"MES_SHOW")
 }
 
 fn is_neko_message_fes_source(host: &LoggingHost<'_>, bytes: &[u8]) -> bool {
@@ -3033,7 +3159,7 @@ fn neko_message_notification_rejects_other_shapes() {
     assert!(!neko_message_notification(341, 0, b"MES_SETSTATE", true));
     assert!(!neko_message_notification(343, 1, b"MES_SETSTATE", true));
     assert!(!neko_message_notification(343, 0, b"MES_SETSTATE", false));
-    assert!(!neko_message_notification(343, 0, b"MES_SHOW", true));
+    assert!(neko_message_notification(343, 0, b"MES_SHOW", true));
     assert!(!neko_message_notification(343, 0, b"MES_DRAW", true));
 }
 
