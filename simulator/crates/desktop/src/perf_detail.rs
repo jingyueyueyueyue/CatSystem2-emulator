@@ -34,6 +34,8 @@ pub struct HostPerfDetails {
     emote_gpu: EmoteGpuSample,
     warmup_notes: Vec<String>,
     audio_async_notes: Vec<String>,
+    visual_notes: Vec<(&'static str, String)>,
+    visual_dropped: usize,
 }
 
 struct Capture(Option<HostPerfDetails>);
@@ -55,8 +57,25 @@ impl HostPerfDetails {
 
     pub fn rows(mut self, session: u64, frame: u64, call: u64) -> String {
         let mut rows = String::new();
+        let mut text_summary = self.text_summary.row(session, frame, call, self.text.len());
+        let text_reserve = text_summary.as_ref().map_or(0, |row| {
+            row.len() + " detail_wire_dropped=\n".len() + MAX_TEXT.ilog10() as usize + 1
+        });
+        if !self.visual_notes.is_empty() {
+            let mut progress = String::new();
+            let mut dropped = self.visual_dropped;
+            for (kind, note) in &self.visual_notes {
+                let row = format!("{kind} session={session} frame={frame} call={call} {note}\n");
+                if progress.len() + row.len() <= 2600 { progress.push_str(&row); }
+                else { dropped += 1; }
+            }
+            let coverage = format!("visual_coverage session={session} frame={frame} call={call} kept={} dropped={dropped}",
+                self.visual_notes.len() + self.visual_dropped - dropped);
+            append_row_reserving(&mut rows, &coverage, text_reserve);
+            append_row_reserving(&mut rows, progress.trim_end(), text_reserve);
+        }
         if let Some(row) = self.gpu_output.row(session, frame, call) {
-            let _ = append_row(&mut rows, &row);
+            let _ = append_row_reserving(&mut rows, &row, text_reserve);
         }
         if self.emote_gpu.poses != 0 {
             let sample = self.emote_gpu;
@@ -69,13 +88,8 @@ impl HostPerfDetails {
                 sample.sync_waits, sample.sync_poses, sample.span_hits, sample.span_misses, sample.span_cache_peak_bytes,
                 sample.parallel_wall.as_micros(), sample.parallel_join.as_micros(), sample.parallel_copy_bytes,
             );
-            append_row(&mut rows, &row);
+            append_row_reserving(&mut rows, &row, text_reserve);
         }
-        let mut text_summary = self.text_summary.row(session, frame, call, self.text.len());
-        // Preserve the aggregate and coverage counters even if detailed rows fill the batch.
-        let text_reserve = text_summary.as_ref().map_or(0, |row| {
-            row.len() + " detail_wire_dropped=\n".len() + MAX_TEXT.ilog10() as usize + 1
-        });
         for note in &self.warmup_notes {
             append_row_reserving(&mut rows,
                 &format!("resource_warmup session={session} frame={frame} call={call} {note}"), text_reserve);
@@ -177,6 +191,32 @@ impl HostPerfDetails {
 
 // Portable notes travel through the existing host profile wire; the platform
 // bridge owns logcat output. Keep both row count and message length bounded.
+pub(super) fn enabled() -> bool {
+    DETAIL.with_borrow(Option::is_some)
+}
+
+pub(super) fn visual_note(kind: &'static str, note: String) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            if detail.visual_notes.len() < 12 && note.len() <= 640 {
+                detail.visual_notes.push((kind, note));
+            } else { detail.visual_dropped += 1; }
+        }
+    });
+}
+
+#[test]
+fn visual_progress_wire_reports_truncation_and_stays_bounded() {
+    let (_, details) = HostPerfDetails::capture(false, || {
+        for _ in 0..30 { visual_note("visual_pose", "x".repeat(600)); }
+    });
+    let rows = details.rows(91, 1, 1);
+    assert!(rows.starts_with("visual_coverage session=91"));
+    assert!(!rows.contains("dropped=0"));
+    assert!(rows.len() < MAX_WIRE_BYTES);
+    assert!(!rows.contains('\0'));
+}
+
 pub(super) fn resource_warmup_note(note: &str) {
     DETAIL.with_borrow_mut(|slot| {
         if let Some(detail) = slot && detail.warmup_notes.len() < 4 {

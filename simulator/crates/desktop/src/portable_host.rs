@@ -124,6 +124,22 @@ pub(super) fn measure_script_detail(phase: HostPhase) -> HostPhaseTimer {
 }
 
 impl HeadlessPlayer {
+    /// Wall-clock work limits are opt-in. Offline replay stays deterministic.
+    pub fn set_host_iteration_work_budget(&mut self, budget: Option<Duration>) {
+        self.host_work_budget = budget;
+    }
+
+    pub fn enable_host_tick_pacing(&mut self) {
+        self.host_tick_pacer = Some(super::host_pacing::TickPacer::new(Instant::now()));
+    }
+
+    pub fn host_tick_delay_ms(&mut self, reset: bool) -> u32 {
+        let now = Instant::now();
+        let Some(pacer) = &mut self.host_tick_pacer else { return 0; };
+        if reset || self.data_services.host_pause.paused { pacer.reset(now); }
+        pacer.delay_ms(now)
+    }
+
     /// Enable the hardware raster backend on this interactive host thread.
     pub fn enable_host_gpu_raster() {
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -341,6 +357,7 @@ impl HeadlessPlayer {
             return Ok(());
         }
         let focus = if let InputEvent::FocusChanged(value) = &event { Some(*value) } else { None };
+        if focus.is_some() { self.host_tick_delay_ms(true); }
         self.observe_host_device_input(&event)?;
         match &event {
             InputEvent::KeyDown(InputKey::MouseButton(button)) => {
@@ -391,6 +408,8 @@ impl HeadlessPlayer {
     /// continues, while input edge bits are committed only after that frame
     /// really finishes. The next frame consumes events queued during a yield.
     pub fn advance_host_frame(&mut self, instruction_budget: usize) -> Result<bool> {
+        let _slice = self.host_work_budget.map(super::host_work_budget::Scope::enter);
+        let instruction_budget = if self.host_work_budget.is_some() { instruction_budget.min(2048) } else { instruction_budget };
         {
             let _timing = measure_host_phase(HostPhase::Script);
             if !self.advance_posted_window_commands(instruction_budget)? { return Ok(false); }
@@ -403,10 +422,12 @@ impl HeadlessPlayer {
         self.run_frames(1, instruction_budget)?;
         let completed = !self.frame_in_progress() && (continued || self.state.clock.frame != before);
         if completed && !self.audio_input_deferred { self.state.input.commit(); }
+        if completed && let Some(pacer) = &mut self.host_tick_pacer { pacer.completed(Instant::now()); }
         Ok(completed)
     }
 
     pub fn advance_host_frame_with_retries(&mut self, instruction_budget: usize) -> Result<bool> {
+        let _slice = self.host_work_budget.map(super::host_work_budget::Scope::enter);
         let start = Instant::now();
         if self.advance_host_frame(instruction_budget)? { return Ok(true); }
         for _ in 0..3 {

@@ -393,6 +393,10 @@ impl OrdinaryNativeServices {
 
     pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.preloads.predecode_image(bytes); }
 
+    pub(super) fn image_predecode_snapshot(&self) -> Vec<(std::sync::Arc<[u8]>, cs2_renderer::RgbaFrame)> {
+        self.preloads.image_predecode_snapshot()
+    }
+
     pub(super) fn take_predecoded_image(&mut self, bytes: &[u8], id: u32) -> Option<cs2_renderer::RgbaFrame> {
         self.preloads.take_predecoded_image(bytes, id)
     }

@@ -21,6 +21,8 @@ use cs2_runtime::emote::{
     emote_native_descriptor,
 };
 use cs2_runtime::resource_router::ResourceMode;
+#[path = "emote_progress.rs"]
+mod progress;
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
 use super::{LoggingHost, expand_kcs_format};
@@ -435,6 +437,7 @@ pub(super) struct EmoteNativeServices {
     action_config: Arc<CpuM2ActionConfig>,
     prepared_frames: BTreeMap<u32, EmoteRasterFrame>,
     loads: load_async::Loads,
+    progress: progress::Progress,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -637,6 +640,7 @@ impl LoggingHost<'_> {
 
     /// Valid after a profile mismatch as well.
     pub(super) fn emote_release_task_hook(&mut self, id: u32) -> Result<()> {
+        self.data_services.emote.progress.remove(id);
         self.data_services.emote.cancel_pending_loads_for(id);
         self.data_services.emote.sound_links.remove(&id);
         self.data_services.emote.placements.remove(&id);
@@ -1215,17 +1219,20 @@ impl EmoteNativeServices {
     fn render_frame(
         &mut self, resolved_target: u32, size: [u32; 2],
     ) -> std::result::Result<EmoteRasterFrame, EmoteError> {
+        if super::perf_detail::enabled() {
+            self.progress.request(resolved_target, self.state.diagnostic_player(resolved_target));
+        }
         let frame = {
             let _timing = SlowTask::new(resolved_target, || 54, "emote_render_rgba");
             self.state.render_rgba(resolved_target)?
         };
         let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
-        if blend == BlendMode::SourceOver || frame.device().is_some() {
-            Ok(frame)
-        } else {
+        let frame = if blend == BlendMode::SourceOver || frame.device().is_some() { frame } else {
             // Other blend modes can depend on transparent pixels outside the pose bounds.
-            frame.into_viewport(size)
-        }
+            frame.into_viewport(size)?
+        };
+        self.progress.rendered(resolved_target, &frame);
+        Ok(frame)
     }
 
     fn submit_frame(
@@ -1238,6 +1245,7 @@ impl EmoteNativeServices {
         };
         if submitted != 0 {
             self.state.record_pixel_submission(resolved_target)?;
+            self.progress.scene_applied(resolved_target, &frame);
         }
         Ok(submitted)
     }
@@ -1251,6 +1259,10 @@ impl EmoteNativeServices {
     ) -> std::result::Result<usize, EmoteError> {
         let frame = self.render_frame(resolved_target, [canvas.width(), canvas.height()])?;
         self.submit_frame(resolved_target, canvas, frame)
+    }
+
+    pub(super) fn trace_visual_progress(&mut self) -> (usize, usize) {
+        self.progress.trace(&self.state)
     }
 }
 

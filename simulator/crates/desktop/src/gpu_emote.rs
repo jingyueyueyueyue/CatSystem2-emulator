@@ -688,19 +688,27 @@ fn pack_span(span: EmoteTextureSpan) -> Option<[u32; 8]> {
 }
 
 fn set_draw_header(draw: &mut Draw<'_>, bounds: [u32; 4], offset: usize, words: usize, commands: &mut [u32]) {
-    commands[offset..offset + 12].copy_from_slice(&[
-        bounds[2] - bounds[0], bounds[3] - bounds[1], bounds[0], bounds[1],
-        0, 0, 0, draw.stencil.serial, u32::from(draw.stencil.clear), u32::from(draw.reference),
-        (match draw.operation {
-            None => 0,
-            Some(CpuStencilWrite::IncrementWrapping) => 1,
-            Some(CpuStencilWrite::DecrementWrapping) => 255,
-        }) | (u32::from(draw.mesh.texture.is_bgra()) << 8),
-        (draw.mesh.opacity as f32).to_bits(),
-    ]);
+    commands[offset..offset + 12].copy_from_slice(&draw_header_words(
+        bounds, draw.stencil, draw.reference, draw.operation, draw.mesh.texture, draw.mesh.opacity,
+    ));
     draw.bounds = bounds;
     draw.offset = offset;
     draw.words = words;
+}
+
+fn draw_header_words(bounds: [u32; 4], stencil: Stencil, reference: u8,
+    operation: Option<CpuStencilWrite>, texture: &CpuTexture, opacity: f64,
+) -> [u32; 12] {
+    [
+        bounds[2] - bounds[0], bounds[3] - bounds[1], bounds[0], bounds[1],
+        0, 0, 0, stencil.serial, u32::from(stencil.clear), u32::from(reference),
+        (match operation {
+            None => 0,
+            Some(CpuStencilWrite::IncrementWrapping) => 1,
+            Some(CpuStencilWrite::DecrementWrapping) => 255,
+        }) | (u32::from(texture.is_bgra()) << 8),
+        (opacity as f32).to_bits(),
+    ]
 }
 
 fn clamp_prep_workers(requested: usize, available: usize) -> usize {
@@ -891,6 +899,7 @@ impl CachedAtlas {
     }
 }
 
+#[derive(Clone)]
 struct OwnedDraw {
     mesh: OwnedEmoteSpriteMesh,
     stencil: Stencil,
@@ -901,10 +910,11 @@ struct OwnedDraw {
     words: usize,
 }
 
+#[derive(Clone)]
 struct PreparedPose {
     player: usize,
-    state: CpuPlayerRenderState,
-    draws: Vec<OwnedDraw>,
+    state: Arc<CpuPlayerRenderState>,
+    draws: Arc<[OwnedDraw]>,
     words: Vec<u32>,
     phases: [Duration; 2],
     indexed: Option<Arc<mesh::IndexedGeometry>>,
@@ -915,6 +925,8 @@ struct IndexedPoseCache {
     player: usize,
     model: Weak<CpuMotionModel>,
     geometry: mesh::GeometryCache,
+    prepared: Option<PreparedPose>,
+    reservation_bytes: usize,
 }
 
 fn reserve_indexed_geometry(reserved: &std::sync::atomic::AtomicUsize, bytes: usize) -> bool {
@@ -932,8 +944,9 @@ fn prepare_indexed_poses(players: &[(&CpuPlayer, CpuViewport)]) {
     // Preserve one cache per actual player/model pair, in this frame's scene
     // order. Jobs mutate disjoint caches and only CPU data; GPU encoding remains
     // on the render thread in the original pose and primitive order.
+    // Retire unconsumed previous snapshots before taking this frame's budget.
+    PREPARED.with_borrow_mut(Vec::clear);
     if players.is_empty() || players.len() > MAX_INDEXED_PREP_POSES {
-        PREPARED.with_borrow_mut(Vec::clear);
         INDEXED_CACHES.with_borrow_mut(Vec::clear);
         if !players.is_empty() { report(&format!("emote_indexed_prep fallback=serial reason=pose_budget poses={} max={MAX_INDEXED_PREP_POSES}", players.len())); }
         return;
@@ -945,6 +958,10 @@ fn prepare_indexed_poses(players: &[(&CpuPlayer, CpuViewport)]) {
     let worker_jobs = std::sync::atomic::AtomicUsize::new(0);
     let reserved = std::sync::atomic::AtomicUsize::new(0);
     let budget_fallbacks = std::sync::atomic::AtomicUsize::new(0);
+    let pose_hits = std::sync::atomic::AtomicUsize::new(0);
+    let pose_evaluations = std::sync::atomic::AtomicUsize::new(0);
+    let evaluate_work_us = std::sync::atomic::AtomicU64::new(0);
+    let geometry_work_us = std::sync::atomic::AtomicU64::new(0);
     let mut poses: Vec<_> = std::iter::repeat_with(|| None).take(players.len()).collect();
     let counters = INDEXED_CACHES.with_borrow_mut(|caches| {
         let mut previous = std::mem::take(caches);
@@ -953,27 +970,64 @@ fn prepare_indexed_poses(players: &[(&CpuPlayer, CpuViewport)]) {
             let model = Arc::downgrade(player.shared_motion_model());
             let cache = previous.iter().position(|cache| cache.player == identity && Weak::ptr_eq(&cache.model, &model))
                 .map(|i| previous.swap_remove(i)).unwrap_or_else(|| IndexedPoseCache {
-                    player: identity, model, geometry: mesh::GeometryCache::default(),
+                    player: identity, model, geometry: mesh::GeometryCache::default(), prepared: None, reservation_bytes: 0,
                 });
             caches.push(cache);
         }
+        drop(previous);
         cs2_renderer::parallel_for_each(poses.iter_mut().zip(players).zip(caches.iter_mut()), workers,
             |((slot, &(player, viewport)), cache)| {
                 if std::thread::current().id() != caller { worker_jobs.fetch_add(1, Ordering::Relaxed); }
-                let Ok(variables) = player.effective_variables() else { return };
-                let Ok(pose) = collect_pose(player, viewport, &variables, true) else { return };
-                if mesh::compatible(&pose.draws).is_err() { return; }
-                if !reserve_indexed_geometry(&reserved, mesh::GeometryCache::reservation_bytes(&pose.draws)) {
+                let Ok(variables) = player.effective_variables() else {
+                    cache.prepared = None;
+                    cache.geometry = mesh::GeometryCache::default();
+                    return;
+                };
+                if let Some(prepared) = &cache.prepared
+                    && prepared.state.matches(player, viewport, &variables)
+                {
+                    if reserve_indexed_geometry(&reserved, cache.reservation_bytes) {
+                        pose_hits.fetch_add(1, Ordering::Relaxed);
+                        *slot = Some(prepared.clone());
+                    } else {
+                        cache.prepared = None;
+                        cache.geometry = mesh::GeometryCache::default();
+                        budget_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+                // Effective controls and reference clocks have already advanced
+                // in scene order. Only pure primitive evaluation is cached.
+                cache.prepared = None;
+                pose_evaluations.fetch_add(1, Ordering::Relaxed);
+                let evaluating = Instant::now();
+                let pose = collect_pose(player, viewport, &variables, true);
+                evaluate_work_us.fetch_add(evaluating.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let Ok(pose) = pose else {
+                    cache.geometry = mesh::GeometryCache::default();
+                    return;
+                };
+                if mesh::compatible(&pose.draws).is_err() {
+                    cache.geometry = mesh::GeometryCache::default();
+                    return;
+                }
+                let reservation_bytes = cache.geometry.reservation_bytes(&pose.draws);
+                if !reserve_indexed_geometry(&reserved, reservation_bytes) {
                     cache.geometry = mesh::GeometryCache::default();
                     budget_fallbacks.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+                let packing = Instant::now();
                 let indexed = cache.geometry.prepare(&pose.draws, viewport);
-                *slot = Some(PreparedPose {
-                    player: cache.player, state: player.render_state_snapshot(viewport, &variables),
-                    has_warnings: pose.has_warnings, draws: own_draws(pose.draws),
+                geometry_work_us.fetch_add(packing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let prepared = PreparedPose {
+                    player: cache.player, state: Arc::new(player.render_state_snapshot(viewport, &variables)),
+                    has_warnings: pose.has_warnings, draws: own_draws(pose.draws).into(),
                     words: Vec::new(), phases: [Duration::ZERO; 2], indexed: Some(indexed),
-                });
+                };
+                cache.reservation_bytes = reservation_bytes;
+                cache.prepared = Some(prepared.clone());
+                *slot = Some(prepared);
             });
         caches.iter().map(|cache| cache.geometry.counters()).fold([0; 2], |total, next|
             [total[0] + next[0], total[1] + next[1]])
@@ -990,9 +1044,11 @@ fn prepare_indexed_poses(players: &[(&CpuPlayer, CpuViewport)]) {
     let count_bit = 1 << players.len();
     let first_count = POSE_COUNTS.fetch_or(count_bit, Ordering::Relaxed) & count_bit == 0;
     if sample < 3 || first_count || sample.is_multiple_of(120) || budget_fallbacks.load(Ordering::Relaxed) != 0 {
-        report(&format!("emote_indexed_prep poses={} prepared={completed} warnings={warning_poses} workers={workers} worker_jobs={} cpu_wall_us={} geometry_hits={} geometry_misses={} geometry_reserved_bytes={} geometry_budget_bytes={INDEXED_PREP_GEOMETRY_BYTES} budget_fallbacks={}",
+        report(&format!("emote_indexed_prep poses={} prepared={completed} warnings={warning_poses} workers={workers} worker_jobs={} cpu_wall_us={} geometry_hits={} geometry_misses={} geometry_reserved_bytes={} geometry_budget_bytes={INDEXED_PREP_GEOMETRY_BYTES} budget_fallbacks={} pose_cache_hits={} pose_evaluations={} evaluate_work_us={} geometry_work_us={}",
             players.len(), worker_jobs.load(Ordering::Relaxed), started.elapsed().as_micros(), counters[0], counters[1],
-            reserved.load(Ordering::Relaxed), budget_fallbacks.load(Ordering::Relaxed)));
+            reserved.load(Ordering::Relaxed), budget_fallbacks.load(Ordering::Relaxed),
+            pose_hits.load(Ordering::Relaxed), pose_evaluations.load(Ordering::Relaxed),
+            evaluate_work_us.load(Ordering::Relaxed), geometry_work_us.load(Ordering::Relaxed)));
     }
 }
 
@@ -1078,8 +1134,8 @@ pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
             for ((pose, &(player, viewport)), (words, phases)) in poses.into_iter().zip(players).zip(packed) {
                 if let Some((variables, draws)) = pose {
                     prepared.push(PreparedPose {
-                        player: player as *const CpuPlayer as usize, state: player.render_state_snapshot(viewport, &variables),
-                        draws: own_draws(draws), words, phases, indexed: None, has_warnings: false,
+                        player: player as *const CpuPlayer as usize, state: Arc::new(player.render_state_snapshot(viewport, &variables)),
+                        draws: own_draws(draws).into(), words, phases, indexed: None, has_warnings: false,
                     });
                 }
             }
@@ -1099,8 +1155,8 @@ fn prepare_across_poses(players: &[(&CpuPlayer, CpuViewport)], alignment: usize,
             let Ok(mut pose) = collect_pose(player, viewport, &variables, false) else { return };
             if batch.prepare(&mut pose.draws, viewport, alignment, profile, COMMAND_WORDS).is_err() { return; }
             *slot = Some((PreparedPose {
-                player: player as *const CpuPlayer as usize, state: player.render_state_snapshot(viewport, &variables),
-                draws: own_draws(pose.draws), words: std::mem::take(&mut batch.commands), phases: batch.phases, indexed: None,
+                player: player as *const CpuPlayer as usize, state: Arc::new(player.render_state_snapshot(viewport, &variables)),
+                draws: own_draws(pose.draws).into(), words: std::mem::take(&mut batch.commands), phases: batch.phases, indexed: None,
                 has_warnings: false,
             }, main_thread.filter(|id| *id == std::thread::current().id()).map(|_| Instant::now())));
         });
@@ -1621,12 +1677,17 @@ impl EmoteRaster {
         if mesh::enabled() && mesh_preview() && self.mesh.is_some() {
             let (draws, geometry) = if let Some(prepared) = take_prepared_pose(player, viewport, variables) {
                 if prepared.has_warnings && !allow_warnings { bail!("E-mote pose has CPU evaluator warnings"); }
-                let draws = prepared.draws.into_iter().map(|draw| Ok(Draw {
+                if let Some(geometry) = prepared.indexed {
+                    let evaluated = started.map(|_| Instant::now());
+                    return self.render_prepared_indexed(device, queue, model, &prepared.draws,
+                        failed, started, evaluated, geometry);
+                }
+                let draws = prepared.draws.iter().cloned().map(|draw| Ok(Draw {
                     mesh: draw.mesh.restore(model)?, stencil: draw.stencil,
                     reference: draw.reference, operation: draw.operation,
                     bounds: draw.bounds, offset: draw.offset, words: draw.words,
                 })).collect::<cs2_runtime::emote::Result<Vec<_>>>()?;
-                (draws, prepared.indexed)
+                (draws, None)
             } else {
                 (collect_pose(player, viewport, variables, allow_warnings)?.draws, None)
             };
@@ -1645,7 +1706,7 @@ impl EmoteRaster {
         }
         let prepared = take_prepared_pose(player, viewport, variables).filter(|pose| pose.indexed.is_none());
         let (mut draws, packed) = if let Some(prepared) = prepared {
-            let draws = prepared.draws.into_iter().map(|draw| Ok(Draw {
+            let draws = prepared.draws.iter().cloned().map(|draw| Ok(Draw {
                 mesh: draw.mesh.restore(model)?, stencil: draw.stencil,
                 reference: draw.reference, operation: draw.operation,
                 bounds: draw.bounds, offset: draw.offset, words: draw.words,
@@ -2204,6 +2265,40 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local PSZ fixture"]
+    fn indexed_unchanged_pose_skips_evaluation_and_invalidates_exact_inputs() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let mut players = vec![CpuPlayer::new(CpuMotionModel::load(&resource)?); 2];
+        let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
+        INDEXED_CACHES.with_borrow_mut(Vec::clear);
+        let prepare = |players: &[CpuPlayer], viewport| {
+            prepare_indexed_poses(&players.iter().map(|p| (p, viewport)).collect::<Vec<_>>());
+            INDEXED_CACHES.with_borrow(|caches| caches.iter().map(|c| c.geometry.counters()).collect::<Vec<_>>())
+        };
+        let first = prepare(&players, viewport);
+        let unchanged = prepare(&players, viewport);
+        assert_eq!(unchanged, first, "identical exact state must skip mesh inspection and primitive evaluation");
+        assert_eq!(PREPARED.with_borrow(Vec::len), 2, "cache hits still supply both actual actors");
+        players[0].set_variable("head_UD", 20.)?;
+        let changed = prepare(&players, viewport);
+        assert_ne!(changed[0], unchanged[0], "changed effective variables invalidate actor zero");
+        assert_eq!(changed[1], unchanged[1], "one actor's changes cannot invalidate the other");
+        players[1].frame += 1.;
+        let advanced = prepare(&players, viewport);
+        assert_ne!(advanced[1], changed[1], "motion clock invalidates even with unchanged variables");
+        players[0].set_root_affine([1., 0., 0., 1., 1., 0.])?;
+        let moved = prepare(&players, viewport);
+        assert_ne!(moved[0], advanced[0], "root movement invalidates the exact state");
+        let resized = prepare(&players, CpuViewport { width: 1279, ..viewport });
+        assert_ne!(resized, moved, "viewport changes invalidate both actors");
+        prepare_indexed_poses(&[]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the local PSZ fixture"]
     fn indexed_five_pose_preparation_uses_bounded_workers_and_is_consumed() -> Result<()> {
         let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
         let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
@@ -2213,6 +2308,11 @@ mod tests {
         let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
         prepare_indexed_poses(&players.iter().map(|player| (player, viewport)).collect::<Vec<_>>());
         assert_eq!(PREPARED.with_borrow(Vec::len), 5, "actor count must not be confused with the worker count");
+        let four_actor_reservation = INDEXED_CACHES.with_borrow(|caches|
+            caches.iter().take(4).map(|cache| cache.reservation_bytes).sum::<usize>());
+        assert!(four_actor_reservation <= INDEXED_PREP_GEOMETRY_BYTES,
+            "actual four-actor geometry must fit the bounded preparation budget");
+        println!("indexed_geometry_budget actors=4 reserved_bytes={four_actor_reservation} limit_bytes={INDEXED_PREP_GEOMETRY_BYTES}");
         for player in &players {
             let prepared = take_prepared_pose(player, viewport, &player.effective_variables()?).context("prepared fifth actor")?;
             assert!(prepared.indexed.is_some());
@@ -2250,6 +2350,7 @@ mod tests {
         let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
         host.data_services.emote.state.set_viewport(viewport)?;
         let mut actors = Vec::new();
+        let mut progress_versions = BTreeMap::new();
         for count in 1..=2 {
             let task = host.with_host(|host| Ok(host.create_task_object(54, 0, b"emote-regression", b"")?))?;
             actors.push(task);
@@ -2268,7 +2369,28 @@ mod tests {
                 }
                 INDEXED_RENDER_PATHS.with(|counts| counts.set([0; 2]));
                 let started = Instant::now();
-                host.render_scene()?;
+                let (result, details) = crate::perf_detail::HostPerfDetails::capture(false, || -> Result<()> {
+                    host.render_scene()?;
+                    host.data_services.emote.trace_visual_progress();
+                    Ok(())
+                });
+                result?;
+                let progress = details.rows(91, (count * 3 + tick) as u64, 1);
+                println!("{progress}");
+                for &task in &actors {
+                    let row = progress.lines().find(|line| line.starts_with("visual_pose ")
+                        && line.split_whitespace().any(|field| field == format!("task={task}")))
+                        .expect("real scene entry must record each actor");
+                    let value = |key: &str| -> u64 { row.split_whitespace()
+                        .find_map(|field| field.strip_prefix(key)).unwrap().parse().unwrap() };
+                    assert_eq!(value("input_known="), 1, "{row}");
+                    let revision = value("pose_in=");
+                    let previous = progress_versions.insert(task, revision).unwrap_or(0);
+                    assert!(revision > previous, "changed actual player inputs must change pose version: {row}");
+                    assert_eq!(value("render_in="), revision, "{row}");
+                    assert_eq!(value("scene_input="), revision, "{row}");
+                    assert_eq!(value("surface_scene="), value("surface_rev="), "{row}");
+                }
                 let render_us = started.elapsed().as_micros();
                 let [prepared, fallback] = INDEXED_RENDER_PATHS.with(Cell::get);
                 println!("headless_scene_entry actors={count} tick={tick} prepared_consumed={prepared} fallback_geometry={fallback} render_us={render_us}");
@@ -2373,6 +2495,8 @@ mod tests {
         let folded = vec![[2., 2., 0., 0.], [12., 2., 4., 0.], [2., 12., 0., 4.], [2., 2., 0., 0.]];
         let mask = Stencil { serial: 1, clear: 0 };
         let specs = [
+            ("color", vec![[1., 1., 0., 0.], [5., 1., 4., 0.], [1., 5., 0., 4.], [5., 5., 4., 4.]], 0.4, Stencil::default(), 0, None),
+            ("color", vec![[8., 1., 0., 0.], [12., 1., 4., 0.], [8., 5., 0., 4.], [12., 5., 4., 4.]], 0.4, Stencil::default(), 0, None),
             ("color", rect.clone(), 0.45, Stencil::default(), 0, None),
             ("mask", rect.clone(), 1., mask, 0, Some(CpuStencilWrite::IncrementWrapping)),
             ("color", folded, 0.7, mask, 1, None),
@@ -2413,6 +2537,9 @@ mod tests {
             let frame = raster.emote.as_mut().unwrap().render_indexed(&raster.device, &raster.queue,
                 &model, viewport, draws()?, &raster.failed, None, None, None)?.into_viewport([16, 16])?;
             let uploaded = raster.emote.as_ref().unwrap().mesh.as_ref().unwrap().geometry_upload_bytes;
+            let [runs, batches, bindings] = raster.emote.as_ref().unwrap().mesh.as_ref().unwrap().encoding_counts;
+            assert!(batches < runs, "disjoint initial draws must share their actual coverage/compute passes");
+            assert_eq!(bindings, 2, "each unique atlas has one binding regardless of masks, alpha, or ordered runs");
             if pose == 0 { assert!(uploaded > 0, "the first pose uploads actual indexed geometry"); }
             else { assert_eq!(uploaded, 0, "unchanged cached geometry remains on the GPU, including generation wrap"); }
             let max = frame.rgba().iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();

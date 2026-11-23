@@ -17,11 +17,15 @@ impl Default for WindowPacer {
 }
 
 impl WindowPacer {
-    const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+    const TICK: Duration = crate::host_pacing::TICK;
+
+    pub(super) fn reset(&mut self, now: Instant) {
+        self.next = now;
+        self.tick = now;
+    }
 
     pub(super) fn completed(&mut self, now: Instant) {
-        let oldest_tick = now.checked_sub(Self::TICK * 2).unwrap_or(now);
-        self.tick = (self.tick + Self::TICK).max(oldest_tick);
+        self.tick = crate::host_pacing::completed_deadline(self.tick, now);
         self.next = self.tick;
     }
 
@@ -40,6 +44,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn focus_resume_discards_background_debt_and_suspend_delay() {
+        let start = Instant::now();
+        let mut pacer = WindowPacer { next: start, tick: start };
+        pacer.suspend(start);
+        let resumed = start + Duration::from_secs(120);
+        pacer.reset(resumed);
+        assert_eq!(pacer.next, resumed);
+        pacer.completed(resumed);
+        assert_eq!(pacer.next, resumed + WindowPacer::TICK);
+    }
+
+    #[test]
+    fn fixed_step_pacer_preserves_bounded_debt_instead_of_resetting_after_one_late_frame() {
+        let start = Instant::now();
+        let mut pacer = WindowPacer { next: start, tick: start };
+        let late = start + WindowPacer::TICK * 6;
+        pacer.completed(late);
+        assert_eq!(pacer.next, late - WindowPacer::TICK * 4);
+        let before = pacer.next;
+        pacer.retry(late, true);
+        pacer.completed(late);
+        assert_eq!(pacer.next, before + WindowPacer::TICK);
+    }
+
+    #[test]
     fn retries_do_not_consume_ticks_and_stalls_have_bounded_debt() {
         let start = Instant::now();
         let mut pacer = WindowPacer { next: start, tick: start };
@@ -49,8 +78,8 @@ mod tests {
         assert_eq!(pacer.next, start + WindowPacer::TICK);
         let late = start + Duration::from_secs(1);
         pacer.completed(late);
-        assert_eq!(pacer.next, late - WindowPacer::TICK * 2);
-        for _ in 0..3 { pacer.completed(late); }
+        assert_eq!(pacer.next, late - WindowPacer::TICK * 4);
+        for _ in 0..5 { pacer.completed(late); }
         assert_eq!(pacer.next, late + WindowPacer::TICK);
     }
 }

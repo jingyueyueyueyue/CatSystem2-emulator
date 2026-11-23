@@ -210,6 +210,14 @@ pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_c
     unsafe { open_game(game, saves, story, GameLanguage::Automatic) }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_tick_delay(id: u64, reset: i32) -> i32 {
+    call(-1, |sessions| {
+        let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
+        Ok(player.host_tick_delay_ms(reset != 0) as i32)
+    })
+}
+
 unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, language: GameLanguage) -> u64 {
     call(0, |sessions| {
         let game = unsafe { path(game)? };
@@ -223,6 +231,8 @@ unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, langu
         // Java schedules completed logical ticks at 60 Hz; budget retries
         // continue the same tick and do not count as another input update.
         player.set_host_input_update_rate(60);
+        player.set_host_iteration_work_budget(Some(std::time::Duration::from_millis(4)));
+        player.enable_host_async_images();
         player.enable_host_system_open_queue();
         player.enable_host_tweet_queue();
         player.enable_host_dialog_queue();
@@ -230,6 +240,7 @@ unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, langu
             player.enable_host_story_trace();
         }
         player.load_startup().map_err(|error| format!("Load startup: {error:#}"))?;
+        player.enable_host_tick_pacing();
         let id = sessions.next.checked_add(1).ok_or("Android session ids exhausted")?;
         sessions.next = id;
         for note in player.log().iter().filter(|note| note.starts_with("font_prewarm ")).take(1) {

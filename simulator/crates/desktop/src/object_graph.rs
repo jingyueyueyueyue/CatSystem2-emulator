@@ -92,6 +92,9 @@ impl HeadlessPlayer {
         if self.data_services.emote.has_pending_loads() {
             anyhow::bail!("host graph is waiting for asynchronous E-mote material preparation");
         }
+        if self.data_services.image_manager.has_pending_image_loads() {
+            anyhow::bail!("cannot capture an object graph while image material preparation is pending");
+        }
         let unsupported = self.object_graph_unsupported_task_families();
         if !unsupported.is_empty() {
             anyhow::bail!("host graph has {} unsupported task families: {:?}", unsupported.len(), unsupported);

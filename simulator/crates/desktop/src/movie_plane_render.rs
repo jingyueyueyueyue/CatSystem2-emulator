@@ -457,7 +457,7 @@ struct Vertex {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_movie(
+pub(super) fn draw_movie(
     canvas: &mut Canvas,
     frame: &RgbaFrame,
     at: [f32; 3],
@@ -467,6 +467,8 @@ fn draw_movie(
     camera: &PlaneCamera,
     projection: &MoviePlaneProjection,
 ) -> Result<bool> {
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    let _renderer = crate::gpu_raster::scene_renderer_scope("movie_plane_triangles");
     let local = [
         [at[0], at[1], at[2]],
         [at[0] + size[0], at[1], at[2]],
@@ -514,21 +516,44 @@ fn draw_movie(
         };
     }
     let color = argb(properties.color.unwrap_or(node.color));
-    let mut drew = false;
+    let mut triangles = Vec::new();
     for indexes in [[0, 1, 2], [2, 1, 3]] {
         let mut polygon = indexes.map(|index| vertices[index]).to_vec();
         polygon = clip_depth(&polygon, 0., true);
         polygon = clip_depth(&polygon, 1., false);
         for index in 1..polygon.len().saturating_sub(1) {
-            drew |= triangle(
-                canvas,
-                frame,
-                [polygon[0], polygon[index], polygon[index + 1]],
-                color,
-                properties.clip,
-                properties.blend,
-            )?;
+            triangles.push([polygon[0], polygon[index], polygon[index + 1]]);
         }
+    }
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    {
+        use crate::gpu_raster::{SceneTriangle, SceneVertex};
+        let geometry: Vec<SceneTriangle> = triangles.iter().map(|vertices| vertices.map(|vertex| SceneVertex {
+            point: [vertex.p[0], vertex.p[1]], rhw: vertex.rhw, uv_over_w: vertex.uv_rhw,
+            color: [color.r, color.g, color.b, color.a].map(f64::from),
+        })).collect();
+        // Keep the existing positive reciprocal-W error, even when a GPU
+        // dispatch could otherwise produce a finite (but invalid) projection.
+        for vertices in &triangles {
+            if edge(vertices[0], vertices[1], vertices[2].p[0], vertices[2].p[1]) != 0.
+                && vertices.iter().any(|vertex| !vertex.rhw.is_finite() || vertex.rhw <= 0.) {
+                bail!("visible movie-plane triangle has a non-positive reciprocal W");
+            }
+        }
+        if crate::gpu_raster::draw_scene_triangles(canvas, &geometry, Some(frame),
+            properties.blend, properties.clip, true, false) {
+            let mut drew = false;
+            // A presentation receipt requires a covered pixel. Coverage-only
+            // traversal returns at its first pixel and never reads the canvas.
+            for vertices in triangles {
+                drew |= triangle_impl(canvas, frame, vertices, color, properties.clip, properties.blend, true)?;
+            }
+            return Ok(drew);
+        }
+    }
+    let mut drew = false;
+    for vertices in triangles {
+        drew |= triangle(canvas, frame, vertices, color, properties.clip, properties.blend)?;
     }
     Ok(drew)
 }
@@ -662,10 +687,17 @@ fn edge(a: Vertex, b: Vertex, x: f64, y: f64) -> f64 {
 fn triangle(
     canvas: &mut Canvas,
     frame: &RgbaFrame,
-    mut vertices: [Vertex; 3],
+    vertices: [Vertex; 3],
     color: Color,
     clip: Option<Rect>,
     mode: BlendMode,
+) -> Result<bool> {
+    triangle_impl(canvas, frame, vertices, color, clip, mode, false)
+}
+
+fn triangle_impl(
+    canvas: &mut Canvas, frame: &RgbaFrame, mut vertices: [Vertex; 3], color: Color,
+    clip: Option<Rect>, mode: BlendMode, coverage_only: bool,
 ) -> Result<bool> {
     let mut area = edge(vertices[0], vertices[1], vertices[2].p[0], vertices[2].p[1]);
     if area == 0. {
@@ -721,6 +753,7 @@ fn triangle(
             {
                 continue;
             }
+            if coverage_only { return Ok(true); }
             let weights = weights.map(|weight| weight / area);
             let rhw = (0..3)
                 .map(|index| vertices[index].rhw * weights[index])

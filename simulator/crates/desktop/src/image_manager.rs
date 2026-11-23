@@ -13,6 +13,10 @@ use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, cp932_to_utf8, expand_kcs_format, native_state_error, native_state_error_owned, read_u32, trim_nul};
 use super::perf_detail::{ImageSourceStage, ImageSourceStep, SlowTask};
 
+#[cfg(test)]
+#[path = "image_material_async_tests.rs"]
+mod async_tests;
+
 const MAX_FILE: usize = 64 * 1024 * 1024;
 const MAX_PIXELS: usize = 128 * 1024 * 1024;
 const MAX_CACHE: usize = 256 * 1024 * 1024;
@@ -50,9 +54,16 @@ mod state;
 mod resource_surface;
 #[path = "image_island_patch.rs"]
 mod island_patch;
+#[path = "image_material_async.rs"]
+mod material_async;
 pub(super) use state::{ImageCacheSnapshot, PreparedImageCache, PreparedResourceLayers, capture_frame, restore_frame};
 
 pub(super) struct ImageManager {
+    /// Interactive host policy, deliberately absent from saved image state.
+    /// Offline/default players retain deterministic synchronous native710.
+    async_enabled: bool,
+    image_loads: material_async::Loads,
+    prepared_material: Option<material_async::Ready>,
     initialized: bool,
     enabled: bool,
     capacity: usize,
@@ -84,6 +95,8 @@ struct EncodedImageBatch {
 impl Default for ImageManager {
     fn default() -> Self {
         Self {
+            async_enabled: false,
+            image_loads: Default::default(), prepared_material: None,
             initialized: false, enabled: false, capacity: 0, force_cache: 1,
             bytes: 0, rgba_bytes: 0, frames: BTreeMap::new(), recency: VecDeque::new(),
             animation_aliases: Default::default(), aliases_initialized: false,
@@ -94,7 +107,18 @@ impl Default for ImageManager {
     }
 }
 
+impl super::HeadlessPlayer {
+    /// Allow interactive frames to continue while native710 prepares images.
+    /// Offline players keep the synchronous native contract unless opted in.
+    pub fn enable_host_async_images(&mut self) {
+        self.data_services.image_manager.async_enabled = true;
+    }
+}
+
 impl ImageManager {
+    pub(super) fn pending_image_owners(&self) -> impl Iterator<Item = u32> + '_ { self.image_loads.owners() }
+    pub(super) fn has_pending_image_loads(&self) -> bool { self.image_loads.has_pending() }
+    pub(super) fn cancel_image_load(&mut self, owner: u32) { self.image_loads.cancel(owner); }
     /// 69aa68..69aa77 uses the same wrapper as both a sole static source and
     /// the current image. Current-only writes must reach that retained source
     /// too; a composite's separate list output must never overwrite its layers.
@@ -211,6 +235,11 @@ impl LoggingHost<'_> {
     /// Ordinary710 shares the category, HG decoder and layer compositor with
     /// the image manager, rather than the legacy direct CST filename guesses.
     pub(super) fn load_image_resource_native710(&mut self, args: &[u8], vm: &Vm) -> Result<NativeReturn> {
+        let entered = std::time::Instant::now();
+        let owner = self.current_task_id;
+        if self.data_services.image_manager.image_loads.saved(owner) {
+            return self.poll_image_resource710();
+        }
         if args.len() != 4 {
             return Err(native_state_error("native 710 requires exactly one filename address"));
         }
@@ -229,14 +258,56 @@ impl LoggingHost<'_> {
         if invalid || encoded.len() >= 260 {
             return Err(native_state_error("native 710 name exceeds its CP932 buffer or is unencodable"));
         }
-        let names = self.resources.category_names(b"image", &decoded)
-            .map_err(|_| native_state_error("native 710 image category resolution failed"))?;
-        let Some(name) = names.first() else { return Ok(NativeReturn::Value(0)); };
-        let (encoded, _, invalid) = encoding_rs::SHIFT_JIS.encode(name);
-        if invalid { return Err(native_state_error("native 710 completed name is not CP932")); }
-        let (name, id) = super::image_pixels::image_reference(&encoded)?;
-        let name = super::sound_native::decode_name(super::ScriptTextEncoding::Cp932, &name)?;
-        let (image, mut layers) = self.load_resource_layers710(&name, id)?;
+        if !self.data_services.image_manager.async_enabled {
+            let names = self.resources.category_names(b"image", &decoded)
+                .map_err(|_| native_state_error("native 710 image category resolution failed"))?;
+            let Some(name) = names.first() else { return Ok(NativeReturn::Value(0)); };
+            let (encoded, _, invalid) = encoding_rs::SHIFT_JIS.encode(name);
+            if invalid { return Err(native_state_error("native 710 completed name is not CP932")); }
+            let (name, id) = super::image_pixels::image_reference(&encoded)?;
+            let name = super::sound_native::decode_name(super::ScriptTextEncoding::Cp932, &name)?;
+            return self.commit_image_resource710(&name, id);
+        }
+        let warm = self.data_services.ordinary.image_predecode_snapshot();
+        let manager = &mut self.data_services.image_manager;
+        let aliases = manager.aliases_initialized.then(|| manager.animation_aliases.clone());
+        let cached = manager.frames.keys().cloned().collect();
+        manager.image_loads.begin(owner, decoded, self.save_root.to_owned(), aliases, manager.initialized, cached, warm)?;
+        // Even a very fast worker cannot complete in the initial invocation.
+        // Retain the KCS native PC and evaluated filename before any I/O.
+        let resources = self.data_services.sound_async.resources.get_or_insert_with(|| Arc::new(self.resources.clone())).clone();
+        self.data_services.image_manager.image_loads.poll(owner, resources)?;
+        super::perf_detail::visual_note("image_material", format!("event=queued owner={owner} enqueue_us={}", entered.elapsed().as_micros()));
+        Ok(NativeReturn::Retry)
+    }
+
+    fn poll_image_resource710(&mut self) -> Result<NativeReturn> {
+        let started = std::time::Instant::now();
+        let owner = self.current_task_id;
+        let resources = self.data_services.sound_async.resources.get_or_insert_with(|| Arc::new(self.resources.clone())).clone();
+        let Some(mut ready) = self.data_services.image_manager.image_loads.poll(owner, resources)? else { return Ok(NativeReturn::Retry); };
+        let Some((name, id)) = ready.name.take() else { return Ok(NativeReturn::Value(0)); };
+        let manager = &mut self.data_services.image_manager;
+        if !manager.aliases_initialized && let Some(aliases) = ready.aliases.take() {
+            manager.animation_aliases = aliases; manager.aliases_initialized = true;
+        }
+        if !manager.initialized && let Some((enabled, capacity)) = ready.configuration {
+            manager.enabled = enabled; manager.capacity = capacity; manager.initialized = true;
+        }
+        let detail = format!("owner={owner} resource={name:?} read_us={} decode_us={} background_us={} source_bytes={} decoded_bytes={} prewarm_hits={}",
+            ready.read_us, ready.decode_us, ready.wall_us, ready.source_bytes, ready.decoded_bytes, ready.warm_hits);
+        manager.prepared_material = Some(ready);
+        let result = self.commit_image_resource710(&name, id);
+        self.data_services.image_manager.prepared_material = None;
+        let detail = format!("{detail} commit_us={}", started.elapsed().as_micros());
+        super::perf_detail::visual_note("image_material", format!("event=completed {detail}"));
+        self.events.push(super::LogicEvent { frame: self.frame, kind: "image-material".into(),
+            detail });
+        result
+    }
+
+    fn commit_image_resource710(&mut self, name: &str, id: u32) -> Result<NativeReturn> {
+        let (image, mut layers) = self.load_resource_layers710(name, id)?;
         if let Some(layers) = &mut layers && layers.surface.is_some() {
             self.ensure_canvas_state()
                 .map_err(|_| native_state_error("resource list tile configuration failed"))?;
@@ -250,7 +321,7 @@ impl LoggingHost<'_> {
         // composite scans the actual result, whose file Alpha flag is zero.
         let uses_alpha = if layers.as_ref().is_some_and(|state|
             state.layers.iter().any(|layer| layer.animation.timeline().is_some()))
-            || image_plan_components(&name).0.len() > 1 {
+            || image_plan_components(name).0.len() > 1 {
             image.has_alpha()
         } else { image.metadata().alpha_flag != 0 };
         let attributes = image.hg_attributes().iter()
@@ -337,7 +408,7 @@ impl LoggingHost<'_> {
     }
 
     fn load_resource_animation_layer(&mut self, name: &str, anm_name: &str) -> Result<Option<ResourceLayer>> {
-        let Some((path, bytes)) = self.read_managed_image_asset(name, false)? else { return Ok(None); };
+        let Some((path, bytes)) = self.read_shared_image_asset(name, false)? else { return Ok(None); };
         let mut frames = BTreeMap::new();
         if bytes.starts_with(b"HG-3") {
             let file = {
@@ -362,7 +433,10 @@ impl LoggingHost<'_> {
             for (id, index) in indices {
                 let frame = {
                     let _timing = super::measure_host_phase(super::HostPhase::Decode);
-                    checked_hg_frame(decoder.decode(index))?
+                    match self.data_services.image_manager.prepared_material.as_ref().and_then(|ready| ready.frame(&bytes, id)) {
+                        Some(result) => result?.ok_or_else(|| native_state_error("native 710 prepared animation frame is missing"))?,
+                        None => checked_hg_frame(decoder.decode(index))?,
+                    }
                 };
                 let frame = self.apply_managed_hg3_patch(&bytes, id, Some(&file.frames[index]), frame)?;
                 total = total.checked_add(frame.pixels().len()).filter(|&n| n <= MAX_CACHE)
@@ -689,13 +763,16 @@ impl LoggingHost<'_> {
     /// Keep one host-aware dispatcher for all three producers.
     pub(super) fn decode_managed_image_frame(&mut self, bytes: &[u8], id: u32)
         -> Result<Option<RgbaFrame>> {
-        let frame = match self.data_services.ordinary.take_predecoded_image(bytes, id) {
+        let prepared = self.data_services.image_manager.prepared_material.as_ref().and_then(|ready| ready.frame(bytes, id));
+        let frame = if let Some(prepared) = prepared {
+            let Some(frame) = prepared? else { return Ok(None); }; frame
+        } else { match self.data_services.ordinary.take_predecoded_image(bytes, id) {
             Some(frame) => frame,
             None => {
                 let Some(frame) = decode_image_frame(bytes, id)? else { return Ok(None); };
                 frame
             }
-        };
+        }};
         if !bytes.starts_with(b"HG-3") { return Ok(Some(frame)); }
         self.apply_managed_hg3_patch(bytes, id, None, frame).map(Some)
     }
@@ -758,6 +835,8 @@ impl LoggingHost<'_> {
     pub(super) fn resolve_image_animation_resource(&mut self, name: &str) -> Result<Option<String>> {
         use cs2_runtime::resource_router::ResourceMode;
         let exists = |name: &str| -> Result<bool> {
+            let anm = with_extension(name, Some("anm"));
+            if let Some(exists) = self.data_services.image_manager.prepared_material.as_ref().and_then(|ready| ready.exists(&anm)) { return Ok(exists); }
             Ok(self.resources.resolve_mode_utf16(&with_extension(name, Some("anm")).encode_utf16().collect::<Vec<_>>(), ResourceMode::LooseFirst)
                 .map_err(|_| native_state_error("image animation resource routing failed"))?.is_some())
         };
@@ -822,8 +901,8 @@ impl LoggingHost<'_> {
         for (part, id) in &names {
             let fields = match self.data_services.image_manager.geometry(part, *id) {
                 Some(fields) => Some(fields),
-                None => match self.read_managed_image_bytes(part)? {
-                    Some(bytes) => cs2_runtime::native_image_metadata(&bytes, *id)?,
+                None => match self.read_shared_image_asset(part, false)? {
+                    Some((_, bytes)) => cs2_runtime::native_image_metadata(&bytes, *id)?,
                     None => None,
                 },
             };
@@ -871,6 +950,7 @@ impl LoggingHost<'_> {
 
     fn read_shared_image_asset(&self, name: &str, raw: bool) -> Result<Option<(String, Arc<Vec<u8>>)>> {
         let _timing = super::measure_host_phase(super::HostPhase::Read);
+        if let Some(asset) = self.data_services.image_manager.prepared_material.as_ref().and_then(|ready| ready.asset(name, raw)) { return Ok(asset); }
         if name.encode_utf16().count() >= 260 {
             return Err(native_state_error("image manager name exceeds 259 UTF-16 units"));
         }

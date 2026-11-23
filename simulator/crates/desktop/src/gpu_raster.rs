@@ -22,6 +22,57 @@ pub(super) use present::{candidate as surface_candidate, detach, display_stats, 
 #[path = "gpu_emote.rs"]
 mod emote_raster;
 
+#[path = "gpu_scene_triangles.rs"]
+mod scene_triangles;
+pub(super) use scene_triangles::{SceneTriangle, SceneVertex, draw_scene_triangles};
+
+#[derive(Clone, Copy)]
+struct SceneDrawContext {
+    task: u32,
+    kind: u32,
+    renderer: &'static str,
+}
+
+thread_local! {
+    static SCENE_DRAW: Cell<SceneDrawContext> = const { Cell::new(SceneDrawContext {
+        task: 0, kind: 0, renderer: "unspecified",
+    }) };
+}
+
+pub(super) struct SceneDrawScope(SceneDrawContext);
+impl Drop for SceneDrawScope {
+    fn drop(&mut self) { SCENE_DRAW.with(|scope| scope.set(self.0)); }
+}
+
+pub(super) fn scene_draw_scope(task: u32, kind: u32) -> SceneDrawScope {
+    SCENE_DRAW.with(|scope| SceneDrawScope(scope.replace(SceneDrawContext {
+        task, kind, renderer: "scene_node",
+    })))
+}
+
+pub(super) fn scene_renderer_scope(renderer: &'static str) -> SceneDrawScope {
+    SCENE_DRAW.with(|scope| {
+        let mut context = scope.get();
+        context.renderer = renderer;
+        SceneDrawScope(scope.replace(context))
+    })
+}
+
+fn scene_context() -> String {
+    SCENE_DRAW.with(|scope| {
+        let context = scope.get();
+        format!("task={} kind={} renderer={}", context.task, context.kind, context.renderer)
+    })
+}
+
+pub(super) fn scene_cpu_fallback(reason: &str) {
+    static REPORTED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let message = format!("draw=scene_triangles backend=cpu {} reason={reason}", scene_context());
+    if let Ok(mut reported) = REPORTED.lock() && reported.len() < 128 && reported.insert(message.clone()) {
+        report(&message);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RasterStatus {
     NotCreated,
@@ -574,6 +625,7 @@ struct Raster {
     readback: wgpu::Buffer,
     timing: Option<GpuTiming>,
     emote: Option<emote_raster::EmoteRaster>,
+    scene_triangles: Option<scene_triangles::SceneRaster>,
     reported_emote_result: Option<bool>,
     emote_initialization_failed: bool,
     scratch: Vec<u8>,
@@ -659,8 +711,9 @@ impl CanvasReadback for DeviceFrame {
 
     fn read_rgba_at(&self, output: &mut [u8], location: &'static std::panic::Location) -> bool {
         static LOCATIONS: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
-        if let Ok(mut locations) = LOCATIONS.lock() && locations.insert(location.to_string()) {
-            report(&format!("device_barrier bytes={} caller={location}", self.size[0] * self.size[1] * 4));
+        let context = scene_context();
+        if let Ok(mut locations) = LOCATIONS.lock() && locations.insert(format!("{location} {context}")) {
+            report(&format!("device_barrier bytes={} caller={location} {context}", self.size[0] * self.size[1] * 4));
         }
         if self.failed.load(Ordering::Relaxed) { return false; }
         let size = self.size.into_iter().map(u64::from).product::<u64>() * 4;
@@ -807,7 +860,7 @@ impl Raster {
             empty_source: source, empty_atlas, empty_page_table,
             sources: VecDeque::new(), source_bytes: 0,
             target, args_buffer, readback, timing, atlas: None, full_target: None,
-            emote: None, reported_emote_result: None, emote_initialization_failed: false,
+            emote: None, scene_triangles: None, reported_emote_result: None, emote_initialization_failed: false,
             scratch: Vec::new(), previous_planes: None, failed, backend: info.backend, reported: [false; 9],
             spares: Vec::new(), reported_atlas_fallback: false,
             #[cfg(all(test, windows))]
@@ -1433,6 +1486,296 @@ fn replace_rows(canvas: &mut Canvas, first: usize, stride: usize, row_size: usiz
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn ill_conditioned_particle_edges_fall_back_to_exact_cpu_scene() -> Result<()> {
+        verify_particle_precision_fallback(
+            [[-9500., -9500., 0.], [500., 501., 0.], [501., 503., 0.]], [499, 500])
+    }
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn scaled_ill_conditioned_particle_edges_fall_back_to_exact_cpu_scene() -> Result<()> {
+        verify_particle_precision_fallback(
+            [[-1187.875, -1188., 0.], [62.125, 62.125, 0.], [62.25, 62.375, 0.]], [62, 62])
+    }
+
+    fn verify_particle_precision_fallback(points: [[f32; 3]; 3], sample: [usize; 2]) -> Result<()> {
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let background = RgbaFrame::from_rgba8(1280, 720, [13, 23, 43, 255].repeat(1280 * 720))?;
+        let vertices = points.map(|position| crate::particle_vm::ParticleVertex {
+                position, color: 0xfff0417b, ..Default::default()
+            });
+        let mut expected = Canvas::from_rgba8(1280, 720, background.pixels().to_vec())?;
+        crate::particle_render::triangle(&mut expected, vertices, None, BlendMode::SourceOver)?;
+        let offset = (sample[1] * 1280 + sample[0]) * 4;
+        assert_eq!(&expected.pixels()[offset..offset + 4], &[240, 65, 123, 255]);
+        let mut actual = Canvas::new(1280, 720)?;
+        let full = RasterRect { origin: [0; 2], size: [1280, 720] };
+        assert!(raster.draw_jobs(&mut actual, &[full], &[RasterJob { rect: full,
+            source: Some(&background), atlas: None, operation: Draw::Copy { source_origin: [0; 2] },
+        }], RasterOutput::Canvas, false)?);
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        let (drawn, detail) = crate::perf_detail::HostPerfDetails::capture(false, || {
+            let _scope = scene_draw_scope(77, 16);
+            crate::particle_render::triangle(&mut actual, vertices, None, BlendMode::SourceOver)
+        });
+        drawn?;
+        assert!(actual.device_pixels().is_none(), "ill-conditioned geometry must use portable precision fallback");
+        let rows = detail.rows(0, 0, 0);
+        assert!(rows.contains("device_calls=1"), "fallback must retain the existing complete GPU scene: {rows}");
+        assert_eq!(actual.pixels(), expected.pixels(), "precision fallback must match every CPU pixel exactly");
+        RASTER.with_borrow_mut(Option::take);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and the full local vivo game fixture"]
+    fn real_em_note_native_task_mixes_gpu_scene_without_readback() -> Result<()> {
+        use std::time::Instant;
+        use cs2_script::{KcsProgram, NativeReturn, Vm};
+        let root = std::path::PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT")
+            .context("full vivo game fixture directory required")?);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let scratch = std::env::temp_dir().join(format!("cs2-note-scene-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&scratch)?;
+        let mut host = crate::HeadlessPlayer::open_with_save_root(&scratch, scratch.join("save"))?;
+        host.scan.resources = cs2_runtime::ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        host.scan.resources.initialize_resource_router()?;
+        // Native numbering is the exact game PE's identified particle profile.
+        host.data_services.particle_message_pe_sha256 = Some(
+            "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc");
+        host.canvas = Canvas::new(1280, 720)?;
+        host.graphics_canvas = Canvas::new(1280, 720)?;
+        // CST #210 binds an existing task through the ordinary source service.
+        // A live unloaded kind16 supplies this fixture's explicit position;
+        // creating an M2 actor would additionally require its startup surface.
+        let attachment = host.with_host(|host| Ok(host.create_task_object(16, 0, b"note-attachment", b"")?))?;
+        host.scene_nodes.get_mut(&attachment).unwrap().position = [640., 360., 0.];
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let background = RgbaFrame::from_rgba8(1280, 720, [27, 67, 107, 191].repeat(1280 * 720))?;
+        let full = RasterRect { origin: [0; 2], size: [1280, 720] };
+        let projection = crate::movie_plane_render::MoviePlaneProjection::default();
+        let cameras = BTreeMap::new();
+        let mut visible_samples = 0usize;
+        for (image, scale) in [("tex_em04", 100f32), ("tex_em04h", 95f32)] {
+            let task = host.with_host(|host| Ok(host.create_task_object(16, 0, b"em-note-fixture", b"")?))?;
+            let mut data = vec![0; 1024];
+            data[..8].copy_from_slice(b"em_note\0");
+            data[128..128 + image.len()].copy_from_slice(image.as_bytes());
+            // scene.int/01.cst records415..419 supply partition, direction,
+            // scale and fade/hold/fade. Attachment coordinates remain explicit
+            // test input because the original #205/#206 were not logged.
+            for (index, value) in [1f32, 640., 360., 1., scale, 30., 60., 60.].into_iter().enumerate() {
+                data[256 + index * 4..260 + index * 4].copy_from_slice(&value.to_bits().to_le_bytes());
+            }
+            let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], data, 1024)?)?;
+            let args: Vec<u8> = [task, 0, 128, 3, 37000f32.to_bits(), 256].into_iter()
+                .flat_map(u32::to_le_bytes).collect();
+            let loaded = host.with_host(|host| Ok(host.load_particle_native(693, &args, &mut vm)?))?;
+            assert!(matches!(loaded, NativeReturn::Value(1)), "native693 must load the real SDK2 resource");
+            let binding: Vec<u8> = [task, attachment].into_iter().flat_map(u32::to_le_bytes).collect();
+            host.with_host(|host| Ok(host.control_particle_native(427, &binding, &mut vm)?))?;
+            host.with_host(|host| Ok(host.control_particle_native(272, &task.to_le_bytes(), &mut vm)?))?;
+            let state = &host.particles[&task];
+            assert!(state.plugin.is_some() && state.runner.is_none());
+            assert!(state.program_name.ends_with("em_note.ppi"));
+            assert!(state.image_name.contains(image));
+            let program_name = state.program_name.clone();
+            let image_name = state.image_name.clone();
+            let texture = state.texture.clone().context("real note texture must decode")?;
+            println!("real_particle_source scene=scene.int/01.cst records=415..426 original_task=35 task={task} kind=16 native=693 command=314 program={program_name:?} image={image_name:?} texture={}x{}", texture.width(), texture.height());
+            for frame in 2166..=2196u32 {
+                assert!(host.with_host(|host| Ok(host.advance_particle_task(task, frame, 4096)?))?);
+                if ![2166, 2167, 2176, 2186, 2196].contains(&frame) { continue; }
+                let snapshot = host.particles[&task].rendered.as_ref().context("native update must commit SDK snapshot")?.clone();
+                assert!(snapshot.active && snapshot.frame_complete);
+                let triangles = snapshot.projected_quads(&crate::particle_vm::ParticleProjection::default())?.len() * 2;
+                assert!(triangles > 0, "real plugin must submit its own geometry");
+                let mut expected = Canvas::from_rgba8(1280, 720, background.pixels().to_vec())?;
+                let cpu_started = Instant::now();
+                assert!(crate::particle_native::draw_ordinary_task(task, &mut expected, &host.particles,
+                    &projection, &cameras, f32::NEG_INFINITY, f32::INFINITY)?);
+                let cpu_us = cpu_started.elapsed().as_micros();
+                if frame == 2176 {
+                    // Keep the producing device alive, but leave the shared
+                    // acceleration slot empty to exercise the original
+                    // software callback after a device-owned scene layer.
+                    let mut baseline = Canvas::new(1280, 720)?;
+                    assert!(raster.draw_jobs(&mut baseline, &[full], &[RasterJob { rect: full,
+                        source: Some(&background), atlas: None, operation: Draw::Copy { source_origin: [0; 2] },
+                    }], RasterOutput::Canvas, false)?);
+                    let (drawn, detail) = crate::perf_detail::HostPerfDetails::capture(false, || {
+                        let _task = scene_draw_scope(task, 16);
+                        crate::particle_native::draw_ordinary_task(task, &mut baseline, &host.particles,
+                            &projection, &cameras, f32::NEG_INFINITY, f32::INFINITY)
+                    });
+                    assert!(drawn?);
+                    let rows = detail.rows(0, u64::from(frame), 0);
+                    assert!(rows.contains("device_calls=1") && rows.contains("device_bytes=3686400"),
+                        "real software callback must reproduce the observed full-frame barrier: {rows}");
+                    assert_eq!(baseline.pixels(), expected.pixels());
+                    println!("real_particle_cpu_baseline task={task} kind=16 frame={frame} source={image_name:?}\n{rows}");
+                }
+                let mut actual = Canvas::new(1280, 720)?;
+                assert!(raster.draw_jobs(&mut actual, &[full], &[RasterJob { rect: full,
+                    source: Some(&background), atlas: None, operation: Draw::Copy { source_origin: [0; 2] },
+                }], RasterOutput::Canvas, false)?);
+                RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+                let gpu_started = Instant::now();
+                let (drawn, detail) = crate::perf_detail::HostPerfDetails::capture(false, || {
+                    let _task = scene_draw_scope(task, 16);
+                    crate::particle_native::draw_ordinary_task(task, &mut actual, &host.particles,
+                        &projection, &cameras, f32::NEG_INFINITY, f32::INFINITY)
+                });
+                let gpu_cpu_us = gpu_started.elapsed().as_micros();
+                assert!(drawn?);
+                assert!(actual.device_pixels().is_some(), "real particle materialized device scene");
+                let rows = detail.rows(0, u64::from(frame), 0);
+                assert!(!rows.contains("gpu_output "), "real particle intermediate readback: {rows}");
+                let max_error = actual.pixels().iter().zip(expected.pixels())
+                    .map(|(a,b)| a.abs_diff(*b)).max().unwrap_or(0);
+                assert!(max_error <= 2, "{image} frame={frame} differs from f64 reference by {max_error}");
+                visible_samples += usize::from(expected.pixels() != background.pixels());
+                assert_eq!(host.particles[&task].rendered.as_ref(), Some(&snapshot), "composition must not advance SDK state");
+                println!("real_particle_mixed_scene task={task} kind=16 frame={frame} triangles={triangles} cpu_us={cpu_us} gpu_cpu_us={gpu_cpu_us} device_calls=0 packed_calls=0 max_error={max_error}");
+                raster = RASTER.with_borrow_mut(Option::take).unwrap();
+            }
+        }
+        assert!(visible_samples >= 4, "real texture and plugin must change the scene after fade-in");
+        drop(host);
+        std::fs::remove_dir_all(scratch)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn particle_triangles_preserve_device_scene_and_cpu_reference() -> Result<()> {
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let background = RgbaFrame::from_rgba8(32, 24, [23, 47, 91, 191].repeat(32 * 24))?;
+        let texture = RgbaFrame::from_rgba8(2, 2, vec![
+            255, 31, 47, 255, 17, 239, 59, 128, 31, 53, 251, 191, 233, 211, 7, 64,
+        ])?;
+        let mut actual = Canvas::new(32, 24)?;
+        let mut expected = Canvas::from_rgba8(32, 24, background.pixels().to_vec())?;
+        let rect = RasterRect { origin: [0; 2], size: [32, 24] };
+        assert!(raster.draw_jobs(&mut actual, &[rect], &[RasterJob {
+            rect, source: Some(&background), atlas: None,
+            operation: Draw::Copy { source_origin: [0; 2] },
+        }], RasterOutput::Canvas, false)?);
+        let vertices = [
+            crate::particle_vm::ParticleVertex { position: [2., 3., 0.], rhw: 1., uv: [0., 1.], color: 0xbfffffff },
+            crate::particle_vm::ParticleVertex { position: [28., 3., 0.], rhw: 0.5, uv: [1., 1.], color: 0xdfafffff },
+            crate::particle_vm::ParticleVertex { position: [2., 21., 0.], rhw: 2., uv: [0., 0.], color: 0xefffffaf },
+        ];
+        // No raster exists while computing the independent f64 software image.
+        for mode in [BlendMode::SourceOver, BlendMode::AddSource, BlendMode::Multiply] {
+            crate::particle_render::triangle(&mut expected, vertices, Some(&texture), mode)?;
+        }
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        let (drawn, detail) = crate::perf_detail::HostPerfDetails::capture(false, || -> Result<()> {
+            for mode in [BlendMode::SourceOver, BlendMode::AddSource, BlendMode::Multiply] {
+                crate::particle_render::triangle(&mut actual, vertices, Some(&texture), mode)?;
+            }
+            Ok(())
+        });
+        drawn?;
+        assert!(actual.device_pixels().is_some(), "particle draw materialized the GPU scene on CPU");
+        let rows = detail.rows(0, 0, 0);
+        // Zero-readback captures omit the gpu_output row entirely.
+        assert!(!rows.contains("gpu_output "), "unexpected scene readback: {rows}");
+        let actual_pixels = actual.pixels();
+        let max_error = actual_pixels.iter().zip(expected.pixels()).map(|(a,b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert!(max_error <= 2, "f32 filtered scene differs from f64 reference by {max_error}");
+        RASTER.with_borrow_mut(Option::take);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn movie_plane_preserves_device_scene_clip_and_cpu_reference() -> Result<()> {
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let background = RgbaFrame::from_rgba8(32, 24, [43, 79, 113, 127].repeat(32 * 24))?;
+        let texture = RgbaFrame::from_rgba8(2, 2, vec![255, 0, 17, 255, 3, 251, 5, 255,
+            7, 13, 239, 128, 227, 211, 199, 191])?;
+        let node = crate::SceneNode { id: 81, kind: 568, parent: 0, name: "movie-probe".into(),
+            size: [26., 18.], position: [0.; 3], scale: [1.; 3], color: 0xbfffffff,
+            overlay_color: 0, visible: true, initialized: true, fes_block_name: Vec::new(),
+            fes_object_prefix: Vec::new(), fes_bank: 0, fes_parameters: [0; 512] };
+        let properties = crate::movie_plane::PlaneProperties {
+            clip: Some(Rect::new(5, 4, 18, 13)), ..Default::default()
+        };
+        let camera = crate::movie_plane::PlaneCamera::default();
+        let projection = crate::movie_plane_render::MoviePlaneProjection::default();
+        let mut expected = Canvas::from_rgba8(32, 24, background.pixels().to_vec())?;
+        assert!(crate::movie_plane_render::draw_movie(&mut expected, &texture, [2., 3., 0.],
+            [26., 18.], &node, &properties, &camera, &projection)?);
+        let mut actual = Canvas::new(32, 24)?;
+        let rect = RasterRect { origin: [0; 2], size: [32, 24] };
+        assert!(raster.draw_jobs(&mut actual, &[rect], &[RasterJob { rect, source: Some(&background),
+            atlas: None, operation: Draw::Copy { source_origin: [0; 2] } }], RasterOutput::Canvas, false)?);
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        let (result, detail) = crate::perf_detail::HostPerfDetails::capture(false, || {
+            crate::movie_plane_render::draw_movie(&mut actual, &texture, [2., 3., 0.],
+                [26., 18.], &node, &properties, &camera, &projection)
+        });
+        assert!(result?);
+        assert!(actual.device_pixels().is_some(), "movie plane materialized the GPU scene on CPU");
+        let rows = detail.rows(0, 0, 0);
+        assert!(!rows.contains("gpu_output "), "unexpected scene readback: {rows}");
+        let error = actual.pixels().iter().zip(expected.pixels()).map(|(a,b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert!(error <= 1, "filtered movie differs from f64 reference by {error}");
+        RASTER.with_borrow_mut(Option::take);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn particle_snapshot_batches_overlapping_quads_without_readback() -> Result<()> {
+        use crate::particle_vm::{ParticleCanvas, ParticleQuad, ParticleRenderSnapshot, ParticleVertex};
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let background = RgbaFrame::from_rgba8(32, 24, (0..32 * 24).flat_map(|pixel| {
+            [31, 61, 97, [0, 1, 127, 255][pixel % 4]]
+        }).collect())?;
+        let quads: Vec<_> = [([2., 3.], 0x7f4d83cd), ([7., 6.], 0xbfcb713b)].into_iter()
+            .enumerate().map(|(index, (origin, color))| ParticleQuad {
+                index: index as u32, flag: 1, offset: [0.; 4], depth_bias: 0.,
+                vertices: [[0., 0.], [19., 0.], [0., 13.], [19., 13.]].map(|offset| ParticleVertex {
+                    position: [origin[0] + offset[0], origin[1] + offset[1], 0.], color,
+                    ..Default::default()
+                }),
+            }).collect();
+        let mut snapshot = ParticleRenderSnapshot { active: true, frame_complete: true,
+            elapsed: 1, previous_elapsed: 0, current_quad: 0, render_mode: 0, opacity: 256,
+            canvas: ParticleCanvas::at_depth([32, 24], 0.), quads };
+        for mode in 0..6 {
+            snapshot.render_mode = mode;
+            let mut expected = Canvas::from_rgba8(32, 24, background.pixels().to_vec())?;
+            crate::particle_render::draw(&mut expected, &snapshot, None)?;
+            let mut actual = Canvas::new(32, 24)?;
+            let full = RasterRect { origin: [0; 2], size: [32, 24] };
+            assert!(raster.draw_jobs(&mut actual, &[full], &[RasterJob { rect: full,
+                source: Some(&background), atlas: None, operation: Draw::Copy { source_origin: [0; 2] },
+            }], RasterOutput::Canvas, false)?);
+            RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+            let (drawn, detail) = crate::perf_detail::HostPerfDetails::capture(false, || {
+                crate::particle_render::draw(&mut actual, &snapshot, None)
+            });
+            drawn?;
+            assert!(actual.device_pixels().is_some(), "snapshot materialized scene for mode {mode}");
+            let rows = detail.rows(0, 0, 0);
+            assert!(!rows.contains("gpu_output "), "unexpected batch readback: {rows}");
+            assert_eq!(actual.pixels(), expected.pixels(), "overlap/shared-edge mismatch mode {mode}");
+            raster = RASTER.with_borrow_mut(Option::take).unwrap();
+        }
+        Ok(())
+    }
 
     #[test]
     fn missing_emote_raster_reason_distinguishes_lifecycle_states() {

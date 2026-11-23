@@ -654,6 +654,8 @@ impl Default for ExecutionControl {
 
 pub trait Host {
     fn call(&mut self, index: u32, arguments: &[u8], vm: &mut Vm) -> Result<NativeReturn>;
+    /// A cooperative host-iteration budget. Default hosts remain deterministic.
+    fn should_yield(&self) -> bool { false }
 }
 
 impl<F> Host for F
@@ -1361,7 +1363,7 @@ impl Vm {
         // alive across that call and refresh the program before the next fetch.
         let mut active_program = self.program.clone();
         let mut instruction_cursor: Option<usize> = None;
-        for _ in 0..budget {
+        for instruction_step in 0..budget {
             let program = active_program.as_ref().ok_or(ScriptError::NoProgram)?;
             if self.instruction_pointer == program.code.len() {
                 return Ok(Step::Halted);
@@ -1387,6 +1389,10 @@ impl Vm {
             if instruction.opcode == 0x3b {
                 return Ok(Step::Halted);
             }
+            // Leave PC/stack/native arguments untouched at a cooperative yield.
+            if (instruction_step % 64 == 0 || instruction.opcode == NATIVE_CALL_OPCODE)
+                && host.should_yield()
+            { return Ok(Step::Yield); }
             let opcode = instruction.opcode;
             let next_offset = instruction.offset + 1 + instruction.operands.len() * 5;
             let next_index = instruction_cursor.map(|index| index + 1);
@@ -2362,6 +2368,33 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_work_budget_yields_between_real_native_calls_and_resumes_in_order() {
+        struct Gate { calls: usize, gate: bool }
+        impl Host for Gate {
+            fn call(&mut self, _: u32, _: &[u8], _: &mut Vm) -> Result<NativeReturn> {
+                self.calls += 1;
+                Ok(NativeReturn::Continue)
+            }
+            fn should_yield(&self) -> bool { self.gate && self.calls != 0 }
+        }
+        let mut code = Vec::new();
+        for _ in 0..2 {
+            code.push(NATIVE_CALL_OPCODE);
+            for value in [0, 0] { let operand = Operand::immediate(value);
+                code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes()); }
+        }
+        code.push(0x3b);
+        let mut vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 64], 32).unwrap()).unwrap();
+        let mut host = Gate { calls: 0, gate: true };
+        assert_eq!(vm.run(&mut host, 1000).unwrap(), Step::Yield);
+        assert_eq!(host.calls, 1);
+        assert_eq!(vm.instruction_pointer, 11);
+        host.gate = false;
+        assert_eq!(vm.run(&mut host, 1000).unwrap(), Step::Halted);
+        assert_eq!(host.calls, 2);
+    }
 
     #[test]
     fn compressed_containers_require_the_checksum_and_complete_input() {

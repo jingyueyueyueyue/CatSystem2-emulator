@@ -2169,6 +2169,7 @@ impl<'a> EmoteSpriteMesh<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct OwnedEmoteSpriteMesh {
     source: String,
     opacity: f64,
@@ -2177,6 +2178,13 @@ pub struct OwnedEmoteSpriteMesh {
 }
 
 impl OwnedEmoteSpriteMesh {
+    /// Resolve immutable draw state without copying an already prepared mesh.
+    pub fn texture_opacity<'a>(&self, model: &'a CpuMotionModel) -> Result<(&'a CpuTexture, f64)> {
+        let texture = model.textures.get(&self.source)
+            .ok_or_else(|| unsupported("E-mote draw texture does not belong to model"))?;
+        Ok((texture, self.opacity))
+    }
+
     pub fn restore<'a>(self, model: &'a CpuMotionModel) -> Result<EmoteSpriteMesh<'a>> {
         let (source, texture) = model.textures.get_key_value(&self.source)
             .ok_or_else(|| unsupported("E-mote draw texture does not belong to model"))?;
@@ -4215,6 +4223,9 @@ impl EmoteBackend for CpuEmoteBackend {
         if state.surface.frame().is_some() { return None; }
         Some((state.player.as_ref()?, self.viewport))
     }
+    fn diagnostic_player(&self, task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
+        Some((self.players.get(&task)?.player.as_ref()?, self.viewport))
+    }
     fn can_defer_scene_raster(&self, task: u32) -> bool {
         self.rasterizer.is_some()
             && self.players.get(&task).is_some_and(|state| state.tint_argb() == 0xffff_ffff || self.surface_tinter.is_some())
@@ -4480,6 +4491,17 @@ mod tests {
         let sampled = player.render_state_snapshot(viewport, &variables);
         player.root_affine[4] = -0.;
         assert!(!sampled.matches(player, viewport, &variables), "root transform snapshots compare exact float bits");
+        Ok(())
+    }
+
+    #[test]
+    fn visual_progress_player_is_available_without_gpu_scene_deferral() -> Result<()> {
+        let backend = backend()?;
+        assert!(backend.scene_raster_player(1).is_none());
+        let (player, viewport) = backend.diagnostic_player(1).expect("diagnostic access must not depend on the render path");
+        assert_eq!(player.frame, backend.player(1)?.frame);
+        assert_eq!(viewport.width, backend.viewport.width);
+        assert!(backend.diagnostic_player(99).is_none());
         Ok(())
     }
 

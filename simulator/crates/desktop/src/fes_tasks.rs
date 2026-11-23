@@ -543,6 +543,38 @@ struct ChildCreation {
 }
 
 impl FesTaskStore {
+    pub(super) fn trace_visual_progress(&self, tasks: &super::native_tasks::NativeTaskStore) -> (usize, usize) {
+        let mut kept = 0;
+        for (&id, slot) in &self.slots {
+            let Some(object) = &slot.object else { continue };
+            if !object.loaded || kept == 2 { continue; }
+            let task_now = tasks.task_clock(id).map(|clock| clock.current);
+            let (scope, effective) = if let Some(value) = &object.lower_notification { ("lower", Some(value.now)) }
+                else if let Some(value) = &object.system { ("system", Some(value.now)) }
+                else if object.invocation_now.is_some() { ("invocation", object.invocation_now) }
+                else if object.start_now.is_some() { ("start", object.start_now) }
+                else if object.load_now.is_some() { ("load", object.load_now) }
+                else { ("task", task_now) };
+            let driver = object.runtime.as_ref().and_then(|runtime| runtime.driver.as_ref());
+            let wait = match driver.and_then(|driver| driver.waiting()) {
+                Some(super::fes_driver::FesDriverWait::Frames { .. }) => "frames".into(),
+                Some(super::fes_driver::FesDriverWait::Frame { .. }) => "frame".into(),
+                Some(super::fes_driver::FesDriverWait::Control { kind, .. }) => super::visual_progress::token(kind),
+                None => "none".into(),
+            };
+            let block = driver.map_or_else(|| "na".into(), |driver| super::visual_progress::token(driver.interpreter.current_block()));
+            super::perf_detail::visual_note("visual_fes", format!(
+                "task={id} task_now={} effective_now={} scope={scope} media_now={} button_now={} paused={} wait={wait} block={block} pc={} pending_effect={} sync_caller={}",
+                super::visual_progress::optional(task_now), super::visual_progress::optional(effective),
+                super::visual_progress::optional(object.media_frame),
+                super::visual_progress::optional(object.button_refresh.as_ref().map(|refresh| refresh.now)),
+                object.paused, driver.map_or(0, |driver| driver.interpreter.position().1),
+                u8::from(object.pending_effect.is_some()), super::visual_progress::optional(slot.sync_caller)));
+            kept += 1;
+        }
+        (self.slots.len(), kept)
+    }
+
     pub(crate) fn has_synchronous_calls(&self) -> bool {
         self.slots.values().any(|slot| slot.sync_caller.is_some() || !slot.sync_waiters.is_empty())
     }

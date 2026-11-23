@@ -272,6 +272,44 @@ impl Default for FesTextStore {
 }
 
 impl FesTextStore {
+    pub(super) fn trace_visual_progress(&self) -> (usize, usize) {
+        use cs2_runtime::message_object::{MessageAtomKind, MessageGlyphState};
+        let mut seen = 0;
+        let mut kept = 0;
+        // Prefer story/revealing banks over unrelated visible menu labels.
+        for tier in 0..3 {
+        for ((owner, name, index), bank) in &self.banks {
+            let visible = bank.projection.as_ref().is_some_and(|projection|
+                projection.options.visible && projection.options.opacity != 0);
+            if bank.log.is_some() || !(visible || bank.message.active() || bank.story_body.source.is_some()) { continue; }
+            let live = visible || bank.message.active();
+            let priority = if live && (bank.story_body.source.is_some() || bank.message.active()) { 0 }
+                else if live { 1 } else { 2 };
+            if priority != tier { continue; }
+            seen += 1;
+            if kept == 2 { continue; }
+            let mut counts = [0usize; 3];
+            if let Some(layout) = bank.message.layout() {
+                for (entry, state) in layout.entries.iter().zip(bank.message.glyph_states()) {
+                    if !entry.atom.and_then(|atom| bank.message.atoms().get(atom))
+                        .is_some_and(|atom| matches!(&atom.kind, MessageAtomKind::Glyph { .. })) { continue; }
+                    counts[match state { MessageGlyphState::Hidden => 0, MessageGlyphState::Revealing => 1,
+                        MessageGlyphState::Complete => 2 }] += 1;
+                }
+            }
+            let state = bank.message.render_state();
+            super::perf_detail::visual_note("visual_text", format!(
+                "task={owner} bank={index} name={} text_now={} playback_now={} source_epoch={} glyph_total={} hidden={} revealing={} complete={} remaining={} segment_remaining={} active={} visible={} prepared={} pending={} surface_generation={}",
+                super::visual_progress::token(name), super::visual_progress::optional(bank.last_frame), state.playback_time,
+                bank.story_body.source.map_or(0, |source| source.0), counts.iter().sum::<usize>(), counts[0], counts[1], counts[2],
+                bank.remaining, bank.remaining_segment, u8::from(bank.message.active()), u8::from(visible),
+                u8::from(bank.message.prepared()), bank.pending.len(), bank.message.surface_generation()));
+            kept += 1;
+        }
+        }
+        (seen, kept)
+    }
+
     pub(super) fn story_body_generation(&self, owner: u32) -> Option<StoryBodyGeneration> {
         let bank = self.banks.get(&(owner, b"str".to_vec(), 0))?;
         let (source_epoch, source_frame) = bank.story_body.source?;
@@ -2113,6 +2151,39 @@ fn render_bank_with_surface(
     });
 
     Ok(())
+}
+
+#[test]
+#[cfg(windows)]
+fn visual_progress_counts_real_fes_glyphs_without_newline_controls() {
+    let mut store = FesTextStore::default();
+    let mut device = DesktopMessageDevice::default();
+    let windows = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:/Windows".into()));
+    let bytes = std::fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+    device.bind_font("Arial", &bytes, 0).unwrap();
+    let mut defaults = defaults();
+    defaults.font_name = "Arial".encode_utf16().collect();
+    store.create(39, &FesObjectDefinition {
+        offset: 0, name: b"str".to_vec(), kind: b"STRING".to_vec(), bank_expression: None, banks: 1,
+    }, &defaults, &mut device).unwrap();
+    let bank = store.banks.get_mut(&(39, b"str".to_vec(), 0)).unwrap();
+    bank.set_size([180, 80]).unwrap();
+    bank.visible = true;
+    bank.story_body.note_source(1);
+    bank.append(b"A\nB", false).unwrap();
+    bank.draw = Some(u32::MAX);
+    let runtime = FesRuntime::new(cs2_script::FesDocument { sections: Vec::new() });
+    let view = FesTaskView { id: 39, parent: 0, context: Vec::new(),
+        list: Some(super::fes_tasks::FesListBinding { task: 1, clip: [0, 0, 180, 80], offset: [0, 0] }),
+        now: 19, paused: 0 };
+    render_bank(&mut device, &view, &runtime, bank, b"str", 0).unwrap();
+    let before = bank.message.clone();
+    let (_, details) = super::perf_detail::HostPerfDetails::capture(false, || store.trace_visual_progress());
+    let rows = details.rows(91, 1, 1);
+    assert!(rows.contains("visual_text session=91"), "{rows}");
+    assert!(rows.contains("glyph_total=2"), "{rows}");
+    assert!(rows.contains("text_now=19"), "{rows}");
+    assert_eq!(store.banks[&(39, b"str".to_vec(), 0)].message, before, "tracing cannot advance reveal state");
 }
 
 #[test]

@@ -56,6 +56,7 @@ extern int32_t cs2_android_tweet_count(const uint8_t *, size_t, const uint8_t *,
 extern int32_t cs2_android_dialog(uint64_t, const uint8_t **, size_t *);
 extern int32_t cs2_android_dialog_result(uint64_t, uint64_t, int32_t);
 extern int32_t cs2_android_input(uint64_t, uint32_t, int32_t, int32_t);
+extern int32_t cs2_android_tick_delay(uint64_t, int32_t);
 extern int32_t cs2_android_enqueue_input(uint64_t, uint32_t, int32_t, int32_t, uint64_t, int64_t, uint64_t);
 extern int32_t cs2_android_take_consumed_input(uint64_t, uint64_t *, uint64_t *, int64_t *, uint64_t *);
 extern int32_t cs2_android_text(uint64_t, uint32_t, const uint8_t *, size_t, int32_t, int32_t);
@@ -328,6 +329,10 @@ JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, j
     }
     if (story_row != NULL) __android_log_write(ANDROID_LOG_DEBUG, STORY_TAG, story_row);
     return result;
+}
+JNIEXPORT jint JNICALL JNI(nativeTickDelay)(JNIEnv *env, jclass type, jlong handle, jboolean reset) {
+    (void)env; UNUSED_TYPES;
+    return cs2_android_tick_delay((uint64_t)handle, reset ? 1 : 0);
 }
 JNIEXPORT jint JNICALL JNI(nativeSize)(JNIEnv *env, jclass type, jlong handle, jint axis) {
     (void)env; UNUSED_TYPES;

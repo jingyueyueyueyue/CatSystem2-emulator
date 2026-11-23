@@ -1,4 +1,4 @@
-//! CPU submission for particle triangle strips. Script geometry, RHW and UV
+//! Ordered submission for particle triangle strips. Script geometry, RHW and UV
 //! remain distinct until rasterization; textures use bottom-origin UVs.
 
 use cs2_renderer::{BlendMode, Canvas, Color, RgbaFrame};
@@ -27,6 +27,8 @@ pub(super) fn draw_range_with_projection(
     texture: Option<&RgbaFrame>, view: &ParticleProjection,
     lower: f32, upper: f32,
 ) -> anyhow::Result<()> {
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    let _renderer = super::gpu_raster::scene_renderer_scope("particle_triangles");
     if !snapshot.frame_complete { return Ok(()); }
     // The scene range selects the registered owner callback, before that
     // callback projects any of its vertices (Yuki1d0ca8..1d0e08). The loader
@@ -36,9 +38,14 @@ pub(super) fn draw_range_with_projection(
     let depth = snapshot.canvas.depth_offset;
     if depth < lower || depth >= upper { return Ok(()); }
     let mode = BlendMode::from_raw(snapshot.render_mode);
-    for quad in snapshot.projected_quads(view)? {
-        triangle(canvas, [quad.vertices[0], quad.vertices[1], quad.vertices[2]], texture, mode)?;
-        triangle(canvas, [quad.vertices[2], quad.vertices[1], quad.vertices[3]], texture, mode)?;
+    let triangles: Vec<_> = snapshot.projected_quads(view)?.into_iter().flat_map(|quad| [
+        [quad.vertices[0], quad.vertices[1], quad.vertices[2]],
+        [quad.vertices[2], quad.vertices[1], quad.vertices[3]],
+    ]).collect();
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    if try_gpu_triangles(canvas, &triangles, texture, mode) { return Ok(()); }
+    for vertices in triangles {
+        triangle_cpu(canvas, vertices, texture, mode)?;
     }
     Ok(())
 }
@@ -54,9 +61,42 @@ fn top_left(a: [f32; 3], b: [f32; 3]) -> bool {
 
 pub(super) fn triangle(
     canvas: &mut Canvas,
-    mut vertices: [ParticleVertex; 3],
+    vertices: [ParticleVertex; 3],
     texture: Option<&RgbaFrame>,
     mode: BlendMode,
+) -> anyhow::Result<()> {
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    {
+        let _renderer = super::gpu_raster::scene_renderer_scope("particle_triangles");
+        if try_gpu_triangles(canvas, &[vertices], texture, mode) { return Ok(()); }
+        return triangle_cpu(canvas, vertices, texture, mode);
+    }
+    #[cfg(not(all(feature = "gpu-raster", any(windows, target_os = "android"))))]
+    triangle_cpu(canvas, vertices, texture, mode)
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+fn try_gpu_triangles(
+    canvas: &mut Canvas, triangles: &[[ParticleVertex; 3]], texture: Option<&RgbaFrame>, mode: BlendMode,
+) -> bool {
+    use super::gpu_raster::{SceneTriangle, SceneVertex};
+    let geometry: Vec<SceneTriangle> = triangles.iter().map(|vertices| vertices.map(|vertex| SceneVertex {
+        point: [f64::from(vertex.position[0]), f64::from(vertex.position[1])],
+        rhw: f64::from(vertex.rhw),
+        uv_over_w: vertex.uv.map(|value| f64::from(value) * f64::from(vertex.rhw)),
+        color: [(vertex.color >> 16) as u8, (vertex.color >> 8) as u8,
+            vertex.color as u8, (vertex.color >> 24) as u8].map(f64::from),
+    })).collect();
+    // Z is not a shader interpolant but remains part of the submission contract.
+    if triangles.iter().flatten().any(|vertex| !vertex.position[2].is_finite()) {
+        super::gpu_raster::scene_cpu_fallback("non_finite_particle_depth");
+        return false;
+    }
+    super::gpu_raster::draw_scene_triangles(canvas, &geometry, texture, mode, None, false, true)
+}
+
+fn triangle_cpu(
+    canvas: &mut Canvas, mut vertices: [ParticleVertex; 3], texture: Option<&RgbaFrame>, mode: BlendMode,
 ) -> anyhow::Result<()> {
     if vertices.iter().any(|vertex| {
         vertex.position.iter().chain(vertex.uv.iter()).any(|value| !value.is_finite())

@@ -3,6 +3,8 @@
 //! attachment cannot represent multiple samples at the same pixel at once.
 use super::*;
 
+const OVERLAP_BINS: usize = 32;
+
 pub(super) fn enabled() -> bool {
     #[cfg(windows)]
     { !std::env::var("CS2_EMOTE_MESH").is_ok_and(|value| value == "0") }
@@ -83,17 +85,16 @@ fn ordered_runs(triangles: &[[[f64; 4]; 3]]) -> Vec<std::ops::Range<u32>> {
     // A conservative spatial broad phase limits exact SAT tests to nearby
     // triangles. Every bin touched by a triangle is included; order and the
     // exact overlap predicate still decide every run boundary.
-    const BINS: usize = 32;
     let extent: [f64; 4] = std::array::from_fn(|axis| bounds.iter().map(|v| v[axis])
         .fold(if axis < 2 { f64::INFINITY } else { f64::NEG_INFINITY },
             if axis < 2 { f64::min } else { f64::max }));
     let axis = usize::from(extent[3] - extent[1] > extent[2] - extent[0]);
-    let scale = BINS as f64 / (extent[axis + 2] - extent[axis]).max(1e-12);
+    let scale = OVERLAP_BINS as f64 / (extent[axis + 2] - extent[axis]).max(1e-12);
     let bins_for = |bounds: [f64; 4]| {
-        let bin = |v: f64| (((v - extent[axis]) * scale).floor() as usize).min(BINS - 1);
+        let bin = |v: f64| (((v - extent[axis]) * scale).floor() as usize).min(OVERLAP_BINS - 1);
         bin(bounds[axis])..=bin(bounds[axis + 2])
     };
-    let mut bins: [Vec<usize>; BINS] = std::array::from_fn(|_| Vec::new());
+    let mut bins: [Vec<usize>; OVERLAP_BINS] = std::array::from_fn(|_| Vec::new());
     let mut visited = vec![usize::MAX; triangles.len()];
     let mut runs = Vec::new();
     let mut start = 0;
@@ -130,13 +131,30 @@ pub(super) fn compatible(draws: &[Draw<'_>]) -> Result<()> {
     Ok(())
 }
 
+fn coverage_batches(bounds: &[[u32; 4]]) -> Vec<std::ops::Range<usize>> {
+    // Bound the small exact rectangle search even on unusual huge models.
+    const MAX_BATCH_RUNS: usize = 128;
+    let mut batches = Vec::new();
+    let mut start = 0;
+    for (i, b) in bounds.iter().enumerate() {
+        if i - start == MAX_BATCH_RUNS || bounds[start..i].iter().any(|a|
+            a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3])
+        {
+            batches.push(start..i);
+            start = i;
+        }
+    }
+    if start < bounds.len() { batches.push(start..bounds.len()); }
+    batches
+}
+
 struct CachedMesh {
     grid: [u32; 2],
     vertices: Box<[[u64; 4]]>,
     bounds: [f64; 4],
     base: [f64; 2],
     indices: Arc<Vec<u32>>,
-    runs: Vec<std::ops::Range<u32>>,
+    runs: Arc<Vec<std::ops::Range<u32>>>,
 }
 
 struct IndexedDraw {
@@ -165,19 +183,57 @@ pub(super) struct GeometryCache {
 }
 
 impl GeometryCache {
-    pub(super) fn reservation_bytes(draws: &[Draw<'_>]) -> usize {
-        draws.iter().map(|draw| {
+    fn retained_bytes(&self) -> usize {
+        // Count allocated CPU geometry once even when the current frame,
+        // mesh slots, or multiple topologies share immutable Arc allocations.
+        fn shared_vec<T>(values: &Arc<Vec<T>>, seen: &mut std::collections::HashSet<usize>) -> usize {
+            if !seen.insert(Arc::as_ptr(values) as usize) { return 0; }
+            size_of::<Vec<T>>() + 2 * size_of::<usize>() + values.capacity() * size_of::<T>()
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = self.meshes.capacity() * size_of::<Arc<CachedMesh>>();
+        for mesh in self.meshes.iter().chain(self.frame.iter().flat_map(|frame| frame.keys.iter())) {
+            if seen.insert(Arc::as_ptr(mesh) as usize) {
+                bytes += size_of::<CachedMesh>() + 2 * size_of::<usize>()
+                    + mesh.vertices.len() * size_of::<[u64; 4]>()
+                    + shared_vec(&mesh.indices, &mut seen) + shared_vec(&mesh.runs, &mut seen);
+            }
+        }
+        if let Some(frame) = &self.frame {
+            bytes += size_of::<IndexedGeometry>() + 2 * size_of::<usize>()
+                + frame.keys.capacity() * size_of::<Arc<CachedMesh>>()
+                + frame.vertices.capacity() * size_of::<u32>()
+                + frame.draws.capacity() * size_of::<IndexedDraw>()
+                + frame.draws.iter().map(|draw| draw.ranges.capacity() * size_of::<std::ops::Range<u32>>()).sum::<usize>()
+                + shared_vec(&frame.indices, &mut seen);
+        }
+        bytes
+    }
+
+    pub(super) fn reservation_bytes(&self, draws: &[Draw<'_>]) -> usize {
+        // Indexed-preparation admission estimate: exact retained geometry plus
+        // prospective buffers and worst-case overlap scratch. Model/node
+        // caches, evaluator work before admission, and GPU resources are separate.
+        let prospective = draws.iter().map(|draw| {
             let [columns, rows] = draw.mesh.mesh_dimensions();
-            // Evaluated/owned vertices + exact cache keys + packed GPU vertices;
-            // local/combined indices and worst-case one ordered run per triangle.
-            // Include spare Vec capacity and the transient Draw -> OwnedDraw
-            // conversion, rather than budgeting only initialized elements.
-            draw.mesh.vertices.len() * (2 * size_of::<[f64; 4]>() + 2 * size_of::<[f32; 4]>())
-                + columns as usize * rows as usize * 2 * (12 * size_of::<u32>() + 3 * size_of::<std::ops::Range<u32>>())
+            let triangles = columns as usize * rows as usize * 2;
+            // Owned vertices reuse the actual evaluated allocation. Exact keys
+            // use boxed slices; growing packed/index/run Vecs allow 2x capacity.
+            let vertices = draw.mesh.vertices.capacity() * size_of::<[f64; 4]>()
+                + draw.mesh.vertices.len() * (size_of::<[u64; 4]>() + 2 * size_of::<[f32; 4]>());
+            let indices_and_runs = 4 * size_of::<[u32; 3]>() + 4 * size_of::<std::ops::Range<u32>>();
+            let overlap_scratch = size_of::<[[f64; 4]; 3]>() + size_of::<[f64; 4]>()
+                + size_of::<usize>() + size_of::<bool>() + 2 * OVERLAP_BINS * size_of::<usize>();
+            // Each spatial bin can retain entries for every triangle. Include
+            // minimum Vec capacities and allocation headers in addition to 2x growth.
+            let minimum_capacities = OVERLAP_BINS * (4 * size_of::<usize>() + size_of::<Vec<usize>>())
+                + 8 * size_of::<u32>() + 8 * size_of::<std::ops::Range<u32>>() + 16 * size_of::<usize>();
+            vertices + triangles * (indices_and_runs + overlap_scratch) + minimum_capacities
                 + 2 * size_of::<CachedMesh>() + 2 * size_of::<IndexedDraw>()
                 + 2 * size_of::<OwnedDraw>() + 2 * size_of::<Draw<'_>>() + size_of::<IndexedGeometry>()
                 + 8 * size_of::<Arc<CachedMesh>>() + 2 * draw.mesh.source.len()
-        }).sum()
+        }).fold(0usize, usize::saturating_add);
+        self.retained_bytes().saturating_add(prospective)
     }
 
     pub(super) fn counters(&self) -> [usize; 2] { [self.hits, self.misses] }
@@ -195,20 +251,29 @@ impl GeometryCache {
                 return prior.clone();
             }
             self.misses += 1;
-            let bounds = std::array::from_fn(|i| {
+            // Coverage and ordered overlap runs depend only on exact XY and
+            // topology. Animated atlas/UV selection must not redo SAT work.
+            let coverage = prior.filter(|prior| prior.grid == grid
+                && prior.vertices.len() == mesh.vertices.len()
+                && prior.vertices.iter().zip(&mesh.vertices).all(|(a, b)|
+                    [a[0], a[1]] == [b[0], b[1]].map(f64::to_bits)));
+            let bounds = coverage.map(|prior| prior.bounds).unwrap_or_else(|| std::array::from_fn(|i| {
                 let values = mesh.vertices.iter().map(|v| v[i % 2]);
                 if i < 2 { values.fold(f64::INFINITY, f64::min) }
                 else { values.fold(f64::NEG_INFINITY, f64::max) }
-            });
+            }));
             let base = std::array::from_fn(|axis| mesh.vertices.iter().map(|v| v[axis + 2])
                 .fold(f64::INFINITY, f64::min).floor());
             let indices = prior.filter(|prior| prior.grid == grid).map(|prior| prior.indices.clone())
                 .unwrap_or_else(|| Arc::new(mesh.triangle_indices().flatten().map(|v| v as u32).collect()));
-            let triangles: Vec<_> = indices.chunks_exact(3).map(|ids|
-                [mesh.vertices[ids[0] as usize], mesh.vertices[ids[1] as usize], mesh.vertices[ids[2] as usize]]).collect();
+            let runs = coverage.map(|prior| prior.runs.clone()).unwrap_or_else(|| {
+                let triangles: Vec<_> = indices.chunks_exact(3).map(|ids|
+                    [mesh.vertices[ids[0] as usize], mesh.vertices[ids[1] as usize], mesh.vertices[ids[2] as usize]]).collect();
+                Arc::new(ordered_runs(&triangles))
+            });
             Arc::new(CachedMesh {
                 grid, vertices: mesh.vertices.iter().map(|v| v.map(f64::to_bits)).collect(),
-                bounds, base, indices, runs: ordered_runs(&triangles),
+                bounds, base, indices, runs,
             })
         }).collect();
         let size = [viewport.width, viewport.height];
@@ -274,10 +339,19 @@ pub(super) struct MeshRaster {
     resident_geometry: Weak<IndexedGeometry>,
     resident_indices: Weak<Vec<u32>>,
     pub(super) geometry_upload_bytes: u64,
+    pub(super) encoding_counts: [usize; 3],
     geometry: GeometryCache,
     coverage: Option<(wgpu::Texture, wgpu::TextureView)>,
     pub(super) coverage_stamp: u32,
     poses: u64,
+}
+
+struct MeshMaterial<'a> {
+    texture: &'a CpuTexture,
+    opacity: f64,
+    stencil: Stencil,
+    reference: u8,
+    operation: Option<CpuStencilWrite>,
 }
 
 impl MeshRaster {
@@ -353,7 +427,7 @@ impl MeshRaster {
             vertices: buffer(device, 16, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST),
             indices: buffer(device, 4, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST),
             prior_indices: Vec::new(), prior_vertices: Vec::new(), geometry: GeometryCache::default(),
-            resident_geometry: Weak::new(), resident_indices: Weak::new(), geometry_upload_bytes: 0,
+            resident_geometry: Weak::new(), resident_indices: Weak::new(), geometry_upload_bytes: 0, encoding_counts: [0; 3],
             coverage: None, coverage_stamp: 0, poses: 0,
         })
     }
@@ -383,7 +457,7 @@ impl MeshRaster {
 
 impl EmoteRaster {
     pub(super) fn render_indexed(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
-        model: &Arc<CpuMotionModel>, viewport: CpuViewport, mut draws: Vec<Draw<'_>>,
+        model: &Arc<CpuMotionModel>, viewport: CpuViewport, draws: Vec<Draw<'_>>,
         failed: &Arc<AtomicBool>, started: Option<Instant>, evaluated: Option<Instant>,
         geometry: Option<Arc<IndexedGeometry>>,
     ) -> Result<EmoteRasterFrame> {
@@ -394,7 +468,35 @@ impl EmoteRaster {
             counts.set([prepared + usize::from(geometry.is_some()), fallback + usize::from(geometry.is_none())]);
         });
         let geometry = geometry.unwrap_or_else(|| self.mesh.as_mut().unwrap().geometry.prepare(&draws, viewport));
-        let active: Vec<_> = draws.iter_mut().zip(&geometry.draws).filter(|(_, info)|
+        let materials = draws.iter().map(|draw| MeshMaterial {
+            texture: draw.mesh.texture, opacity: draw.mesh.opacity,
+            stencil: draw.stencil, reference: draw.reference, operation: draw.operation,
+        }).collect();
+        self.render_indexed_materials(device, queue, model, materials, failed, started, evaluated, geometry, preparation_started)
+    }
+
+    pub(super) fn render_prepared_indexed(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        model: &Arc<CpuMotionModel>, draws: &[OwnedDraw],
+        failed: &Arc<AtomicBool>, started: Option<Instant>, evaluated: Option<Instant>,
+        geometry: Arc<IndexedGeometry>,
+    ) -> Result<EmoteRasterFrame> {
+        let preparation_started = Instant::now();
+        #[cfg(test)]
+        INDEXED_RENDER_PATHS.with(|counts| { let [prepared, fallback] = counts.get(); counts.set([prepared + 1, fallback]); });
+        let materials = draws.iter().map(|draw| {
+            let (texture, opacity) = draw.mesh.texture_opacity(model)?;
+            Ok(MeshMaterial { texture, opacity, stencil: draw.stencil,
+                reference: draw.reference, operation: draw.operation })
+        }).collect::<cs2_runtime::emote::Result<Vec<_>>>()?;
+        self.render_indexed_materials(device, queue, model, materials, failed, started, evaluated, geometry, preparation_started)
+    }
+
+    fn render_indexed_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        model: &Arc<CpuMotionModel>, materials: Vec<MeshMaterial<'_>>,
+        failed: &Arc<AtomicBool>, started: Option<Instant>, evaluated: Option<Instant>,
+        geometry: Arc<IndexedGeometry>, preparation_started: Instant,
+    ) -> Result<EmoteRasterFrame> {
+        let active: Vec<_> = materials.iter().zip(&geometry.draws).filter(|(_, info)|
             info.bounds[0] < info.bounds[2] && info.bounds[1] < info.bounds[3]).collect();
         if active.is_empty() { return Ok(EmoteRasterFrame::new(1, 1, [0, 0], vec![0; 4])?); }
         let [x, y, right, bottom] = geometry.bounds;
@@ -405,7 +507,7 @@ impl EmoteRaster {
             bail!("mesh_output_limit");
         }
         // Resolve every atlas before encoding: failure leaves no partial pose.
-        let atlases: Vec<_> = active.iter().map(|(draw, _)| self.atlas(device, queue, model, draw.mesh.texture)).collect::<Result<_>>()?;
+        let atlases: Vec<_> = active.iter().map(|(draw, _)| self.atlas(device, queue, model, draw.texture)).collect::<Result<_>>()?;
         let alignment = device.limits().min_storage_buffer_offset_alignment as usize / 4;
         let stride = 16usize.next_multiple_of(alignment);
         let run_count = active.iter().map(|(_, info)| info.ranges.len()).sum::<usize>();
@@ -416,12 +518,12 @@ impl EmoteRaster {
         let clear_coverage = u64::from(mesh.coverage_stamp) + run_count as u64 > 16_777_215;
         if clear_coverage { mesh.coverage_stamp = 0; }
         let mut headers = vec![0u32; run_count * stride];
-        let mut active = active;
         let mut run = 0;
-        for (draw, info) in &mut active {
+        for (draw, info) in &active {
             for _ in &info.ranges {
                 let offset = run * stride;
-                set_draw_header(draw, info.bounds, offset, 12, &mut headers);
+                headers[offset..offset + 12].copy_from_slice(&draw_header_words(info.bounds,
+                    draw.stencil, draw.reference, draw.operation, draw.texture, draw.opacity));
                 headers[offset + 4..offset + 7].copy_from_slice(&[width, x, y]);
                 headers[offset + 12..offset + 14].copy_from_slice(&info.base.map(|v| v as i32 as u32));
                 mesh.coverage_stamp += 1;
@@ -459,13 +561,17 @@ impl EmoteRaster {
         mesh.poses += 1;
         let sample_log = mesh.poses <= 3 || mesh.poses % 120 == 0;
         let prepared = started.map(|_| Instant::now());
+        let commands_started = Instant::now();
         let mut encoder = device.create_command_encoder(&Default::default());
         encoder.clear_buffer(&self.pixels, 0, Some(bytes * 2));
-        let mut run = 0;
-        for ((_, info), atlas) in active.iter().zip(&atlases) {
-            // One atlas binding is shared by all ordered runs in this draw.
-            let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("CS2 E-mote mesh composite"), layout: &composite.get_bind_group_layout(0),
+        // Header offsets carry alpha/mask state, so every draw using the same
+        // actual atlas view can share one immutable resource binding.
+        let layout = composite.get_bind_group_layout(0);
+        let mut composite_bindings: Vec<(wgpu::TextureView, wgpu::BindGroup)> = Vec::new();
+        let binding_indices: Vec<_> = atlases.iter().map(|atlas| {
+            if let Some(index) = composite_bindings.iter().position(|(view, _)| view == atlas) { return index; }
+            let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("CS2 E-mote mesh composite"), layout: &layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.commands, offset: 0, size: NonZeroU64::new(64),
@@ -475,16 +581,25 @@ impl EmoteRaster {
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(coverage) },
                 ],
             });
-          for range in &info.ranges {
-            let offset = run * stride;
-            let stamp = headers[offset + 14];
+            let index = composite_bindings.len();
+            composite_bindings.push((atlas.clone(), binding));
+            index
+        }).collect();
+        let runs: Vec<_> = active.iter().enumerate().flat_map(|(draw, (_, info))|
+            info.ranges.iter().cloned().map(move |range| (draw, range))).collect();
+        let run_bounds: Vec<_> = runs.iter().map(|(draw, _)| active[*draw].1.bounds).collect();
+        let batches = coverage_batches(&run_bounds);
+        for batch in &batches {
+            // Coverage and integer composition can be grouped only when their
+            // entire pixel-write rectangles are disjoint. Overlapping runs,
+            // including folded meshes and serial masks, retain their barriers.
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("CS2 ordered indexed E-mote mesh"),
+                    label: Some("CS2 ordered indexed E-mote meshes"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: coverage, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations {
-                            load: if clear_coverage && run == 0 { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) }
+                            load: if clear_coverage && batch.start == 0 { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) }
                                 else { wgpu::LoadOp::Load },
                             store: wgpu::StoreOp::Store,
                         },
@@ -493,14 +608,22 @@ impl EmoteRaster {
                 pass.set_pipeline(&mesh.raster);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(range.clone(), 0, stamp..stamp + 1);
+                for run in batch.clone() {
+                    let (draw, range) = &runs[run];
+                    let [left, top, right, bottom] = active[*draw].1.bounds;
+                    pass.set_scissor_rect(left - x, top - y, right - left, bottom - top);
+                    let stamp = headers[run * stride + 14];
+                    pass.draw_indexed(range.clone(), 0, stamp..stamp + 1);
+                }
             }
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(composite);
-            pass.set_bind_group(0, &bindings, &[(offset * 4) as u32]);
-            pass.dispatch_workgroups(headers[offset].div_ceil(8), headers[offset + 1].div_ceil(8), 1);
-            run += 1;
-          }
+            for run in batch.clone() {
+                let offset = run * stride;
+                let binding = &composite_bindings[binding_indices[runs[run].0]].1;
+                pass.set_bind_group(0, binding, &[(offset * 4) as u32]);
+                pass.dispatch_workgroups(headers[offset].div_ceil(8), headers[offset + 1].div_ceil(8), 1);
+            }
         }
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("CS2 indexed E-mote RGBA"), layout: &pack.get_bind_group_layout(0),
@@ -515,12 +638,19 @@ impl EmoteRaster {
             pass.set_pipeline(pack); pass.set_bind_group(0, &bindings, &[]);
             pass.dispatch_workgroups((width * height).div_ceil(64), 1, 1);
         }
-        queue.submit(Some(encoder.finish()));
+        let command_buffer = encoder.finish();
+        let submit_started = Instant::now();
+        queue.submit(Some(command_buffer));
+        let submit_finished = Instant::now();
         let draw_count = active.len();
+        mesh.encoding_counts = [run_count, batches.len(), composite_bindings.len()];
         if sample_log {
-            report(&format!("emote_mesh draws={draw_count} triangles={triangle_count} runs={run_count} preview=true cpu_prepare_encode_us={} uv_bytes={} vertex_upload_capacity={} index_upload_capacity={} geometry_upload_bytes={} coverage_clears={} composite_bindings={draw_count} fallback_geometry_hits={} fallback_geometry_misses={}",
+            report(&format!("emote_mesh draws={draw_count} triangles={triangle_count} runs={run_count} preview=true cpu_prepare_encode_us={} uv_bytes={} vertex_upload_capacity={} index_upload_capacity={} geometry_upload_bytes={} coverage_clears={} composite_bindings={} coverage_batches={} ordered_passes_saved={} fallback_geometry_hits={} fallback_geometry_misses={} cpu_prepare_us={} cpu_encode_us={} cpu_submit_us={}",
                 preparation_started.elapsed().as_micros(), u64::from(width) * u64::from(height) * 16, mesh.vertices.size(), mesh.indices.size(),
-                mesh.geometry_upload_bytes, u32::from(clear_coverage), mesh.geometry.hits, mesh.geometry.misses));
+                mesh.geometry_upload_bytes, u32::from(clear_coverage), composite_bindings.len(), batches.len(),
+                (run_count - batches.len()) * 2, mesh.geometry.hits, mesh.geometry.misses,
+                (commands_started - preparation_started).as_micros(), (submit_started - commands_started).as_micros(),
+                (submit_finished - submit_started).as_micros()));
             let counters = model.node_cache_counters();
             report(&format!("emote_node_cache affine_hits={} affine_misses={} mesh_hits={} mesh_misses={} retained_bytes={}",
                 counters[0], counters[1], counters[2], counters[3], counters[4]));
@@ -545,6 +675,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coverage_batches_join_only_consecutive_disjoint_pixel_regions() {
+        // Adjacent regions may share an edge, while any intersecting write
+        // region must retire coverage before a later run overwrites it.
+        let regions = [[0, 0, 4, 4], [4, 0, 8, 4], [2, 2, 6, 6], [8, 0, 12, 4], [8, 0, 12, 4]];
+        assert_eq!(coverage_batches(&regions), vec![0..2, 2..4, 4..5]);
+        assert!(coverage_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn indexed_reservation_covers_retained_geometry_and_overlap_scratch() -> Result<()> {
+        use cs2_runtime::emote::CpuMeshGrid;
+        let texture = CpuTexture::from_rgba(1, 1, vec![255; 4])?;
+        let vertices = (0..=16).flat_map(|y| (0..=16).map(move |x|
+            [f64::from(x), f64::from(y), 0., 0.])).collect();
+        let mut draws = vec![Draw {
+            mesh: EmoteSpriteMesh::from_grid("texture", &texture, 1., vertices, CpuMeshGrid { columns: 16, rows: 16 })?,
+            stencil: Stencil::default(), reference: 0, operation: None, bounds: [0; 4], offset: 0, words: 0,
+        }];
+        let viewport = CpuViewport { width: 32, height: 32, origin_x: 0., origin_y: 0., scale: 1., time_units_per_frame: 1. };
+        let mut cache = GeometryCache::default();
+        let previous = cache.prepare(&draws, viewport);
+        draws[0].mesh.vertices[0][0] = 0.125;
+        // During changed-pose overlap analysis the previous immutable frame,
+        // current evaluated vertices, and overlap scratch are all live. This
+        // lower bound deliberately excludes spatial-bin capacity and metadata.
+        let retained = previous.vertices.capacity() * size_of::<u32>()
+            + previous.indices.capacity() * size_of::<u32>()
+            + previous.keys.iter().map(|key| key.vertices.len() * size_of::<[u64; 4]>()
+                + key.indices.capacity() * size_of::<u32>()
+                + key.runs.capacity() * size_of::<std::ops::Range<u32>>()).sum::<usize>();
+        let evaluated = draws[0].mesh.vertices.capacity() * size_of::<[f64; 4]>();
+        let triangles = draws[0].mesh.triangle_indices().count();
+        let scratch_minimum = triangles * (size_of::<[[f64; 4]; 3]>()
+            + size_of::<[f64; 4]>() + size_of::<usize>() + size_of::<bool>());
+        let reserved = cache.reservation_bytes(&draws);
+        assert!(reserved >= retained + evaluated + scratch_minimum,
+            "reservation={reserved} cannot cover retained={retained} evaluated={evaluated} overlap_scratch_minimum={scratch_minimum}");
+        let smaller = vec![Draw {
+            mesh: EmoteSpriteMesh::from_grid("texture", &texture, 1.,
+                vec![[0., 0., 0., 0.], [1., 0., 0., 0.], [0., 1., 0., 0.], [1., 1., 0., 0.]],
+                CpuMeshGrid { columns: 1, rows: 1 })?,
+            stencil: Stencil::default(), reference: 0, operation: None, bounds: [0; 4], offset: 0, words: 0,
+        }];
+        assert!(cache.reservation_bytes(&smaller) >= retained,
+            "shrinking topology still accounts for the previous large frame until replacement");
+        Ok(())
+    }
+
+    #[test]
     fn indexed_geometry_cache_checks_exact_uv_topology_and_viewport() -> Result<()> {
         use cs2_runtime::emote::CpuMeshGrid;
         let texture = CpuTexture::from_rgba(1, 1, vec![255; 4])?;
@@ -566,6 +745,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&same, &uv), "even UV changes below f32 precision must invalidate the exact cache");
         assert!(Arc::ptr_eq(&same.keys[0].indices, &uv.keys[0].indices), "deforming geometry keeps its exact topology");
         assert!(Arc::ptr_eq(&same.indices, &uv.indices), "unchanged topology and visibility reuse the combined GPU index data");
+        assert!(Arc::ptr_eq(&same.keys[0].runs, &uv.keys[0].runs), "UV-only changes must reuse exact XY overlap analysis");
         viewport.height = 6;
         let clipped = cache.prepare(&draws, viewport);
         assert!(!Arc::ptr_eq(&uv, &clipped));

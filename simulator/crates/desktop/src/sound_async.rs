@@ -50,6 +50,8 @@ impl LoggingHost<'_> {
                 self.data_services.tasks.audio_wait_reaches(cancelled, owner))
             || self.data_services.emote.pending_load_owners().any(|caller|
                 self.data_services.tasks.audio_wait_reaches(caller, owner))
+            || self.data_services.image_manager.pending_image_owners().any(|caller|
+                self.data_services.tasks.audio_wait_reaches(caller, owner))
     }
 
     pub(super) fn cancel_audio_channel_start(&mut self, channel: u32) -> cs2_script::Result<()> {

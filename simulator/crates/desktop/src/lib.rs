@@ -99,6 +99,9 @@ mod file_native;
 mod portable_host;
 pub use portable_host::HostFrameTiming;
 mod perf_detail;
+mod visual_progress;
+mod host_work_budget;
+mod host_pacing;
 pub use perf_detail::HostPerfDetails;
 use portable_host::{HostPhase, measure_host_operation, measure_host_phase, measure_script_detail};
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -3838,6 +3841,8 @@ impl RandomStream {
 }
 
 impl Host for LoggingHost<'_> {
+    fn should_yield(&self) -> bool { host_work_budget::exhausted() }
+
     fn call(
         &mut self,
         index: u32,
@@ -7079,6 +7084,9 @@ pub struct HeadlessPlayer {
     save_root: PathBuf,
     default_entry: Option<String>,
     frame_phase: PlayerFramePhase,
+    visual_progress: visual_progress::VisualProgress,
+    host_work_budget: Option<std::time::Duration>,
+    host_tick_pacer: Option<host_pacing::TickPacer>,
     particle_frame_cursor: Option<i32>,
     external_size: usize,
     configured_shared_slots: usize,
@@ -7201,6 +7209,9 @@ impl HeadlessPlayer {
             save_root,
             default_entry: None,
             frame_phase: PlayerFramePhase::Start,
+            visual_progress: visual_progress::VisualProgress::default(),
+            host_work_budget: None,
+            host_tick_pacer: None,
             particle_frame_cursor: None,
             external_size: 0,
             configured_shared_slots: 512,
@@ -7686,6 +7697,7 @@ impl HeadlessPlayer {
             // Keep an interrupted frame/VM continuation and the game's pause
             // state intact. Background audio-device failures still propagate.
             self.audio_host.poll().context("poll host-paused audio")?;
+            self.trace_visual_progress();
             return Ok(());
         }
         let mut completed_frames = 0;
@@ -7694,6 +7706,9 @@ impl HeadlessPlayer {
             // All LoggingHost and VM borrows have returned at this safe point.
             self.service_object_graph_request().context("service object graph transaction")?;
             if self.frame_phase == PlayerFramePhase::Start {
+            if perf_detail::enabled() {
+                self.visual_progress.frame_clock_sampled = self.data_services.top_clock.sampled;
+            }
             self.audio_host.poll().context("poll asynchronous audio completions")?;
             self.update_script_prefetch();
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -8004,6 +8019,7 @@ impl HeadlessPlayer {
                 continue;
             }
             for released in self.data_services.tasks.take_released_task_ids() {
+                self.data_services.image_manager.cancel_image_load(released);
                 self.with_host(|host| Ok(host.emote_release_task_hook(released)?))?;
                 let channels = self.sound_channels.iter().filter_map(|(&channel, state)|
                     state.pending_start.as_ref().filter(|pending| pending.owner == released).map(|_| channel)).collect::<Vec<_>>();
@@ -8056,6 +8072,7 @@ impl HeadlessPlayer {
             completed_frames += 1;
         }
         self.log.push(format!("ran {completed_frames} logical frame(s)"));
+        self.trace_visual_progress();
         Ok(())
     }
 
@@ -8486,6 +8503,8 @@ impl HeadlessPlayer {
                 }
                 self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
             }
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            let _scene_draw = gpu_raster::scene_draw_scope(id, self.scene_nodes.get(&id).map_or(0, |node| node.kind));
             if particle_native::draw_ordinary_task(
                 id, &mut self.canvas, &self.particles,
                 &self.movie_host.planes.projection, &self.movie_host.planes.cameras,
@@ -8731,6 +8750,8 @@ fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     player.initialize_general_window_host(1)?;
     // Both Windows presenters consume one logical input tick at 60 Hz.
     player.set_host_input_update_rate(60);
+    player.set_host_iteration_work_budget(Some(std::time::Duration::from_millis(4)));
+    player.enable_host_async_images();
     player.load_startup()?;
     Ok(player)
 }
@@ -9436,6 +9457,10 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
             }
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Focused(_) => {
+                    self.pacer.reset(Instant::now());
+                    window.request_redraw();
+                }
                 WindowEvent::Resized(size) => {
                     if let Some(gpu) = self.gpu.as_mut() {
                         gpu.resize(size.width, size.height);
@@ -9612,6 +9637,10 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
             }
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Focused(_) => {
+                    self.pacer.reset(Instant::now());
+                    window.request_redraw();
+                }
                 WindowEvent::Resized(_) => window.request_redraw(),
                 WindowEvent::RedrawRequested => {
                     if size.width == 0 || size.height == 0 { return; }
@@ -12753,6 +12782,62 @@ impl LoggingHost<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_work_budget_retains_real_kcs_invocation_and_tick() {
+        let root = std::env::temp_dir().join(format!("cs2-native-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&root, root.join("profile")).unwrap();
+        let mut code = vec![0x2b];
+        for value in [0, 0] { let operand = cs2_script::Operand::immediate(value);
+            code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes()); }
+        code.push(0x3b);
+        let vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 64], 32).unwrap()).unwrap();
+        player.data_services.tasks.register_external_task(player.current_task_id, 0, &player.data_services.language.languages).unwrap();
+        player.vm = Some(vm);
+        {
+            let _budget = host_work_budget::Scope::enter(std::time::Duration::ZERO);
+            player.run_frames(1, 1000).unwrap();
+        }
+        assert!(player.frame_in_progress(), "deadline must leave the invocation unfinished");
+        assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 0);
+        let tick = player.state.clock.elapsed_ticks;
+        player.run_frames(1, 1000).unwrap();
+        assert!(!player.frame_in_progress());
+        assert_eq!(player.state.clock.elapsed_ticks, tick, "retry cannot consume another game tick");
+        assert_eq!(player.events.iter().filter(|event| event.kind == "native-call" && event.detail.starts_with("index=0 ")).count(), 1);
+        drop(player);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn visual_progress_reports_real_player_clock_and_hold_without_changing_ticks() {
+        let root = std::env::temp_dir().join(format!("cs2-visual-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&root, root.join("profile")).unwrap();
+        player.run_frames(1, 1000).unwrap();
+        assert!(player.visual_progress.last.is_none(), "unprofiled frames must not create trace state");
+        let (_, detail) = perf_detail::HostPerfDetails::capture(false, || player.run_frames(1, 1000).unwrap());
+        let rows = detail.rows(91, player.state.clock.frame, 1);
+        assert!(rows.contains("visual_clock session=91"), "{rows}");
+        assert!(rows.contains("clock_sampled=0"), "{rows}");
+        let (_, quiet) = perf_detail::HostPerfDetails::capture(false, || player.run_frames(1, 1000).unwrap());
+        assert!(!quiet.rows(91, player.state.clock.frame, 2).contains("visual_clock"), "stable clocks must be rate limited");
+        let tick = player.state.clock.elapsed_ticks;
+        player.data_services.top_clock.sampled = 1;
+        player.data_services.top_clock.requested = 1;
+        let (_, detail) = perf_detail::HostPerfDetails::capture(false, || player.run_frames(1, 1000).unwrap());
+        let rows = detail.rows(91, player.state.clock.frame, 2);
+        assert!(rows.contains("clock_sampled=1"), "{rows}");
+        assert!(rows.contains("tick_delta=1"), "{rows}");
+        assert_eq!(player.state.clock.elapsed_ticks, tick);
+        std::thread::sleep(std::time::Duration::from_millis(510));
+        let (_, detail) = perf_detail::HostPerfDetails::capture(false, || player.run_frames(1, 1000).unwrap());
+        let rows = detail.rows(91, player.state.clock.frame, 3);
+        assert!(rows.contains("tick_delta=0"), "held game time needs a continuing wall-clock heartbeat: {rows}");
+        drop(player);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

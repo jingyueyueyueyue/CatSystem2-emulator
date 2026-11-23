@@ -292,6 +292,10 @@ impl ResourcePreloads {
 
     pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.images.submit(bytes); }
 
+    pub(super) fn image_predecode_snapshot(&self) -> Vec<(Arc<[u8]>, cs2_renderer::RgbaFrame)> {
+        self.images.snapshot()
+    }
+
     pub(super) fn take_predecoded_image(&mut self, bytes: &[u8], id: u32) -> Option<cs2_renderer::RgbaFrame> {
         self.images.take(bytes, id)
     }

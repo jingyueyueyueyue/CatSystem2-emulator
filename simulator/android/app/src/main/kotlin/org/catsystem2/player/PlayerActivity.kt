@@ -239,6 +239,7 @@ class PlayerActivity : PlayerEngineActivity() {
         @JvmStatic external fun nativeOpen(game: ByteArray, saves: ByteArray, language: Int): Long
         @JvmStatic external fun nativeClose(handle: Long): Int
         @JvmStatic external fun nativeStep(handle: Long, budget: Int): Int
+        @JvmStatic external fun nativeTickDelay(handle: Long, reset: Boolean): Int
         @JvmStatic external fun nativeSize(handle: Long, axis: Int): Int
         @JvmStatic external fun nativePointer(handle: Long, output: IntArray): Int
         @JvmStatic external fun nativeCursorVisibility(handle: Long): Int

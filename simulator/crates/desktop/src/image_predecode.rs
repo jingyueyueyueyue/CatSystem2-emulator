@@ -31,6 +31,11 @@ struct Job {
 }
 
 impl ImagePredecode {
+    pub(super) fn snapshot(&self) -> Vec<(Arc<[u8]>, RgbaFrame)> {
+        self.entries.iter().filter_map(|entry| {
+            Some((entry.source.clone(), entry.decoded.try_lock().ok()?.as_ref()?.clone()))
+        }).collect()
+    }
     pub(super) fn submit(&mut self, bytes: &[u8]) {
         if bytes.len() > MAX_SOURCE_BYTES
             || !bytes.starts_with(b"HG-3")

@@ -414,6 +414,16 @@ struct EmotePixels {
     alpha_bounds: OnceLock<Option<[u32; 4]>>,
 }
 
+/// Weak storage identity for diagnostics: never retains textures or reads pixels.
+#[derive(Debug, Clone)]
+pub struct EmoteFrameIdentity(std::sync::Weak<EmotePixels>);
+
+impl EmoteFrameIdentity {
+    pub fn matches(&self, frame: &EmoteRasterFrame) -> bool {
+        self.0.ptr_eq(&Arc::downgrade(&frame.pixels))
+    }
+}
+
 impl EmoteRasterFrame {
     fn frame_bytes(width: u32, height: u32) -> Result<usize> {
         (width as usize)
@@ -464,6 +474,9 @@ impl EmoteRasterFrame {
     }
     pub fn shares_pixels(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.pixels, &other.pixels)
+    }
+    pub fn diagnostic_identity(&self) -> EmoteFrameIdentity {
+        EmoteFrameIdentity(Arc::downgrade(&self.pixels))
     }
     pub fn is_valid(&self) -> bool {
         self.pixels.device.as_ref().is_none_or(|device| device.is_valid())
@@ -603,6 +616,8 @@ pub trait EmoteBackend: Send {
     fn scene_raster_player(&self, _task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
         None
     }
+    /// Read-only diagnostics must also see players hidden by a held transition surface.
+    fn diagnostic_player(&self, _task: u32) -> Option<(&CpuPlayer, CpuViewport)> { None }
     fn can_defer_scene_raster(&self, _task: u32) -> bool {
         false
     }
@@ -1006,6 +1021,9 @@ impl EmoteServices {
     pub fn scene_raster_player(&self, task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
         self.backend.as_ref()?.scene_raster_player(task)
     }
+    pub fn diagnostic_player(&self, task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
+        self.backend.as_ref()?.diagnostic_player(task)
+    }
 
     pub fn can_defer_scene_raster(&self, task: u32) -> bool {
         self.backend.as_ref().is_some_and(|backend| backend.can_defer_scene_raster(task))
@@ -1199,6 +1217,19 @@ impl EmoteServices {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn visual_progress_frame_identity_does_not_retain_pixels_or_alias_new_results() {
+        let frame = EmoteRasterFrame::new(1, 1, [0, 0], vec![1, 2, 3, 255]).unwrap();
+        let identity = frame.diagnostic_identity();
+        assert_eq!(Arc::strong_count(&frame.pixels), 1);
+        assert!(identity.matches(&frame.clone()));
+        let pixels = Arc::downgrade(&frame.pixels);
+        drop(frame);
+        assert!(pixels.upgrade().is_none(), "diagnostics must not pin frame/texture resources");
+        let next = EmoteRasterFrame::new(1, 1, [0, 0], vec![1, 2, 3, 255]).unwrap();
+        assert!(!identity.matches(&next), "equal pixels in a new result have a different storage identity");
+    }
 
     #[test]
     fn loose_model_version_tracks_file_replacement_without_redecoding_bytes() {

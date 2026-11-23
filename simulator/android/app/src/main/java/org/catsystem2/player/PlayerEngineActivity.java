@@ -84,7 +84,6 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
 
     private static final int SELECT_GAME = 1;
     private static final int EXPORT_DIAGNOSTICS = 2;
-    private static final int GAME_TICK_HZ = 60;
     private static final int FRAME_CHANGED = 1;
     private static final int FRAME_UNCHANGED = 4;
     private static final int GAME_MENU_EFFECT_SETTINGS = 40027;
@@ -155,8 +154,6 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private boolean running;
     private boolean frameScheduled;
     private long nextFrame;
-    private long clockOrigin;
-    private long completedFrames;
     private boolean hasFrame;
     private boolean framePending;
     private RenderSurface presentedSurface;
@@ -799,8 +796,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                             return;
                         }
                         running = true;
-                        nextFrame = clockOrigin = SystemClock.uptimeMillis();
-                        completedFrames = 0;
+                        nextFrame = SystemClock.uptimeMillis();
                         scheduleFrame();
                     });
                 });
@@ -987,15 +983,11 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                         scheduleFrame();
                         return;
                     }
-                    long planned = clockOrigin + ++completedFrames * 1000 / GAME_TICK_HZ;
-                    long now = SystemClock.uptimeMillis();
-                    if (now - planned >= 1000 / GAME_TICK_HZ) {
-                        // Reset after falling a whole tick behind. The scheduler runs
-                        // a late frame immediately while keeping short delays out of the clock.
-                        clockOrigin += now - planned;
-                        planned = now;
-                    }
-                    nextFrame = planned;
+                    // The portable fixed-step clock retains bounded tick debt.
+                    // A late draw must not reset game time on every iteration.
+                    int delay = nativeTickDelay(session, false);
+                    if (delay < 0) throw new IOException(nativeErrorText());
+                    nextFrame = SystemClock.uptimeMillis() + delay;
                 } else {
                     // Script budget continuation stays at the same game tick.
                     nextFrame = SystemClock.uptimeMillis() + 1;
@@ -2646,8 +2638,11 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                 stopWithError("恢复游戏失败", new IOException(nativeErrorText()));
                 return;
             }
-            nextFrame = clockOrigin = SystemClock.uptimeMillis();
-            completedFrames = 0;
+            nextFrame = SystemClock.uptimeMillis();
+            if (session != 0 && nativeTickDelay(session, true) < 0) {
+                stopWithError("恢复游戏时钟失败", new IOException(nativeErrorText()));
+                return;
+            }
             scheduleFrame();
         });
     }
