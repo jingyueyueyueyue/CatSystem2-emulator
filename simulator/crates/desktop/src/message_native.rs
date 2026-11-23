@@ -897,6 +897,26 @@ mod utate_tests {
     }
 
     #[test]
+    fn message_body_preserves_literal_percent_alongside_kcs_fields() -> Result<()> {
+        let program = cs2_script::KcsProgram::from_code(&[0x3b], Vec::new(), 0)?;
+        let mut vm = Vm::from_program(program)?;
+        let value = vm.allocate_region(&7u32.to_le_bytes())?;
+        let source = format!("40%之前 %02u[G{value}] 100%% 50%\0");
+        let input = vm.allocate_region(source.as_bytes())?;
+        let output = vm.allocate_region(&[0; 64])?;
+        let args = [output.to_le_bytes(), input.to_le_bytes()].concat();
+        let expected = "40%之前 07 100% 50%".as_bytes();
+        for index in [392, 1049] {
+            assert_eq!(
+                call_message_body_native(index, &args, &mut vm, false)?,
+                NativeReturn::Value(expected.len() as u32)
+            );
+            assert_eq!(vm.read_string(output)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn utate_layout_native616_reports_pending_glyphs_across_segments() {
         let mut services = MessageNativeServices {
             defaults: Some(MessageDefaults {

@@ -1,6 +1,6 @@
 use super::{MAX_PCM, error};
 use cs2_formats::{AudioMetadata, OggVorbis};
-use cs2_runtime::RuntimeResult;
+use cs2_runtime::RuntimeError;
 use lewton::audio::{PreviousWindowRight, read_audio_packet_generic};
 use lewton::header::{IdentHeader, SetupHeader};
 use lewton::inside_ogg::{OggStreamReader, read_headers};
@@ -14,7 +14,18 @@ const MAX_SAMPLES: usize = MAX_PCM / size_of::<i16>();
 pub(super) const MIN_PARALLEL_BYTES: usize = 256 * 1024;
 const MAX_PARALLEL_PACKETS: usize = 65_536;
 
-pub(super) fn decode(encoded: &[u8]) -> RuntimeResult<(AudioMetadata, Vec<i16>)> {
+pub(super) enum DecodeError {
+    PcmLimit,
+    Invalid(RuntimeError),
+}
+
+impl From<RuntimeError> for DecodeError {
+    fn from(cause: RuntimeError) -> Self {
+        Self::Invalid(cause)
+    }
+}
+
+pub(super) fn decode(encoded: &[u8]) -> Result<(AudioMetadata, Vec<i16>), DecodeError> {
     // Retain full validation, including archives that end at a completed
     // page without the Ogg end-of-stream flag.
     let metadata = OggVorbis::metadata_at_entry_boundary(encoded)
@@ -36,7 +47,7 @@ pub(super) fn decode(encoded: &[u8]) -> RuntimeResult<(AudioMetadata, Vec<i16>)>
     Ok((metadata, samples))
 }
 
-pub(super) fn decode_parallel(encoded: &[u8], lanes: usize) -> RuntimeResult<Option<Vec<i16>>> {
+fn decode_parallel(encoded: &[u8], lanes: usize) -> Result<Option<Vec<i16>>, DecodeError> {
     let mut reader = PacketReader::new(Cursor::new(encoded));
     let ((ident, _, setup), _) = read_headers(&mut reader)
         .map_err(|cause| error(format!("open Ogg/Vorbis decoder: {cause}")))?;
@@ -90,12 +101,12 @@ pub(super) fn decode_parallel(encoded: &[u8], lanes: usize) -> RuntimeResult<Opt
             .chain(workers.into_iter().map(|worker| {
                 worker
                     .join()
-                    .unwrap_or_else(|_| Err(error("Vorbis decoder worker panicked")))
+                    .unwrap_or_else(|_| Err(error("Vorbis decoder worker panicked").into()))
             }))
             .collect::<Vec<_>>();
         let mut pieces = pieces
             .into_iter()
-            .collect::<RuntimeResult<Vec<_>>>()?
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter();
         let mut result = pieces.next().expect("first Vorbis lane");
         result
@@ -114,7 +125,7 @@ fn decode_range(
     previous: Option<&Packet>,
     packets: &[Packet],
     total: &AtomicUsize,
-) -> RuntimeResult<Vec<i16>> {
+) -> Result<Vec<i16>, DecodeError> {
     let mut window = PreviousWindowRight::new();
     let mut granule = None;
     if let Some(previous) = previous {
@@ -141,17 +152,17 @@ fn decode_range(
                 .ok_or_else(|| error("Vorbis granule position overflow"))?;
         }
         if total.fetch_add(pcm.samples.len(), Ordering::Relaxed) + pcm.samples.len() > MAX_SAMPLES {
-            return Err(error("decoded audio exceeds the 80 MiB PCM limit"));
+            return Err(DecodeError::PcmLimit);
         }
         append_samples(&mut samples, &pcm.samples)?;
     }
     Ok(samples)
 }
 
-fn append_samples(samples: &mut Vec<i16>, packet: &[i16]) -> RuntimeResult<()> {
+fn append_samples(samples: &mut Vec<i16>, packet: &[i16]) -> Result<(), DecodeError> {
     let length = samples.len() + packet.len();
     if length > MAX_SAMPLES {
-        return Err(error("decoded audio exceeds the 80 MiB PCM limit"));
+        return Err(DecodeError::PcmLimit);
     }
     if length > samples.capacity() {
         let capacity = length.max((samples.capacity() * 2).min(MAX_SAMPLES));

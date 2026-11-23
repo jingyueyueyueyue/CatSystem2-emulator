@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use cs2_desktop::{HeadlessPlayer, HostWindowRequest};
 use cs2_runtime::message_object::ButtonSource;
+use cs2_runtime::resource_router::GameLanguage;
 use cs2_runtime::{InputEvent, InputKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -88,6 +89,7 @@ fn replay(
     let mut capture_final = !state_mode;
     let mut story_events = state_mode;
     let mut story_trace = state_mode;
+    let mut session_random = false;
     let mut neko_film = None;
     let mut neko_clear_title = None;
     let mut guarded_body: Option<(&[(i32, i32)], u32)> = None;
@@ -277,6 +279,10 @@ fn replay(
             story_trace = true;
             continue;
         }
+        if values == "session-random" {
+            session_random = true;
+            continue;
+        }
         if values == "no-final-capture" {
             capture_final = false;
             continue;
@@ -442,7 +448,12 @@ fn replay(
     if measure {
         HeadlessPlayer::enable_host_gpu_raster();
     }
-    let mut player = HeadlessPlayer::open_with_save_root(game, output.with_extension("profile"))?;
+    let profile = output.with_extension("profile");
+    let mut player = if session_random {
+        HeadlessPlayer::open_with_game_language(game, profile, GameLanguage::Automatic)?
+    } else {
+        HeadlessPlayer::open_with_save_root(game, profile)?
+    };
     let mut happiness_load = happiness_resume_sha.map(|digest| happiness::Load::new(&player, digest)).transpose()?;
     player.enable_host_window_requests();
     player.initialize_general_window_host(1)?;

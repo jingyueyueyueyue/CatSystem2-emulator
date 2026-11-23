@@ -34,10 +34,11 @@ pub(in crate) struct EmoteBatch {
 
 pub(in crate) fn begin_emote_batch() -> Result<EmoteBatch> {
     RASTER.with_borrow_mut(|slot| {
-        if let Some(emote) = slot.as_mut().and_then(|raster| raster.emote.as_ref())
-            && !emote.pending.is_empty()
-        {
-            bail!("E-mote batch started with unfinished poses");
+        if let Some(emote) = slot.as_mut().and_then(|raster| raster.emote.as_mut()) {
+            if !emote.pending.is_empty() {
+                bail!("E-mote batch started with unfinished poses");
+            }
+            emote.begin_atlas_batch();
         }
         BATCHING.with(|batching| batching.set(true));
         Ok(EmoteBatch { active: true })
@@ -335,7 +336,11 @@ impl Raster {
     }
 }
 
-const ATLAS_BYTES: usize = 128 * 1024 * 1024;
+const ATLAS_STAGE_LIMIT: usize = 128 * 1024 * 1024;
+#[cfg(windows)]
+const ATLAS_DRAW_LIMIT: usize = 192 * 1024 * 1024;
+#[cfg(target_os = "android")]
+const ATLAS_DRAW_LIMIT: usize = ATLAS_STAGE_LIMIT;
 const ATLAS_STAGE_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const COMMAND_WORDS: usize = COMMAND_BYTES / size_of::<u32>();
@@ -695,6 +700,24 @@ fn prep_mode() -> PrepMode {
     })
 }
 
+#[cfg(windows)]
+fn default_windows_multi_pose_workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        if std::env::var_os("CS2_EMOTE_PREP_WORKERS").is_some()
+            || std::env::var_os("CS2_EMOTE_PREP_MODE").is_some()
+        {
+            return 1;
+        }
+        let available = std::thread::available_parallelism().map_or(1, |count| count.get());
+        if available < MAX_PREP_WORKERS {
+            return 1;
+        }
+        report("emote_prep_multi_pose=AcrossPoses");
+        MAX_PREP_WORKERS
+    })
+}
+
 fn prepare_commands(
     draws: &mut [Draw<'_>], batches: &mut [CommandBatch; MAX_PREP_WORKERS],
     viewport: CpuViewport, alignment: usize, profile: bool, commands: &mut Vec<u32>,
@@ -834,8 +857,26 @@ struct PreparedPose {
 }
 
 pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
+    RASTER.with_borrow_mut(|slot| {
+        if let Some(emote) = slot.as_mut().and_then(|raster| raster.emote.as_mut()) {
+            emote.atlas_batch_models.extend(
+                players.iter().map(|(player, _)| Arc::downgrade(player.shared_motion_model())),
+            );
+        }
+    });
     let mode = prep_mode();
     let workers = prep_worker_limit().min(players.len());
+    #[cfg(windows)]
+    let (mode, workers) = if (3..=MAX_PREP_WORKERS).contains(&players.len()) {
+        let across_workers = default_windows_multi_pose_workers();
+        if across_workers > 1 {
+            (PrepMode::AcrossPoses, across_workers.min(players.len()))
+        } else {
+            (mode, workers)
+        }
+    } else {
+        (mode, workers)
+    };
     if workers < 2 || players.len() > 4 || matches!(mode, PrepMode::Serial | PrepMode::WithinPose) {
         return;
     }
@@ -1047,6 +1088,7 @@ pub(super) struct EmoteRaster {
     fade_outputs: Vec<Arc<wgpu::Buffer>>,
     atlases: VecDeque<CachedAtlas>,
     atlas_bytes: usize,
+    atlas_batch_models: Vec<Weak<CpuMotionModel>>,
     commands: wgpu::Buffer,
     batch_info: wgpu::Buffer,
     pixels: wgpu::Buffer,
@@ -1142,7 +1184,7 @@ impl EmoteRaster {
             fade_params: source(32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             fade_empty_alpha: buffer(device, 4, TARGET),
             fade_sources: VecDeque::new(), fade_outputs: Vec::new(),
-            atlases: VecDeque::new(), atlas_bytes: 0,
+            atlases: VecDeque::new(), atlas_bytes: 0, atlas_batch_models: Vec::new(),
             commands: source(4, UPLOAD), batch_info: source(4, UPLOAD),
             pixels: source(8, UPLOAD), rgba: Arc::new(source(4, TARGET)),
             rgba_spares: Vec::new(), repairs: source(8, UPLOAD),
@@ -1191,7 +1233,6 @@ impl EmoteRaster {
     ) -> Result<wgpu::TextureView> {
         let atlas = self.atlas_storage(device, owner, source, false)?
             .context("E-mote atlas allocation was declined")?;
-        atlas.used_by_draw = true;
         let extent = atlas.texture.size();
         if atlas.uploaded_rows < extent.height {
             let started = Instant::now();
@@ -1215,6 +1256,13 @@ impl EmoteRaster {
         Ok(0)
     }
 
+    fn begin_atlas_batch(&mut self) {
+        self.atlas_batch_models.clear();
+        for atlas in &mut self.atlases {
+            atlas.used_by_draw = false;
+        }
+    }
+
     fn atlas_storage(
         &mut self, device: &wgpu::Device, owner: &Arc<CpuMotionModel>, source: &CpuTexture,
         preloading: bool,
@@ -1224,7 +1272,11 @@ impl EmoteRaster {
         if let Some(index) = self.atlases.iter().position(|entry|
             entry.identity == identity && Weak::ptr_eq(&entry.owner, &owner_id))
         {
-            let entry = self.atlases.remove(index).unwrap();
+            if preloading {
+                return Ok(self.atlases.get_mut(index));
+            }
+            let mut entry = self.atlases.remove(index).unwrap();
+            entry.used_by_draw = true;
             self.atlases.push_back(entry);
             return Ok(self.atlases.back_mut());
         }
@@ -1232,7 +1284,7 @@ impl EmoteRaster {
         let (pixels, _) = source.upload_pixels();
         let bytes = pixels.len();
         if source.width.max(source.height) > limit || source.width.min(source.height) == 0
-            || source.width * source.height * 4 != bytes || bytes > ATLAS_BYTES
+            || source.width * source.height * 4 != bytes || bytes > ATLAS_STAGE_LIMIT
         {
             bail!("E-mote atlas exceeds device limits");
         }
@@ -1242,12 +1294,22 @@ impl EmoteRaster {
             keep
         });
         // Speculation must leave resident draw textures in the cache.
-        if preloading && self.atlas_bytes + bytes > ATLAS_BYTES {
+        if preloading && self.atlas_bytes + bytes > ATLAS_STAGE_LIMIT {
             return Ok(None);
         }
-        while self.atlas_bytes + bytes > ATLAS_BYTES {
-            let index = self.atlases.iter().position(|atlas| !atlas.used_by_draw).unwrap_or(0);
-            self.atlas_bytes -= self.atlases.remove(index).unwrap().bytes;
+        let mut evicted = 0;
+        let mut evicted_bytes = 0;
+        while self.atlas_bytes + bytes > ATLAS_DRAW_LIMIT {
+            // Prefer the oldest inactive atlas. Draw order breaks ties if the active
+            // models alone exceed the hard cap. Encoded commands own their views.
+            let index = self.atlases.iter().position(|atlas| {
+                !atlas.used_by_draw && !self.atlas_batch_models.iter()
+                    .any(|owner| Weak::ptr_eq(owner, &atlas.owner))
+            }).unwrap_or(0);
+            let atlas = self.atlases.remove(index).unwrap();
+            self.atlas_bytes -= atlas.bytes;
+            evicted += 1;
+            evicted_bytes += atlas.bytes;
         }
         let size = wgpu::Extent3d {
             width: source.width as u32, height: source.height as u32, depth_or_array_layers: 1,
@@ -1260,8 +1322,23 @@ impl EmoteRaster {
         });
         let view = texture.create_view(&Default::default());
         self.atlas_bytes += bytes;
-        self.atlases.push_back(CachedAtlas { owner: owner_id, identity, bytes, view, texture, uploaded_rows: 0, used_by_draw: false });
-        Ok(self.atlases.back_mut())
+        if evicted != 0 {
+            report(&format!(
+                "emote_atlas_evictions={evicted} evicted_bytes={evicted_bytes} resident_bytes={}",
+                self.atlas_bytes,
+            ));
+        }
+        let atlas = CachedAtlas {
+            owner: owner_id, identity, bytes, view, texture, uploaded_rows: 0,
+            used_by_draw: !preloading,
+        };
+        if preloading {
+            self.atlases.push_front(atlas);
+            Ok(self.atlases.front_mut())
+        } else {
+            self.atlases.push_back(atlas);
+            Ok(self.atlases.back_mut())
+        }
     }
 
     fn finish_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
@@ -1376,6 +1453,9 @@ impl EmoteRaster {
         failed: &Arc<AtomicBool>,
     ) -> Result<EmoteRasterFrame> {
         let started = emote_gpu_start();
+        if !batching() {
+            self.begin_atlas_batch();
+        }
         let model = player.shared_motion_model();
         let prepared = take_prepared_pose(player, viewport, variables);
         let (mut draws, packed) = if let Some(prepared) = prepared {

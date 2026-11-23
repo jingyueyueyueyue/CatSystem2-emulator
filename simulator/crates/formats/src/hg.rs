@@ -995,14 +995,9 @@ fn parse_hg3(data: &[u8]) -> Result<HgFile, HgError> {
 
             if next == 0 {
                 let padding = data.get(tag_end..frame_end).ok_or(HgError::InvalidFrame)?;
-                // The final frame of the Daydream update asset evb93_a.hg3
-                // also has nine zero bytes after cptype, ending on an aligned boundary.
-                let extended_padding = if offset_next == 0 {
-                    padding.len() == 9
-                } else {
-                    (8..=15).contains(&padding.len())
-                };
-                let padded_control_tag = extended_padding
+                // HG3 streams can carry an extra alignment word after cptype,
+                // including at the end of the file.
+                let padded_control_tag = (8..=15).contains(&padding.len())
                     && tag_name == b"cptype"
                     && length == 4
                     && frame_end.is_multiple_of(8);

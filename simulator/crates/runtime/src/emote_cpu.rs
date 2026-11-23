@@ -5,14 +5,14 @@
 //! as native draw success or engine equivalence.
 
 use super::psb::{PsbDocument, PsbValue};
-use super::timeline::{LayerTimelines, lookup_layer_keyframes, sample_emote_keys, visible_layer_key};
+use super::timeline::{self, FrameContent, LayerTimelines, lookup_layer_keyframes, sample_emote_keys, visible_layer_key};
 use super::{
     CpuBezierPatch, CpuM2LipBinding, CpuM2LipCurve, CpuM2LipSidecarKind, CpuM2LiveOwner, CpuM2Load,
     CpuM2ModelSource, EmoteArchiveVersion,
     CpuM2TimedVariables, CpuMeshGrid, CpuNative907State, CpuOriginalTaskClock, CpuStencilBuffer,
     CpuStencilWrite, CpuVariableTimelineInfo, CpuVariableTimelines, EmoteBackend, EmoteBuffer,
     EmoteCommand, EmoteError, EmoteOperation, EmotePlaybackInfo, EmoteRasterFrame, EmoteReply,
-    EmoteResource, EmoteTick, MAX_FRAME_BYTES, Result, decode_emote_texture, emote_layer_affine,
+    EmoteResource, EmoteTick, MAX_FRAME_BYTES, Result, decode_emote_texture,
     emote_native_descriptor, m2plane_tint_argb,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +32,10 @@ fn field<'a>(value: &'a PsbValue, key: &str) -> Result<&'a PsbValue> {
         .ok_or_else(|| unsupported(format!("PSB missing {key}")))
 }
 fn num(value: &PsbValue, key: &str, default: f64) -> Result<f64> {
-    match value.get(key) {
+    numeric_field(value.get(key), key, default)
+}
+fn numeric_field(value: Option<&PsbValue>, key: &str, default: f64) -> Result<f64> {
+    match value {
         None | Some(PsbValue::Null) => Ok(default),
         Some(v) => v
             .number()
@@ -190,7 +193,9 @@ impl CpuTexture {
 
 #[derive(Debug, Clone)]
 pub struct CpuMotionModel {
-    pub document: PsbDocument,
+    // The index uses addresses of nodes in the immutable, shared PSB tree.
+    document: Arc<PsbDocument>,
+    layer_timelines: Option<Arc<LayerTimelines>>,
     pub textures: BTreeMap<String, CpuTexture>,
     pub base_object: String,
     pub base_motion: String,
@@ -198,20 +203,20 @@ pub struct CpuMotionModel {
 
 impl CpuMotionModel {
     pub fn load(resource: &EmoteResource) -> Result<Self> {
-        Self::load_filtered(resource, 0, false)
+        Self::load_model(resource, 0, None)
     }
 
     /// Preloads are restricted to atlases that share the decoded resource buffer.
     pub fn load_for_preload(resource: &EmoteResource, memory_limit: usize) -> Result<Self> {
-        let model = Self::load_filtered(resource, 0, true)?;
-        if model.document.estimated_storage_bytes() > memory_limit {
-            return Err(EmoteError::Capacity);
-        }
-        Ok(model)
+        Self::load_model(resource, 0, Some(memory_limit))
     }
 
-    fn load_filtered(resource: &EmoteResource, filter: u32, shared_only: bool) -> Result<Self> {
+    fn load_model(resource: &EmoteResource, filter: u32, preload_limit: Option<usize>) -> Result<Self> {
         let document = PsbDocument::from_resource(resource)?;
+        let preload_budget = preload_limit.map(|limit| (document.estimated_storage_bytes(), limit));
+        if preload_budget.is_some_and(|(document_bytes, limit)| document_bytes > limit) {
+            return Err(EmoteError::Capacity);
+        }
         let spec = string(&document.root, "spec").unwrap_or("");
         if !matches!(spec, "win" | "common") {
             return Err(unsupported(format!(
@@ -245,7 +250,7 @@ impl CpuMotionModel {
             {
                 TexturePixels::Bgra { source: document.resource_backing(), range }
             } else {
-                if shared_only {
+                if preload_limit.is_some() {
                     return Err(unsupported("preloaded textures must use native shared storage"));
                 }
                 let mut rgba = decode_emote_texture(kind, spec, width, height, document.resource(pixel)?)?;
@@ -268,8 +273,9 @@ impl CpuMotionModel {
                 "PSB metadata.base missing; select an explicit object/motion",
             ));
         }
-        let model = Self {
-            document,
+        let mut model = Self {
+            document: Arc::new(document),
+            layer_timelines: None,
             textures,
             base_object,
             base_motion,
@@ -277,7 +283,31 @@ impl CpuMotionModel {
         // Reject a broken metadata.base before replacing the current player.
         // A successful import must at least select an existing default motion.
         model.motion(&model.base_object, &model.base_motion)?;
+        model.prepare_layer_timelines();
+        if preload_budget.is_some_and(|(document_bytes, limit)| {
+            document_bytes.saturating_add(model.estimated_index_bytes()) > limit
+        }) {
+            return Err(EmoteError::Capacity);
+        }
         Ok(model)
+    }
+
+    pub fn document(&self) -> &PsbDocument {
+        &self.document
+    }
+
+    fn prepare_layer_timelines(&mut self) {
+        if use_layer_timeline_index() {
+            self.layer_timelines = Some(Arc::new(LayerTimelines::prepare(&self.document.root)));
+        }
+    }
+
+    fn estimated_document_bytes(&self) -> usize {
+        self.document.estimated_storage_bytes().saturating_add(self.estimated_index_bytes())
+    }
+
+    fn estimated_index_bytes(&self) -> usize {
+        self.layer_timelines.as_deref().map_or(0, LayerTimelines::estimated_storage_bytes)
     }
 
     pub fn motions(&self) -> Result<Vec<(String, String)>> {
@@ -396,7 +426,6 @@ pub struct CpuPlayer {
     ///Parser-created reference clock owners, separate from M2 controllers.
     ///Deep Clone preserves the player's existing transactional update model.
     reference_timelines: super::timeline::CpuReferenceTimelines,
-    layer_timelines: Option<Arc<(Weak<CpuMotionModel>, LayerTimelines)>>,
 }
 
 fn use_layer_timeline_index() -> bool {
@@ -404,7 +433,7 @@ fn use_layer_timeline_index() -> bool {
     *ENABLED.get_or_init(|| {
         #[cfg(not(target_os = "android"))]
         {
-            std::env::var("CS2_EMOTE_KEYFRAME_INDEX").is_ok_and(|value| value == "1")
+            !std::env::var("CS2_EMOTE_KEYFRAME_INDEX").is_ok_and(|value| value == "0")
         }
         #[cfg(target_os = "android")]
         {
@@ -416,7 +445,7 @@ fn use_layer_timeline_index() -> bool {
             let length = unsafe {
                 __system_property_get(c"debug.cs2.emote_keyframe_index".as_ptr(), value.as_mut_ptr().cast())
             };
-            length == 1 && value[0] == b'1'
+            length != 1 || value[0] != b'0'
         }
     })
 }
@@ -426,9 +455,6 @@ impl CpuPlayer {
         Self::from_shared_model(Arc::new(model))
     }
     pub fn from_shared_model(model: Arc<CpuMotionModel>) -> Self {
-        let layer_timelines = use_layer_timeline_index().then(|| Arc::new((
-            Arc::downgrade(&model), LayerTimelines::prepare(&model.document.root),
-        )));
         Self {
             object: model.base_object.clone(),
             motion: model.base_motion.clone(),
@@ -444,13 +470,10 @@ impl CpuPlayer {
             variable_timelines: CpuVariableTimelines::default(),
             m2_timed_variables: CpuM2TimedVariables::default(),
             reference_timelines: super::timeline::CpuReferenceTimelines::default(),
-            layer_timelines,
         }
     }
     fn layer_timelines(&self) -> Option<&LayerTimelines> {
-        let (owner, timelines) = self.layer_timelines.as_deref()?;
-        // A weak owner keeps the indexed model immutable and distinguishes replacements.
-        (owner.as_ptr() == Arc::as_ptr(&self.model)).then_some(timelines)
+        self.model.layer_timelines.as_deref()
     }
 
     pub fn shared_motion_model(&self) -> &Arc<CpuMotionModel> {
@@ -533,8 +556,8 @@ impl CpuPlayer {
         self.variable_timelines.stop(label);
     }
     pub fn effective_variables(&self) -> Result<BTreeMap<String, f64>> {
-        let mut values = self.variable_timelines
-            .evaluate(&self.controller_variables()?)?;
+        let mut values = self.controller_variables()?;
+        self.variable_timelines.apply(&mut values)?;
         //13530 ->1c930: clamp the evaluated driver values after additive
         //timeline/offset lanes; do not feed these outputs back into owners.
         super::clamp::apply(&self.model.document.root, &mut values)?;
@@ -641,8 +664,9 @@ impl CpuPlayer {
                 &[], 0, &[], &mut Vec::new())?;
         }
         context.references.finish();
-        context.references.mark_tick(self.frame as f32, &variables);
-        self.reference_timelines = context.references;
+        let mut references = context.references;
+        references.mark_tick(self.frame as f32, variables);
+        self.reference_timelines = references;
         Ok(())
     }
 
@@ -952,7 +976,7 @@ struct RenderContext<'a, T> {
 
 struct DrawLayer<'a> {
     kind: i32,
-    content: std::borrow::Cow<'a, PsbValue>,
+    content: FrameContent<'a>,
     transform: Transform,
     warps: Vec<MeshAncestor>,
     ///41afd/43cbd copy the referencing layer's effective2c4 into the
@@ -1042,7 +1066,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                 continue;
             };
             let (Some(object), Some(name)) =
-                (string(&draw.content, "src"), string(&draw.content, "icon")) else {
+                (draw.content.text("src"), draw.content.text("icon")) else {
                 continue;
             };
             let motion = self.player.model.motion(object, name)?;
@@ -1232,7 +1256,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                 //entries at consumption; it does not invent their bounds.
                 ranges[index].push(draw.clone());
                 captured.push(draw.clone());
-                if draw.kind == 0 && string(&draw.content, "src") != Some("blank") {
+                if draw.kind == 0 && draw.content.text("src") != Some("blank") {
                     primitives.push(ColorPrimitive { index, motion: scope.clone(), stencils: scopes });
                 }
             }
@@ -1338,7 +1362,8 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         }
         let parameter_time = self.bound_parameter_clock(layer, params)?;
         let at = parameter_time.unwrap_or(time);
-        let (previous, next) = lookup_layer_keyframes(layer, at as f32, self.player.layer_timelines())?;
+        let timelines = self.player.layer_timelines();
+        let (previous, next) = lookup_layer_keyframes(layer, at as f32, timelines)?;
         if self.reference_update {
             // References inherit the physical layer path and clocks here.
             // Their geometry and stencil inputs are only consumed at draw time.
@@ -1347,7 +1372,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             };
             if kind == 3 {
                 pending[preorder_index] = Some(DrawLayer {
-                    kind, content: std::borrow::Cow::Borrowed(content), transform: parent, warps: Vec::new(),
+                    kind, content: FrameContent::borrowed(content), transform: parent, warps: Vec::new(),
                     motion_parent_warps: Vec::new(), mesh_owner: self.layers,
                     time: parameter_time.unwrap_or(self.reference_raw_time),
                     frame_begin,
@@ -1367,7 +1392,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         let Some(mut content) = sample.content else {
             return hide_children(layer, pending);
         };
-        if kind == 12 && string(&content, "src") != Some("blank") {
+        if kind == 12 && content.text("src") != Some("blank") {
             self.warnings.insert(
                 "textured type12 target/reversal state is not recovered".into(),
             );
@@ -1378,9 +1403,13 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             }
         }
         let coord = numbers(content.get("coord"))?;
-        let opacity = super::timeline::frame_opacity(&content)?;
+        let opacity = timeline::opacity(content.get("opa"))?;
+        let order = match timelines {
+            Some(timelines) => timelines.transform_order(layer)?,
+            None => timeline::transform_order(layer)?,
+        };
         let local = Transform {
-            m: emote_layer_affine(layer, &content)?,
+            m: timeline::layer_affine(order, |key| content.get(key))?,
             opacity,
             //3eaea..3eb84: in XY mode, parent affine transforms X/Y;
             //Z is added independently and later orders color primitives.
@@ -1503,7 +1532,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         }
         let mut mesh_grid = None;
         if kind == 0
-            && string(&content, "src") != Some("blank")
+            && content.text("src") != Some("blank")
             && draw_warps.iter().any(|ancestor| ancestor.warp.is_some())
         {
             if num(layer, "meshTransform", 0.0)? == 1.0 {
@@ -1628,7 +1657,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             //44f69 includes a group owner's own nontextured primitive;
             //38f75 marks blank sprites nontextured as well. Neither can be
             //turned into an opaque rectangle or another reference expansion.
-            if !matches!(draw.kind, 0 | 12) || string(&draw.content, "src") == Some("blank") {
+            if !matches!(draw.kind, 0 | 12) || draw.content.text("src") == Some("blank") {
                 continue;
             }
             let pass = EmoteSpritePass::Mask {
@@ -1691,7 +1720,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                 if draw.kind != 0 {
                     return Err(unsupported("invalid composite-mask source layer kind"));
                 }
-                if string(&draw.content, "src") == Some("blank") {
+                if draw.content.text("src") == Some("blank") {
                     // 540b skips an own primitive whose kind byte is nonzero.
                     // Keep the linked plane/reference: an empty positive mask
                     // must still reject color; it must not remove the clip.
@@ -1715,9 +1744,9 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         Ok(Some((plane, plan.color_reference)))
     }
 
-    fn mesh_dimensions(&self, content: &PsbValue) -> Result<[f64; 4]> {
-        let source = string(content, "src").ok_or_else(|| unsupported("BP source"))?;
-        let name = string(content, "icon").ok_or_else(|| unsupported("BP icon"))?;
+    fn mesh_dimensions(&self, content: &FrameContent<'_>) -> Result<[f64; 4]> {
+        let source = content.text("src").ok_or_else(|| unsupported("BP source"))?;
+        let name = content.text("icon").ok_or_else(|| unsupported("BP icon"))?;
         let dims = if source == "blank" {
             // 38f8d/38fa4 use integer conversion for width/height;
             // 38fbb/38fd2 store origins as f32, not unrestricted f64.
@@ -1761,15 +1790,15 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
 
     fn sprite(
         &mut self,
-        content: &PsbValue,
+        content: &FrameContent<'_>,
         transform: Transform,
         warps: &[MeshAncestor],
         mesh_grid: Option<CpuMeshGrid>,
         mesh_owner: usize,
         pass: EmoteSpritePass<'_, T::Stencil>,
     ) -> Result<()> {
-        let source = string(content, "src").ok_or_else(|| unsupported("sprite source"))?;
-        let name = string(content, "icon").ok_or_else(|| unsupported("sprite icon"))?;
+        let source = content.text("src").ok_or_else(|| unsupported("sprite source"))?;
+        let name = content.text("icon").ok_or_else(|| unsupported("sprite icon"))?;
         let src = self
             .player
             .model
@@ -1804,14 +1833,14 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             return Err(unsupported("icon texture rectangle"));
         }
         let is_mask = matches!(&pass, EmoteSpritePass::Mask { .. });
-        if !is_mask && num(content, "bm", 0.0)? != 0.0 {
+        if !is_mask && numeric_field(content.get("bm"), "bm", 0.0)? != 0.0 {
             self.warnings.insert("sprite blend mode unsupported".into());
         }
         // 2c079/2c085 return the other operand for the native neutral
         // DWORD; this is RGB128/alpha255, not RGB255/alpha255. All52
         // explicit colors in ca01_l_body_1 use this identity. Other colors
         // still require inherited/per-corner color ownership and quantizing.
-        if !is_mask && num(content, "color", 0x808080ff_u32 as f64)? != 0x808080ff_u32 as f64 {
+        if !is_mask && numeric_field(content.get("color"), "color", 0x808080ff_u32 as f64)? != 0x808080ff_u32 as f64 {
             self.warnings
                 .insert("nonneutral sprite color multiplier unsupported".into());
         }
@@ -2867,7 +2896,7 @@ impl CpuEmoteBackend {
             models.retain(|model| model.strong_count() != 0);
             !models.is_empty()
         });
-        let model = Arc::new(CpuMotionModel::load_filtered(resource, filter, false)?);
+        let model = Arc::new(CpuMotionModel::load_model(resource, filter, None)?);
         self.models.entry(key).or_default().push(Arc::downgrade(&model));
         Ok(model)
     }
@@ -2875,7 +2904,7 @@ impl CpuEmoteBackend {
     fn remember_recent_m2_model(&mut self, prior: Option<RecentM2Model>) {
         if let Some(prior) = prior.filter(|prior| Arc::strong_count(&prior.model) == 1) {
             let model = &prior.model;
-            let estimated = model.document.estimated_storage_bytes() + model.textures.iter()
+            let estimated = model.estimated_document_bytes() + model.textures.iter()
                 .map(|(name, texture)| name.capacity() + texture.extra_storage_bytes() + size_of::<CpuTexture>())
                 .sum::<usize>();
             if estimated <= RECENT_M2_MODEL_BYTES {
@@ -4121,11 +4150,13 @@ mod tests {
             ("source", object([("atlas", object([("icon", object([("dot", icon)]))]))])),
             ("object", object([("actor", object([("motion", object([("idle", motion)]))]))])),
         ]);
-        let model = CpuMotionModel {
-            document: PsbDocument::from_test_root(root),
+        let mut model = CpuMotionModel {
+            document: Arc::new(PsbDocument::from_test_root(root)),
+            layer_timelines: None,
             textures: [("atlas".into(), CpuTexture::from_rgba(1, 1, vec![200, 100, 50, 255]).unwrap())].into(),
             base_object: "actor".into(), base_motion: "idle".into(),
         };
+        model.prepare_layer_timelines();
         let mut backend = CpuEmoteBackend::new(CpuViewport { width: 3, height: 2,
             origin_x: 0.0, origin_y: 0.0, scale: 1.0, time_units_per_frame: 1.0 })?;
         backend.create_task(1)?;
@@ -4211,7 +4242,7 @@ mod tests {
         let moved = backend.render_rgba(1)?;
         assert_eq!(moved.alpha_bounds(), Some([1, 0, 2, 1]));
         assert_eq!(moved.rgba(), backend.render_preview(1)?.frame.rgba());
-        backend.player_mut(1)?.reference_timelines.mark_tick(1.0, &BTreeMap::new());
+        backend.player_mut(1)?.reference_timelines.mark_tick(1.0, BTreeMap::new());
         let refreshed = backend.render_rgba(1)?;
         assert!(!Arc::ptr_eq(&moved.pixels, &refreshed.pixels));
         assert_eq!(moved.rgba(), refreshed.rgba());

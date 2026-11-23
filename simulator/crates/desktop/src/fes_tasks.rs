@@ -1785,8 +1785,15 @@ impl FesTask {
         let system = self.system.as_ref().unwrap();
         let now = system.now;
         let context_free = system.object.is_none() && system.input.is_none();
+        let daydream_mes_push = key == 343 && value == 0 && context_free && block == b"MES_PUSH"
+            && host.css_task_sha() == Some(super::story_trace::DAYDREAM_PE)
+            && self.verified_bounded_message_driver(host, &mut driver, block);
+        if daydream_mes_push {
+            guard_daydream_mes_push(&mut driver.interpreter.program);
+        }
         // A nested SETBUTTON return belongs to the notification that called it.
-        let bounded_block = ((message_button_notification(key, value, block, context_free)
+        let bounded_block = (daydream_mes_push
+            || (message_button_notification(key, value, block, context_free)
             && (self.verified_bounded_message_driver(host, &mut driver, block)
                 || self.verified_newton_message_driver(host, &mut driver)))
             || (neko_message_notification(key, value, block, context_free)
@@ -2201,7 +2208,16 @@ impl FesTask {
             .filter(|bytes| super::particle_plugin_digest::sha256(bytes) == sha)
             .and_then(|bytes| parse_document(&bytes).ok())
             .and_then(|document| FesProgram::from_document(&document).ok())
-            .is_some_and(|program| program == driver.interpreter.program);
+            .is_some_and(|mut program| {
+                if program == driver.interpreter.program {
+                    return true;
+                }
+                if host.css_task_sha() == Some(super::story_trace::DAYDREAM_PE) {
+                    guard_daydream_mes_push(&mut program);
+                    return program == driver.interpreter.program;
+                }
+                false
+            });
         driver.bounded_message_fes_source = Some(verified);
         verified
     }
@@ -3096,6 +3112,18 @@ fn message_button_notification(key: u32, bank: u32, block: &[u8], context_free: 
     key == 343 && bank == 0 && context_free && matches!(block, b"MES_SHOW" | b"MES_SETSTATE")
 }
 
+fn guard_daydream_mes_push(program: &mut FesProgram) {
+    let Some(line) = program.blocks.iter_mut()
+        .find(|block| block.name == b"MES_PUSH")
+        .and_then(|block| block.lines.first_mut())
+    else { return; };
+    if line.offset == 0x2dcd && line.bytes == br"\(250+\0) = \1" {
+        // SETBUTTON refreshes banks 0 through 13 after this assignment.
+        // An invalid bank can still request the refresh without changing a slot.
+        line.bytes = br"if (\0>=0&&\0<=13) \(250+\0) = \1".to_vec();
+    }
+}
+
 fn bounded_message_fes_identity(host: &LoggingHost<'_>) -> Option<(u64, &'static str)> {
     use super::story_trace::story_trace_15 as labyrinth;
     let source = if host.data_services.particle_message_pe_sha256 == Some(KANMI_PE_SHA256) {
@@ -3161,6 +3189,29 @@ fn neko_message_notification_rejects_other_shapes() {
     assert!(!neko_message_notification(343, 0, b"MES_SETSTATE", false));
     assert!(neko_message_notification(343, 0, b"MES_SHOW", true));
     assert!(!neko_message_notification(343, 0, b"MES_DRAW", true));
+}
+
+#[test]
+fn daydream_mes_push_keeps_refreshing_with_an_invalid_bank() -> anyhow::Result<()> {
+    use cs2_script::{FesInterpreter, FesStep};
+
+    let mut program = FesProgram::from_text(
+        b"#MES_PUSH\n\\(250+\\0) = \\1\ncall SETBUTTON\n#SETBUTTON\n$0 = 1\n",
+    )?;
+    program.blocks[0].lines[0].offset = 0x2dcd;
+    guard_daydream_mes_push(&mut program);
+
+    for (bank, expected) in [(0, 7), (13, 7), (-1, 0), (999, 0)] {
+        let mut interpreter = FesInterpreter::new(program.clone())?;
+        let mut state = ExpressionState::new(1);
+        assert!(interpreter.enter_block(b"MES_PUSH"));
+        interpreter.local_values_mut()[..2].copy_from_slice(&[bank, 7]);
+        assert_eq!(interpreter.run(&mut state, 24)?, FesStep::Event);
+        assert!(matches!(interpreter.pending(), Some(FesEvent::Frame)));
+        assert_eq!(state.shared[0], 1);
+        assert_eq!(interpreter.local_values()[250..264].iter().sum::<i32>(), expected);
+    }
+    Ok(())
 }
 
 #[test]

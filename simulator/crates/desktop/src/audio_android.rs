@@ -606,7 +606,7 @@ fn check(operation: &str, result: i32) -> RuntimeResult<()> {
     }
 }
 
-fn report_audio(message: &str) {
+pub(super) fn report_audio(message: &str) {
     #[link(name = "log")]
     unsafe extern "C" {
         fn __android_log_write(priority: i32, tag: *const c_char, text: *const c_char) -> i32;

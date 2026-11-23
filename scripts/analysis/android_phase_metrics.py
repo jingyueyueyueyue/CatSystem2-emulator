@@ -139,6 +139,12 @@ def append_session_metrics(result, log, session, rows, whole_session):
             'batches': sum(row.get('batches', row['draws']) for row in emote_rows),
             'pixels': sum(row['pixels'] for row in emote_rows),
             'repaired': sum(row['repaired'] for row in emote_rows),
+            'span_hits': sum(row.get('span_hits', 0) for row in emote_rows),
+            'span_misses': sum(row.get('span_misses', 0) for row in emote_rows),
+            'span_cache_peak_batch_bytes': max(row.get('span_cache_peak_bytes', 0) for row in emote_rows),
+            'parallel_wall': summary([row['parallel_wall_us'] for row in emote_rows if row.get('parallel_wall_us', 0)]),
+            'parallel_join': summary([row['parallel_join_us'] for row in emote_rows if row.get('parallel_wall_us', 0)]),
+            'parallel_copy_bytes': sum(row.get('parallel_copy_bytes', 0) for row in emote_rows),
             'timings': {field: summary([row[field] for row in emote_rows]) for field in timings},
             'timing_note': 'collect includes evaluate and prepare; scanlines and pack are CPU work inside prepare',
         }

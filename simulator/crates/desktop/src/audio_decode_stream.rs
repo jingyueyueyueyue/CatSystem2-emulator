@@ -11,8 +11,6 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::thread;
 
-const MAX_PACKETS: usize = 65_536;
-
 struct IndexedPacket {
     encoded: Vec<u8>,
     end: usize,
@@ -32,15 +30,12 @@ impl IndexedVorbis {
         let mut stream = PacketReader::new(Cursor::new(encoded.as_ref()));
         let ((ident, _, setup), _) = read_headers(&mut stream).map_err(packet_error)?;
         let channels = usize::from(metadata.channels);
-        let frame_limit = MAX_PCM / size_of::<i16>() / channels;
+        let frame_limit = usize::MAX / size_of::<i16>() / channels;
         let mut packets: Vec<IndexedPacket> = Vec::new();
         let mut frames = 0usize;
         let mut packet_data_bytes = 0usize;
         let mut granule: Option<u64> = None;
         while let Some(packet) = stream.read_packet().map_err(packet_error)? {
-            if packets.len() == MAX_PACKETS {
-                return Ok(None);
-            }
             // The checked header supplies the sample count directly. Decode
             // packet bodies as the playback cursor reaches them. The first
             // packet emits nothing but must be valid to prime the overlap.
@@ -59,7 +54,10 @@ impl IndexedVorbis {
             };
             let mut emitted = decoded_frames;
             if let (Some(position), true) = (granule, packet.last_in_stream()) {
-                emitted = emitted.min(packet.absgp_page().saturating_sub(position) as usize);
+                emitted = emitted.min(
+                    usize::try_from(packet.absgp_page().saturating_sub(position))
+                        .unwrap_or(usize::MAX),
+                );
                 if emitted == 0
                     && let Some(previous) = packets.last()
                 {
@@ -80,7 +78,7 @@ impl IndexedVorbis {
             frames = frames
                 .checked_add(emitted)
                 .filter(|&frames| frames <= frame_limit)
-                .ok_or_else(|| error("decoded audio exceeds the 80 MiB PCM limit"))?;
+                .ok_or_else(|| packet_error("frame count overflow"))?;
             packet_data_bytes += packet.data.capacity();
             packets.push(IndexedPacket {
                 encoded: packet.data,
@@ -93,8 +91,7 @@ impl IndexedVorbis {
         }
         drop(stream);
         let retained_bytes = packet_data_bytes + packets.capacity() * size_of::<IndexedPacket>();
-        // The cache still charges the original decoded PCM size. Use this
-        // representation only when the index fits inside that charge.
+        // Prefer PCM when it is smaller than the packet index.
         if retained_bytes > frames * channels * size_of::<i16>() {
             return Ok(None);
         }
@@ -109,10 +106,22 @@ impl IndexedVorbis {
         self.packets.last().map_or(0, |packet| packet.end)
     }
 
+    pub(super) fn index_bytes(&self) -> usize {
+        self.packets.capacity() * size_of::<IndexedPacket>()
+            + self
+                .packets
+                .iter()
+                .map(|packet| packet.encoded.capacity())
+                .sum::<usize>()
+    }
+
     pub(super) fn checkpoint_samples(&self) -> RuntimeResult<Vec<i16>> {
         let frames = self.frames();
         let channels = usize::from(self.metadata.channels);
         let sample_count = frames * channels;
+        if sample_count > MAX_PCM / size_of::<i16>() {
+            return Err(error("checkpoint audio exceeds the 80 MiB PCM limit"));
+        }
         let mut samples = Vec::new();
         samples
             .try_reserve_exact(sample_count)
@@ -211,6 +220,9 @@ impl VorbisReader<'_> {
             let offset = self.recent_start;
             return Ok(&self.recent[(start - offset) * channels..(end - offset) * channels]);
         }
+        if start == end {
+            return Ok(&[]);
+        }
         let mut index = self
             .source
             .packets
@@ -220,6 +232,7 @@ impl VorbisReader<'_> {
         self.recent
             .try_reserve_exact((end - start) * channels)
             .map_err(|_| packet_error("could not allocate the streaming window"))?;
+        self.recent_start = start;
         while copied < end {
             self.decode(index)?;
             let packet_start = self.start_of(index);
@@ -231,7 +244,6 @@ impl VorbisReader<'_> {
             copied = copy_end;
             index += 1;
         }
-        self.recent_start = start;
         Ok(&self.recent)
     }
 
@@ -265,6 +277,7 @@ impl VorbisReader<'_> {
             }
         }
         let packet = &self.source.packets[index];
+        self.packet_index = None;
         let mut pcm = decode_packet(&self.ident, &self.setup, &packet.encoded, &mut self.window)?;
         let channels = usize::from(self.source.metadata.channels);
         if pcm.len() != packet.decoded_frames * channels {

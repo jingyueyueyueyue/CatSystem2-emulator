@@ -13,7 +13,7 @@ from pathlib import Path
 from run_playthrough_batch import file_sha256, identify_player
 
 
-def summarize(prefix: Path, frames: range) -> dict:
+def summarize(prefix: Path, frames: range, expected_poses: int | None = None) -> dict:
     samples = {}
     for line in prefix.with_suffix(".host.log").read_text(encoding="utf-8-sig").splitlines():
         kind = line.split(maxsplit=1)[0] if line else ""
@@ -39,6 +39,11 @@ def summarize(prefix: Path, frames: range) -> dict:
         result[name] = {"p50": p50, "p95": ordered[int(len(ordered) * .95) - 1], "max": ordered[-1]}
     if not result:
         raise RuntimeError("No performance samples")
+    if expected_poses is not None:
+        poses = samples.get("emote_gpu.poses", {})
+        for frame in frames:
+            if poses.get(frame) != expected_poses:
+                raise RuntimeError(f"Expected {expected_poses} E-mote poses at frame {frame}, got {poses.get(frame)}")
     result["screenshots"] = {
         path.name[len(prefix.name) + 1:]: file_sha256(path)
         for path in sorted(prefix.parent.glob(f"{prefix.name}.*.png"))
@@ -75,8 +80,13 @@ def run(args: argparse.Namespace) -> dict:
     route[1:3] = [str(prefix), str(args.frames)]
     route = [item for item in route if item not in set(args.drop_input)]
     route.extend(args.append_input)
+    workers = None if args.workers == "auto" else int(args.workers)
     env = dict(os.environ, CS2_REPLAY_PERF="1", CS2_REPLAY_PERF_DETAIL="1",
-               CS2_EMOTE_GPU=args.emote_gpu, CS2_EMOTE_PREP_WORKERS=str(args.workers))
+               CS2_EMOTE_GPU=args.emote_gpu)
+    if workers is None:
+        env.pop("CS2_EMOTE_PREP_WORKERS", None)
+    else:
+        env["CS2_EMOTE_PREP_WORKERS"] = str(workers)
     if args.row_pool is not None:
         env["CS2_RENDERER_ROW_POOL"] = args.row_pool
     with (prefix.with_suffix(".events.log").open("xb") as events,
@@ -88,12 +98,13 @@ def run(args: argparse.Namespace) -> dict:
     frames = range(args.metrics_first, args.frames)
     if not frames:
         raise ValueError("Metrics range is empty")
-    metrics = summarize(prefix, frames)
+    metrics = summarize(prefix, frames, args.expected_poses)
     receipt = {
         "schema": "cs2-emote-performance/v1", "player": identity, "game_root": str(game_root),
         "game_resources_copied": False, "profile": str(profile), "profile_seed_sha256": staged,
-        "argv": [str(player), *route], "emote_gpu": args.emote_gpu, "prepare_workers": args.workers,
+        "argv": [str(player), *route], "emote_gpu": args.emote_gpu, "prepare_workers": workers,
         "row_pool": args.row_pool, "frames": {"first": frames.start, "last": frames.stop - 1},
+        "expected_poses": args.expected_poses,
         "metrics": metrics,
     }
     for path, document in [(prefix.with_suffix(".metrics.json"), metrics),
@@ -115,7 +126,10 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=2590)
     parser.add_argument("--metrics-first", type=int, default=2510)
     parser.add_argument("--emote-gpu", choices=("0", "1"), default="1")
-    parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--workers", choices=("auto", "1", "2", "4"), default="4",
+                        help="Use auto to inherit the player's default worker policy")
+    parser.add_argument("--expected-poses", type=int, choices=(1, 2, 3, 4),
+                        help="Require this many GPU E-mote poses in every measured frame")
     parser.add_argument("--row-pool", choices=("0", "1"))
     parser.add_argument("--drop-input", action="append", default=[])
     parser.add_argument("--append-input", action="append", default=[])

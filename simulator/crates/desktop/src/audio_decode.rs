@@ -63,6 +63,10 @@ pub struct DecodedAudio {
 enum AudioSource {
     Pcm(Arc<[i16]>),
     Vorbis(vorbis_stream::IndexedVorbis),
+    Wav {
+        wave: crate::wav_decode::Wave,
+        encoded: Arc<[u8]>,
+    },
 }
 
 pub(crate) struct PreparedAudio {
@@ -74,7 +78,7 @@ impl std::fmt::Debug for PreparedAudio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedAudio")
             .field("probe", &self.probe)
-            .field("streaming", &matches!(self.source, AudioSource::Vorbis(_)))
+            .field("streaming", &!matches!(self.source, AudioSource::Pcm(_)))
             .finish()
     }
 }
@@ -109,6 +113,14 @@ impl PreparedAudio {
         match &self.source {
             AudioSource::Pcm(samples) => Ok(samples.to_vec()),
             AudioSource::Vorbis(vorbis) => vorbis.checkpoint_samples(),
+            AudioSource::Wav { wave, encoded } => {
+                if self.sample_count() > MAX_PCM / size_of::<i16>() {
+                    return Err(error("checkpoint audio exceeds the 80 MiB PCM limit"));
+                }
+                let mut samples = Vec::new();
+                wave.read(encoded, 0, self.probe.frames as usize, &mut samples)?;
+                Ok(samples)
+            }
         }
     }
 
@@ -128,7 +140,7 @@ impl PreparedAudio {
         match (&self.source, &other.source) {
             (AudioSource::Pcm(samples), _) => other.matches_samples(samples),
             (_, AudioSource::Pcm(samples)) => self.matches_samples(samples),
-            (AudioSource::Vorbis(_), AudioSource::Vorbis(_)) => {
+            _ => {
                 let mut left = self.reader()?;
                 let mut right = other.reader()?;
                 for start in (0..self.probe.frames as usize).step_by(PCM_READ_FRAMES) {
@@ -164,10 +176,23 @@ impl PreparedAudio {
         self.probe.frames as usize * usize::from(self.probe.channels)
     }
 
+    fn resident_bytes(&self) -> usize {
+        match &self.source {
+            AudioSource::Pcm(samples) => std::mem::size_of_val(samples.as_ref()),
+            AudioSource::Vorbis(vorbis) => vorbis.index_bytes(),
+            AudioSource::Wav { wave, .. } => wave.extra_bytes(),
+        }
+    }
+
     pub(super) fn reader(&self) -> RuntimeResult<AudioReader<'_>> {
         let source = match &self.source {
             AudioSource::Pcm(samples) => PcmReader::Slice(samples),
             AudioSource::Vorbis(vorbis) => PcmReader::Stream(vorbis.reader()?),
+            AudioSource::Wav { wave, encoded } => PcmReader::Wav {
+                wave,
+                encoded,
+                samples: Vec::new(),
+            },
         };
         Ok(AudioReader {
             source,
@@ -179,6 +204,11 @@ impl PreparedAudio {
 enum PcmReader<'a> {
     Slice(&'a [i16]),
     Stream(vorbis_stream::VorbisReader<'a>),
+    Wav {
+        wave: &'a crate::wav_decode::Wave,
+        encoded: &'a [u8],
+        samples: Vec<i16>,
+    },
 }
 
 pub(super) struct AudioReader<'a> {
@@ -189,8 +219,24 @@ pub(super) struct AudioReader<'a> {
 impl AudioReader<'_> {
     pub(super) fn read(&mut self, start: usize, end: usize) -> RuntimeResult<&[i16]> {
         match &mut self.source {
-            PcmReader::Slice(samples) => Ok(&samples[start * self.channels..end * self.channels]),
+            PcmReader::Slice(samples) => {
+                if start > end || end > samples.len() / self.channels {
+                    return Err(error("requested frames beyond the PCM source"));
+                }
+                Ok(&samples[start * self.channels..end * self.channels])
+            }
             PcmReader::Stream(reader) => reader.read(start, end),
+            PcmReader::Wav {
+                wave,
+                encoded,
+                samples,
+            } => {
+                if end.saturating_sub(start) > PCM_READ_FRAMES {
+                    return Err(error("requested PCM exceeds the WAV streaming window"));
+                }
+                wave.read(encoded, start, end, samples)?;
+                Ok(samples)
+            }
         }
     }
 }
@@ -199,7 +245,7 @@ struct Entry {
     hash: u64,
     encoded: Arc<[u8]>,
     audio: Arc<PreparedAudio>,
-    // The original encoded-plus-PCM charge bounds either resident source.
+    // Encoded data is shared by the cache key and any indexed source.
     bytes: usize,
 }
 
@@ -310,17 +356,7 @@ fn prepare_audio_with_minimum(
     #[cfg(test)]
     notify_preparation_test(PreparationEvent::PreparationStart);
     let encoded: Arc<[u8]> = encoded.into();
-    let indexed = if encoded.len() >= min_stream_bytes && encoded.starts_with(b"OggS") {
-        let index_limit = (MAX_CACHE - encoded.len()).min(MAX_PCM);
-        vorbis_stream::IndexedVorbis::new(encoded.clone(), index_limit)?
-    } else {
-        None
-    };
-    let audio = if let Some(source) = indexed {
-        PreparedAudio::from_indexed_vorbis(source)
-    } else {
-        decode_pcm(&encoded)?
-    };
+    let audio = prepare_source(&encoded, min_stream_bytes)?;
     let AudioProbe {
         sample_rate,
         channels,
@@ -332,7 +368,7 @@ fn prepare_audio_with_minimum(
             "decoded sound has an unsupported rate, channel count or sample alignment",
         ));
     }
-    let bytes = encoded.len() + audio.sample_count() * size_of::<i16>();
+    let bytes = encoded.len() + audio.resident_bytes();
     if bytes > MAX_CACHE {
         return Err(error("sound cache entry exceeds 128 MiB"));
     }
@@ -342,9 +378,7 @@ fn prepare_audio_with_minimum(
             .entries
             .iter()
             .position(Entry::evictable)
-            .ok_or_else(|| {
-                error("128 MiB decoded sound cache is pinned by loaded/playing channels")
-            })?;
+            .ok_or_else(|| error("128 MiB sound cache is pinned by loaded/playing channels"))?;
         let evicted = cache
             .entries
             .remove(index)
@@ -368,22 +402,61 @@ impl Entry {
     }
 }
 
-fn decode_pcm(encoded: &[u8]) -> RuntimeResult<PreparedAudio> {
-    let (codec, sample_rate, channels, samples) = if encoded.starts_with(b"OggS") {
-        let (metadata, samples) = vorbis::decode(encoded)?;
-        (
+fn prepare_source(encoded: &Arc<[u8]>, min_stream_bytes: usize) -> RuntimeResult<PreparedAudio> {
+    if encoded.starts_with(b"OggS") {
+        let index =
+            || vorbis_stream::IndexedVorbis::new(encoded.clone(), MAX_CACHE - encoded.len());
+        let prefer_stream = encoded.len() >= min_stream_bytes;
+        if prefer_stream && let Some(source) = index()? {
+            return Ok(PreparedAudio::from_indexed_vorbis(source));
+        }
+        let (metadata, samples) = match vorbis::decode(encoded) {
+            Ok(decoded) => decoded,
+            Err(vorbis::DecodeError::Invalid(cause)) => return Err(cause),
+            Err(vorbis::DecodeError::PcmLimit) => {
+                if !prefer_stream && let Some(source) = index()? {
+                    return Ok(PreparedAudio::from_indexed_vorbis(source));
+                }
+                return Err(error(
+                    "long Vorbis source exceeds the streaming index budget",
+                ));
+            }
+        };
+        return prepare_pcm(
             AudioCodec::OggVorbis,
             metadata.sample_rate,
             metadata.channels,
             samples,
-        )
-    } else if encoded.starts_with(b"RIFF") && encoded.get(8..12) == Some(b"WAVE") {
-        crate::wav_decode::decode(encoded)?
-    } else {
-        return Err(error(
-            "sound is neither Ogg/Vorbis nor a supported RIFF/WAVE codec",
-        ));
-    };
+        );
+    }
+    if encoded.starts_with(b"RIFF") && encoded.get(8..12) == Some(b"WAVE") {
+        let wave = crate::wav_decode::Wave::parse(encoded)?;
+        let probe = wave.probe;
+        let size = probe.frames * u64::from(probe.channels) * size_of::<i16>() as u64;
+        if size > (64 * 1024 * 1024).min(MAX_CACHE - encoded.len()) as u64 {
+            return Ok(PreparedAudio {
+                probe,
+                source: AudioSource::Wav {
+                    wave,
+                    encoded: encoded.clone(),
+                },
+            });
+        }
+        let mut samples = Vec::new();
+        wave.read(encoded, 0, probe.frames as usize, &mut samples)?;
+        return prepare_pcm(probe.codec, probe.sample_rate, probe.channels, samples);
+    }
+    Err(error(
+        "sound is neither Ogg/Vorbis nor a supported RIFF/WAVE codec",
+    ))
+}
+
+fn prepare_pcm(
+    codec: AudioCodec,
+    sample_rate: u32,
+    channels: u8,
+    samples: Vec<i16>,
+) -> RuntimeResult<PreparedAudio> {
     if !matches!(channels, 1 | 2)
         || !(1..=MAX_SAMPLE_RATE).contains(&sample_rate)
         || samples.is_empty()
@@ -665,6 +738,109 @@ mod tests {
             .expect("cache hit while cold preparation was blocked")
             .expect("cached audio");
         assert!(Arc::ptr_eq(&cached, &hit));
+    }
+
+    #[test]
+    fn streams_adpcm_beyond_the_eager_pcm_budget() -> anyhow::Result<()> {
+        let _state = TestState::new();
+        let blocks = 17_000;
+        let data_bytes = blocks * 1024;
+        let mut encoded = Vec::with_capacity(data_bytes + 54);
+        encoded.extend_from_slice(b"RIFF");
+        encoded.extend_from_slice(&((data_bytes + 46) as u32).to_le_bytes());
+        encoded.extend_from_slice(b"WAVEfmt \x1a\0\0\0");
+        for value in [2_u16, 1, 44_100, 0, 22_180, 0, 1024, 4, 8, 2036, 1, 256, 0] {
+            encoded.extend_from_slice(&value.to_le_bytes());
+        }
+        encoded.extend_from_slice(b"data");
+        encoded.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+        let mut block = [0; 1024];
+        block[1..3].copy_from_slice(&16_u16.to_le_bytes());
+        block[3..5].copy_from_slice(&1200_i16.to_le_bytes());
+        block[5..7].copy_from_slice(&(-500_i16).to_le_bytes());
+        for _ in 0..blocks {
+            encoded.extend_from_slice(&block);
+        }
+
+        let audio = prepare_audio(encoded)?;
+        assert!(matches!(audio.source, AudioSource::Wav { .. }));
+        assert_eq!(audio.probe.frames, (blocks * 2036) as u64);
+        assert!(audio.sample_count() * size_of::<i16>() > 64 * 1024 * 1024);
+        let mut reader = audio.reader()?;
+        let last_block = (blocks - 1) * 2036;
+        assert_eq!(
+            reader.read(last_block - 1, last_block + 3)?,
+            [1200, -500, 1200, 1200]
+        );
+        assert_eq!(reader.read(0, 3)?, [-500, 1200, 1200]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the original game archives"]
+    fn streams_original_bgm1_12_beyond_the_old_pcm_limit() -> anyhow::Result<()> {
+        let _state = TestState::new();
+        let root = std::env::var_os("CS2_SAMPLE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../games"));
+        let catalog = if root.join("games").is_dir() {
+            root.join("games")
+        } else {
+            root
+        };
+        let game = catalog.join("\u{767d}\u{663c}\u{5922}\u{306e}\u{9752}\u{5199}\u{771f}");
+        let scan = GameRoot::open(game)?.scan()?;
+        let resource = "bgm.int/bgm1_12.ogg";
+        let audio = prepare_named_audio(scan.resources.read(resource)?, resource)?;
+        let AudioSource::Vorbis(source) = &audio.source else {
+            anyhow::bail!("long Vorbis source must stream");
+        };
+        let channels = usize::from(audio.probe.channels);
+        let old_frame_limit = MAX_PCM / size_of::<i16>() / channels;
+        let end = audio.probe.frames as usize;
+        assert!(end > old_frame_limit + PCM_READ_FRAMES);
+        println!(
+            "{resource} {:?}, {} PCM bytes, {} cache bytes",
+            audio.probe,
+            audio.sample_count() * size_of::<i16>(),
+            source.encoded.len() + audio.resident_bytes()
+        );
+
+        let mut reader = audio.reader()?;
+        let starts = [0, old_frame_limit, end - PCM_READ_FRAMES];
+        let windows = starts.map(|start| {
+            reader
+                .read(start, start + PCM_READ_FRAMES)
+                .map(<[i16]>::to_vec)
+        });
+        let windows = windows.into_iter().collect::<RuntimeResult<Vec<_>>>()?;
+        let mut reference = lewton::inside_ogg::OggStreamReader::new(std::io::Cursor::new(
+            source.encoded.as_ref(),
+        ))?;
+        let mut position = 0;
+        let mut audible_after_limit = false;
+        while let Some(packet) = reference.read_dec_packet_itl()? {
+            let next = position + packet.len() / channels;
+            for (start, window) in starts.into_iter().zip(&windows) {
+                let from = start.max(position);
+                let to = (start + PCM_READ_FRAMES).min(next);
+                if from < to {
+                    assert_eq!(
+                        &window[(from - start) * channels..(to - start) * channels],
+                        &packet[(from - position) * channels..(to - position) * channels],
+                        "mismatched samples at frame {from}"
+                    );
+                }
+            }
+            if position >= old_frame_limit && packet.iter().any(|&sample| sample != 0) {
+                audible_after_limit = true;
+            }
+            position = next;
+        }
+        assert_eq!(position, end);
+        assert!(audible_after_limit);
+        assert_eq!(reader.read(0, PCM_READ_FRAMES)?, windows[0]);
+        Ok(())
     }
 
     #[test]

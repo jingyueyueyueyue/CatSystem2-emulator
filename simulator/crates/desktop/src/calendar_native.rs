@@ -25,8 +25,14 @@ impl LoggingHost<'_> {
     }
 }
 
+pub(super) fn script_random_seed() -> Result<u32> {
+    // The original engine sums the local SYSTEMTIME fields except weekday.
+    let [year, month, _, day, hour, minute, second, millis] = local_calendar()?;
+    Ok(year + month + day + hour + minute + second + millis)
+}
+
 #[cfg(windows)]
-fn local_calendar() -> Result<[u32; 7]> {
+fn local_calendar() -> Result<[u32; 8]> {
     #[repr(C)]
     #[derive(Default)]
     struct SystemTime {
@@ -42,12 +48,12 @@ fn local_calendar() -> Result<[u32; 7]> {
     Ok([
         u32::from(sample.year), u32::from(sample.month), u32::from(sample.weekday),
         u32::from(sample.day), u32::from(sample.hour), u32::from(sample.minute),
-        u32::from(sample.second),
+        u32::from(sample.second), u32::from(sample.milliseconds),
     ])
 }
 
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
-fn local_calendar() -> Result<[u32; 7]> {
+fn local_calendar() -> Result<[u32; 8]> {
     use std::ffi::{c_char, c_long};
     use std::time::{SystemTime, UNIX_EPOCH};
     // The installed NDK's 64-bit Bionic tm layout. The timezone extension is preserved
@@ -61,14 +67,21 @@ fn local_calendar() -> Result<[u32; 7]> {
     unsafe extern "C" {
         fn localtime_r(seconds: *const i64, output: *mut Calendar) -> *mut Calendar;
     }
-    let seconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_secs())
-            .map_err(|_| native_state_error("local calendar time exceeds time_t"))?,
+    let (seconds, millis) = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs())
+                .map_err(|_| native_state_error("local calendar time exceeds time_t"))?,
+            duration.subsec_millis(),
+        ),
         Err(error) => {
             let duration = error.duration();
             let whole = i64::try_from(duration.as_secs())
                 .map_err(|_| native_state_error("local calendar time precedes time_t"))?;
-            -whole - i64::from(duration.subsec_nanos() != 0)
+            let nanos = duration.subsec_nanos();
+            (
+                -whole - i64::from(nanos != 0),
+                ((1_000_000_000 - nanos) / 1_000_000) % 1000,
+            )
         }
     };
     let mut sample = std::mem::MaybeUninit::<Calendar>::uninit();
@@ -79,11 +92,11 @@ fn local_calendar() -> Result<[u32; 7]> {
     Ok([
         sample.year.wrapping_add(1900) as u32, sample.month.wrapping_add(1) as u32,
         sample.weekday as u32, sample.day as u32, sample.hour as u32,
-        sample.minute as u32, sample.second as u32,
+        sample.minute as u32, sample.second as u32, millis,
     ])
 }
 
 #[cfg(not(any(windows, all(target_os = "android", target_pointer_width = "64"))))]
-fn local_calendar() -> Result<[u32; 7]> {
+fn local_calendar() -> Result<[u32; 8]> {
     Err(native_state_error("local calendar requires a platform calendar adapter"))
 }

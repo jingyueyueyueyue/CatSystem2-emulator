@@ -276,8 +276,9 @@ pub unsafe extern "C" fn cs2_android_open_profiled_v4(
 #[unsafe(no_mangle)]
 pub extern "C" fn cs2_android_close(id: u64) -> i32 {
     call(-1, |sessions| {
-        sessions.players.get_mut(&id).ok_or("Android session is absent")?.cancel_host_tweet_requests();
-        sessions.players.remove(&id).ok_or("Android session is absent")?;
+        let mut player = sessions.players.remove(&id).ok_or("Android session is absent")?;
+        player.cancel_host_tweet_requests();
+        let saved = player.persist_host_configuration();
         sessions.displayed_frames.remove(&id);
         sessions.story_traces.remove(&id);
         sessions.message_revisions.remove(&id);
@@ -291,7 +292,7 @@ pub extern "C" fn cs2_android_close(id: u64) -> i32 {
                 }
             }
         }
-        Ok(0)
+        saved.map(|()| 0).map_err(|error| format!("Save game settings: {error:#}"))
     })
 }
 

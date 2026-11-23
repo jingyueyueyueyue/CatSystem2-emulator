@@ -256,7 +256,7 @@ impl LoggingHost<'_> {
         let shared = first_handle == second_handle
             || self.data_services.image_wrapper_pixels.get(&first_handle)
                 .is_some_and(|pixel| self.data_services.image_wrapper_pixels.get(&second_handle) == Some(pixel));
-        let mut second_pixels = second.pixels().to_vec();
+        let mut second_pixels = if shared { Vec::new() } else { second.pixels().to_vec() };
         for row in 0..task.size[1] {
             for column in 0..task.size[0] {
                 let a = native_image_offset(&first, task.words[2] + column, task.words[3] + row, first_top_down);
@@ -332,29 +332,42 @@ impl LoggingHost<'_> {
             return Ok(());
         }
         task.rendered_sample = None;
+        let row_bytes = region[2] as usize * 4;
         for row in 0..region[3] {
-            for column in 0..region[2] {
-                let x = region[0] + column;
-                let y = region[1] + row;
-                let a = native_image_offset(first, task.words[2] + x, task.words[3] + y, first_top_down);
-                let target = (y as usize * task.size[0] as usize + x as usize) * 4;
-                let weight = match mask {
-                    Some(mask) if !ended => {
-                        let blue = mask.pixels()[native_image_offset(mask, column, row, false) + 2];
-                        (progress as i64 - i64::from(blue)).clamp(0, 256) as u32
-                    }
-                    _ => progress.min(256),
-                };
-                if let Some(second) = second {
-                    let b = native_image_offset(second, task.words[5] + x, task.words[6] + y, second_top_down);
-                    for channel in 0..4 {
-                        task.pixels[target + channel] = if ended { second.pixels()[b + channel] }
-                            else { ((u32::from(first.pixels()[a + channel]) * (256 - weight)
-                                + u32::from(second.pixels()[b + channel]) * weight) >> 8) as u8 };
+            let [x, y] = [region[0], region[1] + row];
+            let target = (y as usize * task.size[0] as usize + x as usize) * 4;
+            let output = &mut task.pixels[target..target + row_bytes];
+            let a = native_image_offset(first, task.words[2] + x, task.words[3] + y, first_top_down);
+            let first = &first.pixels()[a..a + row_bytes];
+            let mask_row = mask.filter(|_| !ended).map(|mask| {
+                let start = native_image_offset(mask, 0, row, false);
+                &mask.pixels()[start..start + row_bytes]
+            });
+            if let Some(second) = second {
+                let b = native_image_offset(second, task.words[5] + x, task.words[6] + y, second_top_down);
+                let second = &second.pixels()[b..b + row_bytes];
+                if ended {
+                    output.copy_from_slice(second);
+                } else if let Some(mask) = mask_row {
+                    for (((output, first), second), mask) in output.chunks_exact_mut(4)
+                        .zip(first.chunks_exact(4)).zip(second.chunks_exact(4)).zip(mask.chunks_exact(4))
+                    {
+                        let weight = mask_weight(progress, mask[2]);
+                        for i in 0..4 {
+                            output[i] = blend_channel(first[i], second[i], weight);
+                        }
                     }
                 } else {
-                    let alpha = ((u32::from(first.pixels()[a + 3]) * weight) >> 8) as u8;
-                    task.pixels[target + 3] = if task.words[9] != 0 { alpha } else { !alpha };
+                    let weight = progress.min(256);
+                    for ((output, &first), &second) in output.iter_mut().zip(first).zip(second) {
+                        *output = blend_channel(first, second, weight);
+                    }
+                }
+            } else {
+                for (column, (output, first)) in output.chunks_exact_mut(4).zip(first.chunks_exact(4)).enumerate() {
+                    let weight = mask_row.map_or(progress.min(256), |mask| mask_weight(progress, mask[column * 4 + 2]));
+                    let alpha = ((u32::from(first[3]) * weight) >> 8) as u8;
+                    output[3] = if task.words[9] != 0 { alpha } else { !alpha };
                 }
             }
         }
@@ -410,6 +423,14 @@ pub(super) fn render(store: &TransitionStore, canvas: &mut Canvas) -> Result<()>
 pub(super) fn release(store: &mut TransitionStore, id: u32) {
     store.tasks.remove(&id);
     store.queued.remove(&id);
+}
+
+fn mask_weight(progress: u32, blue: u8) -> u32 {
+    progress.saturating_sub(u32::from(blue)).min(256)
+}
+
+fn blend_channel(first: u8, second: u8, weight: u32) -> u8 {
+    ((u32::from(first) * (256 - weight) + u32::from(second) * weight) >> 8) as u8
 }
 
 fn record_size(kind: u32) -> usize { match kind { 26 => 56, 27 => 44, 28 => 48, _ => 0 } }

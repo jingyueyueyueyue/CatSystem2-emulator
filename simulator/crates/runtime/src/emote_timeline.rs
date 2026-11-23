@@ -9,8 +9,7 @@
 use super::{EmoteError, PsbValue, Result};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 ///One parser-created reference holder per physical layer/instance path.
 ///36321 creates its player once;41b83 releases the selected motion on hide.
@@ -21,7 +20,7 @@ pub(super) struct CpuReferenceTimelines {
     owners: BTreeMap<Vec<usize>, ReferenceClock>,
     seen: BTreeSet<Vec<usize>>,
     updated_tick: Option<f32>,
-    updated_variables: BTreeMap<String, f64>,
+    updated_variables: Arc<BTreeMap<String, f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,23 +59,22 @@ impl CpuReferenceTimelines {
     }
 
     pub fn begin(&mut self, object: &str, motion: &str) {
-        let identity = (object.to_owned(), motion.to_owned());
-        if self.root.as_ref() != Some(&identity) {
+        if self.root.as_ref().is_none_or(|(owner, name)| owner != object || name != motion) {
             self.owners.clear();
-            self.root = Some(identity);
+            self.root = Some((object.to_owned(), motion.to_owned()));
             self.updated_tick = None;
-            self.updated_variables.clear();
+            self.updated_variables = Arc::default();
         }
         self.seen.clear();
     }
 
-    pub fn mark_tick(&mut self, tick: f32, variables: &BTreeMap<String, f64>) {
+    pub fn mark_tick(&mut self, tick: f32, variables: BTreeMap<String, f64>) {
         self.updated_tick = Some(tick);
-        self.updated_variables = variables.clone();
+        self.updated_variables = Arc::new(variables);
     }
 
     pub fn has_tick(&self, tick: f32, variables: &BTreeMap<String, f64>) -> bool {
-        self.updated_tick == Some(tick) && self.updated_variables == *variables
+        self.updated_tick == Some(tick) && self.updated_variables.as_ref() == variables
     }
 
     ///Actual mask0/nonloop family in all135 fixed PSZs. Target parameters
@@ -190,7 +188,11 @@ fn invalid(reason: &'static str) -> EmoteError {
 }
 
 fn number(value: &PsbValue, key: &str, default: f32) -> Result<f32> {
-    match value.get(key) {
+    field_number(value.get(key), default)
+}
+
+fn field_number(value: Option<&PsbValue>, default: f32) -> Result<f32> {
+    match value {
         None | Some(PsbValue::Null) => Ok(default),
         Some(value) => {
             let n = value
@@ -291,7 +293,11 @@ fn nonlinear(value: Option<&PsbValue>) -> bool {
 ///Keep the recovered resource domain explicit rather than clamping an
 ///unrecovered out-of-range field into apparently valid pixels.
 pub(super) fn frame_opacity(content: &PsbValue) -> Result<u8> {
-    let value = number(content, "opa", 255.0)?;
+    opacity(content.get("opa"))
+}
+
+pub(super) fn opacity(value: Option<&PsbValue>) -> Result<u8> {
+    let value = field_number(value, 255.0)?;
     if value.fract() != 0.0 || !(0.0..=255.0).contains(&value) {
         return Err(invalid("frame opacity outside recovered byte domain"));
     }
@@ -369,7 +375,7 @@ pub(super) struct LayerTimelines {
 #[derive(Debug)]
 struct IndexedLayer {
     headers: Result<Vec<KeyHeader>>,
-    cursor: AtomicUsize,
+    transform_order: Result<[u8; 4]>,
 }
 
 impl LayerTimelines {
@@ -388,6 +394,19 @@ impl LayerTimelines {
         timelines
     }
 
+    pub(super) fn estimated_storage_bytes(&self) -> usize {
+        let layer_entries = self.layers.capacity() * (std::mem::size_of::<(usize, IndexedLayer)>() + 1);
+        let stencil_entries = self.stencils.capacity()
+            * (std::mem::size_of::<(usize, OnceLock<Result<Vec<super::CpuStencilBinding>>>)>() + 1);
+        let headers = self.layers.values().filter_map(|index| index.headers.as_ref().ok())
+            .map(|headers| headers.capacity() * std::mem::size_of::<KeyHeader>())
+            .sum::<usize>();
+        let bindings = self.stencils.values().filter_map(OnceLock::get).filter_map(|value| value.as_ref().ok())
+            .map(|bindings| bindings.capacity() * std::mem::size_of::<super::CpuStencilBinding>())
+            .sum::<usize>();
+        std::mem::size_of::<Self>() + layer_entries + stencil_entries + headers + bindings
+    }
+
     pub(super) fn stencil_bindings(
         &self, motion: &PsbValue,
     ) -> Result<Cow<'_, [super::CpuStencilBinding]>> {
@@ -403,7 +422,7 @@ impl LayerTimelines {
         for layer in layers {
             self.layers.insert(layer as *const PsbValue as usize, IndexedLayer {
                 headers: key_headers(layer),
-                cursor: AtomicUsize::new(0),
+                transform_order: transform_order(layer),
             });
             self.prepare_layers(layer.get("children"));
         }
@@ -423,9 +442,16 @@ impl LayerTimelines {
         let frames = layer_frames(layer)?;
         // The sentinel can end interpolation but cannot become the current frame.
         let current_count = headers.len() - usize::from(headers.len() >= 2);
-        let boundary = index.boundary(&headers[..current_count], time);
+        let boundary = headers[..current_count].partition_point(|header| header.time <= time);
         let key = |i: usize| LayerKey { header: headers[i], frame: &frames[i] };
         Ok((boundary.checked_sub(1).map(key), (boundary < frames.len()).then(|| key(boundary))))
+    }
+
+    pub(super) fn transform_order(&self, layer: &PsbValue) -> Result<[u8; 4]> {
+        match self.layers.get(&(layer as *const PsbValue as usize)) {
+            Some(index) => index.transform_order.clone(),
+            None => transform_order(layer),
+        }
     }
 }
 
@@ -439,27 +465,6 @@ fn key_headers(layer: &PsbValue) -> Result<Vec<KeyHeader>> {
         last = header.time;
     }
     Ok(headers)
-}
-
-impl IndexedLayer {
-    fn boundary(&self, headers: &[KeyHeader], time: f32) -> usize {
-        let cursor = self.cursor.load(Ordering::Relaxed);
-        let contains = |at: usize| {
-            (at == 0 || headers[at - 1].time <= time)
-                && (at == headers.len() || time < headers[at].time)
-        };
-        if contains(cursor) {
-            return cursor;
-        }
-        let next = cursor + 1;
-        let boundary = if next <= headers.len() && contains(next) {
-            next
-        } else {
-            headers.partition_point(|header| header.time <= time)
-        };
-        self.cursor.store(boundary, Ordering::Relaxed);
-        boundary
-    }
 }
 
 #[cfg(test)]
@@ -500,7 +505,7 @@ mod layer_index_tests {
                 let (previous, next) = prepared.keyframes(layer, time)?;
                 let indexed = sample_emote_keys(previous, next, time)?;
                 let linear = sample_emote_layer(layer, f64::from(time))?;
-                assert_eq!(indexed.content.as_deref(), linear.content.as_ref(), "time {time}");
+                assert_eq!(indexed.content.map(FrameContent::into_value), linear.content, "time {time}");
                 assert_eq!(indexed.frame_begin, linear.frame_begin, "time {time}");
                 assert_eq!(indexed.interpolated, linear.interpolated, "time {time}");
                 assert_eq!(indexed.warnings, linear.warnings, "time {time}");
@@ -553,16 +558,57 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
     let (previous, next) = layer_keyframes(layer, time)?;
     let sample = sample_emote_keys(previous, next, time)?;
     Ok(CpuTimelineSample {
-        content: sample.content.map(Cow::into_owned),
+        content: sample.content.map(FrameContent::into_value),
         frame_begin: sample.frame_begin,
         interpolated: sample.interpolated,
         warnings: sample.warnings,
     })
 }
 
+/// A sampled key keeps its original fields and owns only the interpolated values.
+pub(super) struct FrameContent<'a> {
+    base: Cow<'a, PsbValue>,
+    overrides: Vec<(&'static str, PsbValue)>,
+}
+
+impl<'a> FrameContent<'a> {
+    pub(super) fn borrowed(base: &'a PsbValue) -> Self {
+        Self { base: Cow::Borrowed(base), overrides: Vec::new() }
+    }
+
+    pub(super) fn get(&self, key: &str) -> Option<&PsbValue> {
+        self.overrides.iter().find(|(name, _)| *name == key)
+            .map(|(_, value)| value)
+            .or_else(|| self.base.get(key))
+    }
+
+    pub(super) fn text(&self, key: &str) -> Option<&str> {
+        self.base.get(key).and_then(PsbValue::text)
+    }
+
+    pub(super) fn to_mut(&mut self) -> &mut PsbValue {
+        let base = self.base.to_mut();
+        if let PsbValue::Object(fields) = base {
+            fields.extend(self.overrides.drain(..).map(|(name, value)| (name.to_owned(), value)));
+        }
+        base
+    }
+
+    fn into_value(mut self) -> PsbValue {
+        if !self.overrides.is_empty() {
+            self.to_mut();
+        }
+        self.base.into_owned()
+    }
+
+    fn insert(&mut self, key: &'static str, value: PsbValue) {
+        self.overrides.push((key, value));
+    }
+}
+
 pub(super) fn sample_emote_keys<'a>(
     previous: Option<LayerKey<'a>>, next: Option<LayerKey<'a>>, time: f32,
-) -> Result<CpuTimelineSample<Cow<'a, PsbValue>>> {
+) -> Result<CpuTimelineSample<FrameContent<'a>>> {
     let mut sample = CpuTimelineSample {
         content: None,
         frame_begin: None,
@@ -576,17 +622,17 @@ pub(super) fn sample_emote_keys<'a>(
     let Some((start, begin)) = visible_frame_content(a)? else {
         return Ok(sample);
     };
-    let fields = start.object().unwrap();
+    let mut content = FrameContent::borrowed(start);
     if a.header.kind != 3 {
-        sample.content = Some(Cow::Borrowed(start));
+        sample.content = Some(content);
         return Ok(sample);
     }
     let Some(b) = next else {
-        sample.content = Some(Cow::Borrowed(start));
+        sample.content = Some(content);
         return Ok(sample);
     };
     if b.header.kind == 0 {
-        sample.content = Some(Cow::Borrowed(start));
+        sample.content = Some(content);
         return Ok(sample);
     }
     let end = b.frame
@@ -607,10 +653,9 @@ pub(super) fn sample_emote_keys<'a>(
     let ratio = (elapsed / (finish - begin)).clamp(0.0, 1.0);
     // At a keyframe, no interpolation/easing is needed and exact raw values win.
     if ratio == 0.0 {
-        sample.content = Some(Cow::Borrowed(start));
+        sample.content = Some(content);
         return Ok(sample);
     }
-    let mut map = fields.clone();
     for key in ["ccc", "acc", "zcc", "scc", "occ", "cp"] {
         if nonlinear(start.get(key)) {
             sample
@@ -628,10 +673,7 @@ pub(super) fn sample_emote_keys<'a>(
         if start.get(key).is_some() || end.get(key).is_some() {
             let a = number(start, key, default)?;
             let b = number(end, key, default)?;
-            map.insert(
-                key.into(),
-                PsbValue::Number(f64::from(linear(a, b, ratio)?)),
-            );
+            content.insert(key, PsbValue::Number(f64::from(linear(a, b, ratio)?)));
         }
     }
     if start.get("opa").is_some() || end.get("opa").is_some() {
@@ -643,11 +685,11 @@ pub(super) fn sample_emote_keys<'a>(
             f32::from(frame_opacity(end)?),
             ratio,
         )?;
-        map.insert("opa".into(), PsbValue::Integer((opacity + 0.5).floor() as i64));
+        content.insert("opa", PsbValue::Integer((opacity + 0.5).floor() as i64));
     }
     if start.get("angle").is_some() || end.get("angle").is_some() {
-        map.insert(
-            "angle".into(),
+        content.insert(
+            "angle",
             PsbValue::Number(f64::from(interpolate_emote_angle(
                 number(start, "angle", 0.0)?,
                 number(end, "angle", 0.0)?,
@@ -671,7 +713,7 @@ pub(super) fn sample_emote_keys<'a>(
                 .map(|n| PsbValue::Number(f64::from(n)))
             })
             .collect::<Result<Vec<_>>>()?;
-        map.insert("coord".into(), PsbValue::List(values));
+        content.insert("coord", PsbValue::List(values));
     }
     //3db7d/3dba4 substitute global97df8 when exactly one BP endpoint is
     //empty. Initializer296d0 supplies16 row-major(x/3,y/3) pairs. An empty
@@ -707,7 +749,7 @@ pub(super) fn sample_emote_keys<'a>(
                     .map(|(a, b)| linear(a, b, ratio).map(|n| PsbValue::Number(f64::from(n))))
                     .collect::<Result<Vec<_>>>()?;
                 mesh.insert("bp".into(), PsbValue::List(values));
-                map.insert("mesh".into(), PsbValue::Object(mesh));
+                content.insert("mesh", PsbValue::Object(mesh));
             } else {
                 sample
                     .warnings
@@ -727,8 +769,8 @@ pub(super) fn sample_emote_keys<'a>(
             {
                 return Err(invalid("packed color DWORD"));
             }
-            map.insert(
-                "color".into(),
+            content.insert(
+                "color",
                 PsbValue::Integer(i64::from(interpolate_emote_color(
                     a as u32, b as u32, ratio,
                 )?)),
@@ -739,7 +781,7 @@ pub(super) fn sample_emote_keys<'a>(
                 .push("timeline corner color endpoint layout is not recovered".into());
         }
     }
-    sample.content = Some(Cow::Owned(PsbValue::Object(map)));
+    sample.content = Some(content);
     sample.interpolated = true;
     Ok(sample)
 }
@@ -838,6 +880,10 @@ pub(super) fn apply_transition_outputs(
 /// order:0 mirror,1 rotate,2 zoom,3 shear. Translation comes from coord.
 /// Column-vector output is[a,b,c,d,tx,ty], i.e. x'=a*x+c*y+tx.
 pub fn emote_layer_affine(layer: &PsbValue, content: &PsbValue) -> Result<[f64; 6]> {
+    layer_affine(transform_order(layer)?, |key| content.get(key))
+}
+
+pub(super) fn transform_order(layer: &PsbValue) -> Result<[u8; 4]> {
     let order = vector(layer.get("transformOrder"))?;
     if order.len() != 4
         || order
@@ -848,19 +894,25 @@ pub fn emote_layer_affine(layer: &PsbValue, content: &PsbValue) -> Result<[f64; 
             "transformOrder must contain four operation indices",
         ));
     }
+    Ok([order[0] as u8, order[1] as u8, order[2] as u8, order[3] as u8])
+}
+
+pub(super) fn layer_affine<'a>(
+    order: [u8; 4], get: impl Fn(&str) -> Option<&'a PsbValue>,
+) -> Result<[f64; 6]> {
     let mut a = 1.0f32;
     let mut b = 0.0f32;
     let mut c = 0.0f32;
     let mut d = 1.0f32;
     let truth = |key| -> Result<bool> {
-        match content.get(key) {
+        match get(key) {
             None | Some(PsbValue::Null) => Ok(false),
             Some(PsbValue::Bool(value)) => Ok(*value),
-            _ => Ok(number(content, key, 0.0)? != 0.0),
+            value => Ok(field_number(value, 0.0)? != 0.0),
         }
     };
     for op in order {
-        match op as u8 {
+        match op {
             0 => {
                 if truth("fx")? {
                     a = -a;
@@ -872,7 +924,7 @@ pub fn emote_layer_affine(layer: &PsbValue, content: &PsbValue) -> Result<[f64; 
                 }
             }
             1 => {
-                let angle = number(content, "angle", 0.0)?;
+                let angle = field_number(get("angle"), 0.0)?;
                 if angle != 0.0 {
                     // Original uses f32 PI, then calls double sin/cos and
                     // converts each result back to f32 before matrix products.
@@ -888,22 +940,22 @@ pub fn emote_layer_affine(layer: &PsbValue, content: &PsbValue) -> Result<[f64; 
                 }
             }
             2 => {
-                let zx = number(content, "zx", 1.0)?;
-                let zy = number(content, "zy", 1.0)?;
+                let zx = field_number(get("zx"), 1.0)?;
+                let zy = field_number(get("zy"), 1.0)?;
                 a *= zx;
                 b *= zx;
                 c *= zy;
                 d *= zy;
             }
             3 => {
-                let sx = number(content, "sx", 0.0)?;
-                let sy = number(content, "sy", 0.0)?;
+                let sx = field_number(get("sx"), 0.0)?;
+                let sy = field_number(get("sy"), 0.0)?;
                 (a, b, c, d) = (a + c * sx, b + d * sx, c + a * sy, d + b * sy);
             }
             _ => unreachable!(),
         }
     }
-    let coord = vector(content.get("coord"))?;
+    let coord = vector(get("coord"))?;
     if !coord.is_empty() && coord.len() != 3 {
         return Err(invalid("frame coord must have three components"));
     }

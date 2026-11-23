@@ -105,12 +105,19 @@ pub(crate) mod signal {
 }
 
 impl PcmCursor {
-    pub(crate) fn validate_checkpoint(&self, frames: usize, spec: AudioLoop) -> RuntimeResult<()> {
+    pub(crate) fn validate_checkpoint(&mut self, frames: usize, spec: AudioLoop) -> RuntimeResult<()> {
         let original = Self::new(frames, spec)?;
-        if self.frames != original.frames || self.begin != original.begin || self.end != original.end
-            || self.whole != original.whole || self.valid != original.valid || self.position > frames {
+        // Earlier cursors retained the declared endpoint even past EOF.
+        let legacy_end = usize::try_from(spec.range[1]).ok()
+            .is_some_and(|end| end > frames && self.end == end && !self.valid);
+        if self.frames != original.frames || self.begin != original.begin
+            || self.whole != original.whole || self.position > frames
+            || !legacy_end && (self.end != original.end || self.valid != original.valid)
+        {
             return Err(error("PCM checkpoint source bounds/cursor differ"));
         }
+        self.end = original.end;
+        self.valid = original.valid;
         Ok(())
     }
 }

@@ -14,7 +14,7 @@ use cs2_runtime::{
 };
 use cs2_script::{
     CstDocument, DisplayState, ExpressionState, FesDocument, Host, ImageAnimation, KcsProgram,
-    NativeReturn, Step, Vm, eval_expression_fallback, eval_expression_parameter,
+    NativeReturn, Step, Vm, eval_expression_fallback, eval_kcs_expression_parameter,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -632,7 +632,7 @@ impl DesktopSoundConfig {
             }
         }
         fs::create_dir_all(root)?;
-        fs::write(root.join("soundconf.override"), bytes)?;
+        cs2_runtime::write_private_file(&root.join("soundconf.override"), &bytes)?;
         Ok(())
     }
 
@@ -3772,6 +3772,12 @@ impl Default for ScriptRandom {
 }
 
 impl ScriptRandom {
+    fn for_session() -> Self {
+        calendar_native::script_random_seed()
+            .map(Self::seeded)
+            .unwrap_or_default()
+    }
+
     fn seeded(seed: u32) -> Self {
         Self {
             integer: RandomStream::seeded(seed),
@@ -4182,7 +4188,7 @@ impl LoggingHost<'_> {
             )),
             1 | 1040 if arguments.len() >= 4 => {
                 let source = vm.read_string(word(0).unwrap())?;
-                let text = expand_kcs_format_inner(vm, &source, 0, true)?;
+                let text = expand_kcs_format(vm, &source, 0)?;
                 if self.data_services.story_trace {
                     let kind = match text.as_slice() {
                         b"[input]" => Some(0x02),
@@ -6352,7 +6358,7 @@ impl LoggingHost<'_> {
         let value = if fallback {
             eval_expression_fallback(source, &mut state)
         } else {
-            eval_expression_parameter(source, &mut state)
+            eval_kcs_expression_parameter(source, &mut state)
         };
         for (destination, source) in self.shared_values.iter_mut().zip(state.shared) {
             *destination = source as u32;
@@ -7128,25 +7134,30 @@ pub struct HeadlessPlayer {
 
 impl HeadlessPlayer {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_internal(path.as_ref(), None, cs2_runtime::resource_router::GameLanguage::Automatic)
+        Self::open_internal(path.as_ref(), None, cs2_runtime::resource_router::GameLanguage::Automatic,
+            ScriptRandom::default())
     }
 
-    /// Use a caller-owned save directory for this player only. Android hosts
-    /// can pass their private files directory without changing process-wide
-    /// environment state or reading another player's settings first.
+    /// Open an isolated diagnostic player with a repeatable random stream.
     pub fn open_with_save_root(
         path: impl AsRef<Path>, save_root: impl AsRef<Path>,
     ) -> Result<Self> {
-        Self::open_with_game_language(path, save_root, cs2_runtime::resource_router::GameLanguage::Automatic)
+        Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()),
+            cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::default())
     }
 
+    /// Open an interactive session with a caller-owned save directory.
     pub fn open_with_game_language(
         path: impl AsRef<Path>, save_root: impl AsRef<Path>, language: cs2_runtime::resource_router::GameLanguage,
     ) -> Result<Self> {
-        Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()), language)
+        Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()), language,
+            ScriptRandom::for_session())
     }
 
-    fn open_internal(path: &Path, save_root: Option<PathBuf>, language: cs2_runtime::resource_router::GameLanguage) -> Result<Self> {
+    fn open_internal(
+        path: &Path, save_root: Option<PathBuf>, language: cs2_runtime::resource_router::GameLanguage,
+        script_random: ScriptRandom,
+    ) -> Result<Self> {
         let (root, scan) = measure_host_operation(HostPhase::OpenScan, || -> Result<_> {
             let root = GameRoot::open(path).context("open game directory")?;
             let scan = root.scan_with_language(language).context("scan game directory")?;
@@ -7233,7 +7244,7 @@ impl HeadlessPlayer {
             sound_channels: BTreeMap::new(),
             sound_groups,
             sound_config,
-            script_random: ScriptRandom::default(),
+            script_random,
             script_encoding: ScriptTextEncoding::default(),
             font,
             events: Vec::new(),
@@ -8652,8 +8663,9 @@ pub fn run() -> Result<()> {
 #[cfg(windows)]
 fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     HeadlessPlayer::enable_host_gpu_raster();
-    let mut player = HeadlessPlayer::open(path)
-        .with_context(|| format!("open game directory `{}`", path.display()))?;
+    let mut player = HeadlessPlayer::open_internal(
+        path, None, cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::for_session(),
+    ).with_context(|| format!("open game directory `{}`", path.display()))?;
     player.capture_script_evidence = false;
     player.enable_host_window_requests();
     player.initialize_general_window_host(1)?;
@@ -10942,25 +10954,27 @@ fn xml_dword(text: &[u8]) -> u32 {
     }
 }
 
-fn expand_kcs_format(vm: &Vm, input: &[u8], depth: usize) -> cs2_script::Result<Vec<u8>> {
-    expand_kcs_format_inner(vm, input, depth, false)
-}
-
 #[test]
-fn kcs_debug_format_keeps_literal_percent_without_hiding_address_errors() {
+fn kcs_format_preserves_literal_percent_and_checks_explicit_fields() {
     let vm = Vm::new();
-    let input = b"diagnostic %name (100%%, 92%)";
     assert_eq!(
-        expand_kcs_format_inner(&vm, input, 0, true).unwrap(),
-        b"diagnostic %name (100%, 92%)",
+        expand_kcs_format(&vm, b"%name 30%OFF %s %% % %.[note] 5%", 0).unwrap(),
+        b"%name 30%OFF %s % % %.[note] 5%",
     );
-    assert!(expand_kcs_format(&vm, input, 0).is_err());
-    assert!(expand_kcs_format_inner(&vm, b"%s[G42", 0, true).is_err());
+    for text in ["40%之前", "40%まで"] {
+        for encoding in [encoding_rs::UTF_8, encoding_rs::GBK, encoding_rs::SHIFT_JIS] {
+            let (bytes, _, replaced) = encoding.encode(text);
+            if !replaced {
+                assert_eq!(expand_kcs_format(&vm, &bytes, 0).unwrap(), bytes.as_ref());
+            }
+        }
+    }
+    for invalid in [b"%s[G42".as_slice(), b"%u[Q0]", b"%q[G0]"] {
+        assert!(expand_kcs_format(&vm, invalid, 0).is_err());
+    }
 }
 
-fn expand_kcs_format_inner(
-    vm: &Vm, input: &[u8], depth: usize, allow_literal_percent: bool,
-) -> cs2_script::Result<Vec<u8>> {
+fn expand_kcs_format(vm: &Vm, input: &[u8], depth: usize) -> cs2_script::Result<Vec<u8>> {
     if depth >= 32 {
         return Err(cs2_script::ScriptError::InvalidStructuredText {
             offset: 0,
@@ -11001,25 +11015,17 @@ fn expand_kcs_format_inner(
         } else {
             None
         };
-        if allow_literal_percent && input.get(cursor + 1) != Some(&b'[') {
-            output.push(b'%');
-            cursor = percent_start + 1;
-            continue;
-        }
-        let kind = *input
-            .get(cursor)
-            .ok_or(cs2_script::ScriptError::InvalidStructuredText {
-                offset: cursor,
-                message: "KCS format conversion is missing",
-            })?;
-        cursor += 1;
-        if input.get(cursor) != Some(&b'[') {
-            return Err(cs2_script::ScriptError::InvalidStructuredText {
-                offset: cursor,
-                message: "KCS format address is missing",
-            });
-        }
-        cursor += 1;
+        // A KCS field has a conversion letter followed by a bracketed VM address.
+        // For a literal percent, resume at the next byte so no text is consumed.
+        let kind = match input.get(cursor..cursor + 2) {
+            Some(&[kind, b'[']) if kind.is_ascii_alphabetic() => kind,
+            _ => {
+                output.push(b'%');
+                cursor = percent_start + 1;
+                continue;
+            }
+        };
+        cursor += 2;
         let domain = *input
             .get(cursor)
             .ok_or(cs2_script::ScriptError::InvalidStructuredText {
@@ -11054,7 +11060,7 @@ fn expand_kcs_format_inner(
         let rendered = match kind {
             b's' => {
                 let source = vm.read_string(address)?;
-                let mut text = expand_kcs_format_inner(vm, &source, depth + 1, allow_literal_percent)?;
+                let mut text = expand_kcs_format(vm, &source, depth + 1)?;
                 if let Some(limit) = precision {
                     text.truncate(limit);
                 }

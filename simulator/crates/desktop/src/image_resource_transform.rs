@@ -41,7 +41,7 @@ impl LoggingHost<'_> {
                         }
                     }
                     723 => crate::image_transform_native::rotate_frame(frame, read_u32(args, 4)?)?,
-                    726 => crate::image_native::blur_wrapper_bgra32(frame,
+                    726 => crate::image_native::blur_wrapper(frame,
                         [read_u32(args, 4)?, read_u32(args, 8)?])?,
                     727 => flip_frame(frame, read_u32(args, 4)? != 0)?,
                     // The PE passes the requested dimensions to 5e4f10 for

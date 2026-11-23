@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 const MAX_EXPRESSION_BYTES: usize = 64 * 1024;
 const MAX_EXPRESSION_NODES: usize = 512;
 const MAX_EXPRESSION_DEPTH: usize = 128;
+const UNMATCHED_BRACKET: &str = "unmatched expression bracket";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(crate = "serde")]
@@ -127,6 +128,15 @@ pub fn eval_expression_parameter(source: &[u8], state: &mut ExpressionState) -> 
         return Ok(0);
     }
     eval_expression_fallback_with_text(source.strip_suffix(b"%").unwrap_or(source), state)
+}
+
+pub fn eval_kcs_expression_parameter(source: &[u8], state: &mut ExpressionState) -> Result<i32> {
+    match eval_expression_parameter(source, state) {
+        // Native 213 returns zero on a bracket mismatch, including fragments
+        // such as `[2` and `3]` from an earlier comma-delimited split.
+        Err(ScriptError::InvalidExpression { message, .. }) if message == UNMATCHED_BRACKET => Ok(0),
+        result => result,
+    }
 }
 
 pub(crate) fn eval_expression_fallback_with_text(
@@ -668,10 +678,10 @@ impl FallbackParser {
                 loop {
                     let (operator, position) = operators
                         .pop()
-                        .ok_or_else(|| expression_error(at, "unmatched expression bracket"))?;
+                        .ok_or_else(|| expression_error(at, UNMATCHED_BRACKET))?;
                     if let FallbackOperator::Open(is_index) = operator {
                         if is_index != indexed {
-                            return Err(expression_error(at, "unmatched expression bracket"));
+                            return Err(expression_error(at, UNMATCHED_BRACKET));
                         }
                         break;
                     }
@@ -731,7 +741,7 @@ impl FallbackParser {
         }
         while let Some((operator, at)) = operators.pop() {
             if matches!(operator, FallbackOperator::Open(_)) {
-                return Err(expression_error(at, "unmatched expression bracket"));
+                return Err(expression_error(at, UNMATCHED_BRACKET));
             }
             Self::reduce(operator, at, &mut values)?;
         }
@@ -832,5 +842,17 @@ mod tests {
             13
         );
         assert_eq!(state.shared, [7, 13]);
+    }
+
+    #[test]
+    fn kcs_expression_parameters_return_zero_for_unmatched_brackets() {
+        let mut state = ExpressionState::new(1);
+        for fragment in [b"[2".as_slice(), b"3]", b"(2", b"2)", b"($0=7"] {
+            assert_eq!(eval_kcs_expression_parameter(fragment, &mut state).unwrap(), 0);
+            assert!(eval_expression_parameter(fragment, &mut state).is_err());
+        }
+        assert_eq!(state.shared[0], 0);
+        assert_eq!(eval_kcs_expression_parameter(b"(2+3)", &mut state).unwrap(), 5);
+        assert!(eval_kcs_expression_parameter(b"$1", &mut state).is_err());
     }
 }

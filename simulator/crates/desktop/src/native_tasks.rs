@@ -1086,6 +1086,31 @@ impl LoggingHost<'_> {
         Ok(if done { NativeReturn::Value(output) } else { NativeReturn::Retry })
     }
 
+    pub(super) fn broadcast_title_return(&mut self) -> Result<()> {
+        // The window receiver uses command 11's forced traversal with inner
+        // command 21. Ordinary receivers queue message 0xffff_0013 for update.
+        self.broadcast_title_return_branch(self.current_task_id, 0)
+    }
+
+    fn broadcast_title_return_branch(&mut self, target: u32, depth: usize) -> Result<()> {
+        if depth >= 256 {
+            return Err(native_state_error("title-return task hierarchy exceeds 256 levels"));
+        }
+        self.ensure_task_record(target)?;
+        if ordinary_kind(self.data_services.tasks.records[&target].kind) {
+            self.receive_task_command(
+                TaskCommand { target: target as i32, sender: 0, code: 21, data: [0; 3] },
+                &mut cs2_runtime::TaskCommandBuffers::default(), &mut 0, 4096,
+            )?;
+        }
+        let mut cursor = None;
+        while let Some(child) = self.next_task_message_child(target, cursor) {
+            self.broadcast_title_return_branch(child, depth + 1)?;
+            cursor = Some(child as i32);
+        }
+        Ok(())
+    }
+
     pub(super) fn message_branch(
         &mut self,
         target: u32,

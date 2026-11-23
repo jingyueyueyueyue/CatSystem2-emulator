@@ -1,7 +1,6 @@
 //! Host-owned configuration persistence. Paths always refer to the player's
 //! private save directory; original game files are only read as definitions.
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use cs2_formats::ConfigXml;
@@ -226,7 +225,7 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn write_general_information(&mut self, bytes: &[u8]) {
-        self.write_configuration_file(Path::new("info.txt"), bytes);
+        let _ = self.write_configuration_file(Path::new("info.txt"), bytes);
     }
     pub(super) fn ensure_configuration_state(&mut self) -> Result<()> {
         if self.data_services.configuration.initialized { return Ok(()); }
@@ -291,6 +290,10 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn persist_configuration(&mut self) -> Result<()> {
+        self.persist_configuration_files(false)
+    }
+
+    fn persist_configuration_files(&mut self, report_io_errors: bool) -> Result<()> {
         self.ensure_fes_settings()?;
         self.ensure_configuration_state()?;
         let state = &self.data_services.configuration;
@@ -304,7 +307,7 @@ impl LoggingHost<'_> {
         self.write_fes_settings(&mut document)?;
         self.write_legacy_sound_configuration(&mut document)?;
         let bytes = document.to_bytes()?;
-        self.write_configuration_file(Path::new("setup.xml"), &bytes);
+        let setup = self.write_configuration_file(Path::new("setup.xml"), &bytes);
         if self.sound_config_enabled != 0 {
             if !self.sound_config.source_loaded {
                 bail!("native 361 has no independent sound configuration");
@@ -313,33 +316,41 @@ impl LoggingHost<'_> {
             let filename = self.data_services.configuration.sound_file.clone();
             // An ordinary main-file failure must not suppress the sound-file
             // attempt. A serialization/integration error remains a diagnostic.
-            self.write_configuration_file(&filename, &sound);
-            if let Err(error) = self.sound_config.save_overrides(self.save_root) {
+            let sound = self.write_configuration_file(&filename, &sound);
+            let overrides = self.sound_config.save_overrides(self.save_root);
+            if let Err(error) = &overrides {
                 self.events.push(LogicEvent {
                     frame: self.frame, kind: "configuration-write-failed".into(),
                     detail: format!("soundconf.override: {error}"),
                 });
             }
+            if report_io_errors {
+                setup?;
+                sound?;
+                overrides.context("write soundconf.override")?;
+            }
+        } else if report_io_errors {
+            setup?;
         }
         Ok(())
     }
 
-    fn write_configuration_file(&mut self, filename: &Path, bytes: &[u8]) {
-        let result = (|| -> std::io::Result<()> {
+    fn write_configuration_file(&mut self, filename: &Path, bytes: &[u8]) -> Result<()> {
+        let result = (|| -> Result<()> {
             let path = self.save_root.join(filename);
             std::fs::create_dir_all(path.parent().unwrap_or(self.save_root))?;
-            let mut file = std::fs::File::create(path)?;
-            file.write_all(bytes)?;
-            file.flush()
-        })();
+            cs2_runtime::write_private_file(&path, bytes)?;
+            Ok(())
+        })().with_context(|| format!("write {}", filename.display()));
         self.events.push(LogicEvent {
             frame: self.frame,
             kind: if result.is_ok() { "configuration-written" } else { "configuration-write-failed" }.into(),
-            detail: match result {
+            detail: match &result {
                 Ok(()) => format!("{}: {} bytes", filename.display(), bytes.len()),
-                Err(error) => format!("{}: {error}", filename.display()),
+                Err(error) => format!("{error:#}"),
             },
         });
+        result
     }
 
     fn write_legacy_sound_configuration(&mut self, document: &mut ConfigurationDocument) -> Result<()> {
@@ -361,6 +372,10 @@ impl LoggingHost<'_> {
 }
 
 impl HeadlessPlayer {
+    pub fn persist_host_configuration(&mut self) -> Result<()> {
+        self.with_host(|host| host.persist_configuration_files(true))
+    }
+
     pub(super) fn initialize_configuration_host(&mut self) -> Result<()> {
         self.with_host(|host| host.ensure_configuration_state())?;
         // Own the mutable definition here; LoggingHost's live scripts borrow

@@ -422,8 +422,8 @@ impl FesScriptDriver {
 
     /// Queue _SLEEP, _WAKE, MES_CHANGECONFIG or another exact block name.
     /// Returns false for an absent optional block. Pump advance until the
-    /// matching SystemBlock { complete: true }; main position/wait is restored
-    /// automatically while local and shared changes remain in effect.
+    /// matching SystemBlock { complete: true }. Local and shared changes remain
+    /// in effect. A callback can also hand off to the main body.
     pub(crate) fn dispatch_system_block(&mut self, name: &[u8]) -> Result<bool> {
         self.dispatch_system_block_with_context(name, None)
     }
@@ -774,17 +774,18 @@ impl FesScriptDriver {
                         return Ok(effect);
                     }
                 }
-                FesEvent::Wait(count) => {
-                    let until = frame.checked_add(count.max(1) as u64)
-                        .ok_or_else(|| anyhow::anyhow!("FES wait deadline overflows"))?;
-                    return self.install_wait(FesDriverWait::Frames { until });
-                }
+                FesEvent::Wait(count) => return self.install_frame_wait(frame, count),
                 FesEvent::WaitFrame => {
                     return self.install_wait(FesDriverWait::Control {
                         kind: Vec::new(), arguments: Vec::new(), entered: frame,
                     });
                 }
                 FesEvent::WaitControl { kind, arguments } => {
+                    if kind == b"voice" && self.adapter.object_bank(&kind, 0).is_none() {
+                        // Native wait tries an object lookup before evaluating the operand as a duration.
+                        let count = self.number(&kind)?;
+                        return self.install_frame_wait(frame, count);
+                    }
                     return self.install_wait(FesDriverWait::Control { kind, arguments, entered: frame });
                 }
                 FesEvent::Frame => {
@@ -812,6 +813,12 @@ impl FesScriptDriver {
             }
         }
         Ok(FesDriverEffect::Yield)
+    }
+
+    fn install_frame_wait(&mut self, frame: u64, count: i32) -> Result<FesDriverEffect> {
+        let until = frame.checked_add(count.max(1) as u64)
+            .ok_or_else(|| anyhow::anyhow!("FES wait deadline overflows"))?;
+        self.install_wait(FesDriverWait::Frames { until })
     }
 
     fn install_wait(&mut self, wait: FesDriverWait) -> Result<FesDriverEffect> {
@@ -1154,9 +1161,14 @@ impl FesScriptDriver {
 
     fn check_handler_boundary(&mut self) -> Result<Option<FesDriverEffect>> {
         let handler = self.handler.as_ref().expect("handler checked by caller");
-        if handler.phase == HandlerPhase::Object
+        let block = self.interpreter.current_block();
+        // select.fes starts its choice rebuild in the body so SETSEL_0's wait
+        // can yield a frame before SETSEL restores the labels and buttons.
+        let choice_reset = handler.phase == HandlerPhase::System
+            && handler.object_header == b"SEL_RESET" && block == b"SETSEL_0";
+        if (handler.phase == HandlerPhase::Object || choice_reset)
             && self.interpreter.call_depth() == handler.depth
-            && self.interpreter.current_block() != handler.object_header.as_slice()
+            && block != handler.object_header.as_slice()
         {
             return Ok(Some(self.finish_handler(true)?));
         }

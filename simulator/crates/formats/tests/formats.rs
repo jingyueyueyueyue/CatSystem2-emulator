@@ -285,10 +285,9 @@ fn restricts_extended_hg3_padding_to_aligned_cptype() {
     };
 
     let cptype = *b"cptype\0\0";
-    let last_frame = make_frame(cptype, 9, 0);
-    assert_eq!(HgFile::parse(&last_frame).unwrap().frames.len(), 1);
     for padding_len in 8..=15 {
         let mut bytes = make_frame(cptype, padding_len, 0);
+        assert_eq!(HgFile::parse(&bytes).unwrap().frames.len(), 1);
         let next_frame_offset = bytes.len();
         append_frame(&mut bytes);
         let file = HgFile::parse(&bytes).unwrap();
@@ -300,8 +299,9 @@ fn restricts_extended_hg3_padding_to_aligned_cptype() {
         ("oversized inter-frame padding", cptype, 16, 0, true, false),
         ("different tag", *b"unknown\0", 9, 0, true, false),
         ("unaligned next frame", cptype, 9, 1, true, false),
-        ("eight bytes at file end", cptype, 8, 0, false, false),
-        ("ten bytes at file end", cptype, 10, 0, false, false),
+        ("oversized file-end padding", cptype, 16, 0, false, false),
+        ("different tag at file end", *b"unknown\0", 9, 0, false, false),
+        ("unaligned file end", cptype, 9, 1, false, false),
         ("nonzero padding", cptype, 9, 0, true, true),
         ("nonzero file end", cptype, 9, 0, false, true),
     ] {

@@ -151,9 +151,9 @@ impl LoggingHost<'_> {
         if !matches!(selector, 1 | 2) {
             return Err(audio_script_error("sound load selector must be 1 or 2"));
         }
-        let completed = names
-            .first()
-            .ok_or_else(|| audio_script_error("sound category produced no resource name"))?;
+        let Some(completed) = names.first() else {
+            return Ok(NativeReturn::Value(if grouped { u32::MAX } else { 0 }));
+        };
         let name = encode_name(self.text_encoding, completed)?;
         if name.len() >= 260 {
             return Err(audio_script_error(
@@ -277,7 +277,8 @@ impl LoggingHost<'_> {
                 Ok(None) => {}
                 Err(cause) => {
                     self.sound_channels.insert(channel, state);
-                    return Err(self.sound_host_error(cause));
+                    self.note_sound_resource_failure("resolve", &name, cause);
+                    return Ok(NativeReturn::Value(0));
                 }
             }
         }
@@ -298,16 +299,17 @@ impl LoggingHost<'_> {
                 let _detail = SlowTask::new(self.current_task_id, kind, "sound_load_decode")
                     .named(resource.as_bytes(), None);
                 let _timing = AudioStage::Prepare.begin();
-                prepare_named_audio(encoded, &resource).map_err(|cause| self.sound_host_error(cause))
+                prepare_named_audio(encoded, &resource)
             }
-            Ok(None) => Err(self.sound_host_error("encoded sound must contain 1 byte to 64 MiB")),
-            Err(cause) => Err(self.sound_host_error(cause)),
+            Ok(None) => Err(crate::media_process::error("encoded sound exceeds 64 MiB")),
+            Err(cause) => Err(cause),
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(cause) => {
                 self.sound_channels.insert(channel, state);
-                return Err(cause);
+                self.note_sound_resource_failure("load", &resource, cause);
+                return Ok(NativeReturn::Value(0));
             }
         };
         state.resource = Some(resource.clone());
@@ -332,10 +334,7 @@ impl LoggingHost<'_> {
         match sidecars {
             Ok(sidecars) => state.task.sidecars = sidecars,
             Err(cause) => {
-                // Preserve successful PCM preparation and report the actual
-                // ancillary failure; do not pretend the whole load succeeded.
-                self.sound_channels.insert(channel, state);
-                return Err(cause);
+                self.note_sound_resource_failure("sidecar", &resource, cause);
             }
         }
         self.sound_channels.insert(channel, state);
@@ -460,6 +459,21 @@ impl LoggingHost<'_> {
             }
         }
         Ok(names)
+    }
+
+    fn note_sound_resource_failure(
+        &mut self,
+        operation: &str,
+        resource: &str,
+        cause: impl std::fmt::Display,
+    ) {
+        let detail = format!("sound_{operation}_failed resource={resource:?} error={cause:#}");
+        if let Some(event) = self.events.last_mut() {
+            event.detail.push(' ');
+            event.detail.push_str(&detail);
+        }
+        #[cfg(target_os = "android")]
+        crate::audio_android::report_audio(&detail);
     }
 
     pub(super) fn sound_host_error(

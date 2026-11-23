@@ -604,22 +604,31 @@ impl CpuVariableTimelines {
     /// Actual additive values in active-label order, in f32 like20170/13530.
     /// Never accumulate last frame's difference into the next frame's baseline.
     pub fn evaluate(&self, base: &BTreeMap<String, f64>) -> Result<BTreeMap<String, f64>> {
-        let mut sums = BTreeMap::<String, f32>::new();
+        let mut output = base.clone();
+        self.apply(&mut output)?;
+        Ok(output)
+    }
+
+    pub(super) fn apply(&self, values: &mut BTreeMap<String, f64>) -> Result<()> {
+        let mut sums = BTreeMap::<&str, f32>::new();
         for instance in &self.active {
             for (track, tween) in instance.definition.tracks.iter().zip(&instance.tweens) {
                 if track.immediate_target.is_none() {
-                    *sums.entry(track.name.clone()).or_default() += tween.current;
+                    *sums.entry(&track.name).or_default() += tween.current;
                 }
             }
         }
-        let mut output = base.clone();
         for (name, offset) in sums {
-            let value = *base.get(&name).unwrap_or(&0.0) as f32 + offset;
+            let value = *values.get(name).unwrap_or(&0.0) as f32 + offset;
             if !value.is_finite() {
                 return Err(invalid("timelineControl additive overflow"));
             }
-            output.insert(name, f64::from(value));
+            if let Some(existing) = values.get_mut(name) {
+                *existing = f64::from(value);
+            } else {
+                values.insert(name.to_owned(), f64::from(value));
+            }
         }
-        Ok(output)
+        Ok(())
     }
 }

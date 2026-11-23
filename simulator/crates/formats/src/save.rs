@@ -201,10 +201,40 @@ impl CssFile {
     pub fn append(&mut self, id: u32, data: &[u8]) -> Result<(), CssError> {
         let length = u32::try_from(data.len()).map_err(|_| CssError::TooLarge)?;
         if data.len() > MAX_BUFFER { return Err(CssError::TooLarge); }
-        let mut candidate = self.clone();
         let mut header = [0; 8];
         header[..4].copy_from_slice(&id.to_le_bytes());
         header[4..].copy_from_slice(&length.to_le_bytes());
+        let start = self.used_length as usize;
+        if let Some(end) = start.checked_add(header.len() + data.len())
+            && end <= self.logical_capacity as usize
+            && end / CSS_BLOCK_SIZE == start / CSS_BLOCK_SIZE
+        {
+            let saved = &self.storage[start..end];
+            // Common appends only touch a zero-filled tail. Retain any overwritten
+            // bytes in loaded or previously removed containers for error rollback.
+            let overwritten = (zero_tail_start(saved) != 0).then(|| saved.to_vec());
+            let (header_slot, data_slot) = self.storage[start..end].split_at_mut(header.len());
+            header_slot.copy_from_slice(&header);
+            data_slot.copy_from_slice(data);
+            match record_view(&self.storage, self.logical_capacity as usize) {
+                Ok(records) => {
+                    self.records = records;
+                    self.used_length = end as u32;
+                    self.inflation = None;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let slot = &mut self.storage[start..end];
+                    if let Some(saved) = overwritten {
+                        slot.copy_from_slice(&saved);
+                    } else {
+                        slot.fill(0);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut candidate = self.clone();
         // 0x6eac10 invokes the grow/write helper twice. Its block arithmetic
         // depends on used-length transitions, not round_up(new used).
         candidate.append_bytes(&header)?;
@@ -369,7 +399,7 @@ fn record_end(storage: &[u8], offset: usize) -> Result<usize, CssError> {
 
 fn find_record(storage: &[u8], capacity: usize, id: u32) -> Result<Option<(usize, usize, usize)>, CssError> {
     if capacity > storage.len() { return Err(CssError::InvalidRecord); }
-    let zero_tail = zero_tail_start(&storage[..capacity]);
+    let mut zero_tail = None;
     let mut offset = 0;
     for _ in 0..=MAX_ITEMS {
         // Safe boundary for a partial header at the logical allocation end.
@@ -377,7 +407,9 @@ fn find_record(storage: &[u8], capacity: usize, id: u32) -> Result<Option<(usize
         let found = u32_at(storage, offset).ok_or(CssError::InvalidRecord)?;
         let end = record_end(storage, offset)?;
         if found == id { return Ok(Some((offset, offset + 8, end))); }
-        if found == 0 && end == offset + 8 && offset >= zero_tail {
+        if found == 0 && end == offset + 8
+            && offset >= *zero_tail.get_or_insert_with(|| zero_tail_start(&storage[..capacity]))
+        {
             return Ok(None);
         }
         offset = end;
@@ -409,5 +441,36 @@ fn record_view(data: &[u8], capacity: usize) -> Result<Vec<CssRecord>, CssError>
 }
 
 fn zero_tail_start(data: &[u8]) -> usize {
-    data.iter().rposition(|&byte| byte != 0).map_or(0, |offset| offset + 1)
+    const ZEROS: [u8; 32] = [0; 32];
+    let mut end = data.len();
+    let chunks = data.rchunks_exact(ZEROS.len());
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        if chunk != ZEROS {
+            let last = chunk.iter().rposition(|&byte| byte != 0).unwrap();
+            return end - ZEROS.len() + last + 1;
+        }
+        end -= ZEROS.len();
+    }
+    remainder.iter().rposition(|&byte| byte != 0).map_or(0, |offset| offset + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn css_append_rolls_back_an_invalid_write_inside_logical_capacity() {
+        let mut storage = vec![0; 31];
+        storage[..4].copy_from_slice(&1_u32.to_le_bytes());
+        storage[4..8].copy_from_slice(&4_u32.to_le_bytes());
+        storage[8..12].copy_from_slice(b"keep");
+        let mut container = CssFile::from_storage_state(7, 31, 1, storage).unwrap();
+        let before = container.clone();
+
+        assert_eq!(container.append(0x1122_3344, b"new"), Err(CssError::InvalidRecord));
+        assert_eq!(container, before);
+        assert_eq!(container.records, before.records);
+        assert_eq!(container.try_record(1).unwrap(), Some(b"keep".as_slice()));
+    }
 }

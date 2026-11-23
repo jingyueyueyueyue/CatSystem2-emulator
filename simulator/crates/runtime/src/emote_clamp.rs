@@ -71,7 +71,6 @@ pub(super) fn apply(root: &PsbValue, values: &mut BTreeMap<String, f64>) -> Resu
         .ok_or_else(|| invalid("clampControl bounded list"))?;
     //1c930 reads the independent controller54/difference64 banks. Writing
     //driver variables13710 does not feed a prior clamp into the next record.
-    let input = values.clone();
     let mut writes = Vec::new();
     for control in controls {
         if control.get("enabled").and_then(PsbValue::number) == Some(0.0) { continue; }
@@ -79,7 +78,7 @@ pub(super) fn apply(root: &PsbValue, values: &mut BTreeMap<String, f64>) -> Resu
             .filter(|s| !s.is_empty() && s.len() <= 4095)
             .ok_or_else(|| invalid("clampControl variable name"));
         let names = [name("var_lr")?, name("var_ud")?];
-        let raw = names.map(|key| *input.get(key).unwrap_or(&0.0) as f32);
+        let raw = names.map(|key| *values.get(key).unwrap_or(&0.0) as f32);
         let kind = number(control, "type")?;
         if !matches!(kind, 0.0 | 1.0) {
             return Err(invalid("clampControl type outside recovered0/1"));
@@ -89,7 +88,11 @@ pub(super) fn apply(root: &PsbValue, values: &mut BTreeMap<String, f64>) -> Resu
     }
     for (names, result) in writes {
         for (name, value) in names.into_iter().zip(result) {
-            values.insert(name.to_owned(), f64::from(value));
+            if let Some(existing) = values.get_mut(name) {
+                *existing = f64::from(value);
+            } else {
+                values.insert(name.to_owned(), f64::from(value));
+            }
         }
     }
     Ok(())

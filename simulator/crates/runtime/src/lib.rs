@@ -65,7 +65,7 @@ pub use resource::{
     ResourceLease, ResourceLeaseId, ResourceLocation, ResourceReader, ScanDiagnostic,
     ScanDiagnosticLevel,
 };
-pub use save::{FileSaveStore, SaveKind, SaveRepository};
+pub use save::{FileSaveStore, SaveKind, SaveRepository, write_private_file};
 pub use scheduler::{
     ObjectHandle, ObjectHandleTable, RuntimeTask, TaskId, TaskScheduler, TaskStatus,
 };
@@ -216,9 +216,13 @@ mod tests {
     #[test]
     fn scans_directory_and_reads_kif_entries() {
         let temp = TempDirectory::new();
-        fs::write(temp.path.join("startup.xml"), b"directory").expect("file fixture");
+        let startup = br#"<?xml version="1.0" encoding="UTF-8"?><document><title>directory</title></document>"#;
+        fs::write(temp.path.join("startup.xml"), startup).expect("file fixture");
         fs::create_dir_all(temp.path.join("config")).expect("config directory");
-        fs::write(temp.path.join("config").join("startup.xml"), b"nested").expect("nested fixture");
+        fs::write(
+            temp.path.join("config").join("startup.xml"),
+            br#"<?xml version="1.0" encoding="UTF-8"?><document><title>nested</title></document>"#,
+        ).expect("nested fixture");
         write_kif(
             &temp.path.join("scene.int"),
             b"start.cst",
@@ -228,8 +232,11 @@ mod tests {
         let root = GameRoot::open(&temp.path).expect("fixture root should open");
         let scan = root.scan().expect("fixture root should scan");
 
-        assert_eq!(scan.resources.read("startup.xml").unwrap(), b"directory");
-        assert_eq!(scan.resources.read("start.cst").unwrap(), b"archive script");
+        assert_eq!(scan.resources.read("startup.xml").unwrap(), startup);
+        assert_eq!(
+            scan.resources.read_archive_entry("scene.int", b"start.cst").unwrap(),
+            b"archive script"
+        );
         assert_eq!(scan.resources.archives().len(), 1);
         assert_eq!(scan.resources.archives()[0].entry_count, 1);
         assert!(

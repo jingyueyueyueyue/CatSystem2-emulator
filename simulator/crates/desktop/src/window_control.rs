@@ -15,7 +15,7 @@ pub enum HostWindowRequest {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PostedWindowCommand { ToggleFullscreen, SetWindowed(u32), Minimize, Close, Settings, GeneralSettings, Menu, Notify([u32; 4]), Open(u32), ConfirmTitle, SystemVolume }
+enum PostedWindowCommand { ToggleFullscreen, SetWindowed(u32), Minimize, Close, Settings, GeneralSettings, Menu, Notify([u32; 4]), Open(u32), ConfirmTitle, ReturnToTitle, SystemVolume }
 
 #[derive(Default)]
 pub(super) struct WindowControlState {
@@ -30,6 +30,16 @@ pub(super) struct WindowControlState {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn post_title_return(&mut self) -> cs2_script::Result<()> {
+        let state = &mut self.data_services.window_control;
+        if state.commands.len() + state.requests.len() >= 4096 {
+            return Err(native_state_error("posted window command queue exceeds 4096 entries"));
+        }
+        // The FES command posts the return request for delivery after the frame.
+        state.commands.push_back(PostedWindowCommand::ReturnToTitle);
+        Ok(())
+    }
+
     pub(super) fn post_effect_settings(&mut self) -> cs2_script::Result<()> {
         self.window_control_native(457, &[])?;
         Ok(())
@@ -129,7 +139,7 @@ impl HeadlessPlayer {
     }
     pub(super) fn accept_menu_title_return(&mut self) {
         // Continue at4913cc before commands posted while the modal UI was open.
-        self.data_services.window_control.commands.push_front(PostedWindowCommand::Notify([0, 21, 0, 0]));
+        self.data_services.window_control.commands.push_front(PostedWindowCommand::ReturnToTitle);
     }
     pub(super) fn queue_menu_system_volume(&mut self) -> Result<()> {
         let state = &mut self.data_services.window_control;
@@ -199,6 +209,14 @@ impl HeadlessPlayer {
                         } };
                     self.data_services.window_control.opening_menu = !done;
                     if !done { return Ok(false); }
+                }
+                PostedWindowCommand::ReturnToTitle => {
+                    if self.loaded.is_none() { bail!("title return requires the actual main task"); }
+                    self.with_host(|host| Ok(host.broadcast_title_return()?))?;
+                    self.events.push(LogicEvent {
+                        frame: self.state.clock.frame, kind: "title-return".into(),
+                        detail: "queued task command 21 throughout the main task tree".into(),
+                    });
                 }
                 PostedWindowCommand::Notify(packet) => {
                     if self.loaded.is_none() { bail!("menu notification requires the actual main task"); }

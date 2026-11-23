@@ -671,6 +671,11 @@ impl LoggingHost<'_> {
             .message_task_state(target)
             .is_some_and(|(kind, deletion, _)| kind == 54 && deletion == 0)
         {
+            // The original finish wrapper returns status 2 even when its
+            // command has no live M2 receiver.
+            if index == 908 {
+                return Ok(NativeReturn::Continue);
+            }
             return Err(unsupported(
                 index,
                 "addressed live type54 task is unavailable",
@@ -1484,6 +1489,42 @@ fn submit_rgba_with_workers(
 mod tests {
     use super::*;
     use cs2_renderer::Color;
+
+    #[test]
+    fn native908_finishes_with_or_without_a_live_emote_task() -> anyhow::Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-emote-finish-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = player?;
+        player.with_host(|host| {
+            let emote = &mut host.data_services.emote;
+            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
+            let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
+            emote.state.set_backend(Box::new(backend)).map_err(error)?;
+            emote.surface_fade_default = Some(0);
+
+            let live = host.create_task_object(54, host.current_task_id, b"m2plane", b"")?;
+            let ordinary = host.create_task_object(2, host.current_task_id, b"plane", b"")?;
+            let deleting = host.create_task_object(54, host.current_task_id, b"m2plane", b"")?;
+            host.request_ordinary_task_delete(deleting)?;
+            let absent = 22_u32;
+            assert!(host.data_services.tasks.message_task_state(absent).is_none());
+
+            let mut vm = Vm::new();
+            for target in [live, absent, deleting, ordinary] {
+                assert!(matches!(
+                    host.emote_native(908, &target.to_le_bytes(), &mut vm)?,
+                    NativeReturn::Continue
+                ));
+            }
+            assert!(host.emote_native(909, &absent.to_le_bytes(), &mut vm).is_err());
+            assert!(host.emote_native(908, &[], &mut vm).is_err());
+            Ok(())
+        })
+    }
 
     #[test]
     fn sidecar_emote_submission_preserves_clipping_and_mask_modes() {

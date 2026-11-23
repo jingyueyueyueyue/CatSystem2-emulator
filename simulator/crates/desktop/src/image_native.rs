@@ -317,7 +317,7 @@ impl LoggingHost<'_> {
                 let radius = [read_u32(arguments, 4)?, read_u32(arguments, 8)?];
                 let source = self.image_handles.get(&handle)
                     .ok_or_else(|| native_state_error("native 538 invalid image wrapper"))?;
-                let frame = blur_wrapper_bgra32(source, radius)?;
+                let frame = blur_wrapper(source, radius)?;
                 self.replace_image_wrapper_pixels(handle, frame)?;
                 Ok(NativeReturn::Continue)
             }
@@ -460,7 +460,7 @@ pub(super) fn expand_frame_border(source: &RgbaFrame, raw: [u32; 2]) -> Result<R
 }
 
 /// 5e33b0 dispatches distinct 24/32-bit kernels and adjusts the base.
-pub(super) fn blur_wrapper_bgra32(source: &RgbaFrame, raw_radius: [u32; 2]) -> Result<RgbaFrame> {
+pub(super) fn blur_wrapper(source: &RgbaFrame, raw_radius: [u32; 2]) -> Result<RgbaFrame> {
     // The pixel helper returns false before expansion for an empty allocation;
     // its ordinary wrapper ignores that result and retains the binding.
     if source.is_empty() { return Ok(source.clone()); }
@@ -545,56 +545,60 @@ pub(super) fn blur_wrapper_bgra32(source: &RgbaFrame, raw_radius: [u32; 2]) -> R
         .map_err(|_| native_state_error("native 538 filtered frame construction failed"))
 }
 
-/// 5e5c30: raw-radius border BEFORE signed clamping, then native BGR sums.
-/// The horizontal branch writes only `width` bytes of each `width*3` row
-/// into HeapAlloc(flags=0) storage. Reject those uninitialised RGB reads;
-/// the zero-horizontal-radius copy plus vertical kernel is fully defined.
+/// 5e5c30 expands by the raw radius before clamping the filter radius.
+/// Apply the integer RGB kernel to every channel using initialized pixels.
 fn blur_wrapper_bgr24(source: &RgbaFrame, raw_radius: [u32; 2]) -> Result<RgbaFrame> {
     if raw_radius.iter().any(|&v| (v as i32) < 0) { return Ok(source.clone()); }
-    if source.is_empty() { return Ok(source.clone()); }
     let radius = raw_radius.map(|v| (v as i32).clamp(0, 255) as usize);
-    if radius[0] != 0 {
-        return Err(native_state_error(
-            "native 538 BGR24 horizontal blur reads unwritten HeapAlloc(flags=0) RGB bytes"));
-    }
-    let mut expanded = expand_frame_border(source, raw_radius)?;
-    let mut pixels = expanded.pixels().to_vec();
-    for pixel in pixels.chunks_exact_mut(4) { pixel[3] = 255; }
-    if radius[1] != 0 {
-        let weights = triangular_weights(radius[1]);
-        let scale = 256 / (radius[1] as u32 + 1);
-        let width = expanded.width() as usize;
-        let height = expanded.height() as usize;
-        // Native scratch selection compares width with height+radius, but
-        // the column writer needs height+2*radius triples. Do not silently
-        // substitute a bounded result for the original out-of-bounds case.
-        if width > height + radius[1] && width < height + radius[1] * 2 {
-            return Err(native_state_error("native 538 BGR24 vertical scratch allocation is too short"));
+    let expanded = expand_frame_border(source, raw_radius)?;
+    let size = [expanded.width() as usize, expanded.height() as usize];
+    let pixels = match radius {
+        [0, 0] => {
+            let mut pixels = expanded.pixels().to_vec();
+            for pixel in pixels.chunks_exact_mut(4) { pixel[3] = 255; }
+            pixels
         }
-        for y in 0..height {
-            for x in 0..width {
-                let to = (y * width + x) * 4;
-                for channel in 0..3 {
-                    let mut sum = 0u32;
-                    for (i, &weight) in weights.iter().enumerate() {
-                        let row = y.saturating_add(i).saturating_sub(radius[1]).min(height - 1);
-                        sum = sum.wrapping_add(u32::from(expanded.pixels()[(row * width + x) * 4 + channel])
-                            .wrapping_mul(weight));
-                    }
-                    pixels[to + channel] = (sum.wrapping_mul(scale) >> 16) as u8;
-                }
-                pixels[to + 3] = 255;
-            }
+        [0, y] => blur_bgr24_axis(expanded.pixels(), size, y, false)?,
+        [x, 0] => blur_bgr24_axis(expanded.pixels(), size, x, true)?,
+        [x, y] => {
+            let horizontal = blur_bgr24_axis(expanded.pixels(), size, x, true)?;
+            blur_bgr24_axis(&horizontal, size, y, false)?
         }
-    }
+    };
     let mut m = expanded.metadata();
     let old = source.metadata();
     m.base = [old.base[0].wrapping_add(old.offset[0].wrapping_sub(m.offset[0])),
         old.base[1].wrapping_add(old.offset[1].wrapping_sub(m.offset[1]))];
-    expanded = RgbaFrame::from_rgba8(expanded.width(), expanded.height(), pixels)
-        .map_err(|_| native_state_error("native 538 BGR24 filtered frame construction failed"))?
-        .with_raw_metadata(m).with_hg_attributes(source.hg_attributes().clone());
-    Ok(expanded)
+    RgbaFrame::from_rgba8(expanded.width(), expanded.height(), pixels)
+        .map(|frame| frame.with_raw_metadata(m).with_hg_attributes(source.hg_attributes().clone()))
+        .map_err(|_| native_state_error("native 538 BGR24 filtered frame construction failed"))
+}
+
+fn blur_bgr24_axis(
+    source: &[u8], [width, height]: [usize; 2], radius: usize, horizontal: bool,
+) -> Result<Vec<u8>> {
+    let mut pixels = zero_blur_pixels(source.len())?;
+    let weights = triangular_weights(radius);
+    let scale = 256 / (radius as u32 + 1);
+    let (axis_length, stride) = if horizontal { (width, 1) } else { (height, width) };
+    for (y, row) in pixels.chunks_exact_mut(width * 4).enumerate() {
+        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let (position, start) = if horizontal { (x, y * width) } else { (y, x) };
+            let mut sums = [0u32; 3];
+            for (index, &weight) in weights.iter().enumerate() {
+                let sample = (position + index).saturating_sub(radius).min(axis_length - 1);
+                let offset = (start + sample * stride) * 4;
+                for (sum, &value) in sums.iter_mut().zip(&source[offset..offset + 3]) {
+                    *sum = sum.wrapping_add(u32::from(value).wrapping_mul(weight));
+                }
+            }
+            for (channel, sum) in pixel.iter_mut().zip(sums) {
+                *channel = (sum.wrapping_mul(scale) >> 16) as u8;
+            }
+            pixel[3] = 255;
+        }
+    }
+    Ok(pixels)
 }
 
 fn zero_blur_pixels(length: usize) -> Result<Vec<u8>> {
@@ -653,4 +657,63 @@ fn blur_pixel(
         let product = sum.wrapping_mul(scale);
         ((product >> 24) + ((product >> 23) & 1)) as u8
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cs2_renderer::FrameMetadata;
+
+    #[test]
+    fn bgr24_blur_filters_rgb_with_replicated_edges() {
+        let source = RgbaFrame::from_hg_bgr24(2, 2, &[
+            80, 24, 0, 0, 56, 80,
+            160, 120, 160, 240, 248, 240,
+        ], FrameMetadata { bit_depth: 24, canvas_size: [2, 2], ..FrameMetadata::default() }).unwrap();
+
+        assert_eq!(blur_wrapper(&source, [1, 0]).unwrap().pixels(), &[
+            20, 32, 60, 255, 60, 48, 20, 255,
+            180, 152, 180, 255, 220, 216, 220, 255,
+        ]);
+        assert_eq!(blur_wrapper(&source, [0, 1]).unwrap().pixels(), &[
+            40, 48, 100, 255, 120, 104, 60, 255,
+            120, 96, 140, 255, 200, 200, 180, 255,
+        ]);
+        assert_eq!(blur_wrapper(&source, [1, 1]).unwrap().pixels(), &[
+            60, 62, 90, 255, 100, 90, 70, 255,
+            140, 122, 150, 255, 180, 174, 170, 255,
+        ]);
+    }
+
+    #[test]
+    fn bgr24_blur_expands_crop_and_adjusts_base() {
+        let metadata = FrameMetadata {
+            bit_depth: 24, canvas_size: [3, 3], offset: [1, 1], base: [-3, 7],
+            ..FrameMetadata::default()
+        };
+        let attributes = HgFrameAttributes::new([(1, [1, 2, 3, 4, 5])].into());
+        let source = RgbaFrame::from_hg_bgr24_with_attributes(
+            1, 1, &[0, 0, 240], metadata, attributes.clone(),
+        ).unwrap();
+
+        let result = blur_wrapper(&source, [1, 1]).unwrap();
+        assert_eq!([result.width(), result.height()], [3, 3]);
+        assert_eq!(result.metadata(), FrameMetadata { offset: [0, 0], base: [-2, 8], ..metadata });
+        assert_eq!(result.hg_attributes(), &attributes);
+        assert_eq!(result.pixels(), &[
+            15, 0, 0, 255, 30, 0, 0, 255, 15, 0, 0, 255,
+            30, 0, 0, 255, 60, 0, 0, 255, 30, 0, 0, 255,
+            15, 0, 0, 255, 30, 0, 0, 255, 15, 0, 0, 255,
+        ]);
+    }
+
+    #[test]
+    fn bgr24_blur_handles_short_columns() {
+        let source = RgbaFrame::from_hg_bgr24(4, 1, &[64, 128, 240].repeat(4), FrameMetadata {
+            bit_depth: 24, canvas_size: [4, 1], ..FrameMetadata::default()
+        }).unwrap();
+
+        assert_eq!(blur_wrapper(&source, [0, 2]).unwrap().pixels(), &[239, 127, 63, 255].repeat(4));
+        assert_eq!(blur_wrapper(&source, [5, 5]).unwrap().pixels(), &[232, 124, 62, 255].repeat(4));
+    }
 }

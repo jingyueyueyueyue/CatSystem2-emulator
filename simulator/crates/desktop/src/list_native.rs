@@ -2420,8 +2420,13 @@ pub(super) fn prepare_layers(host: &mut LoggingHost<'_>, id: u32) -> Result<()> 
             options.scale_y = entry.scale[1];
             options.rotation_radians = entry.rotation;
             options.pivot = entry.base;
-        } else if legacy_list && source.metadata().bit_depth == 32
-            && host.data_services.image_control_values.get(&wrapper) == Some(&4)
+        }
+        // Native 728 records the script's alpha-mask setting on the resource.
+        // The older wrapper path reads the equivalent flag from native 564.
+        if matches!(entry.source, Source::Resource { handle, .. }
+            if host.image_resources.get(&handle).is_some_and(|resource| resource.auxiliary == 4))
+            || (entry.transform == 0 && legacy_list && source.metadata().bit_depth == 32
+                && host.data_services.image_control_values.get(&wrapper) == Some(&4))
         {
             options.blend_mode = cs2_renderer::BlendMode::ListAlphaFromAlpha;
         }
@@ -2671,7 +2676,7 @@ pub(super) fn draw_layer(
     verify_distinct_layer_source(host, list_id, &entry)?;
     if entry.transform != 0 {
         return draw_affine(canvas, frame, source_geometry(host, &entry, frame)?,
-            &entry, opacity, options.clip);
+            &entry, opacity, options);
     }
     draw_plain_frame(canvas, frame, options, opacity, opaque)
 }
@@ -3145,11 +3150,11 @@ fn draw_affine(
     geometry: crate::image_manager::ResourceGeometry,
     entry: &Entry,
     opacity: u32,
-    clip: Option<Rect>,
+    options: &ImageDrawOptions,
 ) -> Result<()> {
     draw_affine_placement(canvas, source, geometry.size,
-        AffinePlacement::from_entry(entry, entry.base, geometry.offset), opacity, clip,
-        cs2_renderer::BlendMode::SourceOver)
+        AffinePlacement::from_entry(entry, entry.base, geometry.offset), opacity, options.clip,
+        options.blend_mode)
 }
 
 fn draw_affine_placement(
@@ -3328,7 +3333,9 @@ mod raster_tests {
                 options.clip = Some(clip);
                 draw_plain_frame(&mut target, &source, &options, 255, &mut None).unwrap();
             } else {
-                draw_affine(&mut target, &source, geometry, &entry, 255, Some(clip)).unwrap();
+                let mut options = ImageDrawOptions::new(Point::new(0, 0));
+                options.clip = Some(clip);
+                draw_affine(&mut target, &source, geometry, &entry, 255, &options).unwrap();
             }
             assert_eq!(target.pixel(2, 1).unwrap(), Color::rgba(255, 0, 0, 255));
             assert_eq!(target.pixel(2, 2).unwrap(), Color::rgba(0, 0, 255, 255));

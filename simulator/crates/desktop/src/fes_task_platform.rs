@@ -1037,6 +1037,10 @@ fn apply_effect(
             if verb == b"keyskip" {
                 return Ok(true);
             }
+            if verb.eq_ignore_ascii_case(b"rettitle") {
+                host.post_title_return()?;
+                return Ok(true);
+            }
             if super::fes_text::apply_name_image_table(
                 runtime, driver, command, shared, host.text_encoding,
             )? {

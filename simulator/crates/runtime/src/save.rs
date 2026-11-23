@@ -98,18 +98,7 @@ impl SaveRepository for FileSaveStore {
             return Err(RuntimeError::InvalidSave("serialized save exceeds 512 MiB".into()));
         }
         let path = self.path_for(kind)?;
-        let temporary = temporary_path(&path);
-        if let Err(source) = write_temporary(&temporary, &bytes) {
-            return Err(RuntimeError::Io {
-                path: temporary,
-                source,
-            });
-        }
-        if let Err(source) = replace_file(&temporary, &path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(RuntimeError::Io { path, source });
-        }
-        Ok(())
+        write_private_file(&path, &bytes)
     }
 
     fn read(&mut self, kind: SaveKind) -> RuntimeResult<Option<RuntimeState>> {
@@ -244,6 +233,20 @@ struct SaveEnvelope {
 
 fn ordinary_filename(slot: u32) -> String {
     format!("slot_{slot:03}.{SAVE_FILE_EXTENSION}")
+}
+
+/// Replace a private file only after its new contents have been written.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> RuntimeResult<()> {
+    let temporary = temporary_path(path);
+    write_temporary(&temporary, bytes).map_err(|source| RuntimeError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    if let Err(source) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(RuntimeError::Io { path: path.to_path_buf(), source });
+    }
+    Ok(())
 }
 
 fn temporary_path(path: &Path) -> PathBuf {

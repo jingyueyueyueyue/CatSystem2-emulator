@@ -255,7 +255,7 @@ impl PcmCursor {
         let end = if end == -1 {
             frames
         } else {
-            usize::try_from(end).unwrap_or(usize::MAX)
+            usize::try_from(end).map_or(usize::MAX, |end| end.min(frames))
         };
         let valid = begin_value
             .as_ref()
@@ -536,5 +536,42 @@ impl AudioFade {
 
     pub(crate) fn raw_value(&self) -> u32 {
         self.current.trunc() as i64 as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_endpoint_past_eof_preserves_the_loop_start() {
+        let parameters = AudioParameters::new(1.0, 0.0).unwrap();
+        parameters.reset_repeat_count(0).unwrap();
+        let spec = AudioLoop { range: [43_392, 5_088_000], whole: false };
+        let mut cursor = PcmCursor::new(4_895_100, spec).unwrap();
+        assert_eq!(cursor.end(&parameters).unwrap(), 4_895_100);
+        cursor.position = 4_895_100;
+        cursor.rewind();
+        assert_eq!(cursor.position, 43_392);
+
+        // An older checkpoint can contain these bounds from one-shot playback.
+        cursor.end = 5_088_000;
+        cursor.valid = false;
+        cursor.validate_checkpoint(4_895_100, spec).unwrap();
+        assert_eq!(cursor.end(&parameters).unwrap(), 4_895_100);
+    }
+
+    #[test]
+    fn loop_bounds_still_reject_empty_ranges_and_invalid_end_sentinels() {
+        let parameters = AudioParameters::new(1.0, 0.0).unwrap();
+        parameters.reset_repeat_count(0).unwrap();
+        for range in [[-1, 120], [100, 120], [40, 39], [40, -2]] {
+            let cursor = PcmCursor::new(100, AudioLoop { range, whole: false }).unwrap();
+            assert!(cursor.end(&parameters).is_err(), "{range:?}");
+        }
+        let cursor = PcmCursor::new(100, AudioLoop { range: [40, 80], whole: false }).unwrap();
+        assert_eq!(cursor.end(&parameters).unwrap(), 80);
+        parameters.reset_repeat_count(1).unwrap();
+        assert_eq!(cursor.end(&parameters).unwrap(), 100);
     }
 }

@@ -31,7 +31,7 @@ pub(crate) struct WorkerState {
     pub(crate) queue: QueueState,
 }
 impl WorkerState {
-    fn validate(&self, source: &PreparedAudio, parameters: &AudioParameters) -> cs2_runtime::RuntimeResult<()> {
+    fn validate(&mut self, source: &PreparedAudio, parameters: &AudioParameters) -> cs2_runtime::RuntimeResult<()> {
         self.cursor.validate_checkpoint(source.probe.frames as usize, self.loop_spec)?;
         self.cursor.end(parameters)?;
         self.repeats.validate_checkpoint(parameters)?;
@@ -244,7 +244,7 @@ impl DesktopAudioHost {
             let (tx, rx) = mpsc::sync_channel(1);
             playback.commands.send(WavWorkerCommand::Capture(tx)).map_err(|_| error("SOUND worker completed before checkpoint; poll its real result first"))?;
             saved.release.push(playback.commands.clone());
-            let worker = rx.recv_timeout(Duration::from_secs(5)).map_err(|_| error("SOUND worker did not acknowledge checkpoint"))??;
+            let mut worker = rx.recv_timeout(Duration::from_secs(5)).map_err(|_| error("SOUND worker did not acknowledge checkpoint"))??;
             if worker.paused != playback.paused { return Err(error("SOUND worker/host script pause differs")); }
             worker.validate(&playback.prepared, &playback._parameters)?;
             checkpoint_pcm_bytes += playback.prepared.sample_count() * size_of::<i16>();
@@ -268,7 +268,7 @@ impl DesktopAudioHost {
         let mut host = DesktopAudioHost { resolve: self.resolve.clone(), ogg: WavAudioHost::new(move |name| ogg_resolve(name)),
             wav: WavAudioHost::new(move |name| wav_resolve(name)), handles: HashMap::new() };
         host.ogg.suspended = self.ogg.suspended; host.wav.suspended = self.wav.suspended;
-        for (id, playback) in saved.playbacks {
+        for (id, mut playback) in saved.playbacks {
             if id == 0 || id == u64::MAX || playback.resource.is_empty() || playback.resource.len() > 4096 || playback.resource.contains('\0') {
                 return Err(error("invalid saved physical SOUND handle/resource"));
             }

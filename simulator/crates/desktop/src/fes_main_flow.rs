@@ -148,15 +148,42 @@ pub(crate) fn object_command(host: &LoggingHost<'_>, _view: &FesTaskView,
     runtime: &mut FesRuntime, driver: &mut FesScriptDriver,
     command: &FesDriverCommand, shared: &mut ExpressionState) -> Result<bool> {
     let verb = command.parameters.get(1).map(Vec::as_slice).unwrap_or_default();
-    if !matches!(verb, b"keypos" | b"attach" | b"pos2") { return Ok(false); }
+    if !matches!(verb, b"keypos" | b"attach" | b"pos2" | b"getsize") { return Ok(false); }
     let source = if command.parameters.first().is_some_and(|value| value == b"@") {
         command.object_event.as_ref().context("navigation property @ has no event object")?.parameter()
     } else { command.parameters.first().cloned().unwrap_or_default() };
     let (name, bank) = crate::fes_media::split_target(&source, host.text_encoding)?;
     let Some(definition) = driver.adapter.object(name).map(|object| object.definition.clone()) else {
+        if verb == b"getsize" { return Ok(false); }
         driver.fallback_command(command, shared)?;
         return Ok(true);
     };
+    if verb == b"getsize" {
+        if definition.kind_name != b"PLANE" { return Ok(false); }
+        let bank = match bank {
+            Some(source) => driver.evaluate_parameter(source, command.context.current, shared)?,
+            None if definition.bank_count == 1 => 0,
+            None => return Ok(true),
+        };
+        if usize::try_from(bank).ok().and_then(|bank| driver.adapter.object_bank(name, bank)).is_none() {
+            return Ok(true);
+        }
+        let key = host.text_encoding.decode(name);
+        let key = if definition.bank_count == 1 { key } else { format!("{key}[{bank}]") };
+        let plane = runtime.planes.get_mut(&key).context("FES getsize plane is absent")?;
+        update_plane_size(host, plane, runtime.media.get_mut(&key))?;
+        let size = plane.size;
+        let mut destinations = [-1; 2];
+        for (destination, source) in destinations.iter_mut().zip(&command.parameters[2..]) {
+            *destination = driver.evaluate_parameter(source, command.context.current, shared)?;
+        }
+        for (destination, value) in destinations.into_iter().zip(size) {
+            if let Some(slot) = shared.shared.get_mut(destination as usize) {
+                *slot = value as i32;
+            }
+        }
+        return Ok(true);
+    }
     if verb == b"pos2" && !matches!(definition.kind_name.as_slice(), b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"PLANE" | b"CPLANE") {
         return Ok(false); // SLIDER and STRING retain their dedicated receivers.
     }
@@ -232,24 +259,29 @@ pub(crate) fn initialize_field(runtime: &mut FesRuntime, driver: &mut FesScriptD
     Ok(false)
 }
 
+fn update_plane_size(host: &LoggingHost<'_>, plane: &mut crate::FesPlaneLayer,
+    layer: Option<&mut crate::FesMediaLayer>) -> Result<()> {
+    if !plane.metadata.size_dirty { return Ok(()); }
+    if let Some(reference) = &plane.metadata.size_source {
+        let size = crate::fes_controls::read_metadata(host, reference)?.map_or([0; 2], |(_, size)| size);
+        plane.size = size.map(|value| value as u32);
+        if let Some(layer) = layer {
+            layer.clip = Some(cs2_renderer::Rect::new(0, 0, plane.size[0], plane.size[1]));
+            layer.navigation.set_size(size);
+            crate::fes_media::rebuild_solid(layer)?;
+        }
+    }
+    plane.metadata.size_dirty = false;
+    Ok(())
+}
+
 /// Resolve geometry before the CPU plane/list projection and input rectangles.
 /// Uses the same resource category and HG metadata reader
 /// as the existing viewport/slider consumers; this never decodes image pixels.
 pub(crate) fn update_geometry(host: &LoggingHost<'_>, _view: &FesTaskView,
     runtime: &mut FesRuntime) -> Result<()> {
     for (key, plane) in &mut runtime.planes {
-        if plane.metadata.size_dirty {
-            if let Some(reference) = &plane.metadata.size_source {
-                let size = crate::fes_controls::read_metadata(host, reference)?.map_or([0; 2], |(_, size)| size);
-                plane.size = size.map(|value| value as u32);
-                if let Some(layer) = runtime.media.get_mut(key) {
-                    layer.clip = Some(cs2_renderer::Rect::new(0, 0, plane.size[0], plane.size[1]));
-                    layer.navigation.set_size(size);
-                    crate::fes_media::rebuild_solid(layer)?;
-                }
-            }
-            plane.metadata.size_dirty = false;
-        }
+        update_plane_size(host, plane, runtime.media.get_mut(key))?;
         if let Some(reference) = &plane.metadata.position_source {
             let position = crate::fes_controls::read_metadata(host, reference)?.map_or([0; 2], |(position, _)| position);
             plane.position = cs2_renderer::Point::new(position[0], position[1]);

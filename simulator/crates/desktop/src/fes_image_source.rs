@@ -524,11 +524,12 @@ pub(crate) fn source_image(host: &LoggingHost<'_>, layer: &FesMediaLayer)
     host.retained_image_source_frame(entry, select)
 }
 
-/// Both sources can retain a crop, but only a raw frame supplies an extra base.
+/// Decoded images and DIFIMAGE references have their base applied by the FES object.
+/// A raw list frame supplies its own base along with the crop offset.
 pub(crate) fn source_draw_options(layer: &FesMediaLayer, image: &cs2_renderer::RgbaFrame,
     options: &mut cs2_renderer::ImageDrawOptions) {
     let metadata = image.metadata();
-    if layer.image.is_some() {
+    if layer.source.difimage_resource.is_some() || layer.image.is_some() {
         if layer.motion.is_some() {
             for (pivot, crop) in options.pivot.iter_mut().zip(metadata.offset) {
                 *pivot -= crop as f32;
@@ -682,5 +683,34 @@ fn cropped_button_source_refreshes_existing_motion_base() -> Result<()> {
         assert_eq!(installed.metadata().canvas_size, [2, 1]);
         assert_eq!(installed.pixels(), image.pixels());
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn difimage_reference_applies_crop_relative_to_fes_base() -> Result<()> {
+    use cs2_renderer::{ImageDrawOptions, Point};
+
+    let mut layer = super::internal_layer("DIFIMAGE", "face[0]");
+    layer.source.difimage_resource = Some(1);
+    let image = RgbaFrame::from_rgba8(2, 1, vec![255; 8])?;
+    let mut metadata = image.metadata();
+    metadata.offset = [240, 3];
+    metadata.base = [508, 230];
+    let image = image.with_raw_metadata(metadata);
+
+    // The message window replaces the HG base with attribute 100 at (508, 179).
+    // Without motion, draw options already have that base subtracted.
+    let mut options = ImageDrawOptions::new(Point::new(-352, 430));
+    source_draw_options(&layer, &image, &mut options);
+    assert_eq!(options.position, Point::new(-112, 433));
+
+    layer.motion = Some([0; 36]);
+    let mut options = ImageDrawOptions::new(Point::new(156, 609));
+    options.pivot = [508.0, 179.0];
+    options.scale_x = 0.5;
+    options.scale_y = 0.5;
+    source_draw_options(&layer, &image, &mut options);
+    assert_eq!(options.transform().map_source_point([0.0, 0.0]), [22.0, 521.0]);
     Ok(())
 }

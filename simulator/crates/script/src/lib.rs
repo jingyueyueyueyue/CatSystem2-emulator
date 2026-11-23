@@ -21,7 +21,7 @@ pub use anm::{
 pub use cstl::{CstlError, CstlLanguageSelection, CstlLocalization, CstlMessage, CstlTable};
 pub use expression::{
     Expression, ExpressionState, eval_expression, eval_expression_fallback,
-    eval_expression_parameter,
+    eval_expression_parameter, eval_kcs_expression_parameter,
 };
 pub use message::{
     MessageGlyph, MessageLayout, MessageLayoutSettings, MessageReveal, MessageRevealUpdate,

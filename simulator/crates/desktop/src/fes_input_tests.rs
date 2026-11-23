@@ -65,6 +65,26 @@ fn fresh_fes_dialog_waits_until_a_child_really_exits() -> Result<()> {
 }
 
 #[test]
+fn fes_wait_voice_without_an_object_uses_the_numeric_duration() -> Result<()> {
+    for (value, duration) in [(0, 1), (3, 3)] {
+        let (mut driver, mut shared) = driver(&[b"wait voice", b"exit -2"]);
+        driver.set_named_value("voice", 0, value);
+        let until = 1873 + duration;
+        for frame in 1873..until {
+            assert!(matches!(
+                driver.advance(frame, &mut shared, 32)?,
+                FesDriverEffect::Waiting {
+                    wait: FesDriverWait::Frames { until: deadline },
+                    handler_local: false,
+                } if deadline == until
+            ));
+        }
+        assert!(matches!(driver.advance(until, &mut shared, 32)?, FesDriverEffect::Exit(-2)));
+    }
+    Ok(())
+}
+
+#[test]
 fn routed_click_reaches_next_title_poll_only_once() {
     let (mut driver, mut shared) = driver(&[b"if (_CLICK_L_==17)", b"exit 42", b"endif"]);
     assert!(matches!(
@@ -179,6 +199,43 @@ fn fes_system_block_keeps_legacy_return_outside_verified_rebellions_callbacks() 
         assert_eq!(driver.interpreter.local_values()[100], 1);
         assert_eq!(driver.waiting(), Some(&FesDriverWait::Frames { until: 110 }));
     }
+    Ok(())
+}
+
+#[test]
+fn fes_choice_reset_yields_in_body_before_redrawing_labels() -> Result<()> {
+    let document = FesDocument {
+        sections: [
+            (b"START".as_slice(), &[b"wait 100".as_slice()][..]),
+            (b"SEL_RESET", &[b"next SETSEL_0".as_slice()][..]),
+            (b"SETSEL_0", &[b"str clear".as_slice(), b"wait 1", b"next SETSEL"][..]),
+            (b"SETSEL", &[b"str[0] draw -1".as_slice()][..]),
+        ].into_iter().enumerate().map(|(section, (header, lines))| cs2_script::FesSection {
+            header: header.to_vec(),
+            lines: lines.iter().enumerate().map(|(index, line)| cs2_script::FesLine {
+                offset: 10 * section + index,
+                bytes: line.to_vec(),
+            }).collect(),
+        }).collect(),
+    };
+    let mut driver = FesScriptDriver::new(&document)?;
+    let mut shared = ExpressionState::default();
+    while driver.initialization_pending() {
+        driver.advance_initialization(&mut shared)?;
+    }
+    assert!(matches!(driver.advance(10, &mut shared, 64)?, FesDriverEffect::Waiting { .. }));
+    assert!(driver.dispatch_system_block(b"SEL_RESET")?);
+    for complete in [false, true] {
+        assert!(matches!(driver.advance_notification(10, &mut shared, 64)?,
+            FesDriverEffect::SystemBlock { name, complete: arrived }
+            if name == b"SEL_RESET" && arrived == complete));
+    }
+    assert!(matches!(driver.advance(10, &mut shared, 64)?,
+        FesDriverEffect::Command(command) if command.context.block == b"SETSEL_0"));
+    assert!(matches!(driver.advance(10, &mut shared, 64)?,
+        FesDriverEffect::Waiting { wait: FesDriverWait::Frames { until: 11 }, handler_local: false }));
+    assert!(matches!(driver.advance(11, &mut shared, 64)?,
+        FesDriverEffect::Command(command) if command.context.block == b"SETSEL"));
     Ok(())
 }
 
