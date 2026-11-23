@@ -89,6 +89,9 @@ impl HeadlessPlayer {
 
     fn check_object_graph_boundary(&self) -> anyhow::Result<()> {
         self.check_input_callbacks_for_graph()?;
+        if self.data_services.emote.has_pending_loads() {
+            anyhow::bail!("host graph is waiting for asynchronous E-mote material preparation");
+        }
         let unsupported = self.object_graph_unsupported_task_families();
         if !unsupported.is_empty() {
             anyhow::bail!("host graph has {} unsupported task families: {:?}", unsupported.len(), unsupported);

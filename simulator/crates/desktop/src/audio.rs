@@ -3,13 +3,16 @@ use crate::audio_control::{self, AudioParameters};
 use crate::audio_decode::{AudioCodec, AudioProbe, PreparedAudio, prepare_audio};
 use crate::perf_detail::audio::{self as audio_profile, Stage};
 use cs2_runtime::{
-    AudioChannel, AudioHost, AudioRequest, PlaybackState, ResourceIndex, RuntimeError,
+    AudioChannel, AudioControl, AudioHost, AudioRequest, AudioStart, PlaybackState, ResourceIndex, RuntimeError,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[path = "audio_start.rs"]
+mod start;
 
 #[path = "audio_playback_state.rs"]
 pub(crate) mod checkpoint;
@@ -92,6 +95,29 @@ pub(super) fn play_loaded_sound_range(
     host.play(request)
 }
 
+
+/// Retains the prepared decoder and loop policy before returning a pending
+/// backend ticket; the device worker never depends on this thread-local scope.
+pub(super) fn begin_loaded_sound_range(
+    host: &mut dyn AudioHost,
+    request: AudioRequest,
+    prepared: Option<Arc<PreparedAudio>>,
+    silence_millis: u32,
+    play_count: u32,
+    signal_enabled: bool,
+    loop_spec: audio_control::AudioLoop,
+) -> cs2_runtime::RuntimeResult<AudioStart> {
+    let previous = PREPARED_REQUEST.with(|slot| slot.borrow_mut().take());
+    let _guard = PreparedRequestGuard(previous);
+    PREPARED_REQUEST.with(|slot| {
+        *slot.borrow_mut() = prepared.map(|audio| PreparedRequest {
+            resource: request.resource.clone(), audio, silence_millis,
+            play_count, signal_enabled, loop_spec,
+        });
+    });
+    host.begin_play(request)
+}
+
 fn join_worker(worker: &mut Option<JoinHandle<()>>) {
     if let Some(worker) = worker.take() {
         let _ = worker.join();
@@ -103,6 +129,8 @@ pub struct DesktopAudioHost {
     ogg: WavAudioHost,
     wav: WavAudioHost,
     handles: HashMap<u64, AudioBackendHandle>,
+    pending: HashMap<u64, bool>,
+    controls: HashMap<u64, bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +166,8 @@ impl DesktopAudioHost {
             ogg: WavAudioHost::new(move |name| ogg_resolver(name)),
             wav: WavAudioHost::new(move |name| wav_resolver(name)),
             handles: HashMap::new(),
+            pending: HashMap::new(),
+            controls: HashMap::new(),
         }
     }
 
@@ -157,6 +187,8 @@ impl DesktopAudioHost {
 
     /// Reap completed channels even when the script never queries status.
     pub fn poll(&mut self) -> cs2_runtime::RuntimeResult<()> {
+        self.ogg.reap_retiring();
+        self.wav.reap_retiring();
         let handles = self.handles.keys().copied().collect::<Vec<_>>();
         let mut first_error = None;
         for handle in handles {
@@ -167,6 +199,71 @@ impl DesktopAudioHost {
         first_error.map_or(Ok(()), Err)
     }
 
+
+    /// Gates only device startup; tickets, controls, cancellation, promotion,
+    /// and reaping use the real backend paths in engine scheduling tests.
+    #[cfg(test)]
+    pub(crate) fn begin_test_pending_start(
+        &mut self,
+        request: AudioRequest,
+        completion: mpsc::Receiver<cs2_runtime::RuntimeResult<()>>,
+    ) -> cs2_runtime::RuntimeResult<AudioStart> {
+        self.begin_test_pending_start_with_controls(request, completion, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_pending_start_with_controls(
+        &mut self,
+        request: AudioRequest,
+        completion: mpsc::Receiver<cs2_runtime::RuntimeResult<()>>,
+        controls: Option<mpsc::Receiver<cs2_runtime::RuntimeResult<()>>>,
+    ) -> cs2_runtime::RuntimeResult<AudioStart> {
+        self.ogg.reap_retiring(); self.wav.reap_retiring();
+        if self.ogg.worker_count() + self.wav.worker_count() >= MAX_PCM_WORKERS {
+            return Err(RuntimeError::Host("too many live or retiring PCM workers".into()));
+        }
+        let handle = audio_control::allocate_handle()?;
+        let parameters = AudioParameters::new(request.volume, request.pan)?;
+        audio_control::register(handle, &parameters)?;
+        let (commands, command_receiver) = mpsc::channel();
+        let (started, receiver) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = completion.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| Err(RuntimeError::Host("test driver disconnected or timed out".into())));
+            let acknowledgement = result.as_ref().map(|_| ()).map_err(|cause| match cause {
+                RuntimeError::AudioStartTimeout(message) => RuntimeError::AudioStartTimeout(message.clone()),
+                _ => RuntimeError::Host(cause.to_string()),
+            });
+            let accepted = started.send(acknowledgement).is_ok();
+            let result = if accepted && result.is_ok() {
+                let mut result = Ok(());
+                while let Ok(command) = command_receiver.recv() {
+                    let response = controls.as_ref().map_or(Ok(()), |gate| gate.recv_timeout(Duration::from_secs(5))
+                        .unwrap_or_else(|_| Err(RuntimeError::Host("test control driver timed out".into()))));
+                    match command {
+                        WavWorkerCommand::Stop(_) => { result = response; break; }
+                        WavWorkerCommand::Pause(_, reply, _) | WavWorkerCommand::Suspend(_, reply) => { let _ = reply.send(response); }
+                        _ => {}
+                    }
+                }
+                result
+            } else { result };
+            let _ = done.send(result);
+        });
+        let prepared = Arc::new(PreparedAudio::from_pcm(crate::audio_decode::DecodedAudio {
+            probe: AudioProbe { codec: AudioCodec::WavPcm, sample_rate: 44_100, channels: 1, frames: 0 },
+            samples: Vec::new().into(),
+        }));
+        let channel = request.channel;
+        let resource = request.resource.clone();
+        self.wav.install_start(handle, request, ActiveWavPlayback {
+            channel, paused: false, commands, finished,
+            thread: Some(worker), _parameters: parameters, resource, prepared,
+        }, receiver);
+        self.pending.insert(handle, true);
+        Ok(AudioStart::Pending(handle))
+    }
+
     fn play_backend(
         &mut self,
         request: AudioRequest,
@@ -175,6 +272,11 @@ impl DesktopAudioHost {
         play_count: u32,
         signal_enabled: bool,
     ) -> cs2_runtime::RuntimeResult<PlaybackState> {
+        self.ogg.reap_retiring();
+        self.wav.reap_retiring();
+        if self.ogg.worker_count() + self.wav.worker_count() >= MAX_PCM_WORKERS {
+            return Err(RuntimeError::Host("too many live or retiring PCM workers".into()));
+        }
         let wav = prepared.probe.codec != AudioCodec::OggVorbis;
         let playback = if wav {
             self.wav.play_prepared(
@@ -245,6 +347,101 @@ impl AudioHost for DesktopAudioHost {
         )
     }
 
+    fn begin_play(&mut self, request: AudioRequest) -> cs2_runtime::RuntimeResult<AudioStart> {
+        self.poll()?;
+        let loaded = PREPARED_REQUEST.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|loaded| loaded.resource == request.resource)
+                .map(|loaded| {
+                    (
+                        loaded.audio.clone(),
+                        loaded.silence_millis,
+                        loaded.play_count,
+                        loaded.signal_enabled,
+                    )
+                })
+        });
+        let (prepared, silence_millis, play_count, signal_enabled) = match loaded {
+            Some(loaded) => loaded,
+            None => (
+                prepare_audio((self.resolve)(&request.resource)?)?,
+                0,
+                if request.looped { 0 } else { 1 },
+                false,
+            ),
+        };
+        if self.ogg.worker_count() + self.wav.worker_count() >= MAX_PCM_WORKERS {
+            return Err(RuntimeError::Host("too many live or retiring PCM workers".into()));
+        }
+        let wav = prepared.probe.codec != AudioCodec::OggVorbis;
+        let backend = if wav { &mut self.wav } else { &mut self.ogg };
+        let ticket = backend.begin_prepared(request, prepared, silence_millis, play_count, signal_enabled, true)?;
+        self.pending.insert(ticket, wav);
+        Ok(AudioStart::Pending(ticket))
+    }
+
+    fn poll_play(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<Option<PlaybackState>> {
+        let wav = *self.pending.get(&ticket).ok_or_else(|| RuntimeError::Host(format!("audio start ticket {ticket} is not pending")))?;
+        let backend = if wav { &mut self.wav } else { &mut self.ogg };
+        match backend.poll_play(ticket) {
+            Ok(None) => Ok(None),
+            Ok(Some(playback)) => {
+                self.pending.remove(&ticket);
+                let channel = backend.active.get(&playback.handle).unwrap().channel;
+                self.handles.insert(playback.handle, if wav {
+                    AudioBackendHandle::Wav(playback.handle, channel)
+                } else {
+                    AudioBackendHandle::Ogg(playback.handle, channel)
+                });
+                Ok(Some(playback))
+            }
+            Err(cause) => { self.pending.remove(&ticket); Err(cause) }
+        }
+    }
+
+    fn cancel_play(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<()> {
+        if let Some(wav) = self.pending.remove(&ticket) {
+            if wav { self.wav.cancel_play(ticket) } else { self.ogg.cancel_play(ticket) }
+        } else { Ok(()) }
+    }
+
+    fn begin_stop(&mut self, handle: u64) -> cs2_runtime::RuntimeResult<AudioControl> {
+        let Some(backend) = self.handles.get(&handle).copied() else { return Ok(AudioControl::Ready); };
+        if self.controls.len() >= MAX_PCM_WORKERS { return Err(RuntimeError::Host("too many pending audio controls".into())); }
+        let (wav, result) = match backend {
+            AudioBackendHandle::Wav(inner, _) => (true, self.wav.begin_stop(inner)?),
+            AudioBackendHandle::Ogg(inner, _) => (false, self.ogg.begin_stop(inner)?),
+        };
+        self.handles.remove(&handle);
+        if let AudioControl::Pending(ticket) = result { self.controls.insert(ticket, wav); }
+        Ok(result)
+    }
+
+    fn begin_pause(&mut self, handle: u64, paused: bool) -> cs2_runtime::RuntimeResult<AudioControl> {
+        if self.controls.len() >= MAX_PCM_WORKERS { return Err(RuntimeError::Host("too many pending audio controls".into())); }
+        let (wav, result) = match self.handles.get(&handle) {
+            Some(AudioBackendHandle::Wav(inner, _)) => (true, self.wav.begin_pause(*inner, paused)?),
+            Some(AudioBackendHandle::Ogg(inner, _)) => (false, self.ogg.begin_pause(*inner, paused)?),
+            None => return Err(RuntimeError::Host(format!("audio playback handle {handle} is not active"))),
+        };
+        if let AudioControl::Pending(ticket) = result { self.controls.insert(ticket, wav); }
+        Ok(result)
+    }
+
+    fn poll_control(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<Option<()>> {
+        let wav = *self.controls.get(&ticket).ok_or_else(|| RuntimeError::Host(format!("audio control ticket {ticket} is not pending")))?;
+        let result = if wav { self.wav.poll_control(ticket) } else { self.ogg.poll_control(ticket) };
+        if !matches!(result, Ok(None)) { self.controls.remove(&ticket); }
+        result
+    }
+
+    fn cancel_control(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<()> {
+        if let Some(wav) = self.controls.remove(&ticket) {
+            if wav { self.wav.cancel_control(ticket) } else { self.ogg.cancel_control(ticket) }
+        } else { Ok(()) }
+    }
+
     fn stop(&mut self, handle: u64) -> cs2_runtime::RuntimeResult<()> {
         let Some(backend) = self.handles.remove(&handle) else {
             return Ok(());
@@ -268,6 +465,8 @@ impl AudioHost for DesktopAudioHost {
     fn stop_all(&mut self, channel: AudioChannel) -> cs2_runtime::RuntimeResult<()> {
         let ogg_result = self.ogg.stop_all(channel);
         let wav_result = self.wav.stop_all(channel);
+        self.pending.retain(|ticket, wav| if *wav { self.wav.pending.contains_key(ticket) } else { self.ogg.pending.contains_key(ticket) });
+        self.controls.retain(|ticket, wav| if *wav { self.wav.controls.contains_key(ticket) } else { self.ogg.controls.contains_key(ticket) });
         self.handles.retain(|_, backend| match backend {
             AudioBackendHandle::Ogg(_, active_channel)
             | AudioBackendHandle::Wav(_, active_channel) => *active_channel != channel,
@@ -329,11 +528,27 @@ impl Drop for ActiveWavPlayback {
     }
 }
 
+const MAX_PCM_WORKERS: usize = 64;
+
+struct PendingWavPlayback {
+    acknowledgement: start::StartAcknowledgement<RuntimeError>,
+    playback: PlaybackState,
+    active: ActiveWavPlayback,
+}
+
+enum PendingWavControl {
+    Pause { handle: u64, channel: AudioChannel, paused: bool, acknowledgement: start::StartAcknowledgement<RuntimeError> },
+    Stop { active: ActiveWavPlayback, deadline: Instant },
+}
+
 /// PCM output for RIFF/WAVE and Ogg/Vorbis, using bounded WinMM/AAudio buffers.
 /// The historical `WavAudioHost` name remains available to existing callers.
 pub struct WavAudioHost {
     resolve: Arc<dyn Fn(&str) -> cs2_runtime::RuntimeResult<Vec<u8>> + Send + Sync + 'static>,
     active: HashMap<u64, ActiveWavPlayback>,
+    pending: HashMap<u64, PendingWavPlayback>,
+    controls: HashMap<u64, PendingWavControl>,
+    retiring: Vec<ActiveWavPlayback>,
     suspended: bool,
     #[cfg(target_os = "android")]
     standby: crate::audio_android::StandbyPool,
@@ -346,6 +561,9 @@ impl WavAudioHost {
         Self {
             resolve: Arc::new(resolve),
             active: HashMap::new(),
+            pending: HashMap::new(),
+            controls: HashMap::new(),
+            retiring: Vec::new(),
             suspended: false,
             #[cfg(target_os = "android")]
             standby: crate::audio_android::StandbyPool::default(),
@@ -375,7 +593,7 @@ impl WavAudioHost {
         let mut first_error = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut responses = Vec::with_capacity(self.active.len());
-        for playback in self.active.values() {
+        for playback in self.active.values().chain(self.pending.values().map(|p| &p.active)) {
             let (acknowledge, response) = mpsc::sync_channel(1);
             if playback
                 .commands
@@ -405,7 +623,28 @@ impl WavAudioHost {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn worker_count(&self) -> usize {
+        self.active.len() + self.pending.len() + self.retiring.len()
+            + self.controls.values().filter(|c| matches!(c, PendingWavControl::Stop { .. })).count()
+    }
+
+    fn reap_retiring(&mut self) {
+        self.retiring.retain_mut(|playback| {
+            if playback.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                join_worker(&mut playback.thread);
+                false
+            } else { true }
+        });
+    }
+
+    fn retire(&mut self, playback: ActiveWavPlayback) {
+        let _ = playback.commands.send(WavWorkerCommand::Stop(None));
+        self.retiring.push(playback);
+        self.reap_retiring();
+    }
+
     fn reap_finished(&mut self) -> cs2_runtime::RuntimeResult<()> {
+        self.reap_retiring();
         let completed = self
             .active
             .iter()
@@ -486,6 +725,123 @@ impl AudioHost for WavAudioHost {
         self.play_prepared(request, prepared, silence, count, signal)
     }
 
+    fn begin_play(&mut self, request: AudioRequest) -> cs2_runtime::RuntimeResult<AudioStart> {
+        self.reap_finished()?;
+        if !request.volume.is_finite() || !request.pan.is_finite() {
+            return Err(RuntimeError::Host(
+                "audio volume and pan must be finite".to_string(),
+            ));
+        }
+        let loaded = PREPARED_REQUEST.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|loaded| loaded.resource == request.resource)
+                .map(|loaded| {
+                    (
+                        loaded.audio.clone(),
+                        loaded.silence_millis,
+                        loaded.play_count,
+                        loaded.signal_enabled,
+                    )
+                })
+        });
+        let (prepared, silence, count, signal) = match loaded {
+            Some(loaded) => loaded,
+            None => (
+                prepare_audio((self.resolve)(&request.resource)?)?,
+                0,
+                if request.looped { 0 } else { 1 },
+                false,
+            ),
+        };
+        self.begin_prepared(request, prepared, silence, count, signal, true).map(AudioStart::Pending)
+    }
+
+    fn poll_play(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<Option<PlaybackState>> {
+        self.reap_retiring();
+        let pending = self.pending.get_mut(&ticket).ok_or_else(|| RuntimeError::Host(format!("audio start ticket {ticket} is not pending")))?;
+        let Some(result) = pending.acknowledgement.poll(Instant::now(), || RuntimeError::Host(
+            "WAV worker did not acknowledge opening the device".into()
+        )) else { return Ok(None); };
+        let pending = self.pending.remove(&ticket).unwrap();
+        match result {
+            Ok(()) => {
+                #[cfg(target_os = "android")]
+                self.warm_device_for(pending.active.prepared.probe);
+                self.active.insert(ticket, pending.active);
+                Ok(Some(pending.playback))
+            }
+            Err(cause) => { self.retire(pending.active); Err(cause) }
+        }
+    }
+
+    fn cancel_play(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<()> {
+        if let Some(pending) = self.pending.remove(&ticket) {
+            // A delayed worker cannot publish this canceled start.
+            drop(pending.acknowledgement);
+            self.retire(pending.active);
+        }
+        Ok(())
+    }
+
+    fn begin_stop(&mut self, handle: u64) -> cs2_runtime::RuntimeResult<AudioControl> {
+        self.reap_retiring();
+        if !self.active.contains_key(&handle) { return Ok(AudioControl::Ready); }
+        if self.controls.len() >= MAX_PCM_WORKERS { return Err(RuntimeError::Host("too many pending audio controls".into())); }
+        let ticket = audio_control::allocate_handle()?;
+        let active = self.active.remove(&handle).unwrap();
+        // A concurrent natural finish already owns its result in `finished`.
+        let _ = active.commands.send(WavWorkerCommand::Stop(audio_profile::active()));
+        self.controls.insert(ticket, PendingWavControl::Stop { active, deadline: Instant::now() + Duration::from_secs(5) });
+        Ok(AudioControl::Pending(ticket))
+    }
+
+    fn begin_pause(&mut self, handle: u64, paused: bool) -> cs2_runtime::RuntimeResult<AudioControl> {
+        self.reap_finished()?;
+        if self.controls.len() >= MAX_PCM_WORKERS { return Err(RuntimeError::Host("too many pending audio controls".into())); }
+        let active = self.active.get(&handle).ok_or_else(|| RuntimeError::Host(format!("WAV playback handle {handle} is not active")))?;
+        let ticket = audio_control::allocate_handle()?;
+        let (acknowledge, response) = mpsc::sync_channel(1);
+        active.commands.send(WavWorkerCommand::Pause(paused, acknowledge, audio_profile::active()))
+            .map_err(|_| RuntimeError::Host("WAV playback worker stopped".into()))?;
+        self.controls.insert(ticket, PendingWavControl::Pause {
+            handle, channel: active.channel, paused,
+            acknowledgement: start::StartAcknowledgement::new(response, Instant::now() + Duration::from_secs(5)),
+        });
+        Ok(AudioControl::Pending(ticket))
+    }
+
+    fn poll_control(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<Option<()>> {
+        self.reap_retiring();
+        let pending = self.controls.get_mut(&ticket).ok_or_else(|| RuntimeError::Host(format!("audio control ticket {ticket} is not pending")))?;
+        let result = match pending {
+            PendingWavControl::Pause { acknowledgement, .. } => acknowledgement.poll(Instant::now(), || RuntimeError::Host("WAV worker dropped pause response".into())),
+            PendingWavControl::Stop { active, deadline } => match active.finished.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < *deadline => None,
+                Err(mpsc::TryRecvError::Empty) => Some(Err(RuntimeError::Host("WAV worker stop timed out".into()))),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(RuntimeError::Host("WAV worker dropped result".into()))),
+            },
+        };
+        let Some(result) = result else { return Ok(None); };
+        match self.controls.remove(&ticket).unwrap() {
+            PendingWavControl::Pause { handle, paused, .. } => {
+                if result.is_ok() && let Some(active) = self.active.get_mut(&handle) { active.paused = paused; }
+            }
+            PendingWavControl::Stop { active, .. } => {
+                #[cfg(target_os = "android")]
+                if result.is_ok() { self.warm_device_for(active.prepared.probe); }
+                self.retire(active);
+            }
+        }
+        result.map(|_| Some(()))
+    }
+
+    fn cancel_control(&mut self, ticket: u64) -> cs2_runtime::RuntimeResult<()> {
+        if let Some(PendingWavControl::Stop { active, .. }) = self.controls.remove(&ticket) { self.retire(active); }
+        Ok(())
+    }
+
     fn stop(&mut self, handle: u64) -> cs2_runtime::RuntimeResult<()> {
         #[cfg(target_os = "android")]
         let source = self.active.get(&handle).map(|playback| playback.prepared.probe);
@@ -516,6 +872,13 @@ impl AudioHost for WavAudioHost {
     }
 
     fn stop_all(&mut self, channel: AudioChannel) -> cs2_runtime::RuntimeResult<()> {
+        let controls = self.controls.iter().filter_map(|(&ticket, control)| {
+            let active_channel = match control { PendingWavControl::Pause { channel, .. } => *channel, PendingWavControl::Stop { active, .. } => active.channel };
+            (active_channel == channel).then_some(ticket)
+        }).collect::<Vec<_>>();
+        for ticket in controls { self.cancel_control(ticket)?; }
+        let pending = self.pending.iter().filter_map(|(&ticket, p)| (p.active.channel == channel).then_some(ticket)).collect::<Vec<_>>();
+        for ticket in pending { self.cancel_play(ticket)?; }
         let handles = self
             .active
             .iter()
@@ -551,7 +914,38 @@ impl WavAudioHost {
         play_count: u32,
         signal_enabled: bool,
     ) -> cs2_runtime::RuntimeResult<PlaybackState> {
+        let ticket = self.begin_prepared(request, prepared, silence_millis, play_count, signal_enabled, true)?;
+        let _timing = Stage::Ack.begin();
+        loop {
+            if let Some(playback) = self.poll_play(ticket)? { return Ok(playback); }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn install_start(
+        &mut self, handle: u64, request: AudioRequest, active: ActiveWavPlayback,
+        receiver: mpsc::Receiver<cs2_runtime::RuntimeResult<()>>,
+    ) {
+        self.pending.insert(handle, PendingWavPlayback {
+            acknowledgement: start::StartAcknowledgement::new(receiver, Instant::now() + Duration::from_secs(10)),
+            playback: PlaybackState { handle, resource: request.resource, looped: request.looped, paused: false },
+            active,
+        });
+    }
+
+    fn begin_prepared(
+        &mut self,
+        request: AudioRequest,
+        prepared: Arc<PreparedAudio>,
+        silence_millis: u32,
+        play_count: u32,
+        signal_enabled: bool,
+        compatible_early_ack: bool,
+    ) -> cs2_runtime::RuntimeResult<u64> {
         self.reap_finished()?;
+        if self.worker_count() >= MAX_PCM_WORKERS {
+            return Err(RuntimeError::Host("too many live or retiring PCM workers".into()));
+        }
         let parameters = {
             let _timing = Stage::Register.begin();
             let parameters = AudioParameters::new(request.volume, request.pan)?;
@@ -580,6 +974,7 @@ impl WavAudioHost {
                 silence_millis,
                 loop_spec,
                 initial_suspended,
+                compatible_early_ack,
             );
             Err(RuntimeError::Host(
                 "system PCM audio output is implemented for Windows and Android only".to_string(),
@@ -605,9 +1000,10 @@ impl WavAudioHost {
             let (finished_sender, finished) = mpsc::channel();
             let retained_prepared = prepared.clone();
             let worker_timing = audio_profile::active();
-            // Sound effects have a synchronous, nonfatal startup-timeout
-            // path in native157. Voice/BGM errors can use the worker result.
-            let acknowledge_start_request = cfg!(target_os = "android")
+            // Native157 effects retain confirmed-start/nonfatal-timeout
+            // semantics. BGM/voice acknowledge accepted requests as before;
+            // subsequent device failures remain on the live worker result.
+            let acknowledge_start_request = compatible_early_ack && cfg!(target_os = "android")
                 && matches!(request.channel, AudioChannel::Bgm | AudioChannel::Voice);
             let worker = {
                 let _timing = Stage::Spawn.begin();
@@ -644,53 +1040,24 @@ impl WavAudioHost {
                     })
                     .map_err(|error| RuntimeError::Host(format!("start WAV worker: {error}")))?
             };
-            let ready = {
-                let _timing = Stage::Ack.begin();
-                started_receiver.recv_timeout(Duration::from_secs(10))
-            };
-            match ready {
-                Ok(Ok(())) => {
-                    #[cfg(target_os = "android")]
-                    self.warm_device_for(retained_prepared.probe);
-                    self.active.insert(
-                        handle,
-                        ActiveWavPlayback {
-                            channel: request.channel.clone(),
-                            paused: false,
-                            commands,
-                            finished,
-                            thread: Some(worker),
-                            _parameters: parameters,
-                            resource: request.resource.clone(),
-                            prepared: retained_prepared,
-                        },
-                    );
-                    Ok(PlaybackState {
-                        handle,
-                        resource: request.resource,
-                        looped: request.looped,
-                        paused: false,
-                    })
-                }
-                Ok(Err(error)) => {
-                    let _ = worker.join();
-                    Err(error)
-                }
-                Err(_) => {
-                    drop(commands);
-                    drop(started_receiver);
-                    let _ = worker.join();
-                    Err(RuntimeError::Host(
-                        "WAV worker did not acknowledge opening the device".to_string(),
-                    ))
-                }
-            }
+            let channel = request.channel;
+            let resource = request.resource.clone();
+            self.install_start(handle, request, ActiveWavPlayback {
+                channel, paused: false, commands, finished,
+                thread: Some(worker), _parameters: parameters,
+                resource, prepared: retained_prepared,
+            }, started_receiver);
+            Ok(handle)
         }
     }
 }
 
 impl Drop for WavAudioHost {
     fn drop(&mut self) {
+        let controls = self.controls.keys().copied().collect::<Vec<_>>();
+        for ticket in controls { let _ = self.cancel_control(ticket); }
+        let tickets = self.pending.keys().copied().collect::<Vec<_>>();
+        for ticket in tickets { let _ = self.cancel_play(ticket); }
         let handles = self.active.keys().copied().collect::<Vec<_>>();
         for handle in handles {
             let _ = self.stop_playback(handle);
@@ -701,6 +1068,157 @@ impl Drop for WavAudioHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request() -> AudioRequest {
+        AudioRequest { channel: AudioChannel::SoundEffect, resource: "effect.wav".into(), volume: 1.0, pan: 0.0, looped: false }
+    }
+
+    fn poll_until_ready(host: &mut DesktopAudioHost, ticket: u64) -> cs2_runtime::RuntimeResult<PlaybackState> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(playback) = host.poll_play(ticket)? { return Ok(playback); }
+            assert!(Instant::now() < deadline, "test driver failed to complete");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn delayed_start_returns_pending_then_promotes_the_real_handle() {
+        let mut host = DesktopAudioHost::new(|_| unreachable!());
+        let (completion, startup) = mpsc::channel();
+        let AudioStart::Pending(ticket) = host.begin_test_pending_start(request(), startup).unwrap() else { panic!("pending start required") };
+        assert!(host.poll_play(ticket).unwrap().is_none());
+        assert!(!host.handles.contains_key(&ticket));
+        completion.send(Ok(())).unwrap();
+        let playback = poll_until_ready(&mut host, ticket).unwrap();
+        assert_eq!(playback.handle, ticket);
+        assert_eq!(playback.resource, "effect.wav");
+        assert!(host.is_active(ticket).unwrap());
+        host.stop(ticket).unwrap();
+    }
+
+    #[test]
+    fn cancellation_returns_while_driver_is_still_blocked_and_does_not_promote_it() {
+        let mut host = DesktopAudioHost::new(|_| unreachable!());
+        let (completion, startup) = mpsc::channel();
+        let AudioStart::Pending(ticket) = host.begin_test_pending_start(request(), startup).unwrap() else { panic!("pending start required") };
+        host.cancel_play(ticket).unwrap();
+        assert_eq!(host.wav.retiring.len(), 1);
+        assert!(!host.wav.retiring[0].thread.as_ref().unwrap().is_finished());
+        completion.send(Ok(())).unwrap();
+        assert!(host.poll_play(ticket).is_err());
+        assert!(!host.is_active(ticket).unwrap());
+    }
+
+    #[test]
+    fn deferred_se_start_timeout_keeps_the_native157_error_kind() {
+        let mut host = DesktopAudioHost::new(|_| unreachable!());
+        let (completion, startup) = mpsc::channel();
+        let AudioStart::Pending(ticket) = host.begin_test_pending_start(request(), startup).unwrap() else { panic!("pending start required") };
+        completion.send(Err(RuntimeError::AudioStartTimeout("device still starting".into()))).unwrap();
+        assert!(matches!(poll_until_ready(&mut host, ticket), Err(RuntimeError::AudioStartTimeout(_))));
+        host.poll().unwrap();
+        assert!(!host.is_active(ticket).unwrap());
+    }
+
+    #[test]
+    fn expired_start_can_retire_without_joining_a_blocked_driver() {
+        let mut host = DesktopAudioHost::new(|_| unreachable!());
+        let (completion, startup) = mpsc::channel();
+        let AudioStart::Pending(ticket) = host.begin_test_pending_start(request(), startup).unwrap() else { panic!("pending start required") };
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        host.wav.pending.get_mut(&ticket).unwrap().acknowledgement = start::StartAcknowledgement::new(receiver, Instant::now());
+        assert!(host.poll_play(ticket).is_err());
+        assert_eq!(host.wav.retiring.len(), 1);
+        completion.send(Ok(())).unwrap();
+        host.poll().unwrap();
+    }
+
+    fn delayed_control_host() -> (DesktopAudioHost, u64, mpsc::Sender<cs2_runtime::RuntimeResult<()>>) {
+        let mut host = DesktopAudioHost::new(|_| unreachable!());
+        let handle = audio_control::allocate_handle().unwrap();
+        let parameters = AudioParameters::new(1.0, 0.0).unwrap();
+        let (commands, receiver) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let (gate, driver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                let result = driver.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| Err(RuntimeError::Host("test driver timed out".into())));
+                match command {
+                    WavWorkerCommand::Pause(_, acknowledge, _) => { let _ = acknowledge.send(result); }
+                    WavWorkerCommand::Stop(_) => { let _ = done.send(result); return; }
+                    _ => panic!("unexpected test driver command"),
+                }
+            }
+        });
+        host.wav.active.insert(handle, ActiveWavPlayback {
+            channel: AudioChannel::SoundEffect, paused: false, commands, finished, thread: Some(worker),
+            _parameters: parameters, resource: "effect.wav".into(),
+            prepared: Arc::new(PreparedAudio::from_pcm(crate::audio_decode::DecodedAudio {
+                probe: AudioProbe { codec: AudioCodec::WavPcm, sample_rate: 44_100, channels: 1, frames: 0 },
+                samples: Vec::new().into(),
+            })),
+        });
+        host.handles.insert(handle, AudioBackendHandle::Wav(handle, AudioChannel::SoundEffect));
+        (host, handle, gate)
+    }
+
+    fn poll_control_until_ready(host: &mut DesktopAudioHost, ticket: u64) -> cs2_runtime::RuntimeResult<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if host.poll_control(ticket)?.is_some() { return Ok(()); }
+            assert!(Instant::now() < deadline, "test driver control failed to complete");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn asynchronous_pause_keeps_frames_free_until_the_driver_acknowledges() {
+        let (mut host, handle, gate) = delayed_control_host();
+        let AudioControl::Pending(ticket) = host.begin_pause(handle, true).unwrap() else { panic!("pending pause required") };
+        assert!(host.poll_control(ticket).unwrap().is_none());
+        assert!(!host.wav.active[&handle].paused);
+        gate.send(Ok(())).unwrap();
+        poll_control_until_ready(&mut host, ticket).unwrap();
+        assert!(host.wav.active[&handle].paused);
+        let AudioControl::Pending(ticket) = host.begin_stop(handle).unwrap() else { panic!("pending stop required") };
+        gate.send(Ok(())).unwrap();
+        poll_control_until_ready(&mut host, ticket).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_stop_keeps_cleanup_errors_without_waiting_for_the_driver() {
+        let (mut host, handle, gate) = delayed_control_host();
+        let AudioControl::Pending(ticket) = host.begin_stop(handle).unwrap() else { panic!("pending stop required") };
+        assert!(host.poll_control(ticket).unwrap().is_none());
+        assert!(!host.is_active(handle).unwrap());
+        gate.send(Err(RuntimeError::Host("device cleanup failed".into()))).unwrap();
+        assert!(matches!(poll_control_until_ready(&mut host, ticket), Err(RuntimeError::Host(message)) if message == "device cleanup failed"));
+        host.poll().unwrap();
+    }
+
+    #[test]
+    fn an_expired_stop_retires_the_driver_without_joining_it() {
+        let (mut host, handle, gate) = delayed_control_host();
+        let AudioControl::Pending(ticket) = host.begin_stop(handle).unwrap() else { panic!("pending stop required") };
+        let PendingWavControl::Stop { deadline, .. } = host.wav.controls.get_mut(&ticket).unwrap() else { panic!("stop ownership required") };
+        *deadline = Instant::now();
+        assert!(host.poll_control(ticket).is_err());
+        assert_eq!(host.wav.retiring.len(), 1);
+        assert!(!host.wav.retiring[0].thread.as_ref().unwrap().is_finished());
+        gate.send(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn canceling_an_issued_pause_never_waits_for_its_response() {
+        let (mut host, handle, gate) = delayed_control_host();
+        let AudioControl::Pending(ticket) = host.begin_pause(handle, true).unwrap() else { panic!("pending pause required") };
+        host.cancel_control(ticket).unwrap();
+        gate.send(Ok(())).unwrap();
+        let AudioControl::Pending(ticket) = host.begin_stop(handle).unwrap() else { panic!("pending stop required") };
+        gate.send(Ok(())).unwrap();
+        poll_control_until_ready(&mut host, ticket).unwrap();
+    }
 
     #[test]
     fn stop_uses_the_result_of_a_worker_finishing_concurrently() {
@@ -811,6 +1329,49 @@ mod pcm_worker {
         }
     }
 
+    struct StartupPolicy {
+        paused: bool,
+        suspended: bool,
+        deferred: std::collections::VecDeque<WavWorkerCommand>,
+    }
+
+    /// Open/prime may wait inside the driver. Honor lifecycle and cancellation
+    /// that arrived during that work before any program PCM starts playing.
+    fn activate_pending_output(
+        output: &mut dyn MovieAudioOutput,
+        mut paused: bool,
+        mut suspended: bool,
+        restore_hold: bool,
+        acknowledge_start_request: bool,
+        started: &mpsc::SyncSender<cs2_runtime::RuntimeResult<()>>,
+        commands: &mpsc::Receiver<WavWorkerCommand>,
+    ) -> cs2_runtime::RuntimeResult<Option<StartupPolicy>> {
+        let mut deferred = std::collections::VecDeque::new();
+        let mut acknowledgements = Vec::new();
+        let mut stop = false;
+        let mut stop_timing = None;
+        loop {
+            match commands.try_recv() {
+                Ok(WavWorkerCommand::Stop(timing)) => { stop = true; stop_timing = timing; break; }
+                Ok(WavWorkerCommand::Suspend(value, reply)) => { suspended = value; acknowledgements.push(reply); }
+                Ok(WavWorkerCommand::Pause(value, reply, _)) => { paused = value; acknowledgements.push(reply); }
+                Ok(other) => deferred.push_back(other),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => { stop = true; break; }
+            }
+        }
+        let result = if stop {
+            audio_profile::with_worker(stop_timing, || output.stop()).map(|_| false)
+        } else {
+            activate_and_acknowledge(output, paused || suspended || restore_hold, acknowledge_start_request, started)
+        };
+        for reply in acknowledgements { let _ = reply.send(result.as_ref().map(|_| ()).map_err(clone_error)); }
+        let acknowledged = result?;
+        if stop { return Ok(None); }
+        if !acknowledged { output.stop()?; return Ok(None); }
+        Ok(Some(StartupPolicy { paused, suspended, deferred }))
+    }
+
     pub(super) fn run_playback(
         prepared: Arc<PreparedAudio>,
         resource: &str,
@@ -913,24 +1474,21 @@ mod pcm_worker {
             signal.submitted(samples, channels, &parameters);
         }
         drop(priming);
-        let mut paused = saved.as_ref().is_some_and(|s| s.paused);
+        let paused = saved.as_ref().is_some_and(|s| s.paused);
         let mut restore_hold = restoring;
         let mut capture_hold = false;
-        let acknowledged = activate_and_acknowledge(
-            &mut output,
-            initial_suspended || paused || restore_hold,
-            acknowledge_start_request,
-            &started,
-        )?;
+        let Some(policy) = activate_pending_output(
+            &mut output, paused, initial_suspended, restore_hold,
+            acknowledge_start_request, &started, &commands,
+        )? else { return Ok(()); };
+        let mut paused = policy.paused;
+        let mut suspended = policy.suspended;
+        let mut deferred = policy.deferred;
         audio_profile::clear();
-        if !acknowledged {
-            return output.stop();
-        }
-        let mut suspended = initial_suspended;
         let mut repeats = saved.map_or_else(|| PlaybackRepeats::new(&parameters), |s| s.repeats);
         loop {
             if !restore_hold && !capture_hold { repeats.refresh(&parameters); }
-            match commands.recv_timeout(Duration::from_millis(2)) {
+            match deferred.pop_front().map(Ok).unwrap_or_else(|| commands.recv_timeout(Duration::from_millis(2))) {
                 Ok(WavWorkerCommand::Stop(timing)) => {
                     return audio_profile::with_worker(timing, || output.stop());
                 }
@@ -1078,6 +1636,52 @@ mod pcm_worker {
                 self.startup.try_recv().expect("acknowledge before confirming device")?;
                 Err(RuntimeError::AudioStartTimeout("device never confirmed".into()))
             }
+        }
+
+        struct StartupOutput { pause_calls: Vec<bool>, stopped: bool }
+        impl MovieAudioOutput for StartupOutput {
+            fn submit(&mut self, _: &[i16]) -> RuntimeResult<bool> { unreachable!() }
+            fn position_seconds(&mut self) -> RuntimeResult<f64> { unreachable!() }
+            fn drained(&mut self) -> RuntimeResult<bool> { unreachable!() }
+            fn pause(&mut self, paused: bool) -> RuntimeResult<()> { self.pause_calls.push(paused); Ok(()) }
+            fn stop(&mut self) -> RuntimeResult<()> { self.stopped = true; Ok(()) }
+        }
+
+        #[test]
+        fn startup_cancellation_queued_while_opening_never_activates_device() {
+            let mut output = StartupOutput { pause_calls: Vec::new(), stopped: false };
+            let (commands, pending) = mpsc::channel();
+            commands.send(WavWorkerCommand::Stop(None)).unwrap();
+            let (started, startup) = mpsc::sync_channel(1);
+            assert!(activate_pending_output(&mut output, false, false, false, false, &started, &pending).unwrap().is_none());
+            assert!(output.stopped);
+            assert!(output.pause_calls.is_empty());
+            assert!(startup.try_recv().is_err());
+        }
+
+        #[test]
+        fn lifecycle_suspend_queued_while_opening_keeps_first_activation_paused() {
+            let mut output = StartupOutput { pause_calls: Vec::new(), stopped: false };
+            let (commands, pending) = mpsc::channel();
+            let (reply, acknowledged) = mpsc::sync_channel(1);
+            commands.send(WavWorkerCommand::Suspend(true, reply)).unwrap();
+            let (started, startup) = mpsc::sync_channel(1);
+            let policy = activate_pending_output(&mut output, false, false, false, false, &started, &pending).unwrap().unwrap();
+            assert!(policy.suspended);
+            assert_eq!(output.pause_calls, [true]);
+            assert!(startup.try_recv().unwrap().is_ok());
+            assert!(acknowledged.try_recv().unwrap().is_ok());
+        }
+
+        #[test]
+        fn startup_drain_preserves_restore_commands_for_the_worker_loop() {
+            let mut output = StartupOutput { pause_calls: Vec::new(), stopped: false };
+            let (commands, pending) = mpsc::channel();
+            commands.send(WavWorkerCommand::CommitRestore).unwrap();
+            let (started, _startup) = mpsc::sync_channel(1);
+            let policy = activate_pending_output(&mut output, false, false, true, false, &started, &pending).unwrap().unwrap();
+            assert_eq!(output.pause_calls, [true]);
+            assert!(matches!(policy.deferred.front(), Some(WavWorkerCommand::CommitRestore)));
         }
 
         #[test]

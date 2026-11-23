@@ -1,13 +1,13 @@
-//! E-mote pose raster on the shared device. CPU scanlines retain the original
-//! f64 coverage rule. The compute passes sample, test/write stencil, and
-//! blend the straight RGBA results in the original primitive order.
+//! E-mote pose raster on the shared device. Indexed hardware coverage is the
+//! primary path; f64 scanline/compute remains a compatibility fallback. Ordered
+//! compute composition preserves straight RGBA, serial masks and layer order.
 
 use super::{DOWNLOAD, RASTER, Raster, TARGET, UPLOAD, blend_code, buffer, device_frame, report};
 use crate::perf_detail::{ReadbackKind, ReadbackTimer, emote_gpu_pose, emote_gpu_start, emote_gpu_sync};
 use anyhow::{Context, Result, bail};
 use cs2_renderer::{BlendMode, Canvas};
 use cs2_runtime::emote::{
-    CpuMotionModel, CpuPlayer, CpuStencilBuffer, CpuStencilWrite, CpuTexture, CpuViewport, EmoteDrawTarget,
+    CpuMotionModel, CpuPlayer, CpuPlayerRenderState, CpuStencilBuffer, CpuStencilWrite, CpuTexture, CpuViewport, EmoteDrawTarget,
     EmoteDeviceReadback, EmoteError, EmoteRasterFrame, EmoteRepairScratch, EmoteSpriteMesh, EmoteSpritePass,
     EmoteTextureSpan, OwnedEmoteSpriteMesh, repair_emote_raster, visit_emote_texture_spans,
 };
@@ -18,14 +18,28 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::{Duration, Instant};
 
+#[path = "gpu_emote_mesh.rs"]
+mod mesh;
+
 thread_local! {
     static BATCHING: Cell<bool> = const { Cell::new(false) };
+    static CAPTURING: Cell<bool> = const { Cell::new(false) };
     static PREPARED: RefCell<Vec<PreparedPose>> = const { RefCell::new(Vec::new()) };
     static POSE_BATCHES: RefCell<Vec<CommandBatch>> = const { RefCell::new(Vec::new()) };
+    static INDEXED_CACHES: RefCell<Vec<IndexedPoseCache>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static INDEXED_RENDER_PATHS: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
 }
 
 fn batching() -> bool {
     BATCHING.with(Cell::get)
+}
+
+fn mesh_preview() -> bool { batching() || CAPTURING.with(Cell::get) }
+
+struct EndpointCapture(bool);
+impl Drop for EndpointCapture {
+    fn drop(&mut self) { CAPTURING.with(|capture| capture.set(self.0)); }
 }
 
 pub(in crate) struct EmoteBatch {
@@ -149,6 +163,33 @@ pub(in crate) fn blend_emote(
     })
 }
 
+/// Modulate the completed manager surface, preserving integer rounding and
+/// transparent RGB. A CPU frame or a retired device deliberately returns None.
+pub(in crate) fn tint_emote_surface(frame: &EmoteRasterFrame, argb: u32) -> Option<EmoteRasterFrame> {
+    if !super::emote_device_blend_requested() { return None; }
+    RASTER.with_borrow_mut(|slot| {
+        let raster = slot.as_mut()?;
+        let source = raster.fade_device_pose(frame)?.buffer.clone();
+        let size = [frame.width(), frame.height()];
+        let bytes = fade_extent(&raster.device, size)?;
+        let emote = raster.emote.as_mut()?;
+        let output = emote.fade_output(&raster.device, bytes);
+        let params = [size[0], size[1], argb, 0, 0, 0, 0, 0];
+        let params: Vec<_> = params.into_iter().flat_map(u32::to_le_bytes).collect();
+        raster.queue.write_buffer(&emote.fade_params, 0, &params);
+        let bindings = raster.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CS2 E-mote final tint"), layout: &emote.tint_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: emote.fade_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: source.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: output.as_entire_binding() },
+            ],
+        });
+        dispatch_fade(&raster.device, &raster.queue, &emote.tint, &bindings, size);
+        raster.bind_fade_output(size, frame.origin(), output, bytes, None)
+    })
+}
+
 pub(in crate) fn mix_emote_surfaces(
     old: &EmoteRasterFrame, new: &EmoteRasterFrame, weight: u32, transparent: Option<bool>,
 ) -> Option<EmoteRasterFrame> {
@@ -230,13 +271,19 @@ pub(in crate) fn draw_emote_surface(
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         #[cfg(windows)]
-        let enabled = std::env::var("CS2_EMOTE_DEVICE_ENDPOINT").is_ok_and(|value| value == "1");
+        let enabled = !std::env::var("CS2_EMOTE_DEVICE_ENDPOINT").is_ok_and(|value| value == "0");
         #[cfg(target_os = "android")]
-        let enabled = super::android_property(c"debug.cs2.emote_device_endpoint", |value| value == b"1")
+        let enabled = !super::android_property(c"debug.cs2.emote_device_endpoint", |value| value == b"0")
             .unwrap_or(false);
         enabled
     });
     if !enabled || !super::emote_device_blend_requested() { return None; }
+    if !RASTER.with_borrow(|slot| slot.as_ref().is_some_and(|raster|
+        raster.direct_output_enabled() && !raster.failed.load(Ordering::Relaxed))) { return None; }
+    // Endpoint capture chooses the pure GPU shaders without changing batch
+    // ownership. A span fallback still finishes synchronously when necessary;
+    // it cannot strand a pending readback after this guard restores the flag.
+    let _capture = EndpointCapture(CAPTURING.with(|capture| capture.replace(true)));
     let frame = draw_emote(player, viewport, variables)?;
     expand_emote_surface(&frame, [viewport.width, viewport.height])
 }
@@ -336,18 +383,24 @@ impl Raster {
     }
 }
 
-const ATLAS_STAGE_LIMIT: usize = 128 * 1024 * 1024;
-#[cfg(windows)]
-const ATLAS_DRAW_LIMIT: usize = 192 * 1024 * 1024;
-#[cfg(target_os = "android")]
-const ATLAS_DRAW_LIMIT: usize = ATLAS_STAGE_LIMIT;
+const ATLAS_STAGE_LIMIT: usize = 256 * 1024 * 1024;
+const MAX_ATLAS_BYTES: usize = 128 * 1024 * 1024;
+// Active scene demand has a separate hard budget from speculative uploads.
+// When it cannot fit, decline GPU work rather than evict another active atlas.
+const ATLAS_DRAW_LIMIT: usize = 256 * 1024 * 1024;
 const ATLAS_STAGE_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const COMMAND_WORDS: usize = COMMAND_BYTES / size_of::<u32>();
 const MAX_DRAWS: usize = 1024;
 const MAX_PREP_WORKERS: usize = 4;
+const MAX_INDEXED_PREP_POSES: usize = 16;
+const INDEXED_PREP_GEOMETRY_BYTES: usize = 64 * 1024 * 1024;
 const SPAN_CACHE_SLOTS: usize = 128;
 const SPAN_CACHE_ENTRY_BYTES: usize = 32 * 1024;
+
+fn atlas_eviction_candidate(mut protected: impl Iterator<Item = bool>) -> Option<usize> {
+    protected.position(|protected| !protected)
+}
 
 #[derive(Clone, Copy, Default)]
 struct Stencil {
@@ -370,6 +423,7 @@ struct Pose<'a> {
     draws: Vec<Draw<'a>>,
     serial: u32,
     geometry_bytes: usize,
+    has_warnings: bool,
 }
 
 impl EmoteDrawTarget for Pose<'_> {
@@ -660,11 +714,11 @@ fn prep_worker_limit() -> usize {
         #[cfg(windows)]
         let (requested, source) = std::env::var("CS2_EMOTE_PREP_WORKERS").ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .map_or((1, "default"), |workers| (workers, "CS2_EMOTE_PREP_WORKERS"));
+            .map_or((MAX_PREP_WORKERS, "default"), |workers| (workers, "CS2_EMOTE_PREP_WORKERS"));
         #[cfg(target_os = "android")]
         let (requested, source) = super::android_property(c"debug.cs2.emote_prep_workers", |value| {
             std::str::from_utf8(value).ok()?.parse::<usize>().ok()
-        }).flatten().map_or((1, "default"), |workers| (workers, "debug.cs2.emote_prep_workers"));
+        }).flatten().map_or((MAX_PREP_WORKERS, "default"), |workers| (workers, "debug.cs2.emote_prep_workers"));
         let limit = clamp_prep_workers(requested, available);
         report(&format!(
             "emote_prep_workers={limit} requested={requested} available={available} source={source} max={MAX_PREP_WORKERS}"
@@ -849,11 +903,97 @@ struct OwnedDraw {
 
 struct PreparedPose {
     player: usize,
-    variables: BTreeMap<String, f64>,
-    viewport: CpuViewport,
+    state: CpuPlayerRenderState,
     draws: Vec<OwnedDraw>,
     words: Vec<u32>,
     phases: [Duration; 2],
+    indexed: Option<Arc<mesh::IndexedGeometry>>,
+    has_warnings: bool,
+}
+
+struct IndexedPoseCache {
+    player: usize,
+    model: Weak<CpuMotionModel>,
+    geometry: mesh::GeometryCache,
+}
+
+fn reserve_indexed_geometry(reserved: &std::sync::atomic::AtomicUsize, bytes: usize) -> bool {
+    let mut used = reserved.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = used.checked_add(bytes).filter(|total| *total <= INDEXED_PREP_GEOMETRY_BYTES) else { return false };
+        match reserved.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(current) => used = current,
+        }
+    }
+}
+
+fn prepare_indexed_poses(players: &[(&CpuPlayer, CpuViewport)]) {
+    // Preserve one cache per actual player/model pair, in this frame's scene
+    // order. Jobs mutate disjoint caches and only CPU data; GPU encoding remains
+    // on the render thread in the original pose and primitive order.
+    if players.is_empty() || players.len() > MAX_INDEXED_PREP_POSES {
+        PREPARED.with_borrow_mut(Vec::clear);
+        INDEXED_CACHES.with_borrow_mut(Vec::clear);
+        if !players.is_empty() { report(&format!("emote_indexed_prep fallback=serial reason=pose_budget poses={} max={MAX_INDEXED_PREP_POSES}", players.len())); }
+        return;
+    }
+    let workers = if matches!(prep_mode(), PrepMode::Serial | PrepMode::WithinPose) { 1 }
+        else { prep_worker_limit().min(players.len()) };
+    let started = Instant::now();
+    let caller = std::thread::current().id();
+    let worker_jobs = std::sync::atomic::AtomicUsize::new(0);
+    let reserved = std::sync::atomic::AtomicUsize::new(0);
+    let budget_fallbacks = std::sync::atomic::AtomicUsize::new(0);
+    let mut poses: Vec<_> = std::iter::repeat_with(|| None).take(players.len()).collect();
+    let counters = INDEXED_CACHES.with_borrow_mut(|caches| {
+        let mut previous = std::mem::take(caches);
+        for &(player, _) in players {
+            let identity = player as *const CpuPlayer as usize;
+            let model = Arc::downgrade(player.shared_motion_model());
+            let cache = previous.iter().position(|cache| cache.player == identity && Weak::ptr_eq(&cache.model, &model))
+                .map(|i| previous.swap_remove(i)).unwrap_or_else(|| IndexedPoseCache {
+                    player: identity, model, geometry: mesh::GeometryCache::default(),
+                });
+            caches.push(cache);
+        }
+        cs2_renderer::parallel_for_each(poses.iter_mut().zip(players).zip(caches.iter_mut()), workers,
+            |((slot, &(player, viewport)), cache)| {
+                if std::thread::current().id() != caller { worker_jobs.fetch_add(1, Ordering::Relaxed); }
+                let Ok(variables) = player.effective_variables() else { return };
+                let Ok(pose) = collect_pose(player, viewport, &variables, true) else { return };
+                if mesh::compatible(&pose.draws).is_err() { return; }
+                if !reserve_indexed_geometry(&reserved, mesh::GeometryCache::reservation_bytes(&pose.draws)) {
+                    cache.geometry = mesh::GeometryCache::default();
+                    budget_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let indexed = cache.geometry.prepare(&pose.draws, viewport);
+                *slot = Some(PreparedPose {
+                    player: cache.player, state: player.render_state_snapshot(viewport, &variables),
+                    has_warnings: pose.has_warnings, draws: own_draws(pose.draws),
+                    words: Vec::new(), phases: [Duration::ZERO; 2], indexed: Some(indexed),
+                });
+            });
+        caches.iter().map(|cache| cache.geometry.counters()).fold([0; 2], |total, next|
+            [total[0] + next[0], total[1] + next[1]])
+    });
+    let completed = poses.iter().flatten().count();
+    let warning_poses = poses.iter().flatten().filter(|pose| pose.has_warnings).count();
+    PREPARED.with_borrow_mut(|prepared| {
+        prepared.clear();
+        prepared.extend(poses.into_iter().flatten());
+    });
+    static PREPARATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static POSE_COUNTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sample = PREPARATIONS.fetch_add(1, Ordering::Relaxed);
+    let count_bit = 1 << players.len();
+    let first_count = POSE_COUNTS.fetch_or(count_bit, Ordering::Relaxed) & count_bit == 0;
+    if sample < 3 || first_count || sample.is_multiple_of(120) || budget_fallbacks.load(Ordering::Relaxed) != 0 {
+        report(&format!("emote_indexed_prep poses={} prepared={completed} warnings={warning_poses} workers={workers} worker_jobs={} cpu_wall_us={} geometry_hits={} geometry_misses={} geometry_reserved_bytes={} geometry_budget_bytes={INDEXED_PREP_GEOMETRY_BYTES} budget_fallbacks={}",
+            players.len(), worker_jobs.load(Ordering::Relaxed), started.elapsed().as_micros(), counters[0], counters[1],
+            reserved.load(Ordering::Relaxed), budget_fallbacks.load(Ordering::Relaxed)));
+    }
 }
 
 pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
@@ -864,6 +1004,10 @@ pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
             );
         }
     });
+    if mesh::enabled() {
+        prepare_indexed_poses(players);
+        return;
+    }
     let mode = prep_mode();
     let workers = prep_worker_limit().min(players.len());
     #[cfg(windows)]
@@ -934,8 +1078,8 @@ pub(in crate) fn prepare_emote_poses(players: &[(&CpuPlayer, CpuViewport)]) {
             for ((pose, &(player, viewport)), (words, phases)) in poses.into_iter().zip(players).zip(packed) {
                 if let Some((variables, draws)) = pose {
                     prepared.push(PreparedPose {
-                        player: player as *const CpuPlayer as usize, variables, viewport,
-                        draws: own_draws(draws), words, phases,
+                        player: player as *const CpuPlayer as usize, state: player.render_state_snapshot(viewport, &variables),
+                        draws: own_draws(draws), words, phases, indexed: None, has_warnings: false,
                     });
                 }
             }
@@ -955,8 +1099,9 @@ fn prepare_across_poses(players: &[(&CpuPlayer, CpuViewport)], alignment: usize,
             let Ok(mut pose) = collect_pose(player, viewport, &variables, false) else { return };
             if batch.prepare(&mut pose.draws, viewport, alignment, profile, COMMAND_WORDS).is_err() { return; }
             *slot = Some((PreparedPose {
-                player: player as *const CpuPlayer as usize, variables, viewport,
-                draws: own_draws(pose.draws), words: std::mem::take(&mut batch.commands), phases: batch.phases,
+                player: player as *const CpuPlayer as usize, state: player.render_state_snapshot(viewport, &variables),
+                draws: own_draws(pose.draws), words: std::mem::take(&mut batch.commands), phases: batch.phases, indexed: None,
+                has_warnings: false,
             }, main_thread.filter(|id| *id == std::thread::current().id()).map(|_| Instant::now())));
         });
         if let Some(started) = started {
@@ -979,8 +1124,9 @@ fn collect_pose<'a>(
     player: &'a CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>,
     allow_warnings: bool,
 ) -> Result<Pose<'a>> {
-    let mut pose = Pose { model: player.shared_motion_model(), draws: Vec::new(), serial: 0, geometry_bytes: 0 };
+    let mut pose = Pose { model: player.shared_motion_model(), draws: Vec::new(), serial: 0, geometry_bytes: 0, has_warnings: false };
     let diagnostics = player.draw_primitives_resolved(viewport, variables, &mut pose)?;
+    pose.has_warnings = !diagnostics.warnings.is_empty();
     if !allow_warnings && !diagnostics.warnings.is_empty() {
         bail!("E-mote pose has CPU evaluator warnings");
     }
@@ -1000,14 +1146,8 @@ fn take_prepared_pose(
 ) -> Option<PreparedPose> {
     PREPARED.with_borrow_mut(|poses| {
         let index = poses.iter().position(|pose| {
-            let prior = pose.viewport;
             pose.player == player as *const CpuPlayer as usize
-                && [prior.width, prior.height] == [viewport.width, viewport.height]
-                && [prior.origin_x, prior.origin_y, prior.scale].map(f64::to_bits)
-                    == [viewport.origin_x, viewport.origin_y, viewport.scale].map(f64::to_bits)
-                && pose.variables.len() == variables.len()
-                && pose.variables.iter().zip(variables).all(|((name, value), (other, sample))|
-                    name == other && value.to_bits() == sample.to_bits())
+                && pose.state.matches(player, viewport, variables)
         })?;
         Some(poses.swap_remove(index))
     })
@@ -1039,6 +1179,8 @@ pub(super) struct DevicePose {
 }
 
 impl EmoteDeviceReadback for DevicePose {
+    fn is_valid(&self) -> bool { !self.failed.load(Ordering::Relaxed) }
+
     fn read_rgba(&self, output: &mut [u8]) -> bool {
         if self.failed.load(Ordering::Relaxed) || output.len() as u64 != self.bytes { return false; }
         let measurement = ReadbackTimer::start(ReadbackKind::Emote, self.bytes);
@@ -1067,6 +1209,7 @@ impl EmoteDeviceReadback for DevicePose {
 }
 
 pub(super) struct EmoteRaster {
+    mesh: Option<mesh::MeshRaster>,
     sprite: wgpu::ComputePipeline,
     sprite_layout: wgpu::BindGroupLayout,
     pack: wgpu::ComputePipeline,
@@ -1082,6 +1225,8 @@ pub(super) struct EmoteRaster {
     fade_prepare_layout: wgpu::BindGroupLayout,
     fade_alpha: wgpu::ComputePipeline,
     fade_alpha_layout: wgpu::BindGroupLayout,
+    tint: wgpu::ComputePipeline,
+    tint_layout: wgpu::BindGroupLayout,
     fade_params: wgpu::Buffer,
     fade_empty_alpha: wgpu::Buffer,
     fade_sources: VecDeque<(EmoteRasterFrame, wgpu::Buffer)>,
@@ -1155,6 +1300,7 @@ impl EmoteRaster {
         let fade_expand = pipeline("surface_expand", None, &[]);
         let fade_prepare = pipeline("surface_prepare", None, &[]);
         let fade_alpha = pipeline("surface_alpha", None, &[]);
+        let tint = pipeline("surface_tint", None, &[]);
         #[cfg(target_os = "android")]
         let preview_enabled = true;
         #[cfg(windows)]
@@ -1174,13 +1320,19 @@ impl EmoteRaster {
             bail!("compile E-mote shader: {error}");
         }
         let source = |size, usage| buffer(device, size, usage);
+        let mesh = match mesh::MeshRaster::new(device) {
+            Ok(mesh) => Some(mesh),
+            Err(error) => { report(&format!("emote_mesh_fallback reason={error:#}")); None }
+        };
         Ok(Self {
+            mesh,
             sprite_layout, pack_layout: pack.get_bind_group_layout(0),
             repair_layout: repair.get_bind_group_layout(0), sprite, pack, preview_pipelines, repair,
             fade_layout: fade.get_bind_group_layout(0), fade,
             fade_expand_layout: fade_expand.get_bind_group_layout(0), fade_expand,
             fade_prepare_layout: fade_prepare.get_bind_group_layout(0), fade_prepare,
             fade_alpha_layout: fade_alpha.get_bind_group_layout(0), fade_alpha,
+            tint_layout: tint.get_bind_group_layout(0), tint,
             fade_params: source(32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             fade_empty_alpha: buffer(device, 4, TARGET),
             fade_sources: VecDeque::new(), fade_outputs: Vec::new(),
@@ -1284,7 +1436,7 @@ impl EmoteRaster {
         let (pixels, _) = source.upload_pixels();
         let bytes = pixels.len();
         if source.width.max(source.height) > limit || source.width.min(source.height) == 0
-            || source.width * source.height * 4 != bytes || bytes > ATLAS_STAGE_LIMIT
+            || source.width * source.height * 4 != bytes || bytes > MAX_ATLAS_BYTES
         {
             bail!("E-mote atlas exceeds device limits");
         }
@@ -1293,19 +1445,22 @@ impl EmoteRaster {
             if !keep { self.atlas_bytes -= entry.bytes; }
             keep
         });
-        // Speculation must leave resident draw textures in the cache.
-        if preloading && self.atlas_bytes + bytes > ATLAS_STAGE_LIMIT {
-            return Ok(None);
-        }
+        // Speculation may replace inactive entries, but must leave every draw
+        // and current scene model resident. Both budgets have explicit bounds.
+        let budget = if preloading { ATLAS_STAGE_LIMIT } else { ATLAS_DRAW_LIMIT };
         let mut evicted = 0;
         let mut evicted_bytes = 0;
-        while self.atlas_bytes + bytes > ATLAS_DRAW_LIMIT {
-            // Prefer the oldest inactive atlas. Draw order breaks ties if the active
-            // models alone exceed the hard cap. Encoded commands own their views.
-            let index = self.atlases.iter().position(|atlas| {
-                !atlas.used_by_draw && !self.atlas_batch_models.iter()
+        while self.atlas_bytes + bytes > budget {
+            let Some(index) = atlas_eviction_candidate(self.atlases.iter().map(|atlas| {
+                atlas.used_by_draw || self.atlas_batch_models.iter()
                     .any(|owner| Weak::ptr_eq(owner, &atlas.owner))
-            }).unwrap_or(0);
+            })) else {
+                static REPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if REPORTS.fetch_add(1, Ordering::Relaxed) < 16 {
+                    report(&format!("emote_atlas_declined reason=active_budget speculative={preloading} resident_bytes={} requested_bytes={bytes} limit={budget}", self.atlas_bytes));
+                }
+                return Ok(None);
+            };
             let atlas = self.atlases.remove(index).unwrap();
             self.atlas_bytes -= atlas.bytes;
             evicted += 1;
@@ -1457,7 +1612,38 @@ impl EmoteRaster {
             self.begin_atlas_batch();
         }
         let model = player.shared_motion_model();
-        let prepared = take_prepared_pose(player, viewport, variables);
+        let model_id = Arc::downgrade(model);
+        if !self.atlas_batch_models.iter().any(|owner| Weak::ptr_eq(owner, &model_id)) {
+            self.atlas_batch_models.push(model_id);
+        }
+        // Pixel-exact reference consumers retain f64 span setup. The production
+        // batched path and device endpoints use hardware coverage directly.
+        if mesh::enabled() && mesh_preview() && self.mesh.is_some() {
+            let (draws, geometry) = if let Some(prepared) = take_prepared_pose(player, viewport, variables) {
+                if prepared.has_warnings && !allow_warnings { bail!("E-mote pose has CPU evaluator warnings"); }
+                let draws = prepared.draws.into_iter().map(|draw| Ok(Draw {
+                    mesh: draw.mesh.restore(model)?, stencil: draw.stencil,
+                    reference: draw.reference, operation: draw.operation,
+                    bounds: draw.bounds, offset: draw.offset, words: draw.words,
+                })).collect::<cs2_runtime::emote::Result<Vec<_>>>()?;
+                (draws, prepared.indexed)
+            } else {
+                (collect_pose(player, viewport, variables, allow_warnings)?.draws, None)
+            };
+            match mesh::compatible(&draws) {
+                Ok(()) => {
+                    let evaluated = started.map(|_| Instant::now());
+                    return self.render_indexed(device, queue, model, viewport, draws, failed, started, evaluated, geometry);
+                }
+                Err(reason) => {
+                    static REPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if REPORTS.fetch_add(1, Ordering::Relaxed) < 16 {
+                        report(&format!("emote_mesh_fallback reason={reason:#}"));
+                    }
+                }
+            }
+        }
+        let prepared = take_prepared_pose(player, viewport, variables).filter(|pose| pose.indexed.is_none());
         let (mut draws, packed) = if let Some(prepared) = prepared {
             let draws = prepared.draws.into_iter().map(|draw| Ok(Draw {
                 mesh: draw.mesh.restore(model)?, stencil: draw.stencil,
@@ -1877,6 +2063,450 @@ mod tests {
     use super::*;
     use cs2_runtime::{ResourceIndex, emote::EmoteResource};
     use std::{path::PathBuf, time::Instant};
+
+    #[test]
+    fn active_four_large_atlases_fit_without_lru_churn() {
+        assert!(ATLAS_DRAW_LIMIT >= 4 * 64 * 1024 * 1024,
+            "four active 64MiB atlases must fit the bounded scene budget");
+    }
+
+    #[test]
+    fn active_atlas_overbudget_declines_without_evicting_live_entries() {
+        assert_eq!(atlas_eviction_candidate([true, true, true, true].into_iter()), None);
+        assert_eq!(atlas_eviction_candidate([true, false, true].into_iter()), Some(1));
+        assert_eq!(atlas_eviction_candidate([].into_iter()), None);
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and CS2_EMOTE_DEVICE_BLEND=1"]
+    fn gpu_final_tint_preserves_rounding_transparent_rgb_and_endpoint_order() -> Result<()> {
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        raster.ensure_emote()?;
+        let pixels: Vec<u8> = (0..=255).flat_map(|v| [v, 255 - v, v / 2, v]).collect();
+        let source = Arc::new(buffer(&raster.device, pixels.len() as u64, TARGET));
+        raster.queue.write_buffer(&source, 0, &pixels);
+        let frame = raster.bind_fade_output([256, 1], [-2, 3], source, pixels.len() as u64, None).unwrap();
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        for argb in [0x00000000u32, 0xffffffff, 0x7f814023, 0x01010101, 0x807f8081] {
+            let actual = tint_emote_surface(&frame, argb).context("tint must retain a resident device frame")?;
+            assert!(actual.device().is_some());
+            assert_eq!(actual.origin(), frame.origin());
+            let tint = [argb >> 16 & 255, argb >> 8 & 255, argb & 255, argb >> 24];
+            let expected: Vec<_> = pixels.iter().enumerate().map(|(i, &v)| ((u32::from(v) * tint[i % 4] + 127) / 255) as u8).collect();
+            assert_eq!(actual.rgba(), expected);
+        }
+        // Tinting is a final operation and never modifies a held endpoint.
+        assert_eq!(frame.rgba(), pixels);
+        let cpu = EmoteRasterFrame::new(1, 1, [0, 0], vec![1, 2, 3, 0])?;
+        assert!(tint_emote_surface(&cpu, 0x80808080).is_none());
+        RASTER.with_borrow_mut(Option::take);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12"]
+    fn gpu_retiring_renderer_invalidates_held_device_pose_without_readback() -> Result<()> {
+        let raster = Raster::new()?;
+        let output = Arc::new(buffer(&raster.device, 4, TARGET));
+        let frame = raster.bind_fade_output([1, 1], [0, 0], output, 4, None).unwrap();
+        assert!(frame.is_valid());
+        drop(raster);
+        assert!(!frame.is_valid());
+        assert!(!frame.device().unwrap().read_rgba(&mut [0; 4]));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and the local PSZ fixture"]
+    fn gpu_four_active_atlases_finish_staging_and_stay_resident() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let template = CpuMotionModel::load(&resource)?;
+        let models: Vec<_> = (0..4).map(|i| {
+            let mut model = template.clone();
+            model.textures.clear();
+            model.textures.insert("test".into(), CpuTexture::from_rgba(4096, 4096, vec![i; 64 * 1024 * 1024]).unwrap());
+            Arc::new(model)
+        }).collect();
+        let mut raster = Raster::new()?;
+        raster.ensure_emote()?;
+        let emote = raster.emote.as_mut().unwrap();
+        emote.begin_atlas_batch();
+        emote.atlas_batch_models.extend(models.iter().map(Arc::downgrade));
+        for _ in 0..32 {
+            for model in &models {
+                assert_eq!(emote.stage_atlas(&raster.device, &raster.queue, model)?, ATLAS_STAGE_BYTES);
+            }
+            raster.queue.submit([]);
+        }
+        assert_eq!(emote.atlases.len(), 4);
+        assert_eq!(emote.atlas_bytes, 256 * 1024 * 1024);
+        for _ in 0..4 {
+            emote.begin_atlas_batch();
+            emote.atlas_batch_models.extend(models.iter().map(Arc::downgrade));
+            for model in &models {
+                let source = &model.textures["test"];
+                let atlas = emote.atlas_storage(&raster.device, model, source, false)?.unwrap();
+                assert_eq!(atlas.uploaded_rows, 4096);
+                assert_eq!(atlas.upload(&raster.queue, source.upload_pixels().0, usize::MAX), 0);
+            }
+        }
+        let overflow = Arc::new((*models[0]).clone());
+        assert!(emote.atlas_storage(&raster.device, &overflow, &overflow.textures["test"], false)?.is_none());
+        assert_eq!(emote.atlases.len(), 4);
+        assert_eq!(emote.atlas_bytes, ATLAS_DRAW_LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12, CS2_EMOTE_DEVICE_BLEND=1 and the local PSZ fixture"]
+    fn gpu_device_endpoint_restores_capture_mode_and_never_strands_pending_readbacks() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let mut player = CpuPlayer::new(CpuMotionModel::load(&resource)?);
+        let viewport = CpuViewport { width: 64, height: 64, origin_x: 32., origin_y: 60., scale: 0.05, time_units_per_frame: 1. };
+        player.advance_frames(1.)?;
+        player.update_reference_timelines()?;
+        assert!(player.render_preview(viewport)?.warnings.is_empty(), "endpoint fixture must follow the ordinary player reference-update protocol");
+        let variables = player.effective_variables()?;
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        raster.ensure_emote()?;
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        for fallback in [false, true] {
+            if fallback { RASTER.with_borrow_mut(|slot| slot.as_mut().unwrap().emote.as_mut().unwrap().mesh = None); }
+            let frame = draw_emote_surface(&player, viewport, &variables).context("resident endpoint")?;
+            assert!(frame.device().is_some());
+            assert_eq!([frame.width(), frame.height()], [64, 64]);
+            assert!(!batching());
+            assert!(!CAPTURING.with(Cell::get));
+            assert!(RASTER.with_borrow(|slot| slot.as_ref().unwrap().emote.as_ref().unwrap().pending.is_empty()));
+        }
+        RASTER.with_borrow_mut(Option::take);
+        assert!(draw_emote_surface(&player, viewport, &variables).is_none());
+        assert!(!CAPTURING.with(Cell::get));
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_geometry_reservation_is_bounded_and_rejection_preserves_budget() {
+        let reserved = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..4 { assert!(reserve_indexed_geometry(&reserved, INDEXED_PREP_GEOMETRY_BYTES / 4)); }
+        assert!(!reserve_indexed_geometry(&reserved, 1));
+        assert!(!reserve_indexed_geometry(&reserved, usize::MAX));
+        assert_eq!(reserved.load(Ordering::Relaxed), INDEXED_PREP_GEOMETRY_BYTES);
+    }
+
+    #[test]
+    #[ignore = "requires the local PSZ fixture"]
+    fn indexed_five_pose_preparation_uses_bounded_workers_and_is_consumed() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let players = vec![CpuPlayer::new(CpuMotionModel::load(&resource)?); 5];
+        let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
+        prepare_indexed_poses(&players.iter().map(|player| (player, viewport)).collect::<Vec<_>>());
+        assert_eq!(PREPARED.with_borrow(Vec::len), 5, "actor count must not be confused with the worker count");
+        for player in &players {
+            let prepared = take_prepared_pose(player, viewport, &player.effective_variables()?).context("prepared fifth actor")?;
+            assert!(prepared.indexed.is_some());
+            assert!(!prepared.draws.is_empty());
+        }
+        assert_eq!(PREPARED.with_borrow(Vec::len), 0);
+        prepare_indexed_poses(&[]);
+        assert_eq!(INDEXED_CACHES.with_borrow(Vec::len), 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and the local PSZ fixture"]
+    fn headless_scene_prepares_single_and_multiple_emote_actors_on_changed_frames() -> Result<()> {
+        use cs2_runtime::emote::{EmoteTick, NEKOPARA_PE_SHA256};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("cs2-emote-scene-{suffix}")));
+        std::fs::create_dir_all(&scratch.0)?;
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let mut index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        index.initialize_resource_router()?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let mut host = crate::HeadlessPlayer::open_with_save_root(&scratch.0, scratch.0.join("save"))?;
+        crate::gpu_raster::enable();
+        assert!(crate::gpu_raster::emote_batch_requested(), "test requires the production batched GPU path");
+        assert!(mesh::enabled(), "test requires indexed geometry");
+        host.data_services.emote.initialize(&index, NEKOPARA_PE_SHA256)?;
+        host.canvas = Canvas::new(1280, 720)?;
+        host.graphics_canvas = Canvas::new(1280, 720)?;
+        let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
+        host.data_services.emote.state.set_viewport(viewport)?;
+        let mut actors = Vec::new();
+        for count in 1..=2 {
+            let task = host.with_host(|host| Ok(host.create_task_object(54, 0, b"emote-regression", b"")?))?;
+            actors.push(task);
+            host.data_services.emote.state.import_psz(task, b"ca01_l_body_1.psz", &bytes)?;
+            let node = host.scene_nodes.get_mut(&task).unwrap();
+            node.visible = true;
+            node.initialized = true;
+            let mut previous_pixels = None;
+            for tick in 0..3 {
+                for (i, &task) in actors.iter().enumerate() {
+                    host.data_services.emote.state.set_root_affine(task,
+                        [1., 0., 0., 1., (i * 12 + tick * 7) as f64, 0.])?;
+                    host.data_services.emote.state.advance(task, EmoteTick {
+                        task_elapsed: (count * 3 + tick) as u32, lip_elapsed: None, increment: 1,
+                    })?;
+                }
+                INDEXED_RENDER_PATHS.with(|counts| counts.set([0; 2]));
+                let started = Instant::now();
+                host.render_scene()?;
+                let render_us = started.elapsed().as_micros();
+                let [prepared, fallback] = INDEXED_RENDER_PATHS.with(Cell::get);
+                println!("headless_scene_entry actors={count} tick={tick} prepared_consumed={prepared} fallback_geometry={fallback} render_us={render_us}");
+                assert_eq!([prepared, fallback], [count, 0],
+                    "every actual scene actor must consume prepared geometry, including one actor");
+                assert_eq!(PREPARED.with_borrow(Vec::len), 0);
+                let pixels = host.canvas.pixels().to_vec();
+                assert!(pixels.chunks_exact(4).any(|pixel| pixel[..3] != [0; 3]), "actual scene must contain the imported model");
+                if let Some(previous) = previous_pixels {
+                    assert!(pixels != previous, "changed actor transforms must change actual scene pixels");
+                }
+                previous_pixels = Some(pixels);
+            }
+        }
+        crate::gpu_raster::disable();
+        INDEXED_CACHES.with_borrow_mut(Vec::clear);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and the local PSZ fixture"]
+    fn gpu_indexed_multi_pose_preparation_is_consumed_and_invalidated() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let mut players = vec![CpuPlayer::new(CpuMotionModel::load(&resource)?); 2];
+        players[1].set_root_affine([1., 0., 0., 1., 8., 0.])?;
+        let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
+        let mut raster = Raster::new()?;
+        raster.ensure_emote()?;
+        while raster.emote.as_mut().unwrap().stage_atlas(&raster.device, &raster.queue, &players[0].model)? != 0 {
+            raster.queue.submit([]);
+        }
+        RASTER.with_borrow_mut(|slot| *slot = Some(raster));
+        let references: Vec<_> = players.iter().map(|player| (player, viewport)).collect();
+        prepare_emote_poses(&references);
+        assert_eq!(PREPARED.with_borrow(Vec::len), 2, "indexed poses must use bounded CPU preparation");
+        let batch = begin_emote_batch()?;
+        let mut first_rgba = Vec::new();
+        for (i, player) in players.iter().enumerate() {
+            let variables = player.effective_variables()?;
+            let frame = RASTER.with_borrow_mut(|slot| slot.as_mut().unwrap()
+                .render_emote(player, viewport, &variables, true))?;
+            assert!(frame.device().is_some());
+            assert!(frame.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0));
+            if i == 0 { first_rgba.extend_from_slice(frame.rgba()); }
+            assert_eq!(PREPARED.with_borrow(Vec::len), 1 - i, "prepared geometry must be consumed");
+        }
+        batch.finish()?;
+        prepare_emote_poses(&players.iter().map(|player| (player, viewport)).collect::<Vec<_>>());
+        let batch = begin_emote_batch()?;
+        let replay = RASTER.with_borrow_mut(|slot| slot.as_mut().unwrap().render_emote(
+            &players[0], viewport, &players[0].effective_variables()?, true))?;
+        assert_eq!(replay.rgba(), first_rgba, "switching back to a cached earlier pose restores its GPU geometry");
+        assert!(RASTER.with_borrow(|slot| slot.as_ref().unwrap().emote.as_ref().unwrap()
+            .mesh.as_ref().unwrap().geometry_upload_bytes > 0), "an older cached pose must replace the last resident pose");
+        batch.finish()?;
+        prepare_emote_poses(&players.iter().map(|player| (player, viewport)).collect::<Vec<_>>());
+        let prior_frame = players[0].frame.to_bits();
+        let prior_variables = players[0].effective_variables()?;
+        players[0].update_reference_timelines()?;
+        assert_eq!(players[0].frame.to_bits(), prior_frame);
+        assert_eq!(players[0].effective_variables()?, prior_variables);
+        assert!(take_prepared_pose(&players[0], viewport, &prior_variables).is_none(),
+            "same-frame reference-clock changes must reject previously prepared geometry");
+        players[0].set_variable("head_UD", 20.)?;
+        prepare_emote_poses(&players.iter().map(|player| (player, viewport)).collect::<Vec<_>>());
+        let changed = players[0].effective_variables()?;
+        assert!(take_prepared_pose(&players[0], viewport, &changed).is_some());
+        players[1].set_variable("head_UD", -20.)?;
+        assert!(take_prepared_pose(&players[1], viewport, &players[1].effective_variables()?).is_none(),
+            "changed variables must reject previously prepared geometry");
+        prepare_emote_poses(&players.iter().map(|player| (player, viewport)).collect::<Vec<_>>());
+        players[0].frame += 1.;
+        assert!(take_prepared_pose(&players[0], viewport, &players[0].effective_variables()?).is_none(),
+            "motion clock changes must reject previously prepared geometry");
+        players[1].set_root_affine([1., 0., 0., 1., 9., 0.])?;
+        assert!(take_prepared_pose(&players[1], viewport, &players[1].effective_variables()?).is_none(),
+            "root transforms must reject previously prepared geometry");
+        PREPARED.with_borrow_mut(Vec::clear);
+        RASTER.with_borrow_mut(Option::take);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and the local PSZ fixture"]
+    fn gpu_indexed_mesh_mask_fold_and_uv_matches_cpu() -> Result<()> {
+        use cs2_runtime::emote::CpuMeshGrid;
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let mut model = CpuMotionModel::load(&resource)?;
+        model.textures.clear();
+        model.textures.insert("mask".into(), CpuTexture::from_rgba(4, 4, [255u8; 4].repeat(16))?);
+        let color: Vec<_> = (0..16).flat_map(|i| [i * 11, 255 - i * 9, i * 7, [0, 64, 65, 255][usize::from(i % 4)]]).collect();
+        model.textures.insert("color".into(), CpuTexture::from_rgba(4, 4, color)?);
+        let model = Arc::new(model);
+        let viewport = CpuViewport { width: 16, height: 16, origin_x: 0., origin_y: 0., scale: 1., time_units_per_frame: 1. };
+        let rect = vec![[1., 1., 0., 0.], [14., 1., 4., 0.], [1., 14., 0., 4.], [14., 14., 4., 4.]];
+        let folded = vec![[2., 2., 0., 0.], [12., 2., 4., 0.], [2., 12., 0., 4.], [2., 2., 0., 0.]];
+        let mask = Stencil { serial: 1, clear: 0 };
+        let specs = [
+            ("color", rect.clone(), 0.45, Stencil::default(), 0, None),
+            ("mask", rect.clone(), 1., mask, 0, Some(CpuStencilWrite::IncrementWrapping)),
+            ("color", folded, 0.7, mask, 1, None),
+            ("mask", rect.clone(), 1., mask, 1, Some(CpuStencilWrite::DecrementWrapping)),
+            ("color", rect, 0.1, mask, 0, None),
+        ];
+        let build_mesh = |source: &'static str, vertices: Vec<[f64; 4]>, opacity| {
+            EmoteSpriteMesh::from_grid(source, &model.textures[source], opacity, vertices,
+                CpuMeshGrid { columns: 1, rows: 1 })
+        };
+        let draws = || specs.iter().map(|(source, vertices, opacity, stencil, reference, operation)| Ok(Draw {
+            mesh: build_mesh(source, vertices.clone(), *opacity)?, stencil: *stencil,
+            reference: *reference, operation: *operation, bounds: [0; 4], offset: 0, words: 0,
+        })).collect::<cs2_runtime::emote::Result<Vec<_>>>();
+        assert!(mesh::compatible(&draws()?).is_ok());
+        let rows: Vec<_> = (0..16).map(|_| (0..16usize).collect()).collect();
+        let mut scratch = EmoteRepairScratch::default();
+        repair_emote_raster(viewport, &rows, [0, 0], 16, &mut scratch, |target| {
+            let mut stencil = target.new_stencil(viewport, 0)?;
+            for (source, vertices, opacity, mask, reference, operation) in &specs {
+                let pass = if mask.serial == 0 { EmoteSpritePass::Color(None) }
+                else if let Some(operation) = operation {
+                    EmoteSpritePass::Mask { buffer: &mut stencil, reference: *reference, operation: *operation }
+                } else { EmoteSpritePass::Color(Some((&stencil, *reference))) };
+                target.draw_sprite(viewport, build_mesh(source, vertices.clone(), *opacity)?, pass)?;
+            }
+            Ok(())
+        })?;
+        let mut expected = vec![0u8; 16 * 16 * 4];
+        for pair in scratch.corrections().chunks_exact(2) {
+            expected[pair[0] as usize * 4..][..4].copy_from_slice(&pair[1].to_le_bytes());
+        }
+        let mut raster = Raster::new()?;
+        raster.ensure_emote()?;
+        assert!(raster.emote.as_ref().unwrap().mesh.is_some(), "hardware pipeline must initialize");
+        for (pose, wrap) in [false, false, true, false].into_iter().enumerate() {
+            if wrap { raster.emote.as_mut().unwrap().mesh.as_mut().unwrap().coverage_stamp = 16_777_215; }
+            let frame = raster.emote.as_mut().unwrap().render_indexed(&raster.device, &raster.queue,
+                &model, viewport, draws()?, &raster.failed, None, None, None)?.into_viewport([16, 16])?;
+            let uploaded = raster.emote.as_ref().unwrap().mesh.as_ref().unwrap().geometry_upload_bytes;
+            if pose == 0 { assert!(uploaded > 0, "the first pose uploads actual indexed geometry"); }
+            else { assert_eq!(uploaded, 0, "unchanged cached geometry remains on the GPU, including generation wrap"); }
+            let max = frame.rgba().iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(max <= 2, "hardware integer-sample coverage/mask/overlap diverged: max={max} wrap={wrap}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires hardware DX12 and the local PSZ fixture"]
+    fn gpu_mesh_preview_error_profile_for_one_to_four_poses() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").context("model directory")?);
+        let index = ResourceIndex::scan_with_name_seed(&root, Some(0x0F6BB0AE))?;
+        let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
+        let resource = EmoteResource::decode(&bytes)?;
+        let template = CpuPlayer::new(CpuMotionModel::load(&resource)?);
+        let mut players = vec![template; 4];
+        let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };
+        let mut raster = Raster::new()?;
+        raster.ensure_emote()?;
+        while raster.emote.as_mut().unwrap().stage_atlas(&raster.device, &raster.queue, &players[0].model)? != 0 {
+            raster.queue.submit([]);
+        }
+        for count in 1..=4 {
+            let mut prior_hashes = vec![None; count];
+            let mut changed = vec![false; count];
+            for tick in 0..3 {
+                let mut frames = Vec::new();
+                let mut cpu_us = 0;
+                for (i, player) in players[..count].iter_mut().enumerate() {
+                    player.set_variable("head_UD", [0., 20., -20., 10.][(i + tick) % 4])?;
+                    player.advance_frames(1.)?;
+                    player.update_reference_timelines()?;
+                    let start = Instant::now();
+                    frames.push(player.render_preview(viewport)?.frame);
+                    cpu_us += start.elapsed().as_micros();
+                    let mut hasher = DefaultHasher::new();
+                    frames.last().unwrap().rgba().hash(&mut hasher);
+                    let hash = hasher.finish();
+                    changed[i] |= prior_hashes[i].is_some_and(|prior| prior != hash);
+                    prior_hashes[i] = Some(hash);
+                    println!("mesh_preview_input poses={count} tick={tick} instance={i} head_ud={} cpu_rgba_hash={hash:016x}", [0., 20., -20., 10.][(i + tick) % 4]);
+                }
+                raster.emote.as_mut().unwrap().begin_atlas_batch();
+                let prepare_started = Instant::now();
+                prepare_indexed_poses(&players[..count].iter().map(|player| (player, viewport)).collect::<Vec<_>>());
+                let parallel_prepare_us = prepare_started.elapsed().as_micros();
+                let mut encode_us = 0;
+                for (i, player) in players[..count].iter().enumerate() {
+                    let vars = player.effective_variables()?;
+                    BATCHING.with(|batch| batch.set(true));
+                    let start = Instant::now();
+                    let rendered = raster.render_emote(player, viewport, &vars, true);
+                    encode_us += start.elapsed().as_micros();
+                    BATCHING.with(|batch| batch.set(false));
+                    let rendered = rendered?;
+                    let rgba = rendered.into_viewport([1280, 720])?;
+                    let mut above = [0u64; 3];
+                    let mut max = 0;
+                    let mut alpha_differences = 0u64;
+                    let mut transparent_rgb = 0u64;
+                    let mut squared = 0u64;
+                    for (j, (&a, &b)) in frames[i].rgba().iter().zip(rgba.rgba()).enumerate() {
+                        let delta = a.abs_diff(b);
+                        max = max.max(delta);
+                        squared += u64::from(delta) * u64::from(delta);
+                        for (n, threshold) in [1, 3, 8].into_iter().enumerate() { above[n] += u64::from(delta > threshold); }
+                        if j % 4 == 3 { alpha_differences += u64::from(delta != 0); }
+                        else if frames[i].rgba()[j / 4 * 4 + 3] == 0 && delta != 0 { transparent_rgb += 1; }
+                    }
+                    let psnr = if squared == 0 { f64::INFINITY } else {
+                        10. * (255. * 255. * (1280 * 720 * 4) as f64 / squared as f64).log10()
+                    };
+                    println!("mesh_preview poses={count} tick={tick} instance={i} channels_gt1={} channels_gt3={} channels_gt8={} max={max} alpha_differences={alpha_differences} transparent_rgb_differences={transparent_rgb} psnr={psnr:.3}", above[0], above[1], above[2]);
+                    if count == 4 && tick == 2
+                        && let Some(output) = std::env::var_os("CS2_GPU_QA_OUTPUT")
+                    {
+                        let output = PathBuf::from(output);
+                        std::fs::create_dir_all(&output)?;
+                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-cpu.png")), frames[i].rgba(), 1280, 720, image::ColorType::Rgba8)?;
+                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-gpu.png")), rgba.rgba(), 1280, 720, image::ColorType::Rgba8)?;
+                        let diff: Vec<_> = frames[i].rgba().chunks_exact(4).zip(rgba.rgba().chunks_exact(4)).flat_map(|(a, b)|
+                            [a[0].abs_diff(b[0]).saturating_mul(16), a[1].abs_diff(b[1]).saturating_mul(16), a[2].abs_diff(b[2]).saturating_mul(16), 255]).collect();
+                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-difference-x16.png")), &diff, 1280, 720, image::ColorType::Rgba8)?;
+                    }
+                    assert!(psnr >= 40., "hardware preview error exceeds the fixture acceptance threshold");
+                }
+                println!("mesh_preview_wall poses={count} tick={tick} cpu_reference_us={cpu_us} gpu_evaluate_prepare_encode_us={} parallel_prepare_us={parallel_prepare_us} ordered_encode_us={encode_us} gpu_execution_time=unavailable",
+                    parallel_prepare_us + encode_us);
+            }
+            assert!(changed.into_iter().all(|changed| changed), "every profiled instance must change actual pixels across ticks");
+        }
+        Ok(())
+    }
 
     #[test]
     fn prep_worker_budget_supports_ab_settings_and_stays_bounded() {

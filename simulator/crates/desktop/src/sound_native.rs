@@ -1,13 +1,41 @@
 //! Ordinary 935/936 and direct FES sound preparation, without synthetic VM pointers.
-use crate::audio_decode::{MAX_ENCODED, prepare_named_audio};
-use crate::perf_detail::audio::{Profile as AudioProfile, Stage as AudioStage};
-use crate::perf_detail::SlowTask;
+#[cfg(test)]
+use crate::audio_decode::prepare_named_audio;
 use crate::{
     LoggingHost, ScriptTextEncoding, audio_script_error, expand_kcs_format, read_u32, trim_nul,
 };
-use cs2_runtime::{TaskCommand, TaskCommandBuffers};
+use cs2_runtime::{AudioControl, TaskCommand, TaskCommandBuffers};
 use cs2_script::{NativeReturn, Vm};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[path = "sound_material.rs"]
+mod material;
+
+/// Owned while a real previous device is stopping. Reentry uses these exact
+/// names/options even if another task changes the caller's source strings.
+#[derive(Clone)]
+pub(super) struct PendingSoundLoad {
+    pub(super) channel: u32,
+    names: Vec<String>,
+    selector: u32,
+    duration: u32,
+    group: Option<u32>,
+    source: Option<Arc<material::Source>>,
+    material: Option<Arc<material::Ticket>>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingTaskSoundLoad {
+    pub(super) task: u32,
+    pub(super) code: u32,
+    pub(super) record: Vec<u8>,
+    pub(super) logical: u32,
+    pub(super) target: u32,
+    pub(super) loop_range: [i64; 2],
+    pub(super) queued: bool,
+    pub(super) reclaim_state: Option<(u32, i64, Option<u32>)>,
+}
 
 static SOUND_RESOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -32,6 +60,8 @@ impl LoggingHost<'_> {
                 "native 935 requires at least 20 argument bytes",
             ));
         }
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
+        if let Some(result) = self.resume_plain_sound_load()? { return Ok(result); }
         let name = expand_kcs_format(vm, &vm.read_string(read_u32(args, 8)?)?, 0)?;
         let duration = ((u64::from(read_u32(args, 16)?) * 1000) / 60) as u32;
         if let Some(task) = self.default_sound_task()? {
@@ -58,6 +88,8 @@ impl LoggingHost<'_> {
                 "native 936 requires at least 24 argument bytes",
             ));
         }
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
+        if let Some(result) = self.resume_plain_sound_load()? { return Ok(result); }
         let name = expand_kcs_format(vm, &vm.read_string(read_u32(args, 8)?)?, 0)?;
         let duration = ((u64::from(read_u32(args, 20)?) * 1000) / 60) as u32;
         if let Some(task) = self.default_sound_task()? {
@@ -106,6 +138,7 @@ impl LoggingHost<'_> {
         mode: i32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
         if channel >= 64 {
             return Ok(NativeReturn::Value(0));
         }
@@ -126,6 +159,7 @@ impl LoggingHost<'_> {
         mode: i32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
         let task = self.default_sound_task()?.ok_or_else(|| {
             audio_script_error("FES sound mode loading requires a kind 13 sound task")
         })?;
@@ -147,6 +181,7 @@ impl LoggingHost<'_> {
         mode: i32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
         let names = self.sound_resource_names(name)?;
         if !matches!(selector, 1 | 2) {
             return Err(audio_script_error("sound load selector must be 1 or 2"));
@@ -177,26 +212,45 @@ impl LoggingHost<'_> {
         } else {
             179 + selector
         };
+        self.dispatch_sound_load_record(task, code, &mut record)
+    }
+
+    fn resume_plain_sound_load(&mut self) -> cs2_script::Result<Option<NativeReturn>> {
+        let Some(saved) = self.data_services.sound_async.loads.get(&self.current_task_id).cloned()
+            else { return Ok(None); };
+        let result = self.load_sound_candidates(saved.channel, Vec::new(), saved.selector, saved.duration)?;
+        let Some(group) = saved.group else { return Ok(Some(result)); };
+        Ok(Some(match result {
+            NativeReturn::Value(0) => NativeReturn::Value(u32::MAX),
+            NativeReturn::Value(_) => {
+                let state = self.sound_channels.get_mut(&saved.channel).expect("loaded grouped channel");
+                state.looped = group & 0xffff_0000 == 0;
+                state.repeat_remaining = 0;
+                state.task.grouped = true;
+                NativeReturn::Value(saved.channel)
+            }
+            other => other,
+        }))
+    }
+
+    pub(super) fn resume_task_sound_load(&mut self) -> cs2_script::Result<Option<NativeReturn>> {
+        let Some(saved) = self.data_services.sound_async.task_loads.get(&self.current_task_id).cloned()
+            else { return Ok(None); };
+        let mut record = saved.record;
+        self.dispatch_sound_load_record(saved.task, saved.code, &mut record).map(Some)
+    }
+
+    fn dispatch_sound_load_record(&mut self, task: u32, code: u32, record: &mut [u8]) -> cs2_script::Result<NativeReturn> {
         let mut output = 0;
-        if !self.dispatch_sound_task_command(
-            task,
-            TaskCommand {
-                target: task as i32,
-                sender: self.current_task_id as i32,
-                code,
-                data: [0; 3],
-            },
-            &mut TaskCommandBuffers {
-                data0: None,
-                data1: Some(&mut record),
-            },
-            &mut output,
-        )? {
-            return Err(audio_script_error(
-                "sound task did not consume its load record",
-            ));
+        if !self.dispatch_sound_task_command(task, TaskCommand {
+                target: task as i32, sender: self.current_task_id as i32, code, data: [0; 3],
+            }, &mut TaskCommandBuffers { data0: None, data1: Some(record) }, &mut output)? {
+            return Err(audio_script_error("sound task did not consume its load record"));
         }
-        Ok(NativeReturn::Value(output))
+        if self.data_services.sound_async.loads.contains_key(&self.current_task_id)
+            || self.data_services.sound_async.task_loads.contains_key(&self.current_task_id) {
+            Ok(NativeReturn::Retry)
+        } else { Ok(NativeReturn::Value(output)) }
     }
 
     /// Name is already format-expanded bytes in this host's script encoding.
@@ -209,6 +263,8 @@ impl LoggingHost<'_> {
         selector: u32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
+        if let Some(result) = self.resume_plain_sound_load()? { return Ok(result); }
         let names = self.sound_resource_names(name)?;
         if !matches!(selector, 1 | 2) {
             return Err(audio_script_error("sound load selector must be 1 or 2"));
@@ -221,6 +277,42 @@ impl LoggingHost<'_> {
                 .load_sound_task_record(task, channel, false, false, name, selector, duration);
         }
         self.load_sound_candidates(channel, names, selector, duration)
+    }
+
+    /// The JavaScript bridge has no resumable host-call continuation yet.
+    /// Preserve its synchronous CsSound.load contract explicitly; VM/FES paths
+    /// use the ordinary Retry-returning entry above.
+    pub(super) fn load_sound_name_compat(&mut self, channel: u32, name: &[u8], selector: u32, duration: u32)
+        -> cs2_script::Result<NativeReturn>
+    {
+        loop {
+            let result = self.load_sound_name(channel, name, selector, duration)?;
+            if result != NativeReturn::Retry { return Ok(result); }
+            self.complete_sound_material_compat();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    pub(super) fn load_sound_group_name_compat(&mut self, group: u32, by_key: bool, name: &[u8], selector: u32, duration: u32)
+        -> cs2_script::Result<NativeReturn>
+    {
+        loop {
+            let result = self.load_sound_group_name(group, by_key, name, selector, duration)?;
+            if result != NativeReturn::Retry { return Ok(result); }
+            self.complete_sound_material_compat();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn complete_sound_material_compat(&mut self) {
+        let owner = self.current_task_id;
+        let Some(mut saved) = self.data_services.sound_async.loads.get(&owner).cloned() else { return; };
+        if saved.material.is_some() { return; }
+        let Some(source) = saved.source.as_ref() else { return; };
+        let cached = self.data_services.ordinary.cached_resource_with_source(&source.resource)
+            .filter(|cached| cached.source == source.candidate).map(|cached| cached.bytes.as_slice());
+        saved.material = Some(material::prepare_compat(self.resources, source, cached));
+        self.data_services.sound_async.loads.insert(owner, saved);
     }
 
     /// Kind13 records already carry category-completed virtual names. Do not
@@ -255,63 +347,141 @@ impl LoggingHost<'_> {
         if channel >= 64 {
             return Ok(NativeReturn::Value(0));
         }
-        let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
-        if let Some(handle) = state.handle
-            && let Err(cause) = self.audio_host.stop(handle)
-        {
-            self.sound_channels.insert(channel, state);
-            return Err(self.sound_host_error(cause));
-        }
-        state.release();
-        let resources = self.resources;
-        let mut source = None;
-        for name in names {
-            match resources.resolve_mode_utf16(
-                &name.encode_utf16().collect::<Vec<_>>(),
-                cs2_runtime::resource_router::ResourceMode::LooseFirst,
-            ) {
-                Ok(Some(candidate)) => {
-                    source = Some((name, candidate.value));
-                    break;
+        let owner = self.current_task_id;
+        let saved = self.data_services.sound_async.loads.get(&owner).cloned();
+        let mut saved = if let Some(saved) = saved {
+            saved
+        } else {
+            if self.data_services.sound_async.cancelled.remove(&owner) { return Ok(NativeReturn::Value(0)); }
+            self.cancel_audio_channel_start(channel)?;
+            let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
+            let saved = PendingSoundLoad { channel, names, selector, duration, group: None, source: None, material: None };
+            if let Some(handle) = state.handle {
+                match self.audio_host.begin_stop(handle) {
+                    Ok(AudioControl::Ready) => { state.handle = None; }
+                    Ok(AudioControl::Pending(ticket)) => {
+                        self.data_services.sound_async.loads.insert(owner, saved);
+                        state.pending_start = Some(crate::sound_async::PendingSoundStart {
+                            started: std::time::Instant::now(), owner, index: 935, value: 0,
+                            configured: None, transition: None, operation: crate::sound_async::Operation::StopForLoad(ticket),
+                        });
+                        self.sound_channels.insert(channel, state);
+                        return Ok(NativeReturn::Retry);
+                    }
+                    Err(cause) => { self.sound_channels.insert(channel, state); return Err(self.sound_host_error(cause)); }
                 }
-                Ok(None) => {}
+            }
+            self.sound_channels.insert(channel, state);
+            saved
+        };
+        let channel = saved.channel;
+        if let Some(crate::sound_async::Operation::StopForLoad(ticket)) = self.sound_channels.get(&channel)
+            .and_then(|state| state.pending_start.as_ref()).map(|pending| pending.operation.clone())
+        {
+            match self.audio_host.poll_control(ticket) {
+                Ok(None) => return Ok(NativeReturn::Retry),
                 Err(cause) => {
-                    self.sound_channels.insert(channel, state);
-                    self.note_sound_resource_failure("resolve", &name, cause);
+                    self.data_services.sound_async.loads.remove(&owner);
+                    self.data_services.sound_async.task_loads.remove(&owner);
+                    if let Some(state) = self.sound_channels.get_mut(&channel) { state.pending_start = None; state.handle = None; }
+                    return Err(self.sound_host_error(cause));
+                }
+                Ok(Some(())) => {}
+            }
+            if let Some(state) = self.sound_channels.get_mut(&channel) { state.pending_start = None; state.handle = None; }
+        }
+        if saved.source.is_none() {
+            let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
+            state.release();
+            self.sound_channels.insert(channel, state);
+            let mut source = None;
+            for name in &saved.names {
+                match self.resources.resolve_mode_utf16(&name.encode_utf16().collect::<Vec<_>>(),
+                    cs2_runtime::resource_router::ResourceMode::LooseFirst)
+                {
+                    Ok(Some(candidate)) => { source = Some((name.clone(), candidate.value.clone())); break; }
+                    Ok(None) => {}
+                    Err(cause) => {
+                        self.data_services.sound_async.loads.remove(&owner);
+                        self.note_sound_resource_failure("resolve", name, cause);
+                        return Ok(NativeReturn::Value(0));
+                    }
+                }
+            }
+            let Some((resource, candidate)) = source else {
+                self.data_services.sound_async.loads.remove(&owner);
+                return Ok(NativeReturn::Value(0));
+            };
+            let Some(version) = cs2_runtime::emote::EmoteArchiveVersion::observe(&candidate) else {
+                self.data_services.sound_async.loads.remove(&owner);
+                self.note_sound_resource_failure("load", &resource, "sound material source is unavailable");
+                return Ok(NativeReturn::Value(0));
+            };
+            let sidecars = self.sound_sidecar_request(&resource).map_err(|cause| cause.to_string());
+            saved.source = Some(Arc::new(material::Source { resource: resource.clone(), candidate, sidecars, version }));
+            let state = self.sound_channels.get_mut(&channel).unwrap();
+            state.pending_start = Some(crate::sound_async::PendingSoundStart {
+                started: std::time::Instant::now(), owner, index: 935, value: 0,
+                configured: None, transition: None, operation: crate::sound_async::Operation::PrepareLoad,
+            });
+            crate::perf_detail::audio_async_note(&format!("event=material_queued owner={owner} channel={channel} resource={resource:?}"));
+        }
+        let source = saved.source.as_ref().unwrap().clone();
+        let started = self.sound_channels[&channel].pending_start.as_ref()
+            .filter(|pending| pending.owner == owner).map(|pending| pending.started)
+            .ok_or_else(|| audio_script_error("pending sound material lost its channel reservation"))?;
+        let ready = saved.material.as_ref().and_then(|ticket| ticket.poll());
+        if ready.is_none() && started.elapsed() > material::TIMEOUT {
+            self.data_services.sound_async.loads.remove(&owner);
+            self.sound_channels.get_mut(&channel).unwrap().pending_start = None;
+            crate::perf_detail::audio_async_note(&format!("event=material_timeout owner={owner} channel={channel} pending_wall_us={}", started.elapsed().as_micros()));
+            self.note_sound_resource_failure("load", &source.resource, "sound material preparation timed out");
+            return Ok(NativeReturn::Value(0));
+        }
+        if saved.material.is_none() {
+            let resources = self.data_services.sound_async.resources.get_or_insert_with(|| Arc::new(self.resources.clone())).clone();
+            let cached = self.data_services.ordinary.cached_resource_with_source(&source.resource)
+                .filter(|cached| cached.source == source.candidate).map(|cached| cached.bytes.as_slice());
+            match material::begin(resources, source.clone(), cached) {
+                Ok(ticket) => saved.material = ticket,
+                Err(cause) => {
+                    self.data_services.sound_async.loads.remove(&owner);
+                    self.sound_channels.get_mut(&channel).unwrap().pending_start = None;
+                    self.note_sound_resource_failure("load", &source.resource, cause);
                     return Ok(NativeReturn::Value(0));
                 }
             }
+            // Even a tiny cached clip yields the native once at submission.
+            // Its next entry owns completion and the following VM instruction.
+            self.data_services.sound_async.loads.insert(owner, saved);
+            return Ok(NativeReturn::Retry);
         }
-        let Some((resource, candidate)) = source else {
-            self.sound_channels.insert(channel, state);
-            return Ok(NativeReturn::Value(0));
+        let Some(ready) = ready else {
+            self.data_services.sound_async.loads.insert(owner, saved);
+            return Ok(NativeReturn::Retry);
         };
-        let _audio = AudioProfile::new(self.current_task_id, channel, "load", None, &resource);
-        let kind = || self.scene_nodes.get(&self.current_task_id).map_or(-1, |node| node.kind as i32);
-        let encoded = {
-            let _detail = SlowTask::new(self.current_task_id, kind, "sound_load_read")
-                .named(resource.as_bytes(), None);
-            let _timing = AudioStage::Read.begin();
-            resources.read_candidate_bounded(candidate, MAX_ENCODED)
-        };
-        let prepared = match encoded {
-            Ok(Some(encoded)) => {
-                let _detail = SlowTask::new(self.current_task_id, kind, "sound_load_decode")
-                    .named(resource.as_bytes(), None);
-                let _timing = AudioStage::Prepare.begin();
-                prepare_named_audio(encoded, &resource)
-            }
-            Ok(None) => Err(crate::media_process::error("encoded sound exceeds 64 MiB")),
-            Err(cause) => Err(cause),
-        };
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
+        self.data_services.sound_async.loads.remove(&owner);
+        let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
+        state.pending_start = None;
+        let ready = match ready {
+            Ok(ready) => ready,
             Err(cause) => {
                 self.sound_channels.insert(channel, state);
-                self.note_sound_resource_failure("load", &resource, cause);
+                self.note_sound_resource_failure("load", &source.resource, cause);
+                crate::perf_detail::audio_async_note(&format!("event=material_failed owner={owner} channel={channel} pending_wall_us={}", started.elapsed().as_micros()));
                 return Ok(NativeReturn::Value(0));
             }
         };
+        let committing = std::time::Instant::now();
+        let resource = source.resource.clone();
+        if cs2_runtime::emote::EmoteArchiveVersion::observe(&source.candidate).as_ref() != Some(&source.version) {
+            self.sound_channels.insert(channel, state);
+            self.note_sound_resource_failure("load", &resource, "sound material source changed before installation");
+            return Ok(NativeReturn::Value(0));
+        }
+        let prepared = ready.prepared;
+        let selector = saved.selector;
+        let duration = saved.duration;
         state.resource = Some(resource.clone());
         state.prepared_audio = Some(prepared.clone());
         state.task.resource_id = next_sound_resource_identity()?;
@@ -327,15 +497,12 @@ impl LoggingHost<'_> {
                 + u64::from(prepared.probe.sample_rate) * u64::from(duration) / 1000
                 <= u64::from(prepared.probe.sample_rate) * 4;
         state.volume_fade = None;
-        let sidecars = {
-            let _timing = AudioStage::Sidecars.begin();
-            self.load_sound_sidecars(&resource)
-        };
-        match sidecars {
-            Ok(sidecars) => state.task.sidecars = sidecars,
-            Err(cause) => {
-                self.note_sound_resource_failure("sidecar", &resource, cause);
-            }
+        match ready.sidecars {
+            Ok(sidecars) => match self.validate_sound_sidecar_install(&sidecars) {
+                Ok(()) => state.task.sidecars = sidecars,
+                Err(cause) => self.note_sound_resource_failure("sidecar", &resource, cause),
+            },
+            Err(cause) => self.note_sound_resource_failure("sidecar", &resource, cause),
         }
         self.sound_channels.insert(channel, state);
         if let Some(event) = self.events.last_mut() {
@@ -343,6 +510,10 @@ impl LoggingHost<'_> {
                 " sound_load channel={channel} selector={selector} resource={resource:?} frames={} rate={} channels={} codec={:?}",
                 prepared.probe.frames, prepared.probe.sample_rate, prepared.probe.channels, prepared.probe.codec));
         }
+        crate::perf_detail::audio_async_note(&format!(
+            "event=material_ready owner={owner} channel={channel} material_read_us={} material_prepare_us={} sidecar_us={} background_wall_us={} framecommit_us={} pending_wall_us={}",
+            ready.read_us, ready.prepare_us, ready.sidecar_us, ready.background_wall_us,
+            committing.elapsed().as_micros(), started.elapsed().as_micros()));
         Ok(NativeReturn::Value(1))
     }
 
@@ -356,6 +527,8 @@ impl LoggingHost<'_> {
         selector: u32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
+        if let Some(result) = self.resume_plain_sound_load()? { return Ok(result); }
         // Name resolution occurs before selector validation and group lookup.
         let _names = self.sound_resource_names(name)?;
         if !matches!(selector, 1 | 2) {
@@ -367,10 +540,19 @@ impl LoggingHost<'_> {
             return self
                 .load_sound_task_record(task, group, true, by_key, name, selector, duration);
         }
-        let Some(channel) = self.select_sound_group_channel(group, by_key)? else {
-            return Ok(NativeReturn::Value(u32::MAX));
+        let channel = if let Some(saved) = self.data_services.sound_async.loads.get(&self.current_task_id) {
+            saved.channel
+        } else {
+            let Some(channel) = self.select_sound_group_channel(group, by_key)? else {
+                return Ok(NativeReturn::Value(u32::MAX));
+            };
+            channel
         };
         match self.load_sound_name(channel, name, selector, duration)? {
+            NativeReturn::Retry => {
+                if let Some(saved) = self.data_services.sound_async.loads.get_mut(&self.current_task_id) { saved.group = Some(group); }
+                Ok(NativeReturn::Retry)
+            }
             NativeReturn::Value(0) => Ok(NativeReturn::Value(u32::MAX)),
             NativeReturn::Value(_) => {
                 let state = self
@@ -392,6 +574,8 @@ impl LoggingHost<'_> {
     /// A playing or paused device owns its physical channel.
     pub(super) fn select_free_sound_channel(&mut self) -> cs2_script::Result<u32> {
         for channel in 0..64 {
+            if self.sound_channels.get(&channel).is_some_and(|state| state.pending_start.is_some())
+                || self.data_services.sound_async.task_loads.values().any(|load| load.logical == channel) { continue; }
             let handle = self
                 .sound_channels
                 .get(&channel)
@@ -531,4 +715,536 @@ pub(super) fn encode_name(encoding: ScriptTextEncoding, name: &str) -> cs2_scrip
         ));
     }
     Ok(bytes.into_owned())
+}
+
+#[cfg(test)]
+pub(super) fn gate_sound_material_for_test(resource: &str)
+    -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)
+{
+    async_load_tests::install_material_gate(resource)
+}
+
+#[cfg(test)]
+mod async_load_tests {
+    use super::*;
+    use crate::{HeadlessPlayer, SoundChannelState};
+    use cs2_runtime::{AudioChannel, AudioHost, AudioRequest, AudioStart};
+    use std::{path::PathBuf, sync::mpsc, time::{Duration, Instant}};
+
+    struct MaterialGate {
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+        entered: Option<mpsc::Sender<()>>,
+        timeout: Duration,
+    }
+    fn material_gate(release: mpsc::Receiver<()>) -> Arc<MaterialGate> {
+        Arc::new(MaterialGate { release: std::sync::Mutex::new(release), entered: None, timeout: Duration::from_secs(2) })
+    }
+    type MaterialGates = std::collections::BTreeMap<String, Arc<MaterialGate>>;
+    static MATERIAL_DELAYS: std::sync::LazyLock<std::sync::Mutex<MaterialGates>> =
+        std::sync::LazyLock::new(Default::default);
+    pub(super) fn install_material_gate(resource: &str) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (release, gate) = mpsc::channel();
+        let (entered, notification) = mpsc::channel();
+        MATERIAL_DELAYS.lock().unwrap().insert(resource.to_owned(), Arc::new(MaterialGate {
+            release: std::sync::Mutex::new(gate), entered: Some(entered), timeout: Duration::from_secs(10),
+        }));
+        (release, notification)
+    }
+    pub(super) fn delay_material(resource: &str) {
+        let resource = resource.replace('\\', "/");
+        let gate = MATERIAL_DELAYS.lock().unwrap().iter().find_map(|(path, gate)|
+            path.replace('\\', "/").eq_ignore_ascii_case(&resource).then(|| gate.clone()));
+        if let Some(gate) = gate {
+            if let Some(entered) = &gate.entered { let _ = entered.send(()); }
+            let _ = gate.release.lock().unwrap().recv_timeout(gate.timeout);
+        }
+    }
+
+    #[test]
+    fn native935_cold_material_wait_keeps_frames_siblings_and_instruction_order() {
+        use cs2_script::{KcsProgram, Operand};
+        let (_scratch, mut player, cleanup) = player();
+        // Cold, unique name; cache warmup for replacement.wav must not satisfy it.
+        let name = format!("sound/cold-material-{}.wav", _scratch.0.file_name().unwrap().to_string_lossy());
+        std::fs::write(_scratch.0.join(&name), wave()).unwrap();
+        // Reindex the new real source, retaining this test's routing.
+        let router = player.scan.resources.resource_router().cloned();
+        player.scan.resources = cs2_runtime::ResourceIndex::scan(&_scratch.0).unwrap();
+        if let Some(router) = router { player.scan.resources.set_resource_router(router).unwrap(); }
+        player.data_services.sound_async.resources = Some(Arc::new(player.scan.resources.clone()));
+        let (material_ready, gate) = mpsc::channel();
+        let (entered, material_entered) = mpsc::channel();
+        MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join(&name).to_string_lossy().into_owned(),
+            Arc::new(MaterialGate { release: std::sync::Mutex::new(gate), entered: Some(entered), timeout: Duration::from_secs(2) }));
+        let mut code = Vec::new();
+        for value in [8, 0, 64, 1, 0] {
+            let operand = Operand::immediate(value);
+            code.push(0x25); code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
+        }
+        code.push(0x2b);
+        for value in [935, 20] {
+            let operand = Operand::immediate(value);
+            code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
+        }
+        code.push(0x3b);
+        let mut vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 512], 64).unwrap()).unwrap();
+        vm.write(64, format!("{name}\0").as_bytes()).unwrap();
+        player.data_services.tasks.set_factory_external(vm.external_binding());
+        player.data_services.tasks.register_external_task(player.current_task_id, 0,
+            &player.data_services.language.languages).unwrap();
+        player.vm = Some(vm);
+        let sibling = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(0, b"")?)).unwrap();
+        assert!(player.advance_host_frame_with_retries(1000).unwrap());
+        let entered_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match material_entered.try_recv() {
+                Ok(()) => break,
+                Err(mpsc::TryRecvError::Disconnected) => panic!("the actual material worker never entered its gate"),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            assert!(Instant::now() < entered_deadline, "the actual material worker must acknowledge entry");
+            assert!(player.advance_host_frame_with_retries(1000).unwrap());
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 30);
+            std::thread::yield_now();
+        }
+        let frame = player.state.clock.frame;
+        let start = Instant::now();
+        let mut max_frame = Duration::ZERO;
+        for _ in 0..4 {
+            let frame_started = Instant::now();
+            assert!(player.advance_host_frame_with_retries(1000).unwrap());
+            max_frame = max_frame.max(frame_started.elapsed());
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 30,
+                "native935 must keep the following opcode ordered behind material completion");
+            assert!(player.sound_channels.get(&8).is_none_or(|state| state.prepared_audio.is_none()));
+        }
+        assert_eq!(player.state.clock.frame, frame + 4);
+        assert!(player.data_services.tasks.task_clock(sibling).unwrap().current > 0);
+        eprintln!("async_sound_material gated_frames=4 wall_us={} max_frame_us={}", start.elapsed().as_micros(), max_frame.as_micros());
+        material_ready.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while player.vm.as_ref().unwrap().instruction_pointer == 30 {
+            assert!(Instant::now() < deadline);
+            player.advance_host_frame_with_retries(1000).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(player.sound_channels[&8].resource.as_deref(), Some(name.as_str()));
+        assert!(player.sound_channels[&8].prepared_audio.is_some());
+        MATERIAL_DELAYS.lock().unwrap().remove(&_scratch.0.join(&name).to_string_lossy().into_owned());
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn async_material_cancellation_never_installs_a_late_result() {
+        let (_scratch, mut player, cleanup) = player();
+        let (material_ready, gate) = mpsc::channel();
+        MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join("sound/replacement.wav").to_string_lossy().into_owned(), material_gate(gate));
+        let result = player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap();
+        assert_eq!(result, NativeReturn::Retry);
+        player.with_host(|host| Ok(host.cancel_audio_channel_start(8)?)).unwrap();
+        assert!(player.data_services.sound_async.loads.is_empty());
+        let _ = material_ready.send(());
+        assert_eq!(player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap(), NativeReturn::Value(0));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/second.wav", 2, 13)?)).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(1)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert_eq!(player.sound_channels[&8].resource.as_deref(), Some("sound/second.wav"));
+        assert_eq!(player.sound_channels[&8].selector, 2);
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn async_material_timeout_and_decode_failure_leave_no_pending_load() {
+        let (_scratch, mut player, cleanup) = player();
+        let (material_ready, gate) = mpsc::channel();
+        MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join("sound/replacement.wav").to_string_lossy().into_owned(), material_gate(gate));
+        assert_eq!(player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap(), NativeReturn::Retry);
+        player.sound_channels.get_mut(&8).unwrap().pending_start.as_mut().unwrap().started =
+            Instant::now() - Duration::from_secs(31);
+        assert_eq!(player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap(), NativeReturn::Value(0));
+        assert!(player.data_services.sound_async.loads.is_empty());
+        assert!(player.sound_channels[&8].pending_start.is_none());
+        let _ = material_ready.send(());
+        std::fs::write(_scratch.0.join("sound/second.wav"), b"malformed wave").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/second.wav", 1, 0)?)).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(0)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&8].prepared_audio.is_none());
+        assert!(player.sound_channels[&8].pending_start.is_none());
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn async_material_rejects_a_source_replaced_while_preparation_is_pending() {
+        let (_scratch, mut player, cleanup) = player();
+        let (material_ready, gate) = mpsc::channel();
+        MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join("sound/replacement.wav").to_string_lossy().into_owned(), material_gate(gate));
+        assert_eq!(player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap(), NativeReturn::Retry);
+        std::fs::write(_scratch.0.join("sound/replacement.wav"), b"a replaced and invalid source of different length").unwrap();
+        let _ = material_ready.send(());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(0)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&8].prepared_audio.is_none());
+        assert!(player.sound_channels[&8].pending_start.is_none());
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn javascript_compat_load_finishes_while_other_material_owners_are_suspended() {
+        let (_scratch, mut player, cleanup) = player();
+        let root = player.current_task_id;
+        let caller = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(root, b"")?)).unwrap();
+        let javascript = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(root, b"")?)).unwrap();
+        let (first_ready, first_gate) = mpsc::channel();
+        let (second_ready, second_gate) = mpsc::channel();
+        MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join("sound/replacement.wav").to_string_lossy().into_owned(), material_gate(first_gate));
+        MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join("sound/second.wav").to_string_lossy().into_owned(), material_gate(second_gate));
+        assert_eq!(player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/replacement.wav", 1, 0)?)).unwrap(), NativeReturn::Retry);
+        player.with_host(|host| { host.current_task_id = caller;
+            assert_eq!(host.load_sound_resolved_name(9, b"sound/second.wav", 1, 0)?, NativeReturn::Retry);
+            Ok(())
+        }).unwrap();
+        let start = Instant::now();
+        player.with_host(|host| { host.current_task_id = javascript;
+            assert_eq!(host.load_sound_name_compat(10, b"sound/compat.wav", 1, 0)?, NativeReturn::Value(1));
+            Ok(())
+        }).unwrap();
+        assert_eq!(player.sound_channels[&10].resource.as_deref(), Some("sound/compat.wav"));
+        assert!(player.data_services.sound_async.loads.contains_key(&root));
+        assert!(player.data_services.sound_async.loads.contains_key(&caller));
+        eprintln!("javascript_material_compat other_owners_pending=2 wall_us={}", start.elapsed().as_micros());
+        player.with_host(|host| { host.cancel_audio_channel_start(8)?; host.cancel_audio_channel_start(9)?; Ok(()) }).unwrap();
+        let _ = first_ready.send(()); let _ = second_ready.send(());
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn grouped_load_allocation_reserves_channels_owned_by_pending_commands() {
+        let (_scratch, mut player, cleanup) = player();
+        player.sound_groups.push(crate::SoundGroup { key: 17, id: 0, label: b"effects".to_vec(), range: [8, 9] });
+        for channel in [8, 9] {
+            if channel == 9 {
+                assert_eq!(player.with_host(|host| Ok(host.select_sound_group_channel(17, true)?)).unwrap(), Some(9));
+            }
+            player.sound_channels.insert(channel, SoundChannelState {
+                pending_start: Some(crate::sound_async::PendingSoundStart {
+                    started: Instant::now(), owner: channel, index: 157, value: 1,
+                    configured: None, transition: None, operation: crate::sound_async::Operation::Start(0),
+                }), ..Default::default()
+            });
+        }
+        assert_eq!(player.with_host(|host| Ok(host.select_sound_group_channel(17, true)?)).unwrap(), None);
+        // Dummy tickets represent reservation only; do not send them to a real backend.
+        for channel in [8, 9] { player.sound_channels.get_mut(&channel).unwrap().pending_start = None; }
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn async_group_material_commands_keep_separate_physical_owners() {
+        let (_scratch, mut player, cleanup) = player();
+        player.sound_groups.push(crate::SoundGroup { key: 17, id: 0, label: b"effects".to_vec(), range: [8, 9] });
+        let root = player.current_task_id;
+        let task = player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let caller = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(root, b"")?)).unwrap();
+        let mut record = [0_u8; 292];
+        record[4..8].copy_from_slice(&17_u32.to_le_bytes());
+        record[12..33].copy_from_slice(b"sound/replacement.wav");
+        assert_eq!(player.with_host(|host| Ok(host.dispatch_sound_load_record(task, 206, &mut record)?)).unwrap(), NativeReturn::Retry);
+        player.with_host(|host| { host.current_task_id = caller;
+            assert_eq!(host.dispatch_sound_load_record(task, 206, &mut record)?, NativeReturn::Retry);
+            Ok(())
+        }).unwrap();
+        assert_eq!(player.data_services.sound_async.task_loads[&root].target, 8);
+        assert_eq!(player.data_services.sound_async.task_loads[&caller].target, 9);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for owner in [root, caller] {
+            loop {
+                let result = player.with_host(|host| { host.current_task_id = owner;
+                    Ok(host.dispatch_sound_load_record(task, 206, &mut record)?) }).unwrap();
+                if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(if owner == root { 8 } else { 9 })); break; }
+                assert!(Instant::now() < deadline); std::thread::yield_now();
+            }
+        }
+        assert!(player.data_services.sound_async.cancelled.is_empty());
+        assert_eq!(player.sound_channels[&8].task.owner, Some(task));
+        assert_eq!(player.sound_channels[&9].task.owner, Some(task));
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
+    fn native936_cancelled_retry_never_reclaims_a_new_owners_saturated_channel() {
+        use cs2_script::{Host, KcsProgram};
+        let (_scratch, mut player, old_cleanup) = player();
+        player.sound_groups.push(crate::SoundGroup { key: 17, id: 0, label: b"effects".to_vec(), range: [6, 6] });
+        let root = player.current_task_id;
+        player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let other = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(root, b"")?)).unwrap();
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 512], 64).unwrap()).unwrap();
+        vm.write(64, b"sound/replacement.wav\0").unwrap();
+        let args = [17_u32, 0, 64, 1, 1, 0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        assert_eq!(player.with_host(|host| Ok(host.call(936, &args, &mut vm)?)).unwrap(), NativeReturn::Retry);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| { host.current_task_id = other;
+                Ok(host.load_sound_resolved_name(6, b"sound/second.wav", 1, 0)?) }).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(1)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert!(player.data_services.sound_async.cancelled.contains(&root));
+        let (started, startup) = mpsc::channel();
+        let (new_cleanup, controls) = mpsc::channel();
+        let AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start_with_controls(AudioRequest {
+            channel: AudioChannel::SoundEffect, resource: "new-owner.wav".into(), volume: 1., pan: 0., looped: false,
+        }, startup, Some(controls)).unwrap() else { panic!("test startup must be pending"); };
+        started.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let playback = loop {
+            if let Some(playback) = player.audio_host.poll_play(ticket).unwrap() { break playback; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        };
+        player.sound_channels.get_mut(&6).unwrap().handle = Some(playback.handle);
+        // The only group member is now owned by an unrelated active device.
+        // Its cleanup gate stays closed: a wrong retry would enqueue stop and
+        // suspend again instead of acknowledging the cancelled native.
+        assert_eq!(player.with_host(|host| Ok(host.call(936, &args, &mut vm)?)).unwrap(), NativeReturn::Value(u32::MAX));
+        assert_eq!(player.sound_channels[&6].handle, Some(playback.handle));
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        assert!(player.audio_host.is_active(playback.handle).unwrap());
+        assert!(!player.data_services.sound_async.cancelled.contains(&root));
+        let _ = old_cleanup.send(Ok(())); let _ = new_cleanup.send(Ok(()));
+    }
+
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    fn wave() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF"); bytes.extend_from_slice(&38_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt "); bytes.extend_from_slice(&16_u32.to_le_bytes());
+        for value in [1_u16, 1] { bytes.extend_from_slice(&value.to_le_bytes()); }
+        bytes.extend_from_slice(&44_100_u32.to_le_bytes()); bytes.extend_from_slice(&88_200_u32.to_le_bytes());
+        for value in [2_u16, 16] { bytes.extend_from_slice(&value.to_le_bytes()); }
+        bytes.extend_from_slice(b"data"); bytes.extend_from_slice(&2_u32.to_le_bytes()); bytes.extend_from_slice(&0_i16.to_le_bytes());
+        bytes
+    }
+    fn player() -> (Scratch, HeadlessPlayer, mpsc::Sender<cs2_runtime::RuntimeResult<()>>) {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("cs2-async-load-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(directory.join("sound")).unwrap();
+        std::fs::write(directory.join("sound/replacement.wav"), wave()).unwrap();
+        std::fs::write(directory.join("sound/second.wav"), wave()).unwrap();
+        std::fs::write(directory.join("sound/compat.wav"), wave()).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile")).unwrap();
+        let mut router = cs2_runtime::resource_router::ResourceRouter::default();
+        router.slots[0] = cs2_runtime::resource_router::ResourceSlot {
+            prefix: "sound".encode_utf16().collect(), loose_directory: "sound".encode_utf16().collect(),
+            loose_enabled: true, archive: None,
+        };
+        player.scan.resources.set_resource_router(router).unwrap();
+        assert!(player.resources().resolve_mode_utf16(&"sound/replacement.wav".encode_utf16().collect::<Vec<_>>(),
+            cs2_runtime::resource_router::ResourceMode::LooseFirst).unwrap().is_some());
+        prepare_named_audio(wave(), "sound/replacement.wav").unwrap();
+        let (started, startup) = mpsc::channel();
+        let (cleanup, control) = mpsc::channel();
+        let AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start_with_controls(AudioRequest {
+            channel: AudioChannel::SoundEffect, resource: "old.wav".into(), volume: 1.0, pan: 0.0, looped: false,
+        }, startup, Some(control)).unwrap() else { panic!("pending startup required"); };
+        started.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let playback = loop {
+            if let Some(playback) = player.audio_host.poll_play(ticket).unwrap() { break playback; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        };
+        player.sound_channels.insert(6, SoundChannelState { resource: Some("old.wav".into()), handle: Some(playback.handle), ..Default::default() });
+        (Scratch(directory), player, cleanup)
+    }
+
+    #[test]
+    fn async_sound_reload_waits_for_stop_and_uses_the_original_names_and_options() {
+        let (_scratch, mut player, cleanup) = player();
+        let result = player.with_host(|host| Ok(host.load_sound_resolved_name(6, b"sound/replacement.wav", 1, 25)?)).unwrap();
+        assert_eq!(result, NativeReturn::Retry);
+        assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("old.wav"));
+        assert!(player.with_host(|host| Ok(host.poll_task_audio_start(host.current_task_id)?)).unwrap().is_none());
+        cleanup.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| Ok(host.load_sound_resolved_name(9, b"missing.wav", 2, 999)?)).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(1)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("sound/replacement.wav"));
+        assert_eq!(player.sound_channels[&6].selector, 1);
+        assert_eq!(player.sound_channels[&6].duration_frames, 25);
+        assert!(!player.sound_channels.contains_key(&9));
+    }
+
+    #[test]
+    fn async_group_reload_retains_its_record_and_physical_allocation_through_reclaim() {
+        let (_scratch, mut player, cleanup) = player();
+        player.sound_groups.push(crate::SoundGroup { key: 17, id: 0, label: b"effects".to_vec(), range: [6, 6] });
+        let root = player.current_task_id;
+        let task = player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let mut record = [0_u8; 292];
+        record[4..8].copy_from_slice(&17_u32.to_le_bytes());
+        record[12..33].copy_from_slice(b"sound/replacement.wav");
+        record[280..284].copy_from_slice(&1_u32.to_le_bytes());
+        record[284..288].copy_from_slice(&37_u32.to_le_bytes());
+        let result = player.with_host(|host| Ok(host.dispatch_sound_load_record(task, 206, &mut record)?)).unwrap();
+        assert_eq!(result, NativeReturn::Retry);
+        assert!(player.sound_channels.get(&38).is_none_or(|state| state.resource.is_none()));
+        cleanup.send(Ok(())).unwrap();
+        record[4..8].copy_from_slice(&99_u32.to_le_bytes());
+        record[280..284].copy_from_slice(&0_u32.to_le_bytes());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| Ok(host.dispatch_sound_load_record(task, 206, &mut record)?)).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(38)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert_eq!(player.sound_channels[&38].resource.as_deref(), Some("sound/replacement.wav"));
+        assert_eq!(player.sound_channels[&38].task.load_mode, 1);
+        assert_eq!(player.sound_channels[&38].task.load_duration, 37);
+        assert!(player.sound_channels[&6].resource.is_none());
+    }
+
+    #[test]
+    fn async_saturated_group_reuse_waits_for_cleanup_then_queues_the_next_play() {
+        for mode in [0_u32, 1] {
+            let (_scratch, mut player, cleanup) = player();
+            let (startup, gate) = mpsc::channel();
+            let AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start(AudioRequest {
+                channel: AudioChannel::SoundEffect, resource: "other.wav".into(), volume: 1.0, pan: 0.0, looped: false,
+            }, gate).unwrap() else { panic!("pending startup required"); };
+            startup.send(Ok(())).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let other = loop {
+                if let Some(playback) = player.audio_host.poll_play(ticket).unwrap() { break playback; }
+                assert!(Instant::now() < deadline); std::thread::yield_now();
+            };
+            player.sound_channels.insert(7, SoundChannelState { resource: Some("other.wav".into()), handle: Some(other.handle), ..Default::default() });
+            {
+                let state = player.sound_channels.get_mut(&6).unwrap();
+                state.task.last_tick = 77;
+                state.task.loop_range[1] = 50;
+                state.task.linked = Some(31);
+            }
+            player.sound_groups.push(crate::SoundGroup { key: 17, id: 0, label: b"effects".to_vec(), range: [6, 7] });
+            let owner = player.current_task_id;
+            let task = player.with_host(|host| Ok(host.create_task_object(13, owner, b"sound", b"")?)).unwrap();
+            let mut record = [0_u8; 292];
+            record[4..8].copy_from_slice(&17_u32.to_le_bytes());
+            record[12..33].copy_from_slice(b"sound/replacement.wav");
+            record[280..284].copy_from_slice(&mode.to_le_bytes());
+            for _ in 0..2 {
+                let result = player.with_host(|host| Ok(host.dispatch_sound_load_record(task, 206, &mut record)?)).unwrap();
+                assert_eq!(result, NativeReturn::Retry);
+                assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("old.wav"));
+                assert!(!player.data_services.sound_async.cancelled.contains(&owner));
+            }
+            cleanup.send(Ok(())).unwrap();
+            let channel = 6 + mode * 32;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = player.with_host(|host| Ok(host.dispatch_sound_load_record(task, 206, &mut record)?)).unwrap();
+                if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(channel)); break; }
+                assert!(Instant::now() < deadline); std::thread::yield_now();
+            }
+            assert!(!player.data_services.sound_async.cancelled.contains(&owner));
+            assert_eq!(player.sound_channels[&channel].resource.as_deref(), Some("sound/replacement.wav"));
+            if mode == 1 {
+                let logical = &player.sound_channels[&6];
+                assert!(logical.resource.is_none());
+                assert_eq!(logical.task.last_tick, 77);
+                assert_eq!(logical.task.loop_range[1], 50);
+                assert_eq!(logical.task.linked, Some(31));
+            }
+            assert!(player.audio_host.is_active(other.handle).unwrap());
+            let result = player.with_host(|host| Ok(host.control_sound_values(157, channel, 1, 0)?)).unwrap();
+            assert_eq!(result, NativeReturn::Retry, "the next native157 must enqueue playback, never consume a stale cancellation");
+            assert!(matches!(player.sound_channels[&channel].pending_start.as_ref().map(|pending| &pending.operation),
+                Some(crate::sound_async::Operation::Start(_))));
+            player.with_host(|host| Ok(host.cancel_audio_channel_start(channel)?)).unwrap();
+        }
+    }
+
+    #[test]
+    fn async_queued_reload_cancellation_removes_only_its_retained_packet() {
+        let (_scratch, mut player, cleanup) = player();
+        let root = player.current_task_id;
+        let task = player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let mut record = [0_u8; 292];
+        record[..4].copy_from_slice(&6_u32.to_le_bytes());
+        record[12..33].copy_from_slice(b"sound/replacement.wav");
+        player.with_host(|host| {
+            let mut output = 0;
+            host.queue_sound_task_command(task, TaskCommand { target: task as i32, sender: root as i32, code: 180, data: [0; 3] },
+                &TaskCommandBuffers { data0: None, data1: Some(&mut record) }, &mut output)?;
+            host.queue_sound_task_command(task, TaskCommand { target: task as i32, sender: root as i32, code: 187, data: [6, 42, 0] },
+                &TaskCommandBuffers { data0: None, data1: None }, &mut output)?;
+            host.update_sound_task(task)?;
+            Ok(())
+        }).unwrap();
+        assert!(player.data_services.sound_async.task_loads[&task].queued);
+        player.with_host(|host| Ok(host.cancel_audio_channel_start(6)?)).unwrap();
+        cleanup.send(Ok(())).unwrap();
+        player.with_host(|host| Ok(host.update_sound_task(task)?)).unwrap();
+        assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("old.wav"));
+        assert_eq!(player.sound_channels[&6].volume, 42);
+        assert!(player.data_services.sound_async.task_loads.is_empty());
+    }
+
+    #[test]
+    fn async_queued_reload_superseded_inside_receiver_cannot_replay_after_reinsertion() {
+        let (_scratch, mut player, cleanup) = player();
+        let root = player.current_task_id;
+        let task = player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let mut record = [0_u8; 292];
+        record[..4].copy_from_slice(&6_u32.to_le_bytes());
+        record[12..33].copy_from_slice(b"sound/replacement.wav");
+        player.with_host(|host| {
+            let mut output = 0;
+            host.queue_sound_task_command(task, TaskCommand { target: task as i32, sender: root as i32, code: 180, data: [0; 3] },
+                &TaskCommandBuffers { data0: None, data1: Some(&mut record) }, &mut output)?;
+            host.update_sound_task(task)?;
+            Ok(())
+        }).unwrap();
+        record[12..272].fill(0);
+        record[12..28].copy_from_slice(b"sound/second.wav");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = player.with_host(|host| Ok(host.dispatch_sound_load_record(task, 180, &mut record)?)).unwrap();
+            if result != NativeReturn::Retry { assert_eq!(result, NativeReturn::Value(1)); break; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        cleanup.send(Ok(())).unwrap();
+        player.with_host(|host| Ok(host.update_sound_task(task)?)).unwrap();
+        assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("sound/second.wav"));
+        assert!(player.data_services.sound_async.queued_cancellations.is_empty());
+    }
+
+    #[test]
+    fn async_sound_reload_cancellation_drops_the_owned_load_without_joining() {
+        let (_scratch, mut player, cleanup) = player();
+        let result = player.with_host(|host| Ok(host.load_sound_resolved_name(6, b"sound/replacement.wav", 1, 0)?)).unwrap();
+        assert_eq!(result, NativeReturn::Retry);
+        player.with_host(|host| Ok(host.cancel_audio_channel_start(6)?)).unwrap();
+        assert!(player.data_services.sound_async.loads.is_empty());
+        assert!(player.sound_channels[&6].handle.is_none());
+        cleanup.send(Ok(())).unwrap();
+        let result = player.with_host(|host| Ok(host.load_sound_resolved_name(6, b"missing.wav", 1, 0)?)).unwrap();
+        assert_eq!(result, NativeReturn::Value(0));
+        assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("old.wav"));
+    }
 }

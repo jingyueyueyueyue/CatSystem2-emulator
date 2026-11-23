@@ -232,6 +232,9 @@ unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, langu
         player.load_startup().map_err(|error| format!("Load startup: {error:#}"))?;
         let id = sessions.next.checked_add(1).ok_or("Android session ids exhausted")?;
         sessions.next = id;
+        for note in player.log().iter().filter(|note| note.starts_with("font_prewarm ")).take(1) {
+            input_report(&format!("{note} session={id}"));
+        }
         sessions.players.insert(id, player);
         if story != 0 {
             if let Some(trace) = StoryTrace::new() {

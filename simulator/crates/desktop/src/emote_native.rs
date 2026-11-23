@@ -34,6 +34,8 @@ const EMOTE_BLEND_PARALLEL_PIXELS: usize = 128 * 1024;
 mod geometry;
 #[path = "emote_settings.rs"]
 pub(super) mod settings;
+#[path = "emote_load_async.rs"]
+mod load_async;
 
 /// C's owned-buffer task receiver. Command IDs are kept separate from ordinary
 ///slot IDs; no temporary VM/process address is retained by the M2 owner.
@@ -75,15 +77,19 @@ pub(super) fn receive(
         let spec = buffers
             .data1()
             .ok_or_else(|| unsupported(906, "M2 command524 requires owned load-spec bytes"))?;
-        host.data_services
+        let result = host.data_services
             .emote
-            .load_m2(host.resources, &mut host.data_services.ordinary, target, spec, addressed.data[0])?;
+            .load_m2(host.resources, &mut host.data_services.ordinary, host.current_task_id, target, spec, addressed.data[0])?;
+        if result == NativeReturn::Retry {
+            return Ok(Some(cs2_runtime::TaskCommandOutcome { done: false, propagate: false }));
+        }
         if let Some(node) = host.scene_nodes.get_mut(&target) {
             node.initialized = true;
         }
     } else if addressed.code == 540 {
         host.emote_link_legacy_sound_lip(target, addressed.data[1], addressed.data[0])?;
     } else {
+        if addressed.code == 527 { host.data_services.emote.loads.cancel_target(target); }
         let native = match addressed.code {
             526 => 907,
             527 => 908,
@@ -226,6 +232,7 @@ pub(super) fn load_m2_resource_plan(
         startup_config_name,
         formatted_spec,
         None,
+        None,
     )
 }
 
@@ -235,11 +242,14 @@ fn load_m2_resource_plan_impl(
     startup_config_name: &[u8],
     formatted_spec: &[u8],
     task: Option<u32>,
+    mut identities: Option<&mut Vec<(cs2_runtime::ResourceCandidate, EmoteArchiveVersion)>>,
 ) -> std::result::Result<EmoteM2ResourcePlan, EmoteError> {
     fn read(
         resources: &ResourceIndex,
         category: &[u8],
         name: &[u8],
+        identities: Option<&mut Vec<(cs2_runtime::ResourceCandidate, EmoteArchiveVersion)>>,
+        remaining: &mut usize,
     ) -> std::result::Result<Vec<u8>, EmoteError> {
         if name.is_empty() || name.len() > MAX_FORMAT_BYTES || name.contains(&0) {
             return Err(EmoteError::InvalidResource("M2 resource name"));
@@ -250,9 +260,20 @@ fn load_m2_resource_plan_impl(
                 "invalid CP932 M2 resource name",
             ));
         }
-        resources
-            .read_category(category, &decoded)
-            .map_err(|e| EmoteError::Backend(e.to_string()))
+        for name in resources.category_names(category, &decoded).map_err(|e| EmoteError::Backend(e.to_string()))? {
+            let Some(candidate) = resources.resolve_mode_candidate(&name, ResourceMode::LooseFirst)
+                .map_err(|e| EmoteError::Backend(e.to_string()))? else { continue; };
+            let version = EmoteArchiveVersion::observe(candidate).ok_or(EmoteError::InvalidResource("M2 configuration version unavailable"))?;
+            let bytes = resources.read_candidate_bounded(candidate, (*remaining).min(4 * 1024 * 1024))
+                .map_err(|e| EmoteError::Backend(e.to_string()))?.ok_or(EmoteError::Capacity)?;
+            *remaining = remaining.saturating_sub(bytes.len());
+            if EmoteArchiveVersion::observe(candidate).as_ref() != Some(&version) {
+                return Err(EmoteError::InvalidResource("M2 configuration changed during preparation"));
+            }
+            if let Some(identities) = identities { identities.push((candidate.clone(), version)); }
+            return Ok(bytes);
+        }
+        Err(EmoteError::InvalidResource("M2 configuration not found"))
     }
     fn single(config: &CpuM2Config, section: &[u8]) -> std::result::Result<Vec<u8>, EmoteError> {
         let rows = config.records(section);
@@ -262,10 +283,13 @@ fn load_m2_resource_plan_impl(
         Ok(rows[0][0].clone())
     }
     let config_timer = task.map(|id| SlowTask::new(id, || 54, "emote_m2_config"));
+    let mut remaining = 16 * 1024 * 1024;
     let view = CpuM2Config::parse_cp932(&read(
         resources,
         startup_config_category,
         startup_config_name,
+        identities.as_deref_mut(),
+        &mut remaining,
     )?)?;
     let profile_category = single(&view, b"profilepath")?;
     let data_category = single(&view, b"datapath")?;
@@ -280,7 +304,7 @@ fn load_m2_resource_plan_impl(
     let extension = single(&view, b"dataext")?;
     let load_spec = CpuM2LoadSpec::parse_unquoted(formatted_spec)?;
     let filename = view.profile_file(&load_spec.profile_alias_cp932)?.to_vec();
-    let profile = CpuM2Config::parse_cp932(&read(resources, &profile_category, &filename)?)?;
+    let profile = CpuM2Config::parse_cp932(&read(resources, &profile_category, &filename, identities.as_deref_mut(), &mut remaining)?)?;
     let selection = profile.select_profile(load_spec.chara_id, load_spec.motion_id)?;
     let mut configs = BTreeMap::new();
     configs.insert(filename, profile);
@@ -293,7 +317,7 @@ fn load_m2_resource_plan_impl(
         if configs.len() >= 128 {
             return Err(EmoteError::Capacity);
         }
-        let config = CpuM2Config::parse_cp932(&read(resources, &profile_category, &name)?)?;
+        let config = CpuM2Config::parse_cp932(&read(resources, &profile_category, &name, identities.as_deref_mut(), &mut remaining)?)?;
         let transform = config.difference_transform()?;
         for include in &transform.include_files_cp932 {
             if !configs.contains_key(include) {
@@ -410,6 +434,7 @@ pub(super) struct EmoteNativeServices {
     spline_config: Arc<CpuM2SplineConfig>,
     action_config: Arc<CpuM2ActionConfig>,
     prepared_frames: BTreeMap<u32, EmoteRasterFrame>,
+    loads: load_async::Loads,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -612,6 +637,7 @@ impl LoggingHost<'_> {
 
     /// Valid after a profile mismatch as well.
     pub(super) fn emote_release_task_hook(&mut self, id: u32) -> Result<()> {
+        self.data_services.emote.cancel_pending_loads_for(id);
         self.data_services.emote.sound_links.remove(&id);
         self.data_services.emote.placements.remove(&id);
         if self.data_services.emote.state.state(id).is_some() {
@@ -664,7 +690,8 @@ impl LoggingHost<'_> {
         {
             return Ok(NativeReturn::Continue);
         }
-        let target = word(args, 0)?;
+        let target = if index == 906 { self.data_services.emote.loads.saved(self.current_task_id).map(|saved| saved.0).unwrap_or(word(args, 0)?) } else { word(args, 0)? };
+        if index == 906 { self.data_services.emote.loads.check_cancelled(self.current_task_id).map_err(error)?; }
         if !self
             .data_services
             .tasks
@@ -681,9 +708,12 @@ impl LoggingHost<'_> {
                 "addressed live type54 task is unavailable",
             ));
         }
+        if index == 908 { self.data_services.emote.loads.cancel_target(target); }
         if index == 906 {
-            let spec = formatted(vm, word(args, 1)?)?;
-            let mode = word(args, 2)?;
+            let saved = self.data_services.emote.loads.saved(self.current_task_id);
+            let (spec, mode) = if let Some((_, spec, mode)) = saved { (spec, mode) } else {
+                (formatted(vm, word(args, 1)?)?, word(args, 2)?)
+            };
             // LOAD_LoadObj replays the saved plane's fixed string even when
             // it is empty. For that input the original receiver returns 0
             // (RVA 0x2389ac) and the newly created plane stays unloaded.
@@ -711,9 +741,9 @@ impl LoggingHost<'_> {
             let result = self
                 .data_services
                 .emote
-                .load_m2(self.resources, &mut self.data_services.ordinary, target, &spec, mode)?;
-            if let Some(node) = self.scene_nodes.get_mut(&target) {
-                node.initialized = true;
+                .load_m2(self.resources, &mut self.data_services.ordinary, self.current_task_id, target, &spec, mode)?;
+            if result != NativeReturn::Retry {
+                if let Some(node) = self.scene_nodes.get_mut(&target) { node.initialized = true; }
             }
             return Ok(result);
         }
@@ -745,6 +775,11 @@ struct Plan {
 }
 
 impl EmoteNativeServices {
+    pub(super) fn set_material_resources(&mut self, resources: Arc<ResourceIndex>) { self.loads.set_resources(resources); }
+    pub(super) fn pending_load_owners(&self) -> impl Iterator<Item = u32> + '_ { self.loads.owners() }
+    pub(super) fn has_pending_loads(&self) -> bool { self.loads.has_pending() }
+    pub(super) fn cancel_pending_loads_for(&mut self, id: u32) { self.loads.cancel(id); }
+
     pub(super) fn initialize(&mut self, resources: &ResourceIndex, sha256: &str) -> Result<()> {
         if !NEKOPARA_PE_SHA256.eq_ignore_ascii_case(sha256) {
             return Ok(());
@@ -794,6 +829,7 @@ impl EmoteNativeServices {
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         if crate::gpu_raster::emote_requested() {
             backend.set_rasterizer(crate::gpu_raster::draw_emote);
+            backend.set_surface_tinter(crate::gpu_raster::tint_emote_surface);
             backend.set_surface_gpu(
                 crate::gpu_raster::mix_emote_surfaces,
                 crate::gpu_raster::prepare_emote_surfaces,
@@ -821,66 +857,25 @@ impl EmoteNativeServices {
         &mut self,
         resources: &ResourceIndex,
         ordinary: &mut super::ordinary_native::OrdinaryNativeServices,
+        owner: u32,
         task: u32,
         spec: &[u8],
         mode: u32,
     ) -> Result<NativeReturn> {
-        let plan = load_m2_resource_plan_impl(
-            resources,
-            b"m2config",
-            b"m2view.cnf",
-            spec,
-            Some(task),
-        )
-        .map_err(error)?;
-        let (name, _, invalid) = encoding_rs::SHIFT_JIS.decode(&plan.resource_name);
-        if invalid || plan.resource_name.is_empty() || plan.resource_name.len() > MAX_FORMAT_BYTES
-            || plan.resource_name.contains(&0)
-        {
-            return Err(error(EmoteError::InvalidResource("M2 resource name")));
-        }
-        let names = resources.category_names(&plan.resource_category, &name)
-            .map_err(|cause| error(EmoteError::Backend(cause.to_string())))?;
-        let mut candidate = None;
-        for name in &names {
-            candidate = resources.resolve_mode_candidate(name, ResourceMode::LooseFirst)
-                .map_err(|cause| error(EmoteError::Backend(cause.to_string())))?;
-            if candidate.is_some() { break; }
-        }
-        let candidate = candidate.ok_or_else(|| error(EmoteError::Backend(format!(
-            "resource not found: {}", names.join(" | ")
-        ))))?;
-        let mut version = EmoteArchiveVersion::observe(candidate);
-        let cached = version.as_ref().and_then(|version| {
-            self.state.cached_m2_model(task, &plan.resource_name, version)
-        });
-        let cached = if cached.is_none() && self.state.uses_unfiltered_m2_texture(task) {
-            let prepared = version.as_ref().and_then(|version| ordinary.take_preloaded_model(version));
-            if prepared.is_some() && version != EmoteArchiveVersion::observe(candidate) {
-                version = None;
-                None
-            } else {
-                prepared
-            }
-        } else {
-            cached
+        self.loads.check_cancelled(owner).map_err(error)?;
+        let filter = self.state.m2_texture_filter(task)
+            .ok_or_else(|| unsupported(906, "M2 target has no CPU texture configuration"))?;
+        let Some(prepared) = self.loads.poll(resources, owner, task, spec, mode, filter, self.state.state(task).map_or(0, |state| state.successful_resource_imports), |plan, version| {
+            self.state.cached_m2_model(task, &plan.resource_name, version).or_else(|| {
+                self.state.uses_unfiltered_m2_texture(task).then(|| ordinary.take_preloaded_model(version)).flatten()
+            })
+        }).map_err(error)? else {
+            return Ok(NativeReturn::Retry);
         };
-        let decoded;
-        let source = if let Some((model, version)) = cached.zip(version.clone()) {
-            CpuM2ModelSource::Shared(model, version)
-        } else {
-            let packed = {
-                let _timing = SlowTask::new(task, || 54, "emote_psz_read").named(&plan.resource_name, None);
-                resources.read_candidate(candidate)
-                    .map_err(|cause| error(EmoteError::Backend(cause.to_string())))?
-            };
-            if version.is_some() && version != EmoteArchiveVersion::observe(candidate) {
-                version = None;
-            }
-            let _timing = SlowTask::new(task, || 54, "emote_psz_decode").named(&plan.resource_name, None);
-            decoded = EmoteResource::decode(&packed).map_err(error)?;
-            CpuM2ModelSource::Decoded(&decoded, version)
-        };
+        let commit_started = std::time::Instant::now();
+        let phases_us = prepared.phases_us;
+        let load_async::Prepared { plan, model, version, .. } = prepared;
+        let source = CpuM2ModelSource::Shared(model, version);
         let mut secondary_variables = plan.secondary_config.default_variables().map_err(error)?;
         let secondary_force_defaults = secondary_variables.clone();
         for (dimension, label) in plan
@@ -938,6 +933,8 @@ impl EmoteNativeServices {
         placement.profile_scale = scale[0];
         placement.scale_offset = scale_offset.map(|value| value as f32);
         self.apply_placement(task).map_err(error)?;
+        super::perf_detail::resource_warmup_note(&format!("m2_async native=906 target={task} name={} config_us={} read_us={} decode_us={} model_us={} commit_us={}",
+            String::from_utf8_lossy(&plan.resource_name), phases_us[0], phases_us[1], phases_us[2], phases_us[3], commit_started.elapsed().as_micros()));
         Ok(NativeReturn::Continue)
     }
 
@@ -980,13 +977,13 @@ impl EmoteNativeServices {
         let mut tasks = Vec::new();
         for node in nodes {
             let Some(state) = self.state.state(node.id) else { continue };
-            if state.successful_resource_imports == 0 || node.color != 0xffff_ffff { continue }
+            if state.successful_resource_imports == 0 { continue }
             self.state.set_base_argb(node.id, node.color)?;
             if self.state.can_defer_scene_raster(node.id) {
                 tasks.push(node.id);
             }
         }
-        if tasks.len() > 1 {
+        if !tasks.is_empty() {
             let players: Vec<_> = tasks.iter().filter_map(|&task| self.state.scene_raster_player(task)).collect();
             super::gpu_raster::prepare_emote_poses(&players);
         }
@@ -1489,6 +1486,33 @@ fn submit_rgba_with_workers(
 mod tests {
     use super::*;
     use cs2_renderer::Color;
+
+    #[test]
+    fn native906_cold_preparation_yields_before_reading_resources() -> anyhow::Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-emote-cold-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"))?;
+        let result = player.with_host(|host| {
+            let emote = &mut host.data_services.emote;
+            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
+            emote.state.set_backend(Box::new(CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?)).map_err(error)?;
+            emote.surface_fade_default = Some(0);
+            let target = host.create_task_object(54, host.current_task_id, b"m2plane", b"")?;
+            let mut vm = Vm::from_program(cs2_script::KcsProgram::from_code(&[0x3b], vec![0; 256], 64)?)?;
+            vm.write(0, b"actor,0\0")?;
+            let args = [target, 0, 0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            assert_eq!(host.emote_native(906, &args, &mut vm)?, NativeReturn::Retry,
+                "cold preparation must return to the frame before opening configuration or PSZ files");
+            assert_eq!(host.data_services.emote.state.state(target).unwrap().successful_resource_imports, 0);
+            host.emote_release_task_hook(host.current_task_id)?;
+            assert!(!host.data_services.emote.has_pending_loads());
+            Ok(())
+        });
+        std::fs::remove_dir_all(&root)?;
+        result
+    }
 
     #[test]
     fn native908_finishes_with_or_without_a_live_emote_task() -> anyhow::Result<()> {

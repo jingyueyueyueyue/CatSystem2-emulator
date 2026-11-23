@@ -302,8 +302,48 @@ impl AudioState {
     }
 }
 
+/// A start is complete after the backend's normal acknowledgement. Android
+/// BGM/voice acknowledge an accepted start request; sound effects acknowledge
+/// actual device startup. Later errors remain observable through host polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioStart {
+    Ready(PlaybackState),
+    Pending(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioControl {
+    Ready,
+    Pending(u64),
+}
+
 pub trait AudioHost {
     fn play(&mut self, request: AudioRequest) -> RuntimeResult<PlaybackState>;
+    /// Starts device work and returns an owned ticket when acknowledgement is
+    /// outstanding. Synchronous hosts retain their existing implementation.
+    fn begin_play(&mut self, request: AudioRequest) -> RuntimeResult<AudioStart> {
+        self.play(request).map(AudioStart::Ready)
+    }
+    fn poll_play(&mut self, ticket: u64) -> RuntimeResult<Option<PlaybackState>> {
+        Err(crate::RuntimeError::Host(format!("audio start ticket {ticket} is not pending")))
+    }
+    fn cancel_play(&mut self, ticket: u64) -> RuntimeResult<()> {
+        Err(crate::RuntimeError::Host(format!("audio start ticket {ticket} is not pending")))
+    }
+    fn begin_stop(&mut self, handle: u64) -> RuntimeResult<AudioControl> {
+        self.stop(handle).map(|_| AudioControl::Ready)
+    }
+    fn begin_pause(&mut self, handle: u64, paused: bool) -> RuntimeResult<AudioControl> {
+        self.pause(handle, paused).map(|_| AudioControl::Ready)
+    }
+    /// None leaves the issuing task suspended; Some acknowledges the actual
+    /// device operation. A completed or canceled ticket must not be reused.
+    fn poll_control(&mut self, ticket: u64) -> RuntimeResult<Option<()>> {
+        Err(crate::RuntimeError::Host(format!("audio control ticket {ticket} is not pending")))
+    }
+    fn cancel_control(&mut self, ticket: u64) -> RuntimeResult<()> {
+        Err(crate::RuntimeError::Host(format!("audio control ticket {ticket} is not pending")))
+    }
     fn stop(&mut self, handle: u64) -> RuntimeResult<()>;
     fn pause(&mut self, handle: u64, paused: bool) -> RuntimeResult<()>;
     fn stop_all(&mut self, channel: AudioChannel) -> RuntimeResult<()>;

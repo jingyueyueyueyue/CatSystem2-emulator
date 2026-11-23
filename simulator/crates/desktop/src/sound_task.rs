@@ -100,6 +100,8 @@ pub(super) struct SoundTaskChannel {
     release_when_finished: bool,
     transition: Option<ChannelTransition>,
     delayed: Option<(DelayedControl, u32)>,
+    #[serde(skip)]
+    pub(super) delayed_finish: Option<bool>,
 }
 
 impl Default for SoundTaskChannel {
@@ -132,12 +134,14 @@ impl Default for SoundTaskChannel {
             release_when_finished: false,
             transition: None,
             delayed: None,
+            delayed_finish: None,
         }
     }
 }
 
 impl SoundTaskChannel {
     pub(super) fn cancel_pending_control(&mut self) {
+        self.delayed_finish = None;
         self.delayed = None;
         self.release_priority = false;
         self.control_priority = false;
@@ -369,6 +373,9 @@ impl LoggingHost<'_> {
             Ok(false)
         };
         self.data_services.sounds.tasks.insert(id, task);
+        if let Some(cancelled) = self.data_services.sound_async.queued_cancellations.remove(&id) {
+            self.discard_cancelled_queued_sound_load(&cancelled);
+        }
         result
     }
 
@@ -699,20 +706,34 @@ impl LoggingHost<'_> {
                 *output = 1;
             }
             180 | 181 | 206..=209 => {
+                // A superseded invocation owns only its cancellation receipt.
+                // Consume it before group selection can reclaim another
+                // caller's newly published device or enqueue another stop.
+                if self.data_services.sound_async.cancelled.remove(&self.current_task_id) {
+                    *output = if code >= 206 { u32::MAX } else { 0 };
+                    return Ok(());
+                }
                 if code == 180 && channel >= 64 {
                     return Ok(());
                 }
-                let bytes = data1.as_deref().ok_or_else(|| {
+                let saved_load = self.data_services.sound_async.task_loads.get(&self.current_task_id)
+                    .filter(|saved| saved.task == id && saved.code == code).cloned();
+                let saved_record = saved_load.as_ref().map(|saved| saved.record.clone());
+                let bytes = saved_record.as_deref().or(data1.as_deref()).ok_or_else(|| {
                     audio_script_error("sound load requires an explicit record buffer")
                 })?;
                 let grouped = code >= 206;
-                let logical = if grouped {
+                let logical = if let Some(saved) = &saved_load { saved.logical } else if grouped {
                     let key = read_u32(bytes, if code <= 207 { 4 } else { 8 })?;
                     let Some(group) = sound_group(task, code <= 207, key) else {
                         *output = u32::MAX;
                         return Ok(());
                     };
-                    self.select_task_sound_group_channel(group)?
+                    let Some(selected) = self.select_task_sound_group_channel(group)? else {
+                        *output = u32::MAX;
+                        return Ok(());
+                    };
+                    selected
                 } else {
                     let target = read_u32(bytes, 0)?;
                     if code == 181 && target as i32 >= 64 {
@@ -726,7 +747,7 @@ impl LoggingHost<'_> {
                     ));
                 }
                 let mode = read_u32(bytes, 280)?;
-                let target = if mode == 0 {
+                let target = if let Some(saved) = &saved_load { saved.target } else if mode == 0 {
                     logical
                 } else {
                     logical.wrapping_add(32)
@@ -749,7 +770,7 @@ impl LoggingHost<'_> {
                     .sound_channels
                     .get(&target)
                     .map_or([0, -1], |state| state.task.loop_range);
-                let loop_range = if code == 209 {
+                let loop_range = if let Some(saved) = &saved_load { saved.loop_range } else if code == 209 {
                     previous_range
                 } else if !whole && read_u32(bytes, 272)? != 0 {
                     task.loops
@@ -759,6 +780,33 @@ impl LoggingHost<'_> {
                 } else {
                     [0, -1]
                 };
+                // Busy grouped allocation can first reclaim the logical
+                // slot, even when this record loads its alternate physical slot.
+                // Keep that exact allocation and record until its stop completes.
+                let reclaiming = self.sound_channels.values().any(|state| state.pending_start.as_ref().is_some_and(|pending|
+                    pending.owner == self.current_task_id && matches!(pending.operation, crate::sound_async::Operation::Release(_))));
+                if reclaiming {
+                    let reclaim_state = saved_load.as_ref().and_then(|saved| saved.reclaim_state)
+                        .or_else(|| self.sound_channels.get(&logical).map(|state|
+                            (state.task.last_tick, state.task.loop_range[1], state.task.linked)));
+                    self.data_services.sound_async.task_loads.entry(self.current_task_id).or_insert_with(|| crate::sound_native::PendingTaskSoundLoad {
+                        task: id, code, record: bytes.to_vec(), logical, target, loop_range,
+                        queued: self.data_services.sound_async.queued_owner == Some(id),
+                        reclaim_state,
+                    });
+                    if self.poll_task_audio_start(self.current_task_id)? == Some(NativeReturn::Retry) { return Ok(()); }
+                }
+                if let Some((last_tick, loop_end, linked)) = self.data_services.sound_async.task_loads
+                    .get(&self.current_task_id).and_then(|saved| saved.reclaim_state)
+                    && let Some(state) = self.sound_channels.get_mut(&logical)
+                    && state.pending_start.is_none()
+                {
+                    // The synchronous selector restored these after release.
+                    // Alternate loads retain the old logical slot's metadata.
+                    state.task.last_tick = last_tick;
+                    state.task.loop_range[1] = loop_end;
+                    state.task.linked = linked;
+                }
                 let result = self.load_sound_resolved_name(
                     target,
                     name,
@@ -771,6 +819,15 @@ impl LoggingHost<'_> {
                     state.task.owner = Some(id);
                 }
                 let result = result?;
+                if result == NativeReturn::Retry {
+                    self.data_services.sound_async.task_loads.entry(self.current_task_id).or_insert_with(|| crate::sound_native::PendingTaskSoundLoad {
+                        task: id, code, record: bytes.to_vec(), logical, target, loop_range,
+                        queued: self.data_services.sound_async.queued_owner == Some(id),
+                        reclaim_state: None,
+                    });
+                    return Ok(());
+                }
+                self.data_services.sound_async.task_loads.remove(&self.current_task_id);
                 let loaded = matches!(result, NativeReturn::Value(1));
                 if let Some(state) = self.sound_channels.get_mut(&target) {
                     state.task.owner = Some(id);
@@ -842,8 +899,12 @@ impl LoggingHost<'_> {
                     .get(&channel)
                     .is_some_and(|state| state.resource.is_some())
                 {
-                    self.control_sound_channel_values(157, channel, value, 0)?;
-                    self.begin_sound_transition(id, logical, channel)?;
+                    let result = self.control_sound_channel_values(157, channel, value, 0)?;
+                    if result == NativeReturn::Retry {
+                        if let Some(pending) = self.sound_channels.get_mut(&channel).and_then(|state| state.pending_start.as_mut()) {
+                            pending.transition = Some([id, logical, channel]);
+                        }
+                    } else { self.begin_sound_transition(id, logical, channel)?; }
                 }
             }
             186 => {
@@ -1194,7 +1255,11 @@ impl LoggingHost<'_> {
                         *output = u32::MAX;
                         return Ok(());
                     };
-                    self.select_task_sound_group_channel(group)?
+                    let Some(selected) = self.select_task_sound_group_channel(group)? else {
+                        *output = u32::MAX;
+                        return Ok(());
+                    };
+                    selected
                 } else { read_u32(bytes, 0)? };
                 let mode = read_u32(bytes, 280)?;
                 let physical = if mode == 0 { origin } else { origin.wrapping_add(32) };
@@ -1286,7 +1351,7 @@ impl LoggingHost<'_> {
         })
     }
 
-    fn begin_sound_transition(&mut self, owner: u32, logical: u32, physical: u32) -> Result<()> {
+    pub(super) fn begin_sound_transition(&mut self, owner: u32, logical: u32, physical: u32) -> Result<()> {
         let Some(state) = self.sound_channels.get(&physical) else {
             return Ok(());
         };
@@ -1416,8 +1481,16 @@ impl LoggingHost<'_> {
             .completed_update
             .is_some_and(|serial| serial != update)
         {
+            if self.sound_channels.get(&transition.old).is_some_and(|state| state.pending_start.is_some()) {
+                return Ok(Some(physical));
+            }
             if old_matches {
-                self.control_sound_channel_values(156, transition.old, 0, 0)?;
+                if self.control_sound_channel_values(156, transition.old, 0, 0)? == NativeReturn::Retry {
+                    // The original source still owns its stop ticket. Keep
+                    // the new physical slot and transition until it releases;
+                    // replacing the logical slot here would orphan that ticket.
+                    return Ok(Some(physical));
+                }
             }
             let can_move = self
                 .sound_channels
@@ -1468,38 +1541,31 @@ impl LoggingHost<'_> {
         }
     }
 
-    fn select_task_sound_group_channel(&mut self, group: &SoundGroup) -> Result<u32> {
+    fn select_task_sound_group_channel(&mut self, group: &SoundGroup) -> Result<Option<u32>> {
         let first = group.range[0].clamp(0, 64) as u32;
         let last = group.range[1].clamp(0, 64) as u32;
         if first == 64 {
-            return Err(audio_script_error(
-                "sound group physical endpoint 64 is out of bounds",
-            ));
+            return Err(audio_script_error("sound group physical endpoint 64 is out of bounds"));
         }
+        let mut available = Vec::new();
         for channel in first..=last {
             if channel == 64 {
-                return Err(audio_script_error(
-                    "sound group physical endpoint 64 is out of bounds",
-                ));
+                return Err(audio_script_error("sound group physical endpoint 64 is out of bounds"));
             }
-            if self.sound_playing(channel)? == 0 {
-                return Ok(channel);
-            }
+            // A suspended load reserves the logical group slot even when its
+            // actual material is preparing in logical+32's alternate buffer.
+            let reserved = self.sound_channels.get(&channel).is_some_and(|state| state.pending_start.is_some())
+                || self.data_services.sound_async.task_loads.values().any(|load| load.logical == channel);
+            if reserved { continue; }
+            available.push(channel);
+            if self.sound_playing(channel)? == 0 { return Ok(Some(channel)); }
         }
-        let selected = (first..=last)
-            .find(|channel| {
-                self.sound_channels
-                    .get(channel)
-                    .is_some_and(|state| state.task.release_priority)
-            })
-            .or_else(|| {
-                (first..=last).find(|channel| {
-                    self.sound_channels
-                        .get(channel)
-                        .is_some_and(|state| state.task.control_priority)
-                })
-            })
-            .unwrap_or(first);
+        if first <= last && available.is_empty() { return Ok(None); }
+        let selected = available.iter().copied().find(|channel| self.sound_channels.get(channel)
+                .is_some_and(|state| state.task.release_priority))
+            .or_else(|| available.iter().copied().find(|channel| self.sound_channels.get(channel)
+                .is_some_and(|state| state.task.control_priority)))
+            .unwrap_or_else(|| available.first().copied().unwrap_or(first));
         // All busy (or reversed range) is an actual reclamation, even when a
         // subsequent alternate-mode load targets selected+32. Stop the old
         // device now; it must not survive merely because another slot loads.
@@ -1518,7 +1584,7 @@ impl LoggingHost<'_> {
             state.task.loop_range[1] = loop_end;
             state.task.linked = linked;
         }
-        Ok(selected)
+        Ok(Some(selected))
     }
 
     fn delay_or_control_sound(&mut self, channel: u32, action: DelayedControl) -> Result<()> {
@@ -1562,10 +1628,45 @@ impl LoggingHost<'_> {
         Ok(())
     }
 
+    pub(super) fn discard_cancelled_queued_sound_load(&mut self, load: &crate::sound_native::PendingTaskSoundLoad) {
+        if !load.queued { return; }
+        if let Some(task) = self.data_services.sounds.tasks.get_mut(&load.task) {
+            let owns_front = task.pending.front().is_some_and(|next|
+                next.packet[1] == load.code && next.input.as_deref() == Some(load.record.as_slice()));
+            if owns_front { task.pending.pop_front(); }
+        } else {
+            // The receiver temporarily owns its task outside the service map.
+            // Apply this exact receipt immediately after it is reinserted.
+            self.data_services.sound_async.queued_cancellations.insert(load.task, load.clone());
+        }
+    }
+
     /// Called from kind13's real task body after TaskClock::update. Queue
     /// inputs are retained on failure; successful commands are not repeated.
     pub(super) fn update_sound_task(&mut self, id: u32) -> Result<()> {
         self.register_sound_task(id, &[])?;
+        // Queued commands are executed by the sound service, which owns
+        // their completion even though no script VM remains on the stack.
+        let caller = self.current_task_id;
+        self.current_task_id = id;
+        let result = (|| {
+        if self.poll_task_audio_start(id)? == Some(NativeReturn::Retry) {
+            return Ok(());
+        }
+        let finished: Vec<_> = self.sound_channels.iter().filter_map(|(&channel, state)|
+            (state.task.owner == Some(id) && state.pending_start.is_none())
+                .then_some(channel).filter(|_| state.task.delayed_finish.is_some())).collect();
+        for channel in finished {
+            let state = self.sound_channels.get_mut(&channel).unwrap();
+            let grouped = state.task.delayed_finish.take().unwrap();
+            state.task.owner = Some(id);
+            state.task.grouped = grouped;
+            state.task.started_tick = u32::MAX;
+            state.task.elapsed = 0;
+            state.task.last_tick = 0;
+            state.volume = x86_i32(state.task.requested_volume) as u32;
+            crate::sound_control::apply_live(state).map_err(|cause| self.sound_host_error(cause))?;
+        }
         if !self.data_services.sounds.tasks[&id].enabled {
             return Ok(());
         }
@@ -1578,7 +1679,8 @@ impl LoggingHost<'_> {
                 break;
             };
             let mut output = 0;
-            self.dispatch_sound_task_command(
+            let previous_queue_owner = self.data_services.sound_async.queued_owner.replace(id);
+            let dispatch = self.dispatch_sound_task_command(
                 id,
                 message_command(id, next.packet),
                 &mut TaskCommandBuffers {
@@ -1586,7 +1688,11 @@ impl LoggingHost<'_> {
                     data1: next.input.as_deref_mut(),
                 },
                 &mut output,
-            )?;
+            );
+            self.data_services.sound_async.queued_owner = previous_queue_owner;
+            dispatch?;
+            if self.data_services.sound_async.loads.contains_key(&id)
+                || self.data_services.sound_async.task_loads.contains_key(&id) { return Ok(()); }
             self.data_services
                 .sounds
                 .tasks
@@ -1594,6 +1700,9 @@ impl LoggingHost<'_> {
                 .unwrap()
                 .pending
                 .pop_front();
+            if self.task_waits_for_audio(id) {
+                return Ok(());
+            }
         }
         let clock = self.data_services.tasks.task_clock(id).unwrap_or_default();
         let stereo = self.data_services.sounds.tasks[&id].stereo;
@@ -1606,6 +1715,11 @@ impl LoggingHost<'_> {
             .filter_map(|(&channel, state)| (state.task.owner == Some(id)).then_some(channel))
             .collect();
         for channel in channels {
+            // Its script/FES caller may own the outstanding operation.
+            // Preserve its handle, timing and fades until that caller polls.
+            if self.sound_channels[&channel].pending_start.is_some() {
+                continue;
+            }
             let playing = self.sound_playing(channel)? != 0;
             if !playing
                 && self
@@ -1638,7 +1752,12 @@ impl LoggingHost<'_> {
             if let Some((action, ticks)) = state.task.delayed {
                 if ticks == 0 {
                     let grouped = state.task.grouped;
-                    self.control_sound_channel_values(control_index(action), channel, 0, 0)?;
+                    if self.control_sound_channel_values(control_index(action), channel, 0, 0)? == NativeReturn::Retry {
+                        if let Some(state) = self.sound_channels.get_mut(&channel) {
+                            state.task.delayed_finish = Some(grouped);
+                        }
+                        continue;
+                    }
                     if let Some(state) = self.sound_channels.get_mut(&channel) {
                         state.task.owner = Some(id);
                         state.task.grouped = grouped;
@@ -1678,9 +1797,12 @@ impl LoggingHost<'_> {
                 .map_err(|cause| self.sound_host_error(cause))?;
         }
         Ok(())
+        })();
+        self.current_task_id = caller;
+        result
     }
 
-    /// Stops device workers before destroying the task and its owned queue.
+    /// Retires device workers before destroying the task and its owned queue.
     /// FES object release does not call this: the sound service owns playback.
     pub(super) fn release_sound_task(&mut self, id: u32) -> Result<()> {
         let channels: Vec<_> = self
@@ -1689,9 +1811,24 @@ impl LoggingHost<'_> {
             .filter_map(|(&channel, state)| (state.task.owner == Some(id)).then_some(channel))
             .collect();
         for channel in channels {
-            self.control_sound_channel_values(156, channel, 0, 0)?;
+            // No task invocation survives release to consume a completion.
+            // Cancel its ticket, then give any published playback to the
+            // backend's retirement queue without joining the device thread.
+            self.cancel_audio_channel_start(channel)?;
+            if let Some(handle) = self.sound_channels.get(&channel).and_then(|state| state.handle) {
+                if let cs2_runtime::AudioControl::Pending(ticket) = self.audio_host.begin_stop(handle)
+                    .map_err(|cause| self.sound_host_error(cause))?
+                {
+                    self.audio_host.cancel_control(ticket)
+                        .map_err(|cause| self.sound_host_error(cause))?;
+                }
+            }
             self.sound_channels.remove(&channel);
         }
+        self.data_services.sound_async.cancelled.remove(&id);
+        self.data_services.sound_async.loads.remove(&id);
+        self.data_services.sound_async.task_loads.remove(&id);
+        self.data_services.sound_async.queued_cancellations.remove(&id);
         self.data_services.sounds.tasks.remove(&id);
         Ok(())
     }
@@ -1699,6 +1836,64 @@ impl LoggingHost<'_> {
 
 fn sound_specific(code: u32) -> bool {
     code == 19 || (180..=229).contains(&code)
+}
+
+#[cfg(test)]
+mod async_transition_tests {
+    use super::*;
+    use crate::{HeadlessPlayer, SoundChannelState};
+    use cs2_runtime::{AudioChannel, AudioHost, AudioRequest, AudioStart};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn async_crossfade_handoff_preserves_the_old_owners_stop_ticket() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("cs2-crossfade-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile")).unwrap();
+        let (started, startup) = std::sync::mpsc::channel();
+        let (cleanup, controls) = std::sync::mpsc::channel();
+        let AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start_with_controls(AudioRequest {
+            channel: AudioChannel::Bgm, resource: "old.ogg".into(), volume: 1., pan: 0., looped: false,
+        }, startup, Some(controls)).unwrap() else { panic!("pending startup required"); };
+        started.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let playback = loop {
+            if let Some(playback) = player.audio_host.poll_play(ticket).unwrap() { break playback; }
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        };
+        let owner = player.current_task_id;
+        let other = player.with_host(|host| Ok(host.create_task_object(0, owner, b"other owner", b"")?)).unwrap();
+        player.sound_channels.insert(6, SoundChannelState { resource: Some("old.ogg".into()),
+            handle: Some(playback.handle), task: SoundTaskChannel { owner: Some(owner), resource_id: 1,
+                ..Default::default() }, ..Default::default() });
+        player.sound_channels.insert(38, SoundChannelState { resource: Some("new.ogg".into()),
+            task: SoundTaskChannel { owner: Some(owner), resource_id: 2,
+                transition: Some(ChannelTransition { logical: 6, old: 6, clock: 1, remaining: 0,
+                    completed_update: Some(1), new_volume: 100., old_handle: Some(playback.handle),
+                    old_resource_id: 1, new_start: 100. }), ..Default::default() }, ..Default::default() });
+        assert_eq!(player.with_host(|host| Ok(host.advance_sound_transition(38, 2, 2)?)).unwrap(), Some(38));
+        assert_eq!(player.sound_channels[&6].pending_start.as_ref().unwrap().owner, owner);
+        player.with_host(|host| {
+            host.current_task_id = other;
+            assert_eq!(host.advance_sound_transition(38, 3, 3)?, Some(38));
+            Ok(())
+        }).unwrap();
+        assert_eq!(player.sound_channels[&6].pending_start.as_ref().unwrap().owner, owner);
+        assert_eq!(player.sound_channels[&38].resource.as_deref(), Some("new.ogg"));
+        cleanup.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while player.sound_channels[&6].pending_start.is_some() {
+            player.with_host(|host| Ok(host.poll_task_audio_start(owner)?)).unwrap();
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert_eq!(player.with_host(|host| Ok(host.advance_sound_transition(38, 4, 4)?)).unwrap(), Some(6));
+        assert!(!player.sound_channels.contains_key(&38));
+        assert_eq!(player.sound_channels[&6].resource.as_deref(), Some("new.ogg"));
+        assert!(player.sound_channels[&6].task.transition.is_none());
+        drop(player);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 fn message_command(id: u32, packet: TaskMessage) -> TaskCommand {

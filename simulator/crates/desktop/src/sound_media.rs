@@ -237,7 +237,7 @@ pub(super) struct SoundMediaSubmission {
 impl SoundMediaSubmission {
     pub(crate) fn validate_checkpoint(&self, callback_running: bool) -> anyhow::Result<()> {
         let valid = match self.request {
-            SoundMediaRequest::Stop => matches!(self.stage, 0 | 3),
+            SoundMediaRequest::Stop => matches!(self.stage, 0 | 1 | 3),
             SoundMediaRequest::Play { allowed, .. } => self.stage <= 4
                 && (allowed || !matches!(self.stage, 2 | 4)),
         };
@@ -270,6 +270,15 @@ impl SoundMediaSubmission {
             SoundMediaRequest::Stop => {
                 if self.stage == 0 {
                     host.sound_media_control(185, self.channel, 0)?;
+                    self.stage = 1;
+                }
+                if self.stage == 1 {
+                    if matches!(
+                        host.poll_task_audio_start(host.current_task_id)?,
+                        Some(NativeReturn::Retry)
+                    ) {
+                        return Ok(SoundMediaProgress::Waiting);
+                    }
                     self.stage = 3;
                 }
                 Ok(SoundMediaProgress::Complete)
@@ -294,6 +303,15 @@ impl SoundMediaSubmission {
                     self.stage = 1;
                 }
                 if self.stage == 1 {
+                    // Device startup may span logical frames. The accepted
+                    // command owns stage1 until its completion, so a retry
+                    // neither submits playback twice nor enters PLAY early.
+                    if matches!(
+                        host.poll_task_audio_start(host.current_task_id)?,
+                        Some(NativeReturn::Retry)
+                    ) {
+                        return Ok(SoundMediaProgress::Waiting);
+                    }
                     // Forbidden playback submits BOTH stop and first-time
                     // registration, in that order, and skips PLAY.
                     if !allowed {
@@ -603,4 +621,59 @@ fn checked_file(file: &[u8]) -> Result<&[u8]> {
         return Err(audio_script_error("SOUND media filename exceeds 259 bytes"));
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod async_media_tests {
+    use super::*;
+    use crate::{HeadlessPlayer, SoundChannelState, sound_async};
+    use cs2_runtime::{AudioChannel, AudioRequest, AudioStart};
+
+    #[test]
+    fn async_fes_play_enters_callback_only_after_device_completion() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("cs2-fes-audio-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile")).unwrap();
+        let (completion, gate) = std::sync::mpsc::channel();
+        let request = AudioRequest { channel: AudioChannel::SoundEffect, resource: "gated.ogg".into(),
+            volume: 1.0, pan: 0.0, looped: false };
+        let AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start(request, gate).unwrap()
+            else { panic!("test startup must remain pending"); };
+        player.sound_channels.insert(6, SoundChannelState { resource: Some("gated.ogg".into()),
+            pending_start: Some(sound_async::PendingSoundStart { started: std::time::Instant::now(), owner: player.current_task_id,
+                index: 157, value: 1, configured: Some(AudioChannel::SoundEffect), transition: None,
+                operation: sound_async::Operation::Start(ticket) }), ..Default::default() });
+        // The physical command has been accepted; the media dispatcher owns
+        // stage1 and must retain the callback until the device responds.
+        let mut submission = SoundMediaSubmission::new(6,
+            SoundMediaRequest::Play { count: 1, allowed: true, enabled: true });
+        submission.stage = 1;
+        let mut started = u32::MAX;
+        for _ in 0..3 {
+            assert_eq!(player.with_host(|host| Ok(submission.advance(host, 7, &mut started)?)).unwrap(),
+                SoundMediaProgress::Waiting);
+            assert_eq!(started, u32::MAX);
+            assert!(player.sound_channels[&6].handle.is_none());
+        }
+        completion.send(Ok(())).unwrap();
+        let mut progress = SoundMediaProgress::Waiting;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            progress = player.with_host(|host| Ok(submission.advance(host, 7, &mut started)?)).unwrap();
+            if progress != SoundMediaProgress::Waiting { break; }
+            std::thread::yield_now();
+        }
+        assert_eq!(progress, SoundMediaProgress::Notify(SoundMediaNotification::Play));
+        assert_eq!(started, 7);
+        assert!(player.sound_channels[&6].handle.is_some());
+        submission.callback_started().unwrap();
+        assert_eq!(player.with_host(|host| Ok(submission.advance(host, 8, &mut started)?)).unwrap(),
+            SoundMediaProgress::Waiting);
+        submission.complete_callback().unwrap();
+        assert_eq!(player.with_host(|host| Ok(submission.advance(host, 8, &mut started)?)).unwrap(),
+            SoundMediaProgress::Complete);
+        drop(player);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

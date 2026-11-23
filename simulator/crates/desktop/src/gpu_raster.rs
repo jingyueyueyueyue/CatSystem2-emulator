@@ -82,6 +82,7 @@ pub(super) fn available() -> bool {
 pub(super) use emote_raster::{
     begin_emote_batch, blend_emote, draw_emote, expand_emote_surface, mix_emote_surfaces,
     draw_emote_surface, prepare_emote_poses, prepare_emote_surfaces, prewarm_emote, stage_emote_model,
+    tint_emote_surface,
 };
 
 pub(super) fn textured_planes_requested() -> bool {
@@ -104,7 +105,7 @@ pub(super) fn emote_requested() -> bool {
 
 #[cfg(windows)]
 fn emote_device_blend_requested() -> bool {
-    std::env::var_os("CS2_EMOTE_DEVICE_BLEND").is_some_and(|value| value == "1")
+    !std::env::var_os("CS2_EMOTE_DEVICE_BLEND").is_some_and(|value| value == "0")
 }
 
 #[cfg(target_os = "android")]
@@ -114,8 +115,8 @@ fn emote_device_blend_requested() -> bool {
 
 #[cfg(windows)]
 pub(super) fn emote_batch_requested() -> bool {
-    std::env::var_os("CS2_EMOTE_BATCH").is_some_and(|value| value == "1")
-        && emote_device_blend_requested()
+    available() && emote_device_blend_requested()
+        && !std::env::var_os("CS2_EMOTE_BATCH").is_some_and(|value| value == "0")
 }
 
 #[cfg(target_os = "android")]
@@ -589,6 +590,14 @@ struct Raster {
     presenter: Option<present::Presenter>,
     #[cfg(target_os = "android")]
     failed_window: Option<usize>,
+}
+
+impl Drop for Raster {
+    fn drop(&mut self) {
+        // Frames can outlive the renderer through runtime pose/transition
+        // caches. Retiring this generation invalidates those device snapshots.
+        self.failed.store(true, Ordering::Relaxed);
+    }
 }
 
 struct CachedTexture {

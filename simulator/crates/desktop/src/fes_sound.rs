@@ -765,7 +765,7 @@ pub(super) fn update_owner(
                 continue;
             }
             let resuming_callback = record.action && record.action_stage == 3;
-            if !resuming_callback { load_record(host, record)?; }
+            if !resuming_callback && !load_record(host, record)? { return Ok(false); }
             if record.action && record.action_stage == 0 {
                 record.play_changed = false;
                 if record.requested_play && record.play_values[0] == 0
@@ -891,17 +891,19 @@ pub(super) fn prepare_release_owner(host: &mut LoggingHost<'_>, owner: u32) -> R
     result
 }
 
-fn load_record(host: &mut LoggingHost<'_>, record: &mut SoundBank) -> Result<()> {
-    let Some(mut stage) = record.load_stage else { return Ok(()); };
+fn load_record(host: &mut LoggingHost<'_>, record: &mut SoundBank) -> Result<bool> {
+    let Some(mut stage) = record.load_stage else { return Ok(true); };
     if stage == 0 {
         if record.file.is_empty() {
             control(host, 156, record.channel, 0)?;
+            if host.task_waits_for_audio(host.current_task_id) { return Ok(false); }
             record.load_stage = None;
             record.dirty = true;
-            return Ok(());
+            return Ok(true);
         }
         if record.channel != -1 && record.load_values[0] == 0 {
             control(host, 156, record.channel, 0)?;
+            if host.task_waits_for_audio(host.current_task_id) { return Ok(false); }
         }
         record.load_stage = Some(1);
         stage = 1;
@@ -909,10 +911,11 @@ fn load_record(host: &mut LoggingHost<'_>, record: &mut SoundBank) -> Result<()>
     if stage == 1 {
         if record.group.is_empty() {
             if valid_channel(record.channel) {
-                host.load_sound_name_mode(
+                let result = host.load_sound_name_mode(
                     record.channel as u32, &record.file, 1,
                     record.load_values[0], record.load_values[1] as u32,
                 )?;
+                if result == NativeReturn::Retry { return Ok(false); }
             }
         } else {
             // PE 1b8340..1b837b sends 210 first, then copies its real
@@ -923,6 +926,7 @@ fn load_record(host: &mut LoggingHost<'_>, record: &mut SoundBank) -> Result<()>
                 group, true, &record.file, 1,
                 record.load_values[0], record.load_values[1] as u32,
             )?;
+            if result == NativeReturn::Retry { return Ok(false); }
             let NativeReturn::Value(channel) = result else { bail!("SOUND grouped load did not return a channel"); };
             record.channel = channel as i32;
         }
@@ -933,7 +937,7 @@ fn load_record(host: &mut LoggingHost<'_>, record: &mut SoundBank) -> Result<()>
     record.channel_result = query_load_field(host, 201, record.channel as u32, None)?;
     record.load_stage = None;
     record.dirty = true;
-    Ok(())
+    Ok(true)
 }
 
 fn query_group_key(host: &mut LoggingHost<'_>, name: &[u8]) -> Result<u32> {

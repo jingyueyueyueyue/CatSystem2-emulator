@@ -57,6 +57,7 @@ mod state_tree_native;
 
 #[derive(Default)]
 pub(super) struct NativeTaskStore {
+    audio_deletion_waiters: BTreeMap<u32, BTreeSet<u32>>,
     graph: object_graph::GraphRequests,
     hg_window_abi: Option<hg_window_native::HgWindowAbi>,
     original_state_tree_abi: Option<state_tree_native::OriginalStateTreeAbi>,
@@ -94,6 +95,28 @@ pub(super) struct RootTaskDispatch {
 }
 
 impl NativeTaskStore {
+    /// Follow only retained synchronous invocations. A task's tree parent
+    /// does not imply that its script is waiting for the child's audio.
+    pub(super) fn audio_wait_reaches(&self, waiting_owner: u32, candidate_caller: u32) -> bool {
+        let mut pending = VecDeque::from([waiting_owner]);
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop_front() {
+            if current == candidate_caller {
+                return true;
+            }
+            if !visited.insert(current) || visited.len() > self.records.len() { continue; }
+            let Some(record) = self.records.get(&current) else { continue; };
+            if let Some(caller) = record.message_owner
+                .or_else(|| record.loading.as_ref().map(|pending| pending.caller))
+            { pending.push_back(caller); }
+            pending.extend(self.fes.synchronous_callers(current));
+            if let Some(callers) = self.audio_deletion_waiters.get(&current) {
+                pending.extend(callers.iter().copied());
+            }
+        }
+        false
+    }
+
     pub(crate) fn checkpoint_task_kinds(&self) -> BTreeMap<u32, u32> {
         self.records.iter().map(|(&id, record)| (id, record.kind)).collect()
     }
@@ -389,6 +412,7 @@ pub(super) struct Record {
 }
 
 struct OrdinaryLoad {
+    caller: u32,
     name: Vec<u8>,
     initialize: u32,
     external: SharedExternalStorage,
@@ -485,6 +509,27 @@ fn ordinary_kind(kind: u32) -> bool {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn defer_audio_subtree_deletion(&mut self, target: u32) -> bool {
+        let caller = self.current_task_id;
+        self.data_services.tasks.audio_deletion_waiters.retain(|_, callers| {
+            callers.remove(&caller);
+            !callers.is_empty()
+        });
+        if target == 0 { return false; }
+        let mut subtree = BTreeSet::from([target]);
+        for _ in 0..self.task_parents.len() {
+            let before = subtree.len();
+            for (&child, parent) in self.task_parents.iter() {
+                if subtree.contains(parent) { subtree.insert(child); }
+            }
+            if subtree.len() == before { break; }
+        }
+        let waiting: Vec<_> = subtree.into_iter().filter(|&id| self.task_waits_for_audio(id)).collect();
+        for &id in &waiting {
+            self.data_services.tasks.audio_deletion_waiters.entry(id).or_default().insert(caller);
+        }
+        !waiting.is_empty()
+    }
     /// Keep this aligned with create_task_object's allocation exclusions.
     /// External integrations can publish a VM/node before its record exists.
     pub(super) fn task_number_reserved_or_live(&self, number: u32) -> bool {
@@ -917,7 +962,7 @@ impl LoggingHost<'_> {
         }
         self.ensure_task_record(target)?;
         let record = &self.data_services.tasks.records[&target];
-        if record.deletion != 0 || !ordinary_kind(record.kind) {
+        if (record.deletion != 0 && record.loading.is_none()) || !ordinary_kind(record.kind) {
             return Ok(true);
         }
         if record.active || self.data_services.tasks.external_tasks.contains(&target) {
@@ -940,7 +985,8 @@ impl LoggingHost<'_> {
             .take();
         let mut pending = match pending {
             Some(pending) => {
-                if pending.name != name
+                if pending.caller != self.current_task_id
+                    || pending.name != name
                     || pending.initialize != initialize
                     || !pending.external.same_storage(&external)
                 {
@@ -955,6 +1001,7 @@ impl LoggingHost<'_> {
                 pending
             }
             None => OrdinaryLoad {
+                caller: self.current_task_id,
                 name: name.to_vec(),
                 initialize,
                 external,
@@ -1377,10 +1424,21 @@ impl LoggingHost<'_> {
                 return Ok(outcome.done.then_some(outcome.propagate));
             }
         }
-        if kind == 13 && self.dispatch_sound_task_message(
-            target, packet, queued, output, vm.as_deref_mut(),
-        )? {
-            return Ok(Some(false));
+        if kind == 13 {
+            if !queued {
+                let resumed = if let Some(load) = self.resume_task_sound_load()? { Some(load) }
+                    else { self.poll_task_audio_start(self.current_task_id)? };
+                if let Some(result) = resumed {
+                    return Ok(match result {
+                        NativeReturn::Retry => None,
+                        NativeReturn::Value(value) => { *output = value; Some(false) }
+                        _ => Some(false),
+                    });
+                }
+            }
+            if self.dispatch_sound_task_message(target, packet, queued, output, vm.as_deref_mut())? {
+                return Ok(if !queued && self.task_waits_for_audio(self.current_task_id) { None } else { Some(false) });
+            }
         }
         if matches!(kind, 26..=28) && self.dispatch_transition_message(
             target, packet, queued, output, vm.as_deref_mut(),
@@ -1674,13 +1732,26 @@ impl LoggingHost<'_> {
                     }
                     let kind = self.data_services.tasks.records[&id].kind;
                     let _detail = super::perf_detail::SlowTask::new(id, || kind as i32, "child_body");
+                    // A synchronous caller owns a suspended command's packet
+                    // and output. Its audio wait may span logical frames;
+                    // scheduled updates must not enter the same VM before
+                    // that caller resumes the command.
+                    if ordinary_kind(kind)
+                        && self.data_services.tasks.records[&id].ordinary.as_ref()
+                            .is_some_and(OrdinaryTask::has_pending_command)
+                        && self.task_waits_for_audio(id)
+                    {
+                        traversal.stack.pop();
+                        continue;
+                    }
                     // Deletion is checked before entering the original body,
                     // not between artificial instruction-budget slices. A
                     // nested native67 can mark the detached record while its
                     // VM still owns a message/resume continuation.
                     let resuming_ordinary = ordinary_kind(kind)
-                        && self.data_services.tasks.records[&id].ordinary.as_ref()
-                            .is_some_and(OrdinaryTask::has_pending_update);
+                        && (self.data_services.tasks.records[&id].loading.is_some()
+                            || self.data_services.tasks.records[&id].ordinary.as_ref()
+                                .is_some_and(OrdinaryTask::has_pending_update));
                     if self.data_services.tasks.records[&id].deletion != 0 && !resuming_ordinary {
                         Phase::Unregister
                     } else {
@@ -1688,6 +1759,10 @@ impl LoggingHost<'_> {
                         // not reenter a VM whose current body has only yielded
                         // to the portable scheduler's instruction budget.
                         if !resuming_ordinary && !self.update_task_command_buffers(id, budget)? {
+                            if self.task_waits_for_audio(id) {
+                                traversal.stack.pop();
+                                continue;
+                            }
                             return Ok(false);
                         }
                         if self.data_services.tasks.records[&id].deletion != 0 && !resuming_ordinary {
@@ -1697,6 +1772,10 @@ impl LoggingHost<'_> {
                         if kind == 34 {
                             let _timing = super::measure_script_detail(super::HostPhase::ScriptFes);
                             if !self.update_fes_task(id, traversal.now, budget)? {
+                                if self.task_waits_for_audio(id) {
+                                    traversal.stack.pop();
+                                    continue;
+                                }
                                 return Ok(false);
                             }
                         }
@@ -1786,6 +1865,16 @@ impl LoggingHost<'_> {
                                 result.map_err(|error| host.task_error(id, error))
                             })?
                         {
+                            // An asynchronous device operation suspends only
+                            // this task's VM invocation. Keep its ordinary
+                            // phase/message and Retry arguments, but finish
+                            // this traversal entry so sibling tasks and the
+                            // frame's media/render stages can advance. The
+                            // next logical tick revisits the same invocation.
+                            if self.task_waits_for_audio(id) {
+                                traversal.stack.pop();
+                                continue;
+                            }
                             return Ok(false);
                         }
                         traversal.stack.pop();
@@ -1823,6 +1912,10 @@ impl LoggingHost<'_> {
                     Phase::Release
                 }
                 Phase::Release => {
+                    self.data_services.tasks.audio_deletion_waiters.retain(|_, callers| {
+                        callers.remove(&id);
+                        !callers.is_empty()
+                    });
                     let _detail = super::perf_detail::SlowTask::new(id,
                         || self.data_services.tasks.records.get(&id).map_or(-1, |record| record.kind as i32),
                         "child_release");
@@ -2084,5 +2177,57 @@ impl LoggingHost<'_> {
             detail: format!("task={id}: {error}"),
         });
         native_state_error("ordinary task operation failed; see task-error event")
+    }
+}
+
+#[cfg(test)]
+mod audio_wait_tests {
+    use super::*;
+
+    fn store(ids: &[u32]) -> NativeTaskStore {
+        let mut store = NativeTaskStore::default();
+        for &id in ids {
+            store.records.insert(id, Record::new(id, 0, &LanguageState::default()));
+        }
+        store
+    }
+
+    #[test]
+    fn audio_wait_follows_nested_synchronous_callers_only() {
+        let mut tasks = store(&[1, 2, 3, 4]);
+        tasks.records.get_mut(&3).unwrap().message_owner = Some(2);
+        tasks.records.get_mut(&2).unwrap().message_owner = Some(1);
+
+        assert!(tasks.audio_wait_reaches(3, 3));
+        assert!(tasks.audio_wait_reaches(3, 2));
+        assert!(tasks.audio_wait_reaches(3, 1));
+        assert!(!tasks.audio_wait_reaches(3, 4));
+        assert!(!tasks.audio_wait_reaches(1, 3));
+        assert!(!tasks.audio_wait_reaches(99, 1));
+    }
+
+    #[test]
+    fn audio_wait_follows_the_explicit_initialization_caller() {
+        let mut tasks = store(&[1, 2, 3]);
+        tasks.records.get_mut(&3).unwrap().loading = Some(OrdinaryLoad {
+            caller: 2, name: Vec::new(), initialize: 1,
+            external: SharedExternalStorage::default(), installed: true,
+            initialized: false, system_time_ms: 0,
+        });
+        tasks.records.get_mut(&2).unwrap().message_owner = Some(1);
+
+        assert!(tasks.audio_wait_reaches(3, 2));
+        assert!(tasks.audio_wait_reaches(3, 1));
+        assert!(!tasks.audio_wait_reaches(2, 3));
+    }
+
+    #[test]
+    fn audio_wait_cycles_terminate_without_matching_unrelated_tasks() {
+        let mut tasks = store(&[1, 2, 3]);
+        tasks.records.get_mut(&1).unwrap().message_owner = Some(2);
+        tasks.records.get_mut(&2).unwrap().message_owner = Some(1);
+
+        assert!(tasks.audio_wait_reaches(1, 2));
+        assert!(!tasks.audio_wait_reaches(1, 3));
     }
 }

@@ -117,6 +117,23 @@ impl Default for CpuM2SurfaceOwner {
 }
 
 impl CpuM2SurfaceOwner {
+    pub(super) fn discard_invalid_device_frames(&mut self) {
+        if self.blend.as_ref().is_some_and(|blend|
+            !blend.old.is_valid() || !blend.new.is_valid() || !blend.shown.is_valid())
+        {
+            // An endpoint on a retired device cannot be reconstructed after
+            // its model was replaced. Resume the current pose and retain fade
+            // configuration instead of reading stale device pixels.
+            self.clear();
+            return;
+        }
+        if self.pending.as_ref().is_some_and(|frame| !frame.is_valid()) {
+            self.pending = None;
+            self.deferred_capture = false;
+        }
+        if self.presented.as_ref().is_some_and(|frame| !frame.is_valid()) { self.presented = None; }
+    }
+
     pub(super) fn set_default(&mut self, duration: u32) {
         self.duration = duration;
         self.default_duration = duration;
@@ -175,11 +192,11 @@ impl CpuM2SurfaceOwner {
     }
 
     pub(super) fn frame(&self) -> Option<&EmoteRasterFrame> {
-        self.blend.as_ref().map(|b| &b.shown).or(self.pending.as_ref())
+        self.blend.as_ref().map(|b| &b.shown).or(self.pending.as_ref()).filter(|frame| frame.is_valid())
     }
 
     pub(super) fn capture(&self) -> Option<&EmoteRasterFrame> {
-        self.frame().or(self.presented.as_ref())
+        self.frame().or(self.presented.as_ref()).filter(|frame| frame.is_valid())
     }
 
     pub(super) fn remember(&mut self, frame: EmoteRasterFrame) -> Option<EmoteRasterFrame> {
@@ -198,6 +215,8 @@ impl CpuM2SurfaceOwner {
     pub(super) fn begin(
         &mut self, next: EmoteRasterFrame, enabled: bool, prepare: Option<EmoteSurfacePrepare>,
     ) -> Result<()> {
+        self.discard_invalid_device_frames();
+        if !next.is_valid() { self.clear(); return Ok(()); }
         if self.needs_capture() {
             return Err(EmoteError::InvalidResource(
                 "M2 deferred surface request must capture before driver update",
@@ -215,6 +234,7 @@ impl CpuM2SurfaceOwner {
     }
 
     pub(super) fn hold(&mut self, now: u32, mixer: Option<EmoteSurfaceMixer>) -> bool {
+        self.discard_invalid_device_frames();
         let held = self.blend.as_mut().is_some_and(|blend| blend.hold(now, mixer));
         if !held {
             if let Some(blend) = self.blend.take() {

@@ -76,7 +76,7 @@ pub use control::{
     CpuSceneEnableOverride,
 };
 pub use cpu::{
-    CpuEmoteBackend, CpuEmoteResources, CpuMotionModel, CpuPlayer, CpuTexture, CpuViewport,
+    CpuEmoteBackend, CpuEmoteResources, CpuMotionModel, CpuPlayer, CpuPlayerRenderState, CpuTexture, CpuViewport,
     DiagnosticFrame, EmoteDrawDiagnostics, EmoteDrawTarget, EmoteSpriteMesh, EmoteSpritePass,
     EmoteRepairScratch, EmoteTextureSpan, OwnedEmoteSpriteMesh, decode_rgba_rle, rasterize_emote_stencil_triangle, repair_emote_raster,
     visit_emote_texture_spans,
@@ -199,8 +199,8 @@ pub struct EmoteResource {
     bytes: Arc<Vec<u8>>,
 }
 
-/// Identity of the archive payload which won resource routing, together with
-/// the filesystem version observed around its successful decode.
+/// Identity of the routed payload and its filesystem version. The historical
+/// name also covers loose files, so they can share the same decoded-model cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmoteArchiveVersion {
     location: ResourceLocation,
@@ -213,13 +213,13 @@ pub struct EmoteArchiveVersion {
 
 impl EmoteArchiveVersion {
     pub fn observe(candidate: &ResourceCandidate) -> Option<Self> {
-        let ResourceLocation::Archive { path, offset, size, .. } = &candidate.location else {
-            return None;
+        let path = match &candidate.location {
+            ResourceLocation::Archive { path, .. } | ResourceLocation::File { path } => path,
         };
         let metadata = fs::metadata(path).ok()?;
-        if !metadata.is_file() || offset.checked_add(*size)? > metadata.len() {
-            return None;
-        }
+        if !metadata.is_file() { return None; }
+        if let ResourceLocation::Archive { offset, size, .. } = &candidate.location
+            && offset.checked_add(*size)? > metadata.len() { return None; }
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Some(Self {
@@ -394,6 +394,8 @@ pub struct EmoteServiceStatus {
 pub trait EmoteDeviceReadback: std::any::Any + fmt::Debug + Send + Sync {
     fn read_rgba(&self, output: &mut [u8]) -> bool;
     fn as_any(&self) -> &dyn std::any::Any;
+    /// False after the owning renderer is retired or its device is lost.
+    fn is_valid(&self) -> bool { true }
 }
 
 /// Actual evaluated and rasterized pixels. There is no default/empty frame.
@@ -462,6 +464,9 @@ impl EmoteRasterFrame {
     }
     pub fn shares_pixels(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.pixels, &other.pixels)
+    }
+    pub fn is_valid(&self) -> bool {
+        self.pixels.device.as_ref().is_none_or(|device| device.is_valid())
     }
     pub fn rgba(&self) -> &[u8] {
         self.pixels.rgba.get_or_init(|| {
@@ -577,6 +582,7 @@ pub trait EmoteBackend: Send {
     fn uses_unfiltered_m2_texture(&self, _task: u32) -> bool {
         false
     }
+    fn m2_texture_filter(&self, _task: u32) -> Option<u32> { None }
 
     fn cached_m2_model(
         &self, _task: u32, _name: &[u8], _version: &EmoteArchiveVersion,
@@ -902,6 +908,9 @@ impl EmoteServices {
     pub fn uses_unfiltered_m2_texture(&self, task: u32) -> bool {
         self.backend.as_ref().is_some_and(|backend| backend.uses_unfiltered_m2_texture(task))
     }
+    pub fn m2_texture_filter(&self, task: u32) -> Option<u32> {
+        self.backend.as_ref()?.m2_texture_filter(task)
+    }
 
     pub fn cached_m2_model(
         &self, task: u32, name: &[u8], version: &EmoteArchiveVersion,
@@ -1190,6 +1199,21 @@ impl EmoteServices {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn loose_model_version_tracks_file_replacement_without_redecoding_bytes() {
+        let path = std::env::temp_dir().join(format!("cs2-loose-model-version-{}", std::process::id()));
+        fs::write(&path, b"first PSZ").unwrap();
+        let source = ResourceCandidate { name: "actor.psz".into(), size: 9, priority: 0,
+            location: ResourceLocation::File { path: path.clone() } };
+        let first = EmoteArchiveVersion::observe(&source);
+        assert!(first.is_some(), "loose files need the same versioned model reuse as archive entries");
+        assert_eq!(first, EmoteArchiveVersion::observe(&source));
+        fs::write(&path, b"replacement PSZ with different size").unwrap();
+        assert_ne!(first, EmoteArchiveVersion::observe(&source));
+        fs::remove_file(&path).unwrap();
+        assert!(EmoteArchiveVersion::observe(&source).is_none());
+    }
 
     fn psz(body: &[u8]) -> Vec<u8> {
         let mut compressor =

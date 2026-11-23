@@ -5371,10 +5371,31 @@ impl HeadlessPlayer {
         self.data_services.messages.device_sample_active
     }
 
+    /// The scan owns the active region callback, which may enter a FES owner
+    /// through a lower BUTTON rather than through the root script's VM.
+    pub(super) fn input_dispatch_waits_for_audio(&mut self) -> anyhow::Result<bool> {
+        if self.root_dispatch_waits_for_audio()? { return Ok(true); }
+        let messages = &self.data_services.messages;
+        let targets = [
+            messages.key_selection.as_ref().and_then(|dispatch| dispatch.current.map(|(words, _, _)| words[0])),
+            messages.key_dispatch.as_ref().and_then(|dispatch| dispatch.current.map(|(words, _)| words[0])),
+            messages.pointer_dispatch.as_ref().and_then(|dispatch| dispatch.current.map(|(words, _)| words[0])),
+        ];
+        self.with_host(|host| Ok(targets.into_iter().flatten().any(|target| {
+            host.task_waits_for_audio(target)
+                || host.data_services.messages.button_binding_lookup.and_then(|lookup| lookup(host, target))
+                    .is_some_and(|owner| host.task_waits_for_audio(owner))
+                || host.data_services.messages.fes_button_lookup.and_then(|lookup| lookup(host, target))
+                    .is_some_and(|(owner, _)| host.task_waits_for_audio(owner))
+        })))
+    }
+
     /// Logical input callbacks may run scripts and yield. The frame phase
     /// calling this method must remain pending until it returns true.
     pub(super) fn advance_host_device_keys_scan(&mut self, budget: usize) -> anyhow::Result<bool> {
-        if self.data_services.messages.key_scan_frame != Some(self.state.clock.frame) {
+        if self.data_services.messages.key_scan_frame != Some(self.state.clock.frame)
+            && !self.audio_input_deferred
+        {
             if self.data_services.messages.key_dispatch.is_some()
                 || self.data_services.messages.key_selection.is_some()
                 || self.data_services.messages.pointer_dispatch.is_some()
@@ -5428,7 +5449,7 @@ impl HeadlessPlayer {
             self.with_host(|host| host.ensure_configuration_state())?;
             if self.data_services.configuration.platform_value("KEY/enable_joypad").unwrap_or(0) == 0 { return Ok(()); }
         }
-        if self.frame_in_progress() {
+        if self.frame_in_progress() || self.audio_input_deferred {
             let pending = &mut self.data_services.messages.pending_device_buttons;
             if pending.len() >= 4096 {
                 anyhow::bail!("platform device button queue exceeds 4096 events");
@@ -5505,6 +5526,7 @@ impl HeadlessPlayer {
     /// Frame-start bridge for platforms that apply InputState directly. Call
     /// once before task/FES key queries; edge snapshots preserve short taps.
     pub(super) fn begin_host_device_keys_frame(&mut self) -> anyhow::Result<()> {
+        if self.audio_input_deferred { return Ok(()); }
         self.ensure_device_keys()?;
         self.synchronize_message_input_geometry();
         if self.input_task.owner_id.is_none() {
@@ -5938,6 +5960,7 @@ impl HeadlessPlayer {
     /// Commit physical edge state only after a complete logical frame renders.
     /// Script budget continuations must keep the current samples intact.
     pub(super) fn commit_host_device_keys_frame(&mut self) {
+        if self.audio_input_deferred { return; }
         for event in self.data_services.messages.wheel_buttons.finish() {
             self.data_services.messages.device_keys.button(
                 ButtonSource::Mouse,
@@ -6481,6 +6504,41 @@ fn decode_font_name(bytes: &[u8]) -> Result<String> {
 mod focus_tests {
     use super::*;
     use cs2_runtime::{InputEvent, InputKey};
+
+    #[test]
+    fn input_async_wait_requires_an_unfinished_receiver_not_an_unrelated_audio_task() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("cs2-input-wait-{stamp}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile")).unwrap();
+        player.sound_channels.insert(6, crate::SoundChannelState {
+            pending_start: Some(crate::sound_async::PendingSoundStart {
+                started: std::time::Instant::now(), owner: 123, index: 935, value: 0,
+                configured: None, transition: None, operation: crate::sound_async::Operation::PrepareLoad,
+            }), ..Default::default()
+        });
+        assert!(!player.input_dispatch_waits_for_audio().unwrap());
+        player.data_services.messages.cursor_frame = Some(InputCursorFrame {
+            changed: false, position_changed: false, moving: false, original_nonzero: false,
+            active: 1, foreground: true, initialized: true,
+            broadcast: Some(CursorBroadcast { visible: 1, stack: vec![(123, true, None)], visited: 0 }),
+        });
+        assert!(!player.input_dispatch_waits_for_audio().unwrap(), "an entered receiver is already complete; retain a budget-only slice");
+        player.data_services.messages.cursor_frame.as_mut().unwrap().broadcast.as_mut().unwrap().stack[0].1 = false;
+        assert!(!player.input_dispatch_waits_for_audio().unwrap(), "a newly pushed cursor child has not necessarily attempted a callback");
+        let mut words = [0; 15];
+        words[0] = 123;
+        player.data_services.messages.key_selection = Some(InputSelectionDispatch {
+            point: [0; 2], candidate: None, selected: None, next: 0,
+            current: Some((words, 0, 8)), buffers: Default::default(), output: 0,
+            stage: 0, visited: 0, all_routed: false, routed_any: false,
+        });
+        assert!(player.input_dispatch_waits_for_audio().unwrap());
+        player.sound_channels.clear();
+        assert!(!player.input_dispatch_waits_for_audio().unwrap());
+        drop(player);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn typed_focus_survives_overlapping_legacy_region_and_touch_release() {

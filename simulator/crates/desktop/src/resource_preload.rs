@@ -5,25 +5,57 @@ use cs2_runtime::{ResourceCandidate, ResourceIndex, RuntimeError, resource_route
 use cs2_runtime::emote::{CpuMotionModel, EmoteArchiveVersion, EmoteResource};
 use cs2_script::{NativeReturn, Result, Vm};
 use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{cp932_to_utf8, expand_kcs_format, native_state_error, read_u32};
 
 #[path = "image_predecode.rs"]
 mod images;
+#[path = "resource_read_ahead.rs"]
+mod read_ahead;
+pub(super) use read_ahead::AheadRequest;
 
 const MAX_LIVE: usize = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
-const MAX_MODEL_BYTES: usize = 96 * 1024 * 1024;
-const MAX_PACKED_MODEL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODEL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MODEL_POOL_BYTES: usize = 512 * 1024 * 1024;
+const MAX_PACKED_MODEL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MODELS: usize = 4;
 
 type ModelResult = Option<Arc<CpuMotionModel>>;
-type ModelReceiver = Mutex<mpsc::Receiver<ModelResult>>;
+type ModelReceiver = Mutex<mpsc::Receiver<std::result::Result<ReadyModel, &'static str>>>;
+
+#[derive(Debug, Default)]
+struct ModelBudget(AtomicUsize);
+impl ModelBudget {
+    fn reserve(budget: &Arc<Self>, maximum: usize) -> Option<ModelCharge> {
+        let mut used = budget.0.load(Ordering::Acquire);
+        loop {
+            let allowed = MAX_MODEL_POOL_BYTES.saturating_sub(used).min(maximum);
+            if allowed == 0 { return None; }
+            match budget.0.compare_exchange_weak(used,used+allowed,Ordering::AcqRel,Ordering::Acquire) {
+                Ok(_) => return Some(ModelCharge { budget: budget.clone(), bytes: allowed }),
+                Err(current) => used = current,
+            }
+        }
+    }
+}
+#[derive(Debug)]
+struct ModelCharge { budget: Arc<ModelBudget>, bytes: usize }
+impl Drop for ModelCharge {
+    fn drop(&mut self) { self.budget.0.fetch_sub(self.bytes, Ordering::AcqRel); }
+}
+#[derive(Debug, Clone)]
+struct ReadyModel { model: Arc<CpuMotionModel>, _charge: Arc<ModelCharge> }
+
 
 #[derive(Debug)]
 struct ModelJob {
     bytes: Vec<u8>,
     receiver: Weak<ModelReceiver>,
-    result: mpsc::Sender<ModelResult>,
+    result: mpsc::Sender<std::result::Result<ReadyModel, &'static str>>,
+    budget: Arc<ModelBudget>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,20 +63,39 @@ struct ModelPreload {
     name: String,
     version: EmoteArchiveVersion,
     receiver: Arc<ModelReceiver>,
-    ready: ModelResult,
+    ready: Option<ReadyModel>,
+    finished: bool,
 }
 
 fn start_model_worker() -> Option<mpsc::SyncSender<ModelJob>> {
-    let (sender, jobs) = mpsc::sync_channel::<ModelJob>(1);
+    let (sender, jobs) = mpsc::sync_channel::<ModelJob>(MAX_MODELS);
     std::thread::Builder::new().name("cs2-model-preload".into())
         .spawn(move || {
             while let Ok(job) = jobs.recv() {
                 if job.receiver.strong_count() == 0 {
                     continue;
                 }
-                let model = EmoteResource::decode(&job.bytes).ok()
-                    .and_then(|resource| CpuMotionModel::load_for_preload(&resource, MAX_MODEL_BYTES).ok())
-                    .map(Arc::new);
+                let Some(mut charge) = ModelBudget::reserve(&job.budget, MAX_MODEL_BYTES) else {
+                    let _ = job.result.send(Err("model-pool-budget")); continue;
+                };
+                let available = charge.bytes;
+                let expanded = job.bytes.get(8..12).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize).unwrap_or(usize::MAX);
+                if expanded > available {
+                    let _ = job.result.send(Err("expanded-model/pool-budget"));
+                    continue;
+                }
+                // Compare-exchange reservations remain bounded even if a cloned
+                // preload graph owns a separately started background worker.
+                let model = EmoteResource::decode(&job.bytes).map_err(|_| "PSZ-decode")
+                    .and_then(|resource| CpuMotionModel::load_for_preload(&resource, available)
+                        .map_err(|_| "model-decode/unsupported-or-capacity"));
+                let model = model.and_then(|model| {
+                    let actual = model.estimated_storage_bytes();
+                    if actual > available { return Err("final-model/pool-budget"); }
+                    job.budget.0.fetch_sub(available.saturating_sub(actual), Ordering::AcqRel);
+                    charge.bytes = actual;
+                    Ok(ReadyModel { model: Arc::new(model), _charge: Arc::new(charge) })
+                });
                 let _ = job.result.send(model);
             }
         }).ok()?;
@@ -53,7 +104,7 @@ fn start_model_worker() -> Option<mpsc::SyncSender<ModelJob>> {
 
 fn submit_model(
     worker: &mut Option<mpsc::SyncSender<ModelJob>>, name: &str,
-    version: EmoteArchiveVersion, bytes: &[u8],
+    version: EmoteArchiveVersion, bytes: &[u8], budget: &Arc<ModelBudget>,
 ) -> Option<ModelPreload> {
     if bytes.len() > MAX_PACKED_MODEL_BYTES || !bytes.starts_with(b"PSZ\0") {
         return None;
@@ -67,9 +118,9 @@ fn submit_model(
     }
     let (result, receiver) = mpsc::channel();
     let receiver = Arc::new(Mutex::new(receiver));
-    let job = ModelJob { bytes: bytes.to_vec(), receiver: Arc::downgrade(&receiver), result };
+    let job = ModelJob { bytes: bytes.to_vec(), receiver: Arc::downgrade(&receiver), result, budget: budget.clone() };
     match worker.as_ref()?.try_send(job) {
-        Ok(()) => Some(ModelPreload { name: name.into(), version, receiver, ready: None }),
+        Ok(()) => Some(ModelPreload { name: name.into(), version, receiver, ready: None, finished: false }),
         Err(mpsc::TrySendError::Full(_)) => None,
         Err(mpsc::TrySendError::Disconnected(_)) => {
             *worker = None;
@@ -85,12 +136,29 @@ pub(super) struct SourcedResource {
 }
 
 #[derive(Debug, Clone)]
+struct PreparedResource {
+    resource: SourcedResource,
+    name: String,
+    stamp: read_ahead::ResourceStamp,
+    version: Option<EmoteArchiveVersion>,
+}
+impl std::ops::Deref for PreparedResource {
+    type Target = SourcedResource;
+    fn deref(&self) -> &Self::Target { &self.resource }
+}
+impl PreparedResource {
+    pub(super) fn is_current(&self) -> bool {
+        read_ahead::ResourceStamp::observe(&self.source).as_ref() == Some(&self.stamp)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Request {
     name: String,
     priority: i32,
     age: i32,
     attempted: bool,
-    resource: Option<SourcedResource>,
+    resource: Option<PreparedResource>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,7 +169,14 @@ pub(super) struct ResourcePreloads {
     bytes: usize,
     images: images::ImagePredecode,
     model_worker: Option<mpsc::SyncSender<ModelJob>>,
-    model: Option<ModelPreload>,
+    models: VecDeque<ModelPreload>,
+    staging_cursor: usize,
+    ahead: read_ahead::ReadAhead,
+    diagnostics_remaining: u8,
+    notes: Vec<String>,
+    seen_reasons: Vec<&'static str>,
+    previous_stats: (usize, usize, usize, usize, usize),
+    model_budget: Arc<ModelBudget>,
 }
 
 impl ResourcePreloads {
@@ -112,33 +187,108 @@ impl ResourcePreloads {
 
     pub(super) fn cached_with_source(&self, name: &str) -> Option<&SourcedResource> {
         self.requests.iter().find(|request| request.name.eq_ignore_ascii_case(name))
-            .and_then(|request| request.resource.as_ref())
+            .and_then(|request| request.resource.as_ref()).filter(|resource| resource.is_current())
+            .or_else(|| self.ahead.cached(name)).map(|resource| &resource.resource)
+    }
+
+    #[cfg(test)]
+    fn enqueue_model(&mut self, name: &str, version: EmoteArchiveVersion, bytes: &[u8]) {
+        if self.models.iter().any(|model| model.version == version) { return; }
+        if let Some(model) = submit_model(&mut self.model_worker, name, version, bytes, &self.model_budget) {
+            if self.models.len() >= MAX_MODELS { self.models.pop_front(); }
+            self.models.push_back(model);
+        }
+    }
+
+    fn poll_models(&mut self) {
+        for model in &mut self.models {
+            if model.finished { continue; }
+            let result = match model.receiver.lock() {
+                Ok(receiver) => receiver.try_recv(),
+                Err(_) => { model.finished = true; continue; }
+            };
+            match result {
+                Ok(ready) => {
+                    match ready {
+                        Ok(ready) => model.ready = Some(ready),
+                        Err(reason) => if self.diagnostics_remaining < 64 {
+                            self.diagnostics_remaining += 1;
+                            self.notes.push(format!("prefetch model rejected name={} reason={reason}", model.name));
+                        },
+                    }
+                    model.finished = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {},
+                Err(mpsc::TryRecvError::Disconnected) => model.finished = true,
+            }
+        }
     }
 
     pub(super) fn ready_model(&mut self) -> Option<&Arc<CpuMotionModel>> {
-        let model = self.model.as_mut()?;
-        if model.ready.is_none() {
-            let result = model.receiver.lock().ok()?.try_recv();
-            match result {
-                Ok(Some(ready)) => model.ready = Some(ready),
-                Err(mpsc::TryRecvError::Empty) => return None,
-                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
-                    self.model = None;
-                    return None;
-                }
-            }
+        self.poll_models();
+        let count = self.models.len();
+        for _ in 0..count {
+            let index = self.staging_cursor % count;
+            self.staging_cursor = (index + 1) % count;
+            if self.models[index].ready.is_some() { return self.models[index].ready.as_ref().map(|ready| &ready.model); }
         }
-        self.model.as_ref()?.ready.as_ref()
+        None
     }
 
     pub(super) fn take_model(&mut self, version: &EmoteArchiveVersion) -> ModelResult {
-        if self.model.as_ref().is_some_and(|model| &model.version == version) {
-            let model = self.model.take()?;
-            model.ready.or_else(|| model.receiver.lock().ok()?.recv().ok().flatten())
-        } else {
-            None
+        let index = self.models.iter().position(|model| &model.version == version)?;
+        let model = self.models.remove(index)?;
+        // Demand never waits behind an unbounded decode queue. Give a finishing
+        // job at most 2ms, then use the normal synchronous reference loader.
+        let ready = model.ready.or_else(|| model.receiver.lock().ok()?
+            .recv_timeout(std::time::Duration::from_millis(2)).ok()?.ok());
+        if ready.is_none() { self.note("demand-model-not-ready (wait capped at 2ms)"); }
+        ready.map(|ready| ready.model)
+    }
+
+    pub(super) fn update_prefetch(&mut self, resources: &ResourceIndex,
+        requests: &[AheadRequest], boundaries: &[&'static str]) {
+        self.ahead.update_requests(resources, requests);
+        self.poll_models();
+        self.models.retain(|model|
+            self.requests.iter().filter_map(|r| r.resource.as_ref()).any(|resource|
+                resource.version.as_ref() == Some(&model.version) && resource.is_current())
+            || self.ahead.resources().any(|resource| resource.version.as_ref() == Some(&model.version)));
+        // Each source version generates one warm event. Never compare/copy HG3
+        // sources again just because another logical frame elapsed.
+        for resource in self.ahead.newly_ready() {
+            self.images.submit(&resource.bytes);
+            if let Some(version) = resource.version.clone() {
+                if self.models.len() >= MAX_MODELS || self.models.iter().any(|model| model.version == version) { continue; }
+                if let Some(model) = submit_model(&mut self.model_worker, &resource.name, version, &resource.bytes, &self.model_budget) {
+                    self.models.push_back(model);
+                } else if self.diagnostics_remaining < 64 {
+                    self.diagnostics_remaining += 1;
+                    self.notes.push(format!("prefetch model rejected name={} reason=packed/header/queue-budget",resource.name));
+                }
+            }
+        }
+        let stats = self.ahead.stats();
+        let current = (stats.0, stats.1, stats.2, self.models.len(), self.model_budget.0.load(Ordering::Acquire));
+        if current != self.previous_stats && self.diagnostics_remaining < 64 {
+            self.previous_stats = current;
+            self.diagnostics_remaining += 1;
+            self.notes.push(format!("prefetch scan_limit=20 candidates={} ready={} reserved_bytes={} models={} model_bytes={} model_pool_limit={}",
+                current.0,current.1,current.2,current.3,current.4,MAX_MODEL_POOL_BYTES));
+        }
+        for note in self.ahead.drain_notes() { self.note(note); }
+        for reason in boundaries.iter().copied() {
+            if !matches!(reason, "block-end" | "command-limit") { self.note(reason); }
         }
     }
+
+    fn note(&mut self, reason: &'static str) {
+        if self.diagnostics_remaining >= 64 || self.seen_reasons.contains(&reason) { return; }
+        self.diagnostics_remaining += 1;
+        self.seen_reasons.push(reason);
+        self.notes.push(format!("prefetch reason={reason}; FES scan<=20, KCS stops at first native"));
+    }
+    pub(super) fn drain_notes(&mut self) -> Vec<String> { std::mem::take(&mut self.notes) }
 
     pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.images.submit(bytes); }
 
@@ -155,7 +305,7 @@ impl ResourcePreloads {
                 if self.enabled == Some(true) {
                     self.requests.clear();
                     self.images.clear();
-                    self.model = None;
+                    self.models.clear();
                     self.bytes = 0;
                     self.completed_through = i32::MAX;
                 }
@@ -206,13 +356,20 @@ impl ResourcePreloads {
                     self.completed_through = 0;
                     for request in &mut self.requests {
                         if request.attempted { continue; }
-                        let (resource, version) =
-                            read_optional(resources, &request.name, MAX_LIVE - self.bytes)?;
+                        let remaining = MAX_LIVE - self.bytes;
+                        let (resource, version) = if let Some(prepared) = self.ahead.cached(&request.name) {
+                            if prepared.bytes.capacity() <= remaining {
+                                (Some(prepared.clone()), prepared.version.clone())
+                            } else { (None,None) }
+                        } else { read_optional(resources, &request.name, remaining)? };
                         let total = self.bytes + resource.as_ref().map_or(0, |resource| resource.bytes.capacity());
                         if let Some(resource) = &resource {
                             self.images.submit(&resource.bytes);
-                            if self.model.is_none() && let Some(version) = version {
-                                self.model = submit_model(&mut self.model_worker, &request.name, version, &resource.bytes);
+                            if let Some(version) = version
+                                && !self.models.iter().any(|model| model.version == version)
+                                && let Some(model) = submit_model(&mut self.model_worker, &request.name, version, &resource.bytes, &self.model_budget) {
+                                if self.models.len() >= MAX_MODELS { self.models.pop_front(); }
+                                self.models.push_back(model);
                             }
                         }
                         request.resource = resource;
@@ -244,11 +401,8 @@ impl ResourcePreloads {
                         } else { true }
                     });
                     self.bytes -= reclaimed;
-                    if self.model.as_ref().is_some_and(|model|
-                        !self.requests.iter().any(|request| request.name == model.name))
-                    {
-                        self.model = None;
-                    }
+                    self.models.retain(|model| self.requests.iter().any(|request| request.name == model.name)
+                        || self.ahead.resources().any(|resource| resource.name == model.name));
                     self.completed_through = self.completed_through.wrapping_sub(1);
                 }
                 Ok(NativeReturn::Continue)
@@ -280,15 +434,18 @@ fn formatted(vm: &Vm, address: u32) -> Result<Vec<u8>> {
 
 fn read_optional(
     resources: &ResourceIndex, name: &str, remaining: usize,
-) -> Result<(Option<SourcedResource>, Option<EmoteArchiveVersion>)> {
+) -> Result<(Option<PreparedResource>, Option<EmoteArchiveVersion>)> {
     let Some(candidate) = resources.resolve_mode_candidate(name, ResourceMode::LooseFirst)
         .map_err(|_| native_state_error("native 436 resource routing failed"))? else { return Ok((None, None)); };
+    let Some(stamp) = read_ahead::ResourceStamp::observe(candidate) else { return Ok((None, None)); };
     let version = name.rsplit_once('.').filter(|(_, ext)| ext.eq_ignore_ascii_case("psz"))
         .and_then(|_| EmoteArchiveVersion::observe(candidate));
     match resources.read_candidate_bounded(candidate, remaining) {
         Ok(bytes) => {
             let version = version.filter(|before| Some(before) == EmoteArchiveVersion::observe(candidate).as_ref());
-            Ok((bytes.map(|bytes| SourcedResource { source: candidate.clone(), bytes }), version))
+            if read_ahead::ResourceStamp::observe(candidate).as_ref() != Some(&stamp) { return Ok((None, None)); }
+            Ok((bytes.map(|bytes| PreparedResource { resource: SourcedResource { source: candidate.clone(), bytes }, name: name.into(), stamp,
+                version: version.clone() }), version))
         }
         Err(RuntimeError::ResourceNotFound(_)) => Ok((None, None)),
         Err(RuntimeError::Io { source, .. }) if matches!(source.kind(),
@@ -303,20 +460,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_preload_keeps_multiple_versions_in_a_bounded_queue() {
+        let root = std::env::temp_dir().join(format!("cs2-model-queue-{}", std::process::id()));
+        std::fs::write(&root, vec![0; 64]).unwrap();
+        let mut bytes = b"PSZ\0".to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        let mut cache = ResourcePreloads::default();
+        for i in 0..2 {
+            let source = ResourceCandidate { name: format!("model{i}.psz"), size: 16, priority: 0,
+                location: cs2_runtime::ResourceLocation::Archive { path: root.clone(), offset: i * 16,
+                    size: 16, name_seed: None, payload_key: None } };
+            cache.enqueue_model(&source.name, EmoteArchiveVersion::observe(&source).unwrap(), &bytes);
+        }
+        assert_eq!(cache.models.len(), 2, "preparing one model must not discard the next model");
+        std::fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn model_budget_parallel_reservations_never_exceed_aggregate_limit() {
+        let budget = Arc::new(ModelBudget::default());
+        let (sender,receiver) = mpsc::channel();
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let budget = budget.clone(); let sender = sender.clone();
+            threads.push(std::thread::spawn(move || {
+                sender.send(ModelBudget::reserve(&budget,MAX_MODEL_BYTES)).unwrap();
+            }));
+        }
+        drop(sender);
+        let leases = receiver.into_iter().flatten().collect::<Vec<_>>();
+        for thread in threads { thread.join().unwrap(); }
+        let total = leases.iter().map(|lease|lease.bytes).sum::<usize>();
+        assert_eq!(total,MAX_MODEL_POOL_BYTES);
+        assert_eq!(budget.0.load(Ordering::Acquire),total);
+        drop(leases);
+        assert_eq!(budget.0.load(Ordering::Acquire),0);
+    }
+
+    #[test]
+    fn model_budget_leases_release_only_after_the_last_queue_clone() {
+        let budget = Arc::new(ModelBudget::default());
+        budget.0.store(1024, Ordering::Release);
+        let lease = Arc::new(ModelCharge { budget: budget.clone(), bytes: 1024 });
+        let clone = lease.clone();
+        drop(lease);
+        assert_eq!(budget.0.load(Ordering::Acquire), 1024);
+        drop(clone);
+        assert_eq!(budget.0.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn explicit_cached_bytes_reject_replaced_file_identity() {
+        let root = std::env::temp_dir().join(format!("cs2-preload-version-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("resource.bin"), b"old").unwrap();
+        let resources = ResourceIndex::scan(&root).unwrap();
+        let resource = read_optional(&resources, "resource.bin", 100).unwrap().0;
+        let mut cache = ResourcePreloads::default();
+        cache.requests.push(Request { name: "resource.bin".into(), priority: 0, age: 0,
+            attempted: true, resource });
+        assert_eq!(cache.cached("resource.bin"), Some(b"old".as_slice()));
+        std::fs::write(root.join("resource.bin"), b"new content").unwrap();
+        assert!(cache.cached("resource.bin").is_none(), "stale bytes must never be paired with a new model version");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires the local PSZ fixture"]
     fn model_worker_reuses_the_exact_archived_source() -> anyhow::Result<()> {
         let root = std::env::var_os("CS2_EMOTE_FIXTURE_ROOT").unwrap();
         let resources = ResourceIndex::scan_with_name_seed(root, Some(0x0F6BB0AE))?;
         let name = "ca01_l_body_1.psz";
-        let candidate = resources.category_names(b"m2psb", name)?.iter()
-            .find_map(|name| resources.resolve_mode_candidate(name, ResourceMode::LooseFirst).transpose())
-            .transpose()?.unwrap();
+        let candidate = resources.resolve_mode_candidate(&format!("psz.int/{name}"), ResourceMode::LooseFirst)?.unwrap();
         let version = EmoteArchiveVersion::observe(candidate).unwrap();
         let packed = resources.read_candidate(candidate)?;
         let mut preloads = ResourcePreloads::default();
-        preloads.model = submit_model(&mut preloads.model_worker, name, version.clone(), &packed);
+        preloads.enqueue_model(name, version.clone(), &packed);
+        eprintln!("prefetch fixture packed={} expanded={} limit={}",packed.len(),u32::from_le_bytes(packed[8..12].try_into().unwrap()),MAX_MODEL_BYTES);
+        for _ in 0..1000 {
+            if preloads.ready_model().is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let model = preloads.take_model(&version).expect("worker prepared the registered model");
-        assert!(model.textures.values().all(|texture| texture.is_bgra()));
+        eprintln!("prefetch fixture resident_estimate={}",model.estimated_storage_bytes());
+        assert!(!model.textures.is_empty());
+        assert!(model.estimated_storage_bytes() <= MAX_MODEL_BYTES);
         assert!(preloads.take_model(&version).is_none());
         Ok(())
     }

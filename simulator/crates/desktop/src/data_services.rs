@@ -53,6 +53,7 @@ pub(super) struct PreparedDataTables {
 
 #[derive(Default)]
 pub(super) struct DataServices {
+    pub(super) sound_async: super::sound_async::SoundAsyncStore,
     pub(super) newton_legacy_gbk: bool,
     pub(super) cst_text_origins: super::cst_context_native::CstTextOrigins,
     pub(super) story_trace: bool,

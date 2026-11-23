@@ -384,6 +384,13 @@ impl OrdinaryNativeServices {
         }
     }
 
+    pub(super) fn drain_prefetch_notes(&mut self) -> Vec<String> { self.preloads.drain_notes() }
+
+    pub(super) fn update_prefetch(&mut self, resources: &ResourceIndex,
+        requests: &[super::resource_preload::AheadRequest], boundaries: &[&'static str]) {
+        self.preloads.update_prefetch(resources, requests, boundaries);
+    }
+
     pub(super) fn predecode_image(&mut self, bytes: &[u8]) { self.preloads.predecode_image(bytes); }
 
     pub(super) fn take_predecoded_image(&mut self, bytes: &[u8], id: u32) -> Option<cs2_renderer::RgbaFrame> {

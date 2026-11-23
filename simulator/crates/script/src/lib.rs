@@ -9,6 +9,8 @@ pub mod message;
 pub mod scene;
 mod vm_snapshot;
 mod vm_identity;
+mod lookahead;
+pub use lookahead::StaticNativeCall;
 mod sha256;
 pub use sha256::sha256;
 pub use vm_snapshot::{VmExecutionSnapshot, VmSnapshotGroup};
@@ -1056,6 +1058,10 @@ impl Vm {
 
     pub fn has_pending_execution(&self) -> bool {
         self.control.message.is_some() || self.control.resume_started_at_end.is_some()
+    }
+
+    pub fn has_pending_ordinary_resume(&self) -> bool {
+        self.control.resume_started_at_end.is_some()
     }
 
     pub fn waiting_for_message(&self) -> bool {

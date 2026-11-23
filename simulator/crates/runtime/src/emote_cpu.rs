@@ -16,7 +16,40 @@ use super::{
     emote_native_descriptor, m2plane_tint_argb,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+#[path = "emote_node_cache.rs"]
+mod node_cache;
+use node_cache::BoundedMemo;
+
+#[derive(Debug)]
+struct DerivedNodeCache {
+    affine: BoundedMemo<[f64; 6]>,
+    meshes: BoundedMemo<Vec<[f64; 4]>>,
+}
+
+impl Default for DerivedNodeCache {
+    fn default() -> Self {
+        Self { affine: BoundedMemo::new(256 * 1024), meshes: BoundedMemo::new(8 * 1024 * 1024) }
+    }
+}
+
+fn use_node_cache() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(not(target_os = "android"))]
+        { !std::env::var("CS2_EMOTE_NODE_CACHE").is_ok_and(|value| value == "0") }
+        #[cfg(target_os = "android")]
+        {
+            unsafe extern "C" {
+                fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32;
+            }
+            let mut value = [0u8; 92];
+            let length = unsafe { __system_property_get(c"debug.cs2.emote_node_cache".as_ptr(), value.as_mut_ptr().cast()) };
+            length != 1 || value[0] != b'0'
+        }
+    })
+}
 
 const MAX_TEXTURE_BYTES: usize = 128 * 1024 * 1024;
 const RECENT_M2_MODEL_BYTES: usize = 96 * 1024 * 1024;
@@ -196,6 +229,9 @@ pub struct CpuMotionModel {
     // The index uses addresses of nodes in the immutable, shared PSB tree.
     document: Arc<PsbDocument>,
     layer_timelines: Option<Arc<LayerTimelines>>,
+    // Exact resolved inputs, independent of instance clocks/controllers. Shared
+    // by transactional player clones without deep-copying cached mesh buffers.
+    node_cache: Arc<Mutex<DerivedNodeCache>>,
     pub textures: BTreeMap<String, CpuTexture>,
     pub base_object: String,
     pub base_motion: String,
@@ -206,9 +242,14 @@ impl CpuMotionModel {
         Self::load_model(resource, 0, None)
     }
 
-    /// Preloads are restricted to atlases that share the decoded resource buffer.
+    /// Decode a model within the caller's estimated resident-memory budget.
+    /// Native BGRA atlases borrow the PSB backing; other supported formats may
+    /// decode here as well, with their extra texels charged to the same budget.
     pub fn load_for_preload(resource: &EmoteResource, memory_limit: usize) -> Result<Self> {
         Self::load_model(resource, 0, Some(memory_limit))
+    }
+    pub fn load_for_preload_with_filter(resource: &EmoteResource, filter: u32, memory_limit: usize) -> Result<Self> {
+        Self::load_model(resource, normalized_texture_filter(filter), Some(memory_limit))
     }
 
     fn load_model(resource: &EmoteResource, filter: u32, preload_limit: Option<usize>) -> Result<Self> {
@@ -250,8 +291,11 @@ impl CpuMotionModel {
             {
                 TexturePixels::Bgra { source: document.resource_backing(), range }
             } else {
-                if preload_limit.is_some() {
-                    return Err(unsupported("preloaded textures must use native shared storage"));
+                if preload_budget.is_some_and(|(document_bytes, limit)| {
+                    document_bytes.saturating_add(size).saturating_add(
+                        textures.values().map(CpuTexture::extra_storage_bytes).sum::<usize>()) > limit
+                }) {
+                    return Err(EmoteError::Capacity);
                 }
                 let mut rgba = decode_emote_texture(kind, spec, width, height, document.resource(pixel)?)?;
                 super::texture::apply_m2_texture_filter(&mut rgba, filter);
@@ -276,6 +320,7 @@ impl CpuMotionModel {
         let mut model = Self {
             document: Arc::new(document),
             layer_timelines: None,
+            node_cache: Arc::new(Mutex::new(DerivedNodeCache::default())),
             textures,
             base_object,
             base_motion,
@@ -284,9 +329,7 @@ impl CpuMotionModel {
         // A successful import must at least select an existing default motion.
         model.motion(&model.base_object, &model.base_motion)?;
         model.prepare_layer_timelines();
-        if preload_budget.is_some_and(|(document_bytes, limit)| {
-            document_bytes.saturating_add(model.estimated_index_bytes()) > limit
-        }) {
+        if preload_limit.is_some_and(|limit| model.estimated_storage_bytes() > limit) {
             return Err(EmoteError::Capacity);
         }
         Ok(model)
@@ -294,6 +337,31 @@ impl CpuMotionModel {
 
     pub fn document(&self) -> &PsbDocument {
         &self.document
+    }
+
+    /// Affine hits/misses, mesh hits/misses, and retained payload+key bytes.
+    /// Counters are model-wide CPU work, not per-instance GPU timings.
+    pub fn node_cache_counters(&self) -> [u64; 5] {
+        let cache = self.node_cache.lock().unwrap_or_else(|error| error.into_inner());
+        [cache.affine.hits, cache.affine.misses, cache.meshes.hits, cache.meshes.misses,
+            (cache.affine.bytes() + cache.meshes.bytes()) as u64]
+    }
+
+    fn layer_affine(&self, order: [u8; 4], content: &FrameContent<'_>) -> Result<[f64; 6]> {
+        if !use_node_cache() { return timeline::layer_affine(order, |name| content.get(name)); }
+        let key = affine_cache_key(order, content);
+        if let Some(key) = key.as_ref()
+            && let Some(value) = self.node_cache.lock().unwrap_or_else(|error| error.into_inner())
+                .affine.get(key).copied()
+        {
+            return Ok(value);
+        }
+        let value = timeline::layer_affine(order, |name| content.get(name))?;
+        if let Some(key) = key {
+            self.node_cache.lock().unwrap_or_else(|error| error.into_inner())
+                .affine.insert(key, value, size_of::<[f64; 6]>());
+        }
+        Ok(value)
     }
 
     fn prepare_layer_timelines(&mut self) {
@@ -304,6 +372,17 @@ impl CpuMotionModel {
 
     fn estimated_document_bytes(&self) -> usize {
         self.document.estimated_storage_bytes().saturating_add(self.estimated_index_bytes())
+    }
+
+    /// Estimated retained payload, counting the shared PSB backing only once.
+    /// This is a cache accounting estimate, not allocator RSS or GPU residency.
+    pub fn estimated_storage_bytes(&self) -> usize {
+        let cache = self.node_cache.lock().unwrap_or_else(|error| error.into_inner());
+        self.estimated_document_bytes()
+            .saturating_add(self.textures.iter().map(|(name, texture)|
+                name.capacity() + size_of::<CpuTexture>() + texture.extra_storage_bytes()).sum::<usize>())
+            .saturating_add(cache.affine.bytes()).saturating_add(cache.meshes.bytes())
+            .saturating_add(size_of::<Self>())
     }
 
     fn estimated_index_bytes(&self) -> usize {
@@ -478,6 +557,18 @@ impl CpuPlayer {
 
     pub fn shared_motion_model(&self) -> &Arc<CpuMotionModel> {
         &self.model
+    }
+
+    /// Capture all inputs sampled by primitive evaluation, including private
+    /// driver overrides and independent reference clocks. Prepared geometry may
+    /// only be consumed while this snapshot still matches.
+    pub fn render_state_snapshot(&self, viewport: CpuViewport, variables: &BTreeMap<String, f64>) -> CpuPlayerRenderState {
+        CpuPlayerRenderState {
+            model: Arc::downgrade(&self.model), object: self.object.clone(), motion: self.motion.clone(),
+            pose: RasterPose::new(self, viewport), time_units: viewport.time_units_per_frame.to_bits(),
+            variables: variables.clone(), references: self.reference_timelines.clone(),
+            controllers: [self.controller_a_raw, self.controller_b_raw],
+        }
     }
 
     pub fn select_motion(&mut self, object: &str, motion: &str, frame: f64) -> Result<()> {
@@ -830,6 +921,51 @@ fn check_strict_warnings(warnings: &[String]) -> Result<()> {
     }
 }
 
+fn append_numeric_key(value: Option<&PsbValue>, key: &mut Vec<u64>) -> Option<()> {
+    match value {
+        None => key.push(0),
+        Some(PsbValue::Null) => key.push(1),
+        Some(PsbValue::Bool(value)) => key.extend([2, u64::from(*value)]),
+        Some(PsbValue::Integer(value)) => key.extend([3, *value as u64]),
+        Some(PsbValue::Number(value)) => key.extend([4, value.to_bits()]),
+        Some(PsbValue::Integers(values)) if values.len() <= 16 => {
+            key.extend([5, values.len() as u64]);
+            key.extend(values.iter().map(|value| u64::from(*value)));
+        }
+        Some(PsbValue::List(values)) if values.len() <= 3 => {
+            key.extend([6, values.len() as u64]);
+            for value in values {
+                if !matches!(value, PsbValue::Integer(_) | PsbValue::Number(_)) { return None; }
+                append_numeric_key(Some(value), key)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn affine_cache_key(order: [u8; 4], content: &FrameContent<'_>) -> Option<Vec<u64>> {
+    const FIELDS: [&str; 8] = ["fx", "fy", "angle", "zx", "zy", "sx", "sy", "coord"];
+    let mut key = Vec::with_capacity(16);
+    key.extend(order.map(u64::from));
+    if let Some(base) = content.borrowed_base() {
+        // The owning model retains this immutable tree. Only interpolated
+        // transform overrides can change this node's local matrix.
+        key.extend([0, std::ptr::from_ref(base) as usize as u64]);
+        for (name, value) in content.overrides() {
+            if let Some(index) = FIELDS.iter().position(|field| field == name) {
+                key.push(index as u64);
+                append_numeric_key(Some(value), &mut key)?;
+            }
+        }
+    } else {
+        // Host driver transforms materialize a private content object.
+        key.push(1);
+        for name in FIELDS { append_numeric_key(content.get(name), &mut key)?; }
+    }
+    Some(key)
+}
+
 #[derive(Clone, Copy)]
 struct Transform {
     m: [f64; 6],
@@ -954,6 +1090,25 @@ fn mesh_raster_plan(
         return Err(unsupported("non-finite inherited mesh anchor correction"));
     }
     Ok((geometry, delta))
+}
+
+fn mesh_vertex_key(
+    viewport: CpuViewport, transform: Transform, grid: CpuMeshGrid,
+    coordinates: [f64; 6], anchor_delta: [f64; 2], geometry: &[&Warp],
+) -> Vec<u64> {
+    let mut key = Vec::with_capacity(24 + geometry.len() * 43);
+    key.extend([u64::from(grid.columns), u64::from(grid.rows)]);
+    key.extend(transform.m.map(f64::to_bits));
+    key.extend([viewport.origin_x, viewport.origin_y, viewport.scale].map(f64::to_bits));
+    key.extend(coordinates.map(f64::to_bits));
+    key.extend(anchor_delta.map(f64::to_bits));
+    key.push(geometry.len() as u64);
+    for warp in geometry {
+        key.extend(warp.transform.m.map(f64::to_bits));
+        key.extend([warp.width, warp.height, warp.ox, warp.oy].map(f64::to_bits));
+        key.extend(warp.patch.points().iter().flatten().map(|value| u64::from(value.to_bits())));
+    }
+    key
 }
 
 struct RenderContext<'a, T> {
@@ -1409,7 +1564,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             None => timeline::transform_order(layer)?,
         };
         let local = Transform {
-            m: timeline::layer_affine(order, |key| content.get(key))?,
+            m: self.player.model.layer_affine(order, &content)?,
             opacity,
             //3eaea..3eb84: in XY mode, parent affine transforms X/Y;
             //Z is added independently and later orders color primitives.
@@ -1868,25 +2023,37 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         //row strips. Sample each ancestor warp once per node, then reuse the
         //same XY/UV for adjacent cells in both real color and mask passes.
         let (_, vertex_count) = grid.raster_layout()?;
-        let mut vertices = Vec::with_capacity(vertex_count);
-        for y in 0..=grid.rows {
-            for x in 0..=grid.columns {
-                let u = x as f64 / grid.columns as f64;
-                let q = y as f64 / grid.rows as f64;
-                let mut point = transform.point([u * width - ox, q * height - oy]);
-                for warp in &geometry {
-                    point = warp.apply(point)?;
+        // Tiny unwarped quads are cheaper to rebuild. Larger grids reuse the
+        // exact resolved world/ancestor inputs across ticks and mask passes.
+        let cache_key = (use_node_cache() && vertex_count > 4).then(|| mesh_vertex_key(self.viewport, transform, grid,
+            [left, top, width, height, ox, oy], anchor_delta, &geometry));
+        let cached = cache_key.as_ref().and_then(|key| self.player.model.node_cache.lock()
+            .unwrap_or_else(|error| error.into_inner()).meshes.get(key).cloned());
+        let vertices = if let Some(vertices) = cached {
+            vertices
+        } else {
+            let mut vertices = Vec::with_capacity(vertex_count);
+            for y in 0..=grid.rows {
+                for x in 0..=grid.columns {
+                    let u = x as f64 / grid.columns as f64;
+                    let q = y as f64 / grid.rows as f64;
+                    let mut point = transform.point([u * width - ox, q * height - oy]);
+                    for warp in &geometry { point = warp.apply(point)?; }
+                    point[0] += anchor_delta[0];
+                    point[1] += anchor_delta[1];
+                    vertices.push([
+                        self.viewport.origin_x + point[0] * self.viewport.scale,
+                        self.viewport.origin_y + point[1] * self.viewport.scale,
+                        left + u * width, top + q * height,
+                    ]);
                 }
-                point[0] += anchor_delta[0];
-                point[1] += anchor_delta[1];
-                vertices.push([
-                    self.viewport.origin_x + point[0] * self.viewport.scale,
-                    self.viewport.origin_y + point[1] * self.viewport.scale,
-                    left + u * width,
-                    top + q * height,
-                ]);
             }
-        }
+            if let Some(key) = cache_key {
+                self.player.model.node_cache.lock().unwrap_or_else(|error| error.into_inner())
+                    .meshes.insert(key, vertices.clone(), vertices.capacity() * size_of::<[f64; 4]>());
+            }
+            vertices
+        };
         let mesh = EmoteSpriteMesh {
             source,
             texture,
@@ -1982,6 +2149,24 @@ pub struct EmoteSpriteMesh<'a> {
     pub opacity: f64,
     pub vertices: Vec<[f64; 4]>,
     grid: CpuMeshGrid,
+}
+
+impl<'a> EmoteSpriteMesh<'a> {
+    /// Construct the same indexed node grid consumed by CPU and device backends.
+    pub fn from_grid(
+        source: &'a str, texture: &'a CpuTexture, opacity: f64,
+        vertices: Vec<[f64; 4]>, grid: CpuMeshGrid,
+    ) -> Result<Self> {
+        texture.check()?;
+        let (_, expected) = grid.raster_layout()?;
+        if vertices.len() != expected || !opacity.is_finite()
+            || !(0.0..=1.0).contains(&opacity)
+            || vertices.iter().flatten().any(|value| !value.is_finite())
+        {
+            return Err(EmoteError::InvalidFrame);
+        }
+        Ok(Self { source, texture, opacity, vertices, grid })
+    }
 }
 
 pub struct OwnedEmoteSpriteMesh {
@@ -2608,6 +2793,30 @@ impl RasterPose {
     }
 }
 
+/// Opaque exact identity for reusable evaluated player geometry.
+pub struct CpuPlayerRenderState {
+    model: Weak<CpuMotionModel>,
+    object: String,
+    motion: String,
+    pose: RasterPose,
+    time_units: u64,
+    variables: BTreeMap<String, f64>,
+    references: super::timeline::CpuReferenceTimelines,
+    controllers: [u32; 2],
+}
+
+impl CpuPlayerRenderState {
+    pub fn matches(&self, player: &CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>) -> bool {
+        Weak::ptr_eq(&self.model, &Arc::downgrade(&player.model))
+            && self.object == player.object && self.motion == player.motion
+            && self.pose == RasterPose::new(player, viewport)
+            && self.time_units == viewport.time_units_per_frame.to_bits()
+            && self.controllers == [player.controller_a_raw, player.controller_b_raw]
+            && super::timeline::same_variable_bits(&self.variables, variables)
+            && self.references.same_render_state(&player.reference_timelines)
+    }
+}
+
 struct CachedRaster {
     model: Weak<CpuMotionModel>,
     object: String,
@@ -2620,7 +2829,8 @@ struct CachedRaster {
 
 impl CachedRaster {
     fn matches(&self, player: &CpuPlayer, pose: &RasterPose, variables: &BTreeMap<String, f64>) -> bool {
-        std::ptr::eq(self.model.as_ptr(), Arc::as_ptr(&player.model))
+        self.frame.is_valid()
+            && std::ptr::eq(self.model.as_ptr(), Arc::as_ptr(&player.model))
             && self.object == player.object
             && self.motion == player.motion
             && self.pose == *pose
@@ -2740,6 +2950,7 @@ impl CpuTask {
     fn render_model(
         &mut self, viewport: CpuViewport, scratch: &mut Vec<u8>, rasterizer: Option<HostRasterizer>,
     ) -> Result<EmoteRasterFrame> {
+        self.surface.discard_invalid_device_frames();
         if let Some(frame) = self.surface.frame() {
             return Ok(frame.clone());
         }
@@ -2758,7 +2969,7 @@ impl CpuTask {
             let mut warnings = Vec::new();
             self.append_owner_warnings(&mut warnings);
             check_strict_warnings(&warnings)?;
-            rasterizer(player, viewport, &variables)
+            rasterizer(player, viewport, &variables).filter(EmoteRasterFrame::is_valid)
         } else {
             None
         };
@@ -2794,6 +3005,7 @@ impl CpuTask {
 
 /// Host raster fallback returns None without committing any partial image.
 type HostRasterizer = fn(&CpuPlayer, CpuViewport, &BTreeMap<String, f64>) -> Option<EmoteRasterFrame>;
+type HostSurfaceTinter = fn(&EmoteRasterFrame, u32) -> Option<EmoteRasterFrame>;
 
 struct ArchivedModel {
     version: EmoteArchiveVersion,
@@ -2826,6 +3038,7 @@ pub struct CpuEmoteBackend {
     surface_prepare: Option<super::EmoteSurfacePrepare>,
     surface_expand: Option<super::EmoteSurfaceExpand>,
     surface_rasterizer: Option<HostRasterizer>,
+    surface_tinter: Option<HostSurfaceTinter>,
 }
 impl CpuEmoteBackend {
     pub fn new(viewport: CpuViewport) -> Result<Self> {
@@ -2845,6 +3058,7 @@ impl CpuEmoteBackend {
             surface_prepare: None,
             surface_expand: None,
             surface_rasterizer: None,
+            surface_tinter: None,
         })
     }
     /// Byte-proven174040->driver3540->12bb0 clock path. The host passes
@@ -2865,6 +3079,9 @@ impl CpuEmoteBackend {
 
     pub fn set_resources(&mut self, resources: Box<dyn CpuEmoteResources>) {
         self.resources = Some(resources);
+    }
+    pub fn set_surface_tinter(&mut self, tinter: HostSurfaceTinter) {
+        self.surface_tinter = Some(tinter);
     }
     pub fn set_surface_gpu(
         &mut self, mixer: super::EmoteSurfaceMixer, prepare: super::EmoteSurfacePrepare,
@@ -2970,7 +3187,7 @@ impl CpuEmoteBackend {
         if let Some(frame) = state.surface.capture() {
             // Blend endpoints share the logical viewport; steady presented frames may stay cropped.
             let size = [self.viewport.width, self.viewport.height];
-            if state.tint_argb() == 0xffff_ffff
+            if (state.tint_argb() == 0xffff_ffff || self.surface_tinter.is_some())
                 && let Some(result) = self.surface_expand.and_then(|expand| expand(frame, size))
             {
                 return Ok(result);
@@ -2986,8 +3203,7 @@ impl CpuEmoteBackend {
     fn prepare_m2_surface_update(&mut self, task: u32, now: u32) -> Result<bool> {
         let (pending, enabled, needs_capture) = {
             let state = self.players.get_mut(&task).ok_or(EmoteError::UnknownTask(task))?;
-            // Tinted frames need CPU pixels for the manager's final quad modulation.
-            let mixer = self.surface_mixer.filter(|_| state.tint_argb() == 0xffff_ffff);
+            let mixer = self.surface_mixer.filter(|_| state.tint_argb() == 0xffff_ffff || self.surface_tinter.is_some());
             if state.surface.hold(now, mixer) { return Ok(true); }
             (state.surface.pending(), state.surface.capture_enabled(state.surface_enabled()),
                 state.surface.needs_capture())
@@ -3006,12 +3222,16 @@ impl CpuEmoteBackend {
 
     pub fn render_preview(&self, task: u32) -> Result<DiagnosticFrame> {
         let mut preview = self.model_preview(task)?;
-        Self::tint_surface(self.tint_argb(task)?, &mut preview.frame);
+        Self::tint_surface(self.surface_tinter, self.tint_argb(task)?, &mut preview.frame);
         Ok(preview)
     }
 
-    fn tint_surface(argb: u32, frame: &mut EmoteRasterFrame) {
+    fn tint_surface(tinter: Option<HostSurfaceTinter>, argb: u32, frame: &mut EmoteRasterFrame) {
         if argb == 0xffff_ffff {
+            return;
+        }
+        if let Some(tinted) = tinter.and_then(|tinter| tinter(frame, argb)) {
+            *frame = tinted;
             return;
         }
         let tint = [
@@ -3414,6 +3634,9 @@ impl EmoteBackend for CpuEmoteBackend {
 
     fn uses_unfiltered_m2_texture(&self, task: u32) -> bool {
         self.players.get(&task).is_some_and(|state| normalized_texture_filter(state.texture_filter_raw) == 0)
+    }
+    fn m2_texture_filter(&self, task: u32) -> Option<u32> {
+        self.players.get(&task).map(|state| state.texture_filter_raw)
     }
 
     fn cached_m2_model(
@@ -3856,9 +4079,9 @@ impl EmoteBackend for CpuEmoteBackend {
                 !owner.pending_effects.is_empty() || owner.sidecar_diagnostics().next().is_some()) {
                 return Err(unsupported("M2 surface capture requires complete live owner pixels"));
             }
-            let untinted = state.tint_argb() == 0xffff_ffff;
-            let prepare = self.surface_prepare.filter(|_| untinted);
-            let accelerated = if let Some(rasterizer) = self.surface_rasterizer.filter(|_| untinted && surface_enabled) {
+            let device_modulation = state.tint_argb() == 0xffff_ffff || self.surface_tinter.is_some();
+            let prepare = self.surface_prepare.filter(|_| device_modulation);
+            let accelerated = if let Some(rasterizer) = self.surface_rasterizer.filter(|_| device_modulation && surface_enabled) {
                 rasterizer(p, self.viewport, &p.effective_variables()?)
             } else { None };
             let endpoint = match accelerated {
@@ -3994,7 +4217,7 @@ impl EmoteBackend for CpuEmoteBackend {
     }
     fn can_defer_scene_raster(&self, task: u32) -> bool {
         self.rasterizer.is_some()
-            && self.players.get(&task).is_some_and(|state| state.tint_argb() == 0xffff_ffff)
+            && self.players.get(&task).is_some_and(|state| state.tint_argb() == 0xffff_ffff || self.surface_tinter.is_some())
     }
     fn render_rgba(&mut self, task: u32) -> Result<EmoteRasterFrame> {
         let state = self.players.get_mut(&task).ok_or_else(|| unsupported("E-mote player resource is not loaded"))?;
@@ -4006,7 +4229,7 @@ impl EmoteBackend for CpuEmoteBackend {
                 self.raster_scratch = bytes;
             }
         }
-        Self::tint_surface(state.tint_argb(), &mut captured);
+        Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut captured);
         Ok(captured)
     }
     fn playback_info(&self, task: u32) -> Result<EmotePlaybackInfo> {
@@ -4153,6 +4376,7 @@ mod tests {
         let mut model = CpuMotionModel {
             document: Arc::new(PsbDocument::from_test_root(root)),
             layer_timelines: None,
+            node_cache: Arc::new(Mutex::new(DerivedNodeCache::default())),
             textures: [("atlas".into(), CpuTexture::from_rgba(1, 1, vec![200, 100, 50, 255]).unwrap())].into(),
             base_object: "actor".into(), base_motion: "idle".into(),
         };
@@ -4162,6 +4386,130 @@ mod tests {
         backend.create_task(1)?;
         backend.players.get_mut(&1).unwrap().player = Some(CpuPlayer::new(model));
         Ok(backend)
+    }
+
+    #[test]
+    fn node_affine_cache_survives_ticks_but_parent_transform_still_moves_pixels() -> Result<()> {
+        let backend = backend()?;
+        let mut player = backend.player(1)?.clone();
+        let original = player.render_strict(backend.viewport)?;
+        let first = player.model.node_cache_counters();
+        assert!(first[1] > 0);
+        player.frame = 1.0;
+        let repeated = player.render_strict(backend.viewport)?;
+        assert_eq!(original.rgba(), repeated.rgba());
+        assert!(player.model.node_cache_counters()[0] > first[0]);
+        player.set_root_affine([1.0, 0.0, 0.0, 1.0, 1.0, 0.0])?;
+        let moved = player.render_strict(backend.viewport)?;
+        assert_ne!(original.rgba(), moved.rgba());
+        // Identical local fields can be reused; the world parent is still applied.
+        assert!(player.model.node_cache_counters()[0] > first[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn derived_mesh_cache_key_tracks_world_viewport_and_uv_inputs() {
+        let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640.0,
+            origin_y: 600.0, scale: 1.0, time_units_per_frame: 1.0 };
+        let grid = CpuMeshGrid { columns: 4, rows: 4 };
+        let transform = Transform::identity();
+        let coords = [0.0, 0.0, 10.0, 20.0, 0.0, 0.0];
+        let key = mesh_vertex_key(viewport, transform, grid, coords, [0.0; 2], &[]);
+        let mut moved = transform; moved.m[4] = 1.0;
+        assert_ne!(key, mesh_vertex_key(viewport, moved, grid, coords, [0.0; 2], &[]));
+        let mut resized = viewport; resized.scale = 1.5;
+        assert_ne!(key, mesh_vertex_key(resized, transform, grid, coords, [0.0; 2], &[]));
+        let mut next_icon = coords; next_icon[0] = 20.0;
+        assert_ne!(key, mesh_vertex_key(viewport, transform, grid, next_icon, [0.0; 2], &[]));
+        assert_ne!(key, mesh_vertex_key(viewport, transform, grid, coords, [0.5, 0.0], &[]));
+    }
+
+    #[test]
+    fn sprite_mesh_constructor_rejects_invalid_grid_and_nonfinite_vertices() -> Result<()> {
+        let texture = CpuTexture::from_rgba(1, 1, vec![255; 4])?;
+        let grid = CpuMeshGrid { columns: 1, rows: 1 };
+        let vertices = vec![[0.0; 4]; 4];
+        assert!(EmoteSpriteMesh::from_grid("a", &texture, 1.0, vertices.clone(), grid).is_ok());
+        assert!(EmoteSpriteMesh::from_grid("a", &texture, 1.0, vertices[..3].to_vec(), grid).is_err());
+        let mut invalid = vertices; invalid[0][0] = f64::NAN;
+        assert!(EmoteSpriteMesh::from_grid("a", &texture, 1.0, invalid, grid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn final_quad_tint_prefers_host_hook_without_recoloring_manager_capture() -> Result<()> {
+        let mut backend = backend()?;
+        backend.set_surface_tinter(|frame, argb| {
+            assert_eq!(argb, 0xff80_ffff);
+            Some(EmoteRasterFrame::new(frame.width(), frame.height(), frame.origin(),
+                [17, 18, 19, 20].repeat((frame.width() * frame.height()) as usize)).unwrap())
+        });
+        backend.set_base_argb(1, 0xff80_ffff)?;
+        let tinted = backend.render_rgba(1)?;
+        assert_eq!(&tinted.rgba()[..4], &[17, 18, 19, 20]);
+        let remembered = backend.players[&1].surface.capture().unwrap();
+        assert_ne!(&remembered.rgba()[..4], &[17, 18, 19, 20]);
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct RetiredDevice;
+    impl super::super::EmoteDeviceReadback for RetiredDevice {
+        fn read_rgba(&self, _: &mut [u8]) -> bool { panic!("retired GPU pixels must be rebuilt, not read") }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn is_valid(&self) -> bool { false }
+    }
+
+    #[test]
+    fn player_render_snapshot_rejects_private_driver_and_reference_changes() -> Result<()> {
+        let mut backend = backend()?;
+        let viewport = backend.viewport;
+        let player = backend.player_mut(1)?;
+        let variables = player.effective_variables()?;
+        let frame = player.frame.to_bits();
+        let initial = player.render_state_snapshot(viewport, &variables);
+        assert!(initial.matches(player, viewport, &variables));
+        player.driver_transform = Some(super::super::CpuDriverTransform::new([5., 0.], 1., 0.)?);
+        assert_eq!(player.frame.to_bits(), frame);
+        assert!(super::super::timeline::same_variable_bits(&variables, &player.effective_variables()?));
+        assert!(!initial.matches(player, viewport, &variables), "private driver overrides change prepared geometry at the same clock");
+        let transformed = player.render_state_snapshot(viewport, &variables);
+        player.reference_timelines.mark_tick(player.frame as f32, variables.clone());
+        assert_eq!(player.frame.to_bits(), frame);
+        assert!(!transformed.matches(player, viewport, &variables), "private reference clocks change prepared geometry at the same root clock");
+        let sampled = player.render_state_snapshot(viewport, &variables);
+        player.root_affine[4] = -0.;
+        assert!(!sampled.matches(player, viewport, &variables), "root transform snapshots compare exact float bits");
+        Ok(())
+    }
+
+    #[test]
+    fn retired_gpu_raster_cache_rebuilds_the_current_pose() -> Result<()> {
+        let mut backend = backend()?;
+        let state = backend.players.get_mut(&1).unwrap();
+        let player = state.player.as_ref().unwrap();
+        state.raster_cache = Some(CachedRaster {
+            model: Arc::downgrade(&player.model), object: player.object.clone(), motion: player.motion.clone(),
+            pose: RasterPose::new(player, backend.viewport), variables: player.effective_variables()?,
+            references: player.reference_timelines.clone(),
+            frame: EmoteRasterFrame::from_device(3, 2, [0, 0], Arc::new(RetiredDevice))?,
+        });
+        let rebuilt = state.render_model(backend.viewport, &mut Vec::new(), None)?;
+        assert!(rebuilt.device().is_none(), "retired cached GPU frame must not bypass the rasterizer");
+        assert!(rebuilt.is_valid());
+        Ok(())
+    }
+
+    #[test]
+    fn retired_gpu_surface_capture_is_discarded_without_readback() -> Result<()> {
+        let mut backend = backend()?;
+        let state = backend.players.get_mut(&1).unwrap();
+        let retired = EmoteRasterFrame::from_device(3, 2, [0, 0], Arc::new(RetiredDevice))?;
+        state.surface.remember(retired.clone());
+        state.surface.request(Some(30), retired, false);
+        state.surface.hold(1, None);
+        assert!(state.surface.capture().is_none());
+        Ok(())
     }
 
     #[test]

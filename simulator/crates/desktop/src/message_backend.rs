@@ -32,7 +32,7 @@ use super::message_native::{decode_inline_image, decode_user_glyph, scale_user_g
 use super::perf_detail::{TextStage, TextTimer};
 #[cfg(any(windows, target_os = "android"))]
 use super::perf_detail::{TextFallbackEvent, text_fallback_event};
-use super::text::{FontOrigin, LoadedFont, read_font_file};
+use super::text::{FontOrigin, FontVersion, LoadedFont, prepare_font_face, resource_font_version, shared_font_face, shared_font_file, shared_resource_font, system_font_metadata, system_font_paths};
 
 const MAX_SURFACE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -44,6 +44,45 @@ fn is_east_asian_message_character(character: char) -> bool {
 }
 const MAX_DEVICE_BYTES: usize = 256 * 1024 * 1024;
 const GLYPH_SIDE: usize = 128;
+
+fn resource_font_names(resources: &ResourceIndex) -> BTreeSet<String> {
+    resources.files().iter().map(|file| file.relative_path.to_string_lossy().replace('\\', "/"))
+        .chain(resources.archives().iter().flat_map(|archive| archive.entries.iter().map(|entry| entry.name.replace('\\', "/"))))
+        .filter(|name| {
+            super::text::use_resource_font(resources, name) && std::path::Path::new(name).extension()
+                .and_then(|extension| extension.to_str()).is_some_and(|extension| {
+                    ["ttf", "ttc", "otf"].iter().any(|known| extension.eq_ignore_ascii_case(known))
+                })
+        }).collect()
+}
+
+fn font_registration_versions(resources: &ResourceIndex) -> Vec<(String, std::result::Result<FontVersion, String>)> {
+    let mut versions = Vec::new();
+    for name in resource_font_names(resources) {
+        versions.push((format!("resource:{name}"), resource_font_version(resources, &name).map_err(|error| error.to_string())));
+    }
+    // Filename backends also accept nonstandard extensions. Include exactly
+    // their active plain-file routes, independently of the generic 64 faces.
+    for file in resources.files() {
+        let relative = file.relative_path.to_string_lossy().replace('\\', "/");
+        let lower = relative.to_ascii_lowercase();
+        let indexed = resources.root().join(&file.relative_path);
+        for (offset, _) in lower.match_indices("font/") {
+            if offset != 0 && lower.as_bytes()[offset - 1] != b'/' { continue; }
+            if let Ok(Some(candidate)) = resources.resolve_plain_file(&relative[offset..])
+                && let ResourceLocation::File { path } = &candidate.location
+                && *path == indexed
+            {
+                versions.push((format!("filename:{}", &lower[offset + 5..]), FontVersion::file(path).map_err(|error| error.to_string())));
+                break;
+            }
+        }
+    }
+    for path in system_font_paths() {
+        versions.push((format!("system:{}", path.to_string_lossy()), FontVersion::file(&path).map_err(|error| error.to_string())));
+    }
+    versions
+}
 
 #[cfg(windows)]
 fn installed_settings_fonts() -> Vec<(String, bool)> {
@@ -100,6 +139,8 @@ pub(super) struct DesktopMessageDevice {
     fallback_cache: RefCell<FontFallbackCache>,
     platform_substitutions: RefCell<BTreeSet<MessageFontSubstitution>>,
     fonts_loaded: bool,
+    font_registration_us: u128,
+    font_source_versions: Vec<(String, std::result::Result<FontVersion, String>)>,
     fes_font_faces: OnceLock<Vec<String>>,
     surfaces: BTreeMap<i32, MessageSurface>,
     composited_glyphs: RefCell<CompositedGlyphCache>,
@@ -224,7 +265,7 @@ struct GameFontFile {
 
 #[derive(Debug)]
 struct GameFontFace {
-    font: FontRasterizer,
+    font: Arc<FontRasterizer>,
     name: String,
     bold: bool,
     italic: bool,
@@ -234,10 +275,7 @@ impl GameFontFile {
     fn load(&self) -> std::result::Result<GameFontFace, String> {
         let face = self.path.file_name().map_or(&[][..], std::ffi::OsStr::as_encoded_bytes);
         let _load = TextTimer::new(TextStage::FaceLoad).face(face, 0);
-        let bytes = {
-            let _read = TextTimer::new(TextStage::FaceRead);
-            read_font_file(&self.path).map_err(|error| format!("could not be read: {error}"))?
-        };
+        let bytes = shared_font_file(&self.path).map_err(|error| format!("could not be read: {error}"))?;
         let offset = if bytes.starts_with(b"ttcf") {
             be32(&bytes, 12).unwrap_or(0) as usize
         } else {
@@ -247,11 +285,9 @@ impl GameFontFile {
         let italic = sfnt_italic(&bytes, offset);
         let name = sfnt_face_name(&sfnt_names(&bytes, offset))
             .unwrap_or_else(|| self.path.to_string_lossy().into_owned());
-        let font = {
-            let _decode = TextTimer::new(TextStage::FaceDecode);
-            FontRasterizer::from_shared_bytes(Arc::new(bytes), 0)
-                .map_err(|error| format!("could not be decoded: {error}"))?
-        };
+        let face = shared_font_face(&bytes, 0);
+        let font = prepare_font_face(&bytes, 0, &face)
+            .ok_or_else(|| String::from("could not be decoded: invalid font data"))?;
         Ok(GameFontFace {
             font, name, bold, italic,
         })
@@ -324,19 +360,16 @@ impl NamedFace {
             return font.as_deref();
         }
         let _load = TextTimer::new(TextStage::FaceLoad).face(self.face_name.as_bytes(), self.index);
-        self.font
-            .get_or_init(|| {
-                let bytes = match self.source.as_ref() {
-                    FontSource::Bytes(bytes) => Arc::clone(bytes),
-                    FontSource::File(path) => {
-                        let _read = TextTimer::new(TextStage::FaceRead);
-                        Arc::new(read_font_file(path).ok()?)
-                    }
-                };
-                let _decode = TextTimer::new(TextStage::FaceDecode);
-                FontRasterizer::from_shared_bytes(bytes, self.index).ok().map(Arc::new)
-            })
-            .as_deref()
+        let bytes = match self.source.as_ref() {
+            FontSource::Bytes(bytes) => Some(Arc::clone(bytes)),
+            FontSource::File(path) => shared_font_file(path).ok(),
+        };
+        let prepared = bytes.and_then(|bytes| {
+            let shared = shared_font_face(&bytes, self.index);
+            prepare_font_face(&bytes, self.index, &shared)
+        });
+        let _ = self.font.set(prepared);
+        self.font.get()?.as_deref()
     }
 
 }
@@ -352,6 +385,8 @@ impl Default for DesktopMessageDevice {
             fallback_cache: RefCell::default(),
             platform_substitutions: RefCell::new(BTreeSet::new()),
             fonts_loaded: false,
+            font_registration_us: 0,
+            font_source_versions: Vec::new(),
             fes_font_faces: OnceLock::new(),
             surfaces: BTreeMap::new(),
             composited_glyphs: RefCell::default(),
@@ -460,18 +495,53 @@ impl DesktopMessageDevice {
     }
 
     pub(super) fn load_fonts(&mut self, resources: &ResourceIndex) {
-        if !self.fonts_loaded {
-            self.initialize_fonts(resources, super::load_font(resources).into());
+        // FES and input hooks call this every frame. The registered fonts are
+        // an immutable session snapshot: do not enumerate directories, stat
+        // sources, or rebuild generic font arrays on this path.
+        if self.fonts_loaded {
+            return;
         }
+        self.initialize_fonts(resources, super::load_font(resources).into());
     }
 
+    /// Explicit initialization/refresh boundary. Source version checks belong
+    /// here, outside the per-frame ensure-loaded path; a new player registers
+    /// its own inventory and shared source caches still validate fresh loads.
     pub(super) fn initialize_fonts(&mut self, resources: &ResourceIndex, fonts: Arc<[LoadedFont]>) {
-        if !self.fonts_loaded {
-            self.fonts = fonts;
-            self.load_font_names(resources);
-            self.load_game_font_files(resources);
-            self.fonts_loaded = true;
+        let source_versions = font_registration_versions(resources);
+        if self.fonts_loaded && self.font_source_versions == source_versions && self.fonts.len() == fonts.len() && self.fonts.iter().zip(fonts.iter()).all(|(old, new)| {
+            old.origin == new.origin && old.index == new.index && Arc::ptr_eq(&old.bytes, &new.bytes)
+        }) {
+            return;
         }
+        let start = std::time::Instant::now();
+        if self.fonts_loaded {
+            self.named_fonts.clear();
+            self.resource_font_files.clear();
+            self.fallback_faces.clear();
+            self.fes_font_faces.take();
+            self.platform_substitutions.get_mut().clear();
+            *self.composited_glyphs.get_mut() = CompositedGlyphCache::default();
+            #[cfg(any(windows, target_os = "android"))]
+            { *self.fallback_cache.get_mut() = FontFallbackCache::default(); }
+        }
+        self.fonts = fonts;
+        self.load_font_names(resources);
+        self.load_game_font_files(resources);
+        self.font_source_versions = source_versions;
+        self.fonts_loaded = true;
+        self.font_registration_us = start.elapsed().as_micros();
+    }
+
+    pub(super) fn font_prewarm_report(&self) -> String {
+        let mut seen = BTreeSet::new();
+        let bytes: usize = self.fonts.iter().filter(|font| seen.insert(Arc::as_ptr(&font.bytes) as usize))
+            .map(|font| font.bytes.len()).sum();
+        let ready = self.fonts.iter().filter(|font| font.rasterizer.get().is_some_and(Option::is_some)).count();
+        let game_faces = self.fonts.iter().filter(|font| matches!(font.origin.as_ref(), FontOrigin::Resource(_))).count();
+        let files_ready = self.resource_font_files.values().filter(|file| file.face.get().is_some_and(|face| face.is_ok())).count();
+        format!("font_prewarm faces={} ready={ready} game_faces={game_faces} system_faces={} unique_bytes={bytes} filename_ready={files_ready}/{} registration_us={}",
+            self.fonts.len(), self.fonts.len() - game_faces, self.resource_font_files.len(), self.font_registration_us)
     }
 
     /// Explicit face aliases are case-insensitive and remain local to this
@@ -591,12 +661,17 @@ impl DesktopMessageDevice {
                 if let ResourceLocation::File { path } = &candidate.location
                     && *path == indexed_path
                 {
+                    let file = GameFontFile { path: path.clone(), face: OnceLock::new() };
+                    // Eager face preparation, including cached failures, keeps
+                    // file-font decoding out of the first message click.
+                    if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| {
+                        ["ttf", "ttc", "otf"].iter().any(|known| extension.eq_ignore_ascii_case(known))
+                    }) {
+                        let _ = file.face.set(file.load());
+                    }
                     self.resource_font_files.insert(
                         lower[offset + "font/".len()..].to_owned(),
-                        GameFontFile {
-                            path: path.clone(),
-                            face: OnceLock::new(),
-                        },
+                        file,
                     );
                     break;
                 }
@@ -605,80 +680,36 @@ impl DesktopMessageDevice {
     }
 
     fn load_font_names(&mut self, resources: &ResourceIndex) {
-        let names: BTreeSet<_> = resources
-            .files()
-            .iter()
-            .map(|file| file.relative_path.to_string_lossy().replace('\\', "/"))
-            .chain(resources.archives().iter().flat_map(|archive| {
-                archive
-                    .entries
-                    .iter()
-                    .map(|entry| entry.name.replace('\\', "/"))
-            }))
-            .filter(|name| {
-                super::text::use_resource_font(resources, name) && std::path::Path::new(name)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        ["ttf", "ttc", "otf"]
-                            .iter()
-                            .any(|known| extension.eq_ignore_ascii_case(known))
-                    })
-            })
-            .collect();
+        let names = resource_font_names(resources);
         for name in names {
-            if let Ok(bytes) = super::read_entry_with_fallback(resources, &name) {
-                let bytes = Arc::new(bytes);
+            if let Ok(bytes) = shared_resource_font(resources, &name) {
                 let source = Arc::new(FontSource::Bytes(Arc::clone(&bytes)));
                 self.register_sfnt(&bytes, source, &FontOrigin::Resource(name));
             }
         }
-        #[cfg(windows)]
+        // Discovery remains complete; only rasterizer prewarming is limited.
+        // Unselected files contribute sparse name/style/cmap metadata rather
+        // than whole outline files or eagerly decoded fontdue faces.
+        for path in system_font_paths() {
+            self.register_system_font_path(&path);
+        }
+    }
+
+    fn register_system_font_path(&mut self, path: &std::path::Path) {
+        #[cfg(any(windows, target_os = "android"))]
         {
-            // Enumerating actual installed font files also finds localized
-            // family/full/PostScript names. SFNT names are authoritative; a
-            // filename or registry display label is never used as a face alias.
-            let windows = std::env::var_os("WINDIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-            let mut folders = vec![windows.join("Fonts")];
-            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-                folders.push(std::path::PathBuf::from(local).join("Microsoft/Windows/Fonts"));
-            }
-            for folder in folders {
-                if let Ok(files) = std::fs::read_dir(folder) {
-                    let mut paths: Vec<_> = files
-                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                        .collect();
-                    paths.sort();
-                    for path in paths {
-                        if path
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            .is_some_and(|extension| {
-                                ["ttf", "ttc", "otf"]
-                                    .iter()
-                                    .any(|known| extension.eq_ignore_ascii_case(known))
-                            })
-                        {
-                            if let Ok(bytes) = read_font_file(&path) {
-                                self.register_system_sfnt(&bytes, path);
-                            }
-                        }
-                    }
-                }
+            let prepared = self.fonts.iter().find_map(|font| match font.origin.as_ref() {
+                FontOrigin::System(origin) if origin == path => Some(Arc::clone(&font.bytes)),
+                _ => None,
+            });
+            if let Some(bytes) = prepared {
+                self.register_system_sfnt(&bytes, path.to_path_buf());
+            } else if let Ok(metadata) = system_font_metadata(path) {
+                self.register_system_sfnt(&metadata, path.to_path_buf());
             }
         }
-        #[cfg(target_os = "android")]
-        {
-            // Use the same discovered real files as the plain-text backend,
-            // but register every SFNT collection member and style lazily.
-            for path in super::text::android_font_paths() {
-                if let Ok(bytes) = read_font_file(&path) {
-                    self.register_system_sfnt(&bytes, path);
-                }
-            }
-        }
+        #[cfg(not(any(windows, target_os = "android")))]
+        let _ = path;
     }
 
     #[cfg(any(windows, target_os = "android"))]
@@ -738,7 +769,10 @@ impl DesktopMessageDevice {
                 });
             let cached = self.fonts.iter().find(|loaded| {
                 loaded.origin.as_ref() == origin && loaded.index == face
-            }).map_or_else(|| Arc::new(OnceLock::new()), |loaded| Arc::clone(&loaded.rasterizer));
+            }).map_or_else(|| match source.as_ref() {
+                FontSource::Bytes(bytes) => shared_font_face(bytes, face),
+                FontSource::File(_) => Arc::new(OnceLock::new()),
+            }, |loaded| Arc::clone(&loaded.rasterizer));
             let cmap = if cached.get().is_none() {
                 ttf_parser::RawFace::parse(bytes, face).ok()
                     .and_then(|raw| raw.table(ttf_parser::Tag::from_bytes(b"cmap")))
@@ -2499,10 +2533,118 @@ mod game_font_tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn warmed_font_load_keeps_session_snapshot_until_explicit_refresh() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let fixture = FontFixture(std::env::temp_dir().join(format!("cs2-font-session-{nonce}")));
+        fs::create_dir_all(fixture.0.join("font")).unwrap();
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let bytes = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        let path = fixture.0.join("font/face.ttf");
+        fs::write(&path, &bytes).unwrap();
+        let index = ResourceIndex::scan(&fixture.0).unwrap();
+        let mut device = DesktopMessageDevice::default();
+        device.load_fonts(&index);
+        let original = Arc::clone(&device.fonts);
+        let mut replacement = bytes;
+        replacement.extend_from_slice(&[0, 0, 0, 0]);
+        fs::write(&path, replacement).unwrap();
+
+        // Runtime updates use the already registered session snapshot, including
+        // when the backing filesystem changes. Refresh is an explicit operation.
+        let start = std::time::Instant::now();
+        for _ in 0..1_000 {
+            device.load_fonts(&index);
+            assert!(Arc::ptr_eq(&original, &device.fonts),
+                "a frame must not revalidate or replace the registered font inventory");
+        }
+        eprintln!("warmed_font_load calls=1000 total_us={}", start.elapsed().as_micros());
+
+        device.initialize_fonts(&index, super::super::text::load_font(&index).into());
+        assert!(!Arc::ptr_eq(&original, &device.fonts));
+        let original_face = original.iter().find(|font| matches!(font.origin.as_ref(), FontOrigin::Resource(_))).unwrap();
+        let refreshed_face = device.fonts.iter().find(|font| matches!(font.origin.as_ref(), FontOrigin::Resource(_))).unwrap();
+        assert!(!Arc::ptr_eq(&original_face.bytes, &refreshed_face.bytes));
+        assert!(original_face.rasterizer.get().unwrap().as_ref().unwrap().has_character('A'));
+    }
+
+    #[test]
+    fn font_metadata_discovers_unprewarmed_real_system_style_without_decoding() {
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let path = windows.join("Fonts/arialbi.ttf");
+        let mut device = DesktopMessageDevice::default();
+        device.register_system_font_path(&path);
+        let candidates = device.named_fonts.get("arial").unwrap();
+        let face = candidates.iter().find(|face| face.weight == 700 && face.italic).unwrap();
+        assert!(face.font.get().is_none(), "metadata indexing must not decode unselected rasterizers");
+        assert!(face.get_if_covers(['A']).is_some());
+        assert_eq!(face.weight, 700);
+        assert!(face.italic);
+    }
+
+    #[test]
+    fn font_registry_reloads_replaced_added_and_removed_sources_beyond_generic_limit() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let fixture = FontFixture(std::env::temp_dir().join(format!("cs2-font-full-version-{nonce}")));
+        fs::create_dir_all(fixture.0.join("font")).unwrap();
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let bytes = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        for number in 0..64 { fs::write(fixture.0.join(format!("font/{number:02}.ttf")), &bytes).unwrap(); }
+        fs::write(fixture.0.join("font/zz-extra.ttf"), &bytes).unwrap();
+        let index = ResourceIndex::scan(&fixture.0).unwrap();
+        let generic: Arc<[LoadedFont]> = super::super::text::load_font(&index).into();
+        assert_eq!(generic.len(), 64);
+        assert!(!generic.iter().any(|font| font.origin.name().ends_with("zz-extra.ttf")));
+        let mut device = DesktopMessageDevice::default();
+        device.initialize_fonts(&index, Arc::clone(&generic));
+        let original = Arc::clone(&device.resource_font_files["zz-extra.ttf"].face.get().unwrap().as_ref().unwrap().font);
+        let mut replacement = bytes.clone();
+        replacement.extend_from_slice(&[0, 0, 0, 0]);
+        fs::write(fixture.0.join("font/zz-extra.ttf"), replacement).unwrap();
+        device.initialize_fonts(&index, Arc::clone(&generic));
+        let replaced = &device.resource_font_files["zz-extra.ttf"].face.get().unwrap().as_ref().unwrap().font;
+        assert!(!Arc::ptr_eq(&original, replaced), "65th source must invalidate its filename face");
+        fs::write(fixture.0.join("font/new.ttf"), &bytes).unwrap();
+        device.initialize_fonts(&ResourceIndex::scan(&fixture.0).unwrap(), Arc::clone(&generic));
+        assert!(device.resource_font_files.contains_key("new.ttf"));
+        fs::remove_file(fixture.0.join("font/zz-extra.ttf")).unwrap();
+        device.initialize_fonts(&ResourceIndex::scan(&fixture.0).unwrap(), generic);
+        assert!(!device.resource_font_files.contains_key("zz-extra.ttf"));
+        assert!(original.has_character('A'));
+    }
+
+    #[test]
+    fn font_cache_backend1_is_ready_and_reuses_family_face() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let fixture = FontFixture(std::env::temp_dir().join(format!("cs2-font-shared-{nonce}")));
+        fs::create_dir_all(fixture.0.join("font")).unwrap();
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        fs::copy(windows.join("Fonts/arial.ttf"), fixture.0.join("font/face.ttf")).unwrap();
+        let index = ResourceIndex::scan(&fixture.0).unwrap();
+        let loaded: Arc<[LoadedFont]> = super::super::text::load_font(&index).into();
+        let mut device = DesktopMessageDevice::default();
+        device.initialize_fonts(&index, Arc::clone(&loaded));
+        let file = device.resource_font_files.get("face.ttf").unwrap();
+        assert!(file.face.get().is_some(), "filename backend must prepare its face during startup");
+        let filename = device.font(&configuration("face.ttf", 1), 'A', false, false, None).unwrap();
+        let family = device.font(&configuration("Arial", 0), 'A', false, false, None).unwrap();
+        assert!(std::ptr::eq(filename.font, family.font), "filename/family backends must share decoded face and glyph cache");
+        let filename_mask = filename.font.rasterize_styled_shared('A', 24, false, false).unwrap();
+        let family_mask = family.font.rasterize_styled_shared('A', 24, false, false).unwrap();
+        assert!(Arc::ptr_eq(&filename_mask, &family_mask), "one backend must hit glyphs cached by the other");
+        let original = loaded.iter().find(|face| matches!(face.origin.as_ref(), FontOrigin::Resource(_))).unwrap();
+        let named = device.named_fonts.get("arial").unwrap().iter().find(|face| face.private).unwrap();
+        match named.source.as_ref() {
+            FontSource::Bytes(bytes) => assert!(Arc::ptr_eq(bytes, &original.bytes), "SFNT alias discovery must reuse original bytes"),
+            _ => panic!("game face source must retain shared bytes"),
+        }
+    }
+
     struct FontFixture(PathBuf);
 
     impl Drop for FontFixture {
         fn drop(&mut self) {
+            for number in 0..64 { let _ = fs::remove_file(self.0.join(format!("font/{number:02}.ttf"))); }
             for relative in [
                 "inner/config/startup.xml",
                 "inner/font/face.ttf",
@@ -2510,6 +2652,8 @@ mod game_font_tests {
                 "inner/other/outside.ttf",
                 "font/face.ttf",
                 "font/outside.ttf",
+                "font/zz-extra.ttf",
+                "font/new.ttf",
             ] {
                 let _ = fs::remove_file(self.0.join(relative));
             }

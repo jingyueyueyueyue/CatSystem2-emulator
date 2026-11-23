@@ -86,18 +86,17 @@ impl PrecomputedSignal {
     }
 }
 
-impl LoggingHost<'_> {
-    pub(super) fn load_sound_sidecars(&mut self, resource: &str) -> Result<SoundSidecars> {
-        // These helpers scan raw narrow bytes, including a CP932 trail 0x5c;
-        // they do not share the category resolver's double-byte-aware scan.
-        let encoded = encode_name(self.text_encoding, resource)?;
-        let encoded = trim_nul(&encoded);
-        let start = encoded.iter().rposition(|&byte| matches!(byte, b'/' | b'\\'))
-            .filter(|&at| at > 0).map_or(0, |at| at + 1);
-        let stem = decode_name(self.text_encoding, without_extension(&encoded[start..]))?;
+#[derive(Clone)]
+pub(super) struct SidecarRequest {
+    encoding: ScriptTextEncoding,
+    tags: Vec<String>,
+    sound: Vec<String>,
+}
+
+impl SidecarRequest {
+    pub(super) fn prepare(&self, resources: &cs2_runtime::ResourceIndex) -> Result<SoundSidecars> {
         let mut result = SoundSidecars::default();
-        let tags = self.media_category_candidates(b"tag", &stem)?.unwrap_or_default();
-        if let Some(bytes) = self.read_sound_sidecar(&tags, None)? {
+        if let Some(bytes) = read_sound_sidecar(resources, self.encoding, &self.tags, None)? {
             if bytes.len() % 24 != 0 {
                 return Err(audio_script_error(
                     "sound tag table is not a sequence of 24-byte records",
@@ -118,8 +117,7 @@ impl LoggingHost<'_> {
                 result.tags.entry(name.to_vec()).or_insert(value);
             }
         }
-        let sound = self.media_category_candidates(b"sound", &stem)?.unwrap_or_default();
-        if let Some(bytes) = self.read_sound_sidecar(&sound, Some("plv"))? {
+        if let Some(bytes) = read_sound_sidecar(resources, self.encoding, &self.sound, Some("plv"))? {
             result.encoded_bytes += bytes.len();
             if bytes.len() < 16 || &bytes[..4] != b"PVL\0" {
                 return Err(audio_script_error(
@@ -145,13 +143,70 @@ impl LoggingHost<'_> {
             });
         }
         // The original .lpb success suppresses the independent .lv fallback.
-        if let Some(bytes) = self.read_sound_sidecar(&sound, Some("lpb"))? {
+        if let Some(bytes) = read_sound_sidecar(resources, self.encoding, &self.sound, Some("lpb"))? {
             result.encoded_bytes += bytes.len();
             result.lip = Some(bytes.into());
-        } else if let Some(bytes) = self.read_sound_sidecar(&sound, Some("lv"))? {
+        } else if let Some(bytes) = read_sound_sidecar(resources, self.encoding, &self.sound, Some("lv"))? {
             result.encoded_bytes += bytes.len();
             result.legacy_lip = Some(bytes.into());
         }
+        Ok(result)
+    }
+}
+
+fn read_sound_sidecar(
+        resources: &cs2_runtime::ResourceIndex, encoding: ScriptTextEncoding,
+        names: &[String],
+        extension: Option<&str>,
+    ) -> Result<Option<Vec<u8>>> {
+        let replaced;
+        let names = if let Some(extension) = extension {
+            replaced = names.iter().map(|name| replace_extension(encoding, name, extension))
+                .collect::<Result<Vec<_>>>()?;
+            &replaced
+        } else {
+            names
+        };
+        for name in names {
+            let Some(resource) = resources
+                .resolve_mode_utf16(&name.encode_utf16().collect::<Vec<_>>(), ResourceMode::LooseFirst)
+                .map_err(|cause| { let _ = cause; audio_script_error("sound sidecar resource IO failed") })? else {
+                continue;
+            };
+            let candidate = resource.value;
+            if candidate.size > MAX_FILE {
+                return Err(audio_script_error("sound sidecar exceeds 4 MiB"));
+            }
+            let bytes = resources.read_candidate_bounded(candidate, MAX_FILE as usize)
+                .map_err(|cause| { let _ = cause; audio_script_error("sound sidecar resource IO failed") })?
+                .ok_or_else(|| audio_script_error("sound sidecar exceeds 4 MiB"))?;
+            return Ok((!bytes.is_empty()).then_some(bytes));
+        }
+        Ok(None)
+    }
+
+
+impl LoggingHost<'_> {
+    // Speech's legacy synchronous provider retains its existing sidecar path.
+    pub(super) fn load_sound_sidecars(&mut self, resource: &str) -> Result<SoundSidecars> {
+        let result = self.sound_sidecar_request(resource)?.prepare(self.resources)?;
+        self.validate_sound_sidecar_install(&result)?;
+        Ok(result)
+    }
+    pub(super) fn sound_sidecar_request(&mut self, resource: &str) -> Result<SidecarRequest> {
+        // These helpers scan raw narrow bytes, including a CP932 trail 0x5c;
+        // they do not share the category resolver's double-byte-aware scan.
+        let encoded = encode_name(self.text_encoding, resource)?;
+        let encoded = trim_nul(&encoded);
+        let start = encoded.iter().rposition(|&byte| matches!(byte, b'/' | b'\\'))
+            .filter(|&at| at > 0).map_or(0, |at| at + 1);
+        let stem = decode_name(self.text_encoding, without_extension(&encoded[start..]))?;
+        Ok(SidecarRequest { encoding: self.text_encoding,
+            tags: self.media_category_candidates(b"tag", &stem)?.unwrap_or_default(),
+            sound: self.media_category_candidates(b"sound", &stem)?.unwrap_or_default() })
+    }
+
+    pub(super) fn validate_sound_sidecar_install(&self, result: &SoundSidecars) -> Result<()> {
         let used = self
             .sound_channels
             .values()
@@ -163,38 +218,7 @@ impl LoggingHost<'_> {
         {
             return Err(audio_script_error("owned sound sidecars exceed 64 MiB"));
         }
-        Ok(result)
-    }
-
-    fn read_sound_sidecar(
-        &mut self,
-        names: &[String],
-        extension: Option<&str>,
-    ) -> Result<Option<Vec<u8>>> {
-        let replaced;
-        let names = if let Some(extension) = extension {
-            replaced = names.iter().map(|name| replace_extension(self.text_encoding, name, extension))
-                .collect::<Result<Vec<_>>>()?;
-            &replaced
-        } else {
-            names
-        };
-        let resources = self.resources;
-        for name in names {
-            let Some(resource) = resources
-                .resolve_mode_utf16(&name.encode_utf16().collect::<Vec<_>>(), ResourceMode::LooseFirst)
-                .map_err(|cause| self.sound_host_error(cause))? else {
-                continue;
-            };
-            let candidate = resource.value;
-            if candidate.size > MAX_FILE {
-                return Err(audio_script_error("sound sidecar exceeds 4 MiB"));
-            }
-            let bytes = resources.read_candidate(candidate)
-                .map_err(|cause| self.sound_host_error(cause))?;
-            return Ok((!bytes.is_empty()).then_some(bytes));
-        }
-        Ok(None)
+        Ok(())
     }
 
     /// 215 exact encoded tag lookup; logical=-1 searches physical 0..63.

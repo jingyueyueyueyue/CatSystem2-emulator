@@ -201,6 +201,17 @@ fn surface_expand(@builtin(global_invocation_id) id: vec3u) {
 }
 
 @compute @workgroup_size(8, 8)
+fn surface_tint(@builtin(global_invocation_id) id: vec3u) {
+    if any(id.xy >= fade.size) { return; }
+    let index = id.y * fade.size.x + id.x;
+    let shifts = vec4u(0u, 8u, 16u, 24u);
+    let channels = (vec4u(fade_old[index]) >> shifts) & vec4u(255u);
+    let tint = (vec4u(fade.weight) >> vec4u(16u, 8u, 0u, 24u)) & vec4u(255u);
+    let result = (channels * tint + vec4u(127u)) / vec4u(255u);
+    fade_output[index] = result.r | (result.g << 8u) | (result.b << 16u) | (result.a << 24u);
+}
+
+@compute @workgroup_size(8, 8)
 fn surface_prepare(@builtin(global_invocation_id) id: vec3u) {
     if any(id.xy >= fade.size) { return; }
     let index = id.y * fade.size.x + id.x;

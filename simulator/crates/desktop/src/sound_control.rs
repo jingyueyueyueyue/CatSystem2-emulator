@@ -116,6 +116,9 @@ impl LoggingHost<'_> {
         if args.len() < required {
             return Err(audio_script_error("sound control arguments are truncated"));
         }
+        if matches!(index, 156..=159)
+            && let Some(result) = self.poll_task_audio_start(self.current_task_id)?
+        { return Ok(result); }
         let channel = read_u32(args, 0)?;
         let (value, duration) = if matches!(index, 163 | 166) {
             let target = u16::from_le_bytes(args[4..6].try_into().unwrap());
@@ -184,6 +187,9 @@ impl LoggingHost<'_> {
                     "sound task did not consume its control command",
                 ));
             }
+            if matches!(index, 156..=159) && self.task_waits_for_audio(self.current_task_id) {
+                return Ok(NativeReturn::Retry);
+            }
             if index == 349 {
                 let value = read_u32(&temporary, 0)?;
                 if value == u32::MAX {
@@ -216,6 +222,9 @@ impl LoggingHost<'_> {
         value: u32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if matches!(index, 156..=159)
+            && let Some(result) = self.poll_task_audio_start(self.current_task_id)?
+        { return Ok(result); }
         if index == 219 {
             self.control_sound_play_count(channel, value)?;
             return Ok(NativeReturn::Continue);
@@ -253,6 +262,9 @@ impl LoggingHost<'_> {
                     "sound task did not consume its direct control",
                 ));
             }
+            if matches!(index, 156..=159) && self.task_waits_for_audio(self.current_task_id) {
+                return Ok(NativeReturn::Retry);
+            }
             if index == 349 {
                 let value = u32::from_le_bytes(temporary);
                 if value == u32::MAX {
@@ -280,6 +292,9 @@ impl LoggingHost<'_> {
         value: u32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if let Some(result) = self.begin_async_sound_control(index, channel, value)? {
+            return Ok(result);
+        }
         if index == 219 {
             self.control_sound_play_count(channel, value)?;
             return Ok(NativeReturn::Continue);
@@ -596,6 +611,7 @@ impl HeadlessPlayer {
         // 60Hz-to-milliseconds ratio or the separate physical host clock.
         let now = self.state.clock.elapsed_ticks as u32;
         for state in self.sound_channels.values_mut() {
+            if state.pending_start.is_some() { continue; }
             // Kind13's body uses its real TaskClock and owns queued control.
             if state.task.owner.is_none() {
                 if let Some(handle) = state.handle

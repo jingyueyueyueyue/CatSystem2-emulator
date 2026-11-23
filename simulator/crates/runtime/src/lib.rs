@@ -52,7 +52,7 @@ pub use fes::{
 };
 pub use fingerprint::{BinaryFingerprint, EngineFamily, EngineFingerprint, EngineVariant};
 pub use host::{
-    AudioChannel, AudioHost, AudioRequest, AudioState, InputEvent, InputHost, InputKey, InputState,
+    AudioChannel, AudioControl, AudioHost, AudioRequest, AudioStart, AudioState, InputEvent, InputHost, InputKey, InputState,
     MovieHost, MovieLoadResult, MovieRequest, PlaybackState, SaveHost,
 };
 pub use native::{NativeCallRegistry, NativeHandler};

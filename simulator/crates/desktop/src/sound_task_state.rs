@@ -150,6 +150,15 @@ impl HeadlessPlayer {
     pub(crate) fn capture_physical_sound_state(
         &self, kinds: &BTreeMap<u32,u32>, parents: &BTreeMap<u32,u32>,
     ) -> CheckpointResult<Vec<u8>> {
+        if self.audio_input_deferred || self.audio_configuration_deferred
+            || self.data_services.tasks.fes.has_synchronous_calls()
+            || self.sound_channels.values().any(|state| state.pending_start.is_some())
+            || !self.data_services.sound_async.cancelled.is_empty()
+            || !self.data_services.sound_async.loads.is_empty()
+            || !self.data_services.sound_async.task_loads.is_empty()
+        {
+            bail!("physical SOUND checkpoint is waiting for an asynchronous device completion");
+        }
         self.data_services.sounds.speech.check_audio_checkpoint_boundary()?;
         self.state.audio.validate()?;
         validate(&self.data_services.sounds.tasks, self.data_services.sounds.ever_created,

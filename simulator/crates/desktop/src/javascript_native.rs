@@ -1607,7 +1607,7 @@ impl Adapter<'_, '_> {
                 *saved_group = group.clone();
                 let loaded = if group.is_empty() {
                     let target = self.host.select_free_sound_channel()?;
-                    match self.host.load_sound_name(target, &source, 1, 0)? {
+                    match self.host.load_sound_name_compat(target, &source, 1, 0)? {
                         NativeReturn::Value(0) => None,
                         NativeReturn::Value(_) => Some(target),
                         _ => {
@@ -1625,7 +1625,7 @@ impl Adapter<'_, '_> {
                         .map(|entry| entry.key);
                     match key {
                         Some(key) => {
-                            match self.host.load_sound_group_name(key, true, &source, 1, 0)? {
+                            match self.host.load_sound_group_name_compat(key, true, &source, 1, 0)? {
                                 NativeReturn::Value(u32::MAX) => None,
                                 NativeReturn::Value(channel) => Some(channel),
                                 _ => {

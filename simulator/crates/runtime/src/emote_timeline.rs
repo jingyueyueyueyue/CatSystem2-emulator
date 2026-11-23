@@ -572,6 +572,12 @@ pub(super) struct FrameContent<'a> {
 }
 
 impl<'a> FrameContent<'a> {
+    pub(super) fn borrowed_base(&self) -> Option<&PsbValue> {
+        match &self.base { Cow::Borrowed(value) => Some(value), Cow::Owned(_) => None }
+    }
+
+    pub(super) fn overrides(&self) -> &[(&'static str, PsbValue)] { &self.overrides }
+
     pub(super) fn borrowed(base: &'a PsbValue) -> Self {
         Self { base: Cow::Borrowed(base), overrides: Vec::new() }
     }

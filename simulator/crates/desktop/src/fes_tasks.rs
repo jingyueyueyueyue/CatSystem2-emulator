@@ -1,5 +1,9 @@
 //! Type-34 task ownership and ordinary 447/448/449. Script control is supplied
 //! by fes_driver; rendering/input effects use explicit platform callbacks.
+#[cfg(test)]
+#[path = "fes_sound_async_tests.rs"]
+mod real_sound_async_tests;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use cs2_script::{
@@ -127,6 +131,165 @@ pub(super) fn fes_button_media_hook(
     host.refresh_fes_button_media(owner, budget)
 }
 
+#[cfg(test)]
+mod async_invocation_tests {
+    use super::*;
+    use crate::{SoundChannelState, sound_async};
+    use cs2_runtime::{AudioChannel, AudioRequest, AudioStart, TaskCommand};
+    use cs2_script::{KcsProgram, Operand};
+    use std::time::{Duration, Instant};
+
+    fn sound_completion(host: &mut LoggingHost<'_>, view: &FesTaskView,
+        _: &mut FesRuntime, _: &mut FesScriptDriver) -> anyhow::Result<bool>
+    {
+        Ok(host.poll_task_audio_start(view.id)? != Some(NativeReturn::Retry))
+    }
+
+    fn fixture(mode: u32) -> (std::path::PathBuf, HeadlessPlayer, u32, u32,
+        std::sync::mpsc::Sender<cs2_runtime::RuntimeResult<()>>)
+    {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("cs2-fes-invoke-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile")).unwrap();
+        let root = player.current_task_id;
+        let (target, sibling) = player.with_host(|host| {
+            let target = host.create_task_object(34, root, b"audio FES", b"")?;
+            let sibling = host.create_task_object(0, root, b"sibling", b"")?;
+            let list = host.create_task_object(15, root, b"audio list", b"")?;
+            host.initialize_fes_image_list(list, 16, 16)?;
+            let document = FesDocument { sections: [b"START".as_slice(), b"MES_CHANGECONFIG".as_slice()]
+                .into_iter().enumerate().map(|(offset, header)| FesSection { header: header.to_vec(),
+                    lines: vec![FesLine { offset, bytes: b"wait 1".to_vec() }] }).collect() };
+            host.with_fes_task(target, |host, object| {
+                object.initialize(host)?;
+                object.bind_list(host, list)?;
+                object.runtime = Some(object.new_runtime(document)?);
+                assert!(object.prepare_script(host, 4096)?);
+                object.prepared = true;
+                object.loaded = true;
+                object.auxiliary_prepared = true;
+                Ok(())
+            })?;
+            host.data_services.tasks.fes.platform.finish_extension = Some(sound_completion);
+            Ok((target, sibling))
+        }).unwrap();
+        let mut code = Vec::new();
+        if mode == 0 || mode == 3 {
+            for (opcode, values) in [(0x25, vec![target]), (0x2b, vec![448, 4])] {
+                code.push(opcode);
+                for value in values { let operand = Operand::immediate(value);
+                    code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes()); }
+            }
+        }
+        code.push(0x3b);
+        let vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 256], 64).unwrap()).unwrap();
+        player.data_services.tasks.register_external_task(root, 0, &player.data_services.language.languages).unwrap();
+        player.vm = Some(vm);
+        let (completion, gate) = std::sync::mpsc::channel();
+        let AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start(AudioRequest {
+            channel: AudioChannel::SoundEffect, resource: "fes.ogg".into(), volume: 1., pan: 0., looped: false,
+        }, gate).unwrap() else { panic!("gated audio required"); };
+        player.sound_channels.insert(6, SoundChannelState { resource: Some("fes.ogg".into()),
+            pending_start: Some(sound_async::PendingSoundStart { started: Instant::now(), owner: target,
+                index: 157, value: 1, configured: Some(AudioChannel::SoundEffect), transition: None,
+                operation: sound_async::Operation::Start(ticket) }), ..Default::default() });
+        if mode == 1 {
+            player.with_host(|host| Ok(host.queue_task_command_buffers(TaskCommand {
+                target: target as i32, sender: root as i32, code: 339, data: [0; 3],
+            }, &crate::native_tasks::OwnedTaskBuffers::default(), &mut 0)?)).unwrap();
+        } else if mode == 2 || mode == 3 { player.data_services.language.system_settings_dirty = 1; }
+        (directory, player, target, sibling, completion)
+    }
+
+    fn exercise(mode: u32) {
+        let (directory, mut player, target, sibling, completion) = fixture(mode);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut frames = 0;
+        while Instant::now() < deadline {
+            assert!(player.advance_host_frame_with_retries(4096).unwrap(), "waiting FES invocation must not retain the whole frame");
+            assert!(player.sound_channels[&6].pending_start.is_some());
+            if mode == 0 || mode == 3 {
+                assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 6);
+                assert!(player.with_host(|host| Ok(host.task_waits_for_audio(host.current_task_id))).unwrap());
+            }
+            if mode == 2 {
+                assert!(player.data_services.tasks.pending_root_dispatch().is_none());
+                assert!(player.root_dispatch_waits_for_audio().unwrap());
+            }
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(frames > 5);
+        assert_eq!(u64::from(player.with_host(|host| Ok(host.data_services.tasks.task_clock(sibling).unwrap().current)).unwrap()),
+            player.state.clock.elapsed_ticks);
+        completion.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            player.advance_host_frame_with_retries(4096).unwrap();
+            if player.sound_channels[&6].pending_start.is_none()
+                && !player.data_services.tasks.fes.has_synchronous_calls()
+                && (!matches!(mode, 2 | 3) || player.data_services.language.system_settings_dirty == 0) { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        assert!(!player.data_services.tasks.fes.has_synchronous_calls());
+        if mode == 0 || mode == 3 { assert!(player.vm.as_ref().unwrap().instruction_pointer > 6); }
+        if mode == 1 { assert!(player.with_host(|host| Ok(host.update_task_command_buffers(target, 4096)?)).unwrap()); }
+        if mode == 2 || mode == 3 { assert_eq!(player.data_services.language.system_settings_dirty, 0); }
+        drop(player);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test] fn async_synchronous_fes_start_keeps_sibling_frames_for_500ms() { exercise(0); }
+    #[test] fn async_queued_fes_start_keeps_sibling_frames_for_500ms() { exercise(1); }
+    #[test] fn async_direct_fes_configuration_keeps_sibling_frames_for_500ms() { exercise(2); }
+    #[test] fn async_same_caller_configuration_waits_for_its_distinct_fes_start() { exercise(3); }
+
+    #[test]
+    fn async_ancestor_deletion_waits_for_its_callers_external_fes_completion() {
+        let (directory, mut player, target, _, completion) = fixture(0);
+        let root = player.current_task_id;
+        let (ancestor, caller) = player.with_host(|host| {
+            let ancestor = host.create_task_object(0, root, b"deleted ancestor", b"")?;
+            let caller = host.create_task_object(0, ancestor, b"in flight caller", b"")?;
+            Ok((ancestor, caller))
+        }).unwrap();
+        player.task_vms.insert(caller, player.vm.take().unwrap());
+        player.vm = Some(Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 64], 32).unwrap()).unwrap());
+        assert!(player.advance_host_frame_with_retries(4096).unwrap());
+        assert!(player.with_host(|host| Ok(host.task_waits_for_audio(caller))).unwrap());
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            let done = player.with_host(|host| Ok(host.receive_task_command(TaskCommand {
+                target: ancestor as i32, sender: root as i32, code: 3, data: [0; 3],
+            }, &mut cs2_runtime::TaskCommandBuffers::default(), &mut 0, 4096)?.unwrap().done)).unwrap();
+            assert!(!done);
+            assert!(player.task_parents.contains_key(&caller));
+            assert!(player.advance_host_frame_with_retries(4096).unwrap());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        completion.send(Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            player.advance_host_frame_with_retries(4096).unwrap();
+            let done = player.with_host(|host| Ok(host.receive_task_command(TaskCommand {
+                target: ancestor as i32, sender: root as i32, code: 3, data: [0; 3],
+            }, &mut cs2_runtime::TaskCommandBuffers::default(), &mut 0, 4096)?.is_none_or(|outcome| outcome.done))).unwrap();
+            if done { break; }
+            std::thread::yield_now();
+        }
+        player.advance_host_frame_with_retries(4096).unwrap();
+        assert!(!player.task_parents.contains_key(&ancestor));
+        assert!(!player.task_parents.contains_key(&caller));
+        assert!(player.task_parents.contains_key(&target));
+        assert!(!player.data_services.tasks.fes.has_synchronous_calls());
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        drop(player);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 pub(super) fn fes_button_named_hook(
     host: &mut LoggingHost<'_>, owner: u32, name: &'static str, value: i32,
 ) -> Result<()> {
@@ -221,6 +384,12 @@ struct ActiveFesSend {
 #[derive(Clone, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 struct FesSlot {
+    #[serde(skip)]
+    sync_caller: Option<u32>,
+    #[serde(skip)]
+    sync_operation: Option<u32>,
+    #[serde(skip)]
+    sync_waiters: BTreeSet<u32>,
     object: Option<FesTask>,
     inputs: VecDeque<FesDriverInput>,
     context_initialized: bool,
@@ -374,6 +543,13 @@ struct ChildCreation {
 }
 
 impl FesTaskStore {
+    pub(crate) fn has_synchronous_calls(&self) -> bool {
+        self.slots.values().any(|slot| slot.sync_caller.is_some() || !slot.sync_waiters.is_empty())
+    }
+    pub(super) fn synchronous_callers(&self, id: u32) -> Vec<u32> {
+        self.slots.get(&id).map_or_else(Vec::new, |slot|
+            slot.sync_caller.into_iter().chain(slot.sync_waiters.iter().copied()).collect())
+    }
     pub(super) fn set_hooks(&mut self, hooks: FesTaskHooks) {
         self.hooks = hooks;
     }
@@ -428,6 +604,9 @@ impl FesTaskStore {
                     button_refresh: None,
                     lower_notification: None,
                 }),
+                sync_caller: None,
+                sync_operation: None,
+                sync_waiters: BTreeSet::new(),
                 inputs: VecDeque::new(),
                 context_initialized: false,
                 named_dwords: BTreeMap::new(),
@@ -550,6 +729,7 @@ impl FesTaskStore {
 
     /// Called only after prepare_fes_task_release completed.
     pub(super) fn release(&mut self, id: u32) {
+        for slot in self.slots.values_mut() { slot.sync_waiters.remove(&id); }
         self.platform.remove_task(id);
         self.slots.remove(&id);
     }
@@ -660,7 +840,7 @@ impl LoggingHost<'_> {
             slot.button_media_request = ButtonMediaRequest::Requested;
             return Ok(false);
         }
-        let done = self.with_fes_task(owner, |host, object| object.refresh_button_media(host, budget))?;
+        let done = self.with_synchronous_fes_task(owner, self.current_task_id, 0x10000, |host, object| object.refresh_button_media(host, budget))?;
         if done {
             self.data_services.tasks.fes.slots.get_mut(&owner).unwrap().button_media_request =
                 ButtonMediaRequest::Idle;
@@ -729,7 +909,7 @@ impl LoggingHost<'_> {
             });
             return Ok(false);
         }
-        let done = self.with_fes_task(owner, |host, object|
+        let done = self.with_synchronous_fes_task(owner, self.current_task_id, 0x10001, |host, object|
             object.notify_lower_input(host, notification.command, event, budget))?;
         if done {
             self.data_services.tasks.fes.slots.get_mut(&owner).unwrap()
@@ -1056,10 +1236,10 @@ impl LoggingHost<'_> {
                     return Err(native_state_error("FES 338 filename exceeds 259 bytes"));
                 }
                 let resolved = String::from_utf8(cp932_to_utf8(name)).expect("CP932 emits UTF-8");
-                self.with_fes_task(id, |host, object|
+                self.with_synchronous_fes_task(id, self.current_task_id, 338, |host, object|
                     object.load(host, name, &[resolved], budget))?
             }
-            339 => self.with_fes_task(id, |host, object| object.start(host, budget))?,
+            339 => self.with_synchronous_fes_task(id, self.current_task_id, 339, |host, object| object.start(host, budget))?,
             343 => {
                 let name = nul(buffers.data1.as_deref()
                     .ok_or_else(|| native_state_error("FES 343 requires a block name buffer"))?);
@@ -1081,7 +1261,7 @@ impl LoggingHost<'_> {
                 let bank = object.as_ref().map_or(0, |object| object.bank as u32);
                 self.call_fes_named_block(id, command.sender as u32, bank, name, object, budget)?
             }
-            348 => self.with_fes_task(id, |host, object|
+            348 => self.with_synchronous_fes_task(id, self.current_task_id, 348, |host, object|
                 object.set_paused(host, command.data[1], budget))?,
             342 | 346 | 347 | 349 | 350 | 357 | 358 => {
                 let request = match command.code {
@@ -1190,7 +1370,7 @@ impl LoggingHost<'_> {
             send.requested = Some(call);
             return Ok(false);
         }
-        self.with_fes_task(id, |host, task|
+        self.with_synchronous_fes_task(id, caller, 343, |host, task|
             task.system_command_with_context(host, 343, bank, name, object, budget))
     }
 
@@ -1219,7 +1399,7 @@ impl LoggingHost<'_> {
                     return Ok(NativeReturn::Continue);
                 }
                 self.bind_fes_shared_values(target, self.current_task_id)?;
-                self.with_fes_task(target, |host, object| {
+                self.with_synchronous_fes_task(target, self.current_task_id, 338, |host, object| {
                     object.initialize(host)?;
                     object.load(host, name, &names, SYNC_BUDGET)
                 })?
@@ -1228,7 +1408,7 @@ impl LoggingHost<'_> {
                 if !self.fes_target(target)? {
                     return Ok(NativeReturn::Continue);
                 }
-                self.with_fes_task(target, |host, object| object.start(host, SYNC_BUDGET))?
+                self.with_synchronous_fes_task(target, self.current_task_id, 339, |host, object| object.start(host, SYNC_BUDGET))?
             }
             449 => {
                 let list = read_u32(args, 4)?;
@@ -1278,7 +1458,7 @@ impl LoggingHost<'_> {
         if !self.fes_target(id)? {
             return Ok(true);
         }
-        self.with_fes_task(id, |host, object| {
+        self.with_synchronous_fes_task(id, self.current_task_id, 19, |host, object| {
             object.system_command(host, 19, 0, b"MES_CHANGECONFIG", budget)
         })
     }
@@ -1289,7 +1469,7 @@ impl LoggingHost<'_> {
         if !self.fes_target(id)? {
             return Ok(NativeReturn::Continue);
         }
-        let done = self.with_fes_task(id, |host, object| {
+        let done = self.with_synchronous_fes_task(id, self.current_task_id, 348, |host, object| {
             object.set_paused(host, value, SYNC_BUDGET)
         })?;
         Ok(if done {
@@ -1382,6 +1562,29 @@ impl LoggingHost<'_> {
             self.release_task_values(previous);
         }
         Ok(())
+    }
+
+    fn with_synchronous_fes_task(
+        &mut self, id: u32, caller: u32, operation: u32,
+        call: impl FnOnce(&mut Self, &mut FesTask) -> Result<bool>,
+    ) -> Result<bool> {
+        let slot = self.data_services.tasks.fes.slots.get_mut(&id)
+            .ok_or_else(|| native_state_error("synchronous FES owner is absent"))?;
+        if slot.sync_caller.is_some_and(|owner| owner != caller || slot.sync_operation != Some(operation)) {
+            slot.sync_waiters.insert(caller);
+            return Ok(false);
+        }
+        slot.sync_waiters.remove(&caller);
+        slot.sync_caller = Some(caller);
+        slot.sync_operation = Some(operation);
+        let result = self.with_fes_task(id, call);
+        if !matches!(result, Ok(false)) {
+            if let Some(slot) = self.data_services.tasks.fes.slots.get_mut(&id) {
+                slot.sync_caller = None;
+                slot.sync_operation = None;
+            }
+        }
+        result
     }
 
     fn with_fes_task<T>(
@@ -1487,6 +1690,19 @@ impl LoggingHost<'_> {
 }
 
 impl FesTask {
+    /// Nested input/media work belongs to the invocation that is already
+    /// updating these same banks, even when asynchronous I/O advances the
+    /// physical task clock before the nested scope is entered.
+    fn retained_media_now(&self, host: &LoggingHost<'_>) -> u32 {
+        self.lower_notification.as_ref().map(|notification| notification.now)
+            .or_else(|| self.system.as_ref().map(|system| system.now))
+            .or(self.invocation_now)
+            .or(self.start_now)
+            .or(self.load_now)
+            .unwrap_or_else(|| host.data_services.tasks.task_clock(self.id)
+                .map_or(0, |clock| clock.elapsed()))
+    }
+
     /// The sender waits for this exact input handler, while an already
     /// suspended scene/system handler keeps its own queues and pending host
     /// effect. Both operate on the same interpreter, locals and named bank.
@@ -1513,9 +1729,7 @@ impl FesTask {
         } else {
             self.lower_notification = Some(LowerNotification {
                 request: LowerNotificationRequest { command, input: input.clone(), complete: false },
-                now: self.system.as_ref().map(|system| system.now)
-                    .unwrap_or_else(|| host.data_services.tasks.task_clock(self.id)
-                        .map_or(0, |clock| clock.elapsed())),
+                now: self.retained_media_now(host),
                 entered: false, notifications: None, pending_effect: None,
             });
         }
@@ -1595,9 +1809,7 @@ impl FesTask {
             {
                 return Ok(false);
             }
-            let now = self.system.as_ref().map(|system| system.now)
-                .unwrap_or_else(|| host.data_services.tasks.task_clock(self.id)
-                .map_or(0, |clock| clock.elapsed()));
+            let now = self.retained_media_now(host);
             self.button_refresh = Some(ButtonMediaRefresh {
                 now, motion_advanced: false, media_advanced: false,
                 pending_effect: None, notifications: None,
@@ -2971,7 +3183,7 @@ impl FesTask {
                         pending.phase = ChildPhase::Complete;
                     } else {
                         let names = host.fes_resource_names(&pending.name)?;
-                        if !host.with_fes_task(id, |host, object| {
+                        if !host.with_synchronous_fes_task(id, host.current_task_id, 338, |host, object| {
                             object.load(host, &pending.name, &names, budget)
                         })? {
                             return Ok(false);
@@ -2980,7 +3192,7 @@ impl FesTask {
                     }
                 }
                 ChildPhase::Start => {
-                    if !host.with_fes_task(id, |host, object| object.start(host, budget))? {
+                    if !host.with_synchronous_fes_task(id, host.current_task_id, 339, |host, object| object.start(host, budget))? {
                         return Ok(false);
                     }
                     pending.phase = ChildPhase::Complete;

@@ -41,6 +41,7 @@ impl LoggingHost<'_> {
             samples: pcm.samples,
         }));
         let identity = super::sound_native::next_sound_resource_identity()?;
+        self.cancel_audio_channel_start(channel)?;
         let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
         if let Some(handle) = state.handle {
             if let Err(cause) = self.audio_host.stop(handle) {

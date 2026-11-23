@@ -475,6 +475,9 @@ impl LoggingHost<'_> {
             return Ok(Some(outcome));
         }
         let consumed = TaskCommandOutcome { done: true, propagate: false };
+        if command.code == 3 && self.defer_audio_subtree_deletion(id) {
+            return Ok(Some(TaskCommandOutcome { done: false, propagate: false }));
+        }
         let (kind, deletion) = {
             let record = &self.data_services.tasks.records[&id];
             (record.kind, record.deletion)

@@ -33,6 +33,7 @@ pub use audio_decode::{AudioCodec, AudioProbe, DecodedAudio};
 pub use audio_control::{set_playback_properties, set_playback_repeat_count};
 mod sound_native;
 mod sound_control;
+mod sound_async;
 mod sound_task;
 mod reserved_native;
 mod sound_legacy;
@@ -79,6 +80,7 @@ mod legacy_native925;
 mod ordinary_native;
 mod ordinary_pair_table;
 mod resource_preload;
+mod script_prefetch;
 mod name_table_format;
 mod image_native;
 mod image_export_native;
@@ -304,6 +306,8 @@ impl ParticleObjectState {
 #[derive(Debug, Clone, PartialEq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 struct SoundChannelState {
+    #[serde(skip)]
+    pending_start: Option<sound_async::PendingSoundStart>,
     resource: Option<String>,
     handle: Option<u64>,
     looped: bool,
@@ -463,6 +467,7 @@ impl Default for DesktopInputTask {
 impl Default for SoundChannelState {
     fn default() -> Self {
         Self {
+            pending_start: None,
             resource: None,
             handle: None,
             looped: false,
@@ -694,6 +699,7 @@ impl SoundChannelState {
     }
 
     fn release(&mut self) {
+        self.pending_start = None;
         self.handle = None;
         self.paused = false;
         self.resource = None;
@@ -7104,6 +7110,8 @@ pub struct HeadlessPlayer {
     message_wait_address: Option<u32>,
     pending_messages: VecDeque<[u32; 4]>,
     pending_fes_events: VecDeque<PendingFesInput>,
+    audio_input_deferred: bool,
+    audio_configuration_deferred: bool,
     canvas: Canvas,
     graphics_canvas: Canvas,
     scene_compositor: scene_compositor::SceneCompositor,
@@ -7224,6 +7232,8 @@ impl HeadlessPlayer {
             message_wait_address: None,
             pending_messages: VecDeque::new(),
             pending_fes_events: VecDeque::new(),
+            audio_input_deferred: false,
+            audio_configuration_deferred: false,
             canvas,
             graphics_canvas,
             scene_compositor: scene_compositor::SceneCompositor::default(),
@@ -7317,6 +7327,7 @@ impl HeadlessPlayer {
             &player.scan.resources,
             Arc::clone(&player.font),
         );
+        player.log.push(player.data_services.message_device.font_prewarm_report());
         player.initialize_message_timing().context("initialize message settings")?;
         player.apply_media_settings().context("initialize movie settings")?;
         if let Some(entry) = &player.default_entry {
@@ -7329,6 +7340,11 @@ impl HeadlessPlayer {
         player.initialize_configuration_host()?;
         player.with_host(|host| Ok(host.initialize_root_sound_service()?))?;
         player.initialize_enabled_speech().context("initialize enabled speech provider")?;
+        // Prepare one immutable index snapshot during startup. A cold material
+        // request must not deep-clone the archive index on the game frame.
+        let material_resources = Arc::new(player.scan.resources.clone());
+        player.data_services.sound_async.resources = Some(Arc::clone(&material_resources));
+        player.data_services.emote.set_material_resources(material_resources);
         Ok(player)
     }
 
@@ -7678,9 +7694,13 @@ impl HeadlessPlayer {
             // All LoggingHost and VM borrows have returned at this safe point.
             self.service_object_graph_request().context("service object graph transaction")?;
             if self.frame_phase == PlayerFramePhase::Start {
+            self.audio_host.poll().context("poll asynchronous audio completions")?;
+            self.update_script_prefetch();
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
             self.data_services.ordinary.stage_preloaded_model();
-            self.apply_pending_host_input().context("consume queued platform input")?;
+            if !self.audio_input_deferred {
+                self.apply_pending_host_input().context("consume queued platform input")?;
+            }
             self.particle_frame_cursor = None;
             self.state.clock.frame = self.state.clock.frame.saturating_add(1);
             if self.data_services.top_clock.sampled == 0 {
@@ -7698,9 +7718,14 @@ impl HeadlessPlayer {
             }
             if self.frame_phase == PlayerFramePhase::Input {
             let _timing = measure_host_phase(HostPhase::ScriptInput);
-            if !self.advance_host_device_keys_scan(instruction_budget)
-                .context("scan configured keys and finish input callbacks")?
-            { continue; }
+            let input_complete = self.advance_host_device_keys_scan(instruction_budget)
+                .context("scan configured keys and finish input callbacks")?;
+            if !input_complete {
+                if !self.input_dispatch_waits_for_audio()? { continue; }
+                self.audio_input_deferred = true;
+                self.frame_phase = PlayerFramePhase::Children;
+            } else {
+            self.audio_input_deferred = false;
             let frame = self.state.clock.frame;
             self.dispatch_pending_task_input().context("route input to FES tasks")?;
             if let Some(cst) = self.cst.as_mut() {
@@ -7726,6 +7751,7 @@ impl HeadlessPlayer {
                 )?;
             }
             self.frame_phase = PlayerFramePhase::Children;
+            }
             }
             let frame = self.state.clock.frame;
             let waiting_for_input = self.message_wait_address.is_some();
@@ -7811,6 +7837,7 @@ impl HeadlessPlayer {
                 let execution = (|| -> cs2_script::Result<Option<cs2_script::ResumeStep>> {
                     // Child clocks update before child bodies, then the root
                     // body resumes. Continuations reuse this frame's time.
+                    let mut callback_waiting = self.audio_input_deferred || self.audio_configuration_deferred;
                     if self.frame_phase == PlayerFramePhase::Children {
                         if let Some((target, mut packet)) = host.data_services.tasks.pending_root_dispatch() {
                             if target != host.current_task_id {
@@ -7818,7 +7845,10 @@ impl HeadlessPlayer {
                             }
                             let original = packet;
                             match host.dispatch_external_task_message(vm, &mut packet, instruction_budget)? {
-                                Some(cs2_script::ResumeStep::Yield) => return Ok(None),
+                                Some(cs2_script::ResumeStep::Yield) => {
+                                    if !host.task_waits_for_audio(target) { return Ok(None); }
+                                    callback_waiting = true;
+                                }
                                 step => host.data_services.tasks.complete_root_dispatch_step(target, original, packet, step)?,
                             }
                         }
@@ -7828,6 +7858,15 @@ impl HeadlessPlayer {
                             return Ok(None);
                         }
                         self.frame_phase = PlayerFramePhase::Root;
+                    }
+                    if callback_waiting {
+                        // An input/configuration callback may be parked behind
+                        // this already-running root invocation's FES call.
+                        // Let its producer finish; a new root entry still waits.
+                        if vm.has_pending_ordinary_resume() {
+                            return host.resume_external_task(vm, instruction_budget).map(Some);
+                        }
+                        return Ok(Some(cs2_script::ResumeStep::Yield));
                     }
                     self.pending_messages.extend(
                         host.drain_root_task_messages_with_vm(host.current_task_id, vm)?,
@@ -7847,6 +7886,8 @@ impl HeadlessPlayer {
                     }
                     host.resume_external_task(vm, instruction_budget).map(Some)
                 })();
+                let root_audio_waiting = host.task_waits_for_audio(host.current_task_id)
+                    || self.audio_input_deferred || self.audio_configuration_deferred;
                 if execution.is_ok() && self.data_services.tasks.object_graph_request_pending() {
                     // Retry is a native event, not an instruction-budget
                     // result. Freeze this exact Root stage before consuming
@@ -7938,7 +7979,7 @@ impl HeadlessPlayer {
                     self.state.script = ScriptState::from_vm(vm);
                     self.state.script.current_script = self.state.scene.current_script.clone();
                 }
-                if root_budget_yield {
+                if root_budget_yield && !root_audio_waiting {
                     continue;
                 }
             }
@@ -7949,7 +7990,8 @@ impl HeadlessPlayer {
             if self.data_services.tasks.fes.is_direct_entry(self.current_task_id) {
                 let root = self.current_task_id;
                 let now = self.state.clock.elapsed_ticks as u32;
-                if !self.with_host(|host| Ok(host.advance_direct_fes_entry(root, now, instruction_budget)?))? {
+                if !self.with_host(|host| Ok(host.advance_direct_fes_entry(root, now, instruction_budget)?
+                    || host.task_waits_for_audio(root)))? {
                     continue;
                 }
             } else if self.fes.is_some() {
@@ -7962,6 +8004,13 @@ impl HeadlessPlayer {
                 continue;
             }
             for released in self.data_services.tasks.take_released_task_ids() {
+                self.with_host(|host| Ok(host.emote_release_task_hook(released)?))?;
+                let channels = self.sound_channels.iter().filter_map(|(&channel, state)|
+                    state.pending_start.as_ref().filter(|pending| pending.owner == released).map(|_| channel)).collect::<Vec<_>>();
+                for channel in channels { self.with_host(|host| Ok(host.cancel_audio_channel_start(channel)?))?; }
+                self.data_services.sound_async.cancelled.remove(&released);
+                self.data_services.sound_async.loads.remove(&released);
+                self.data_services.sound_async.task_loads.remove(&released);
                 self.data_services.messages.release(released);
                 self.data_services.message_device.release(released as i32);
                 self.release_plane_state(released);
@@ -7984,13 +8033,20 @@ impl HeadlessPlayer {
             {
                 let _timing = measure_host_phase(HostPhase::Script);
                 if !self.service_pending_root_dispatch(instruction_budget)? {
-                    continue;
+                    if !self.root_dispatch_waits_for_audio()? { continue; }
+                    self.audio_configuration_deferred = true;
+                    self.frame_phase = PlayerFramePhase::Render;
                 }
             }
+            if self.frame_phase == PlayerFramePhase::Configuration {
             if !self.finish_language_frame().context("refresh language and configuration")? {
-                continue;
+                if !self.root_dispatch_waits_for_audio()? { continue; }
+                self.audio_configuration_deferred = true;
+            } else {
+                self.audio_configuration_deferred = false;
             }
             self.frame_phase = PlayerFramePhase::Render;
+            }
             }
             self.render_scene().context("render logical scene")?;
             self.capture_completed_frame();
@@ -8010,6 +8066,10 @@ impl HeadlessPlayer {
             let Some(mut state) = self.sound_channels.remove(&channel) else {
                 continue;
             };
+            if state.pending_start.is_some() {
+                self.sound_channels.insert(channel, state);
+                continue;
+            }
             let active = match state.handle {
                 Some(handle) => match self.audio_host.is_active(handle) {
                     Ok(active) => active,
@@ -12661,6 +12721,9 @@ impl LoggingHost<'_> {
         }
         let mut first_channel = None;
         for channel in first..=last.min(63) {
+            if self.sound_channels.get(&channel).is_some_and(|state| state.pending_start.is_some()) {
+                continue;
+            }
             first_channel.get_or_insert(channel);
             let active = match self
                 .sound_channels
@@ -12692,6 +12755,247 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn gated_audio_player(channel_type: AudioChannel) -> (TempDir, HeadlessPlayer, std::sync::mpsc::Sender<cs2_runtime::RuntimeResult<()>>) {
+        let temp = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile")).unwrap();
+        let (completion, gate) = std::sync::mpsc::channel();
+        let request = AudioRequest { channel: channel_type, resource: "mock.ogg".into(), volume: 1.0, pan: 0.0, looped: false };
+        let cs2_runtime::AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start(request, gate).unwrap() else { panic!("driver must be pending"); };
+        player.sound_channels.insert(6, SoundChannelState { resource: Some("mock.ogg".into()),
+            pending_start: Some(sound_async::PendingSoundStart { started: std::time::Instant::now(), owner: player.current_task_id,
+                index: 157, value: 1, configured: Some(channel_type), transition: None,
+                operation: sound_async::Operation::Start(ticket) }), ..Default::default() });
+        let mut code = Vec::new();
+        for (opcode, operands) in [(0x25, vec![6]), (0x25, vec![1]), (0x2b, vec![157, 8])] {
+            code.push(opcode);
+            for value in operands {
+                let operand = cs2_script::Operand::immediate(value);
+                code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
+            }
+        }
+        code.push(0x3b);
+        let vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 256], 64).unwrap()).unwrap();
+        player.data_services.tasks.set_factory_external(vm.external_binding());
+        player.data_services.tasks.register_external_task(player.current_task_id, 0, &player.data_services.language.languages).unwrap();
+        player.vm = Some(vm);
+        (temp, player, completion)
+    }
+
+    #[test]
+    fn async_audio_wait_keeps_frames_and_script_order_until_completion() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::SoundEffect);
+        let before = player.state.clock.frame;
+        for _ in 0..5 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap(), "pending audio must not retain the entire frame");
+            assert!(player.sound_channels[&6].handle.is_none());
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 12, "the next script opcode must not run early");
+        }
+        assert_eq!(player.state.clock.frame, before + 5);
+        completion.send(Ok(())).unwrap();
+        for _ in 0..100 {
+            player.advance_host_frame_with_retries(1_000).unwrap();
+            if player.sound_channels[&6].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        assert!(player.sound_channels[&6].handle.is_some());
+        assert!(player.vm.as_ref().unwrap().instruction_pointer > 12);
+    }
+
+    #[test]
+    fn async_audio_half_second_driver_wait_keeps_submitting_frames() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::SoundEffect);
+        let started = std::time::Instant::now();
+        let driver = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            completion.send(Ok(())).unwrap();
+        });
+        let mut frames_while_pending = 0;
+        let mut slowest_frame = std::time::Duration::ZERO;
+        while player.sound_channels[&6].pending_start.is_some() {
+            let tick = std::time::Instant::now();
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            slowest_frame = slowest_frame.max(tick.elapsed());
+            if player.sound_channels[&6].pending_start.is_some() {
+                frames_while_pending += 1;
+                assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 12);
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            std::thread::yield_now();
+        }
+        driver.join().unwrap();
+        assert!(frames_while_pending >= 3, "device confirmation must not serialize the rendering frame");
+        eprintln!("async_audio_mock driver_delay_ms=500 completed_frames_while_pending={frames_while_pending} wall_us={} max_frame_us={}",
+            started.elapsed().as_micros(), slowest_frame.as_micros());
+    }
+
+    #[test]
+    fn async_audio_independent_tasks_complete_without_global_barrier() {
+        let (_temp, mut player, root_completion) = gated_audio_player(AudioChannel::SoundEffect);
+        let child = player.with_host(|host| Ok(host.create_unloaded_ordinary_task(0, b"")?)).unwrap();
+        let mut code = player.vm.as_ref().unwrap().program().unwrap().code.to_vec();
+        code[2..6].copy_from_slice(&7u32.to_le_bytes());
+        player.register_task_vm(child, Vm::from_program(KcsProgram::from_code(&code, vec![0; 256], 64).unwrap()).unwrap()).unwrap();
+        let (completion, gate) = std::sync::mpsc::channel();
+        let request = AudioRequest { channel: AudioChannel::Voice, resource: "second.ogg".into(), volume: 1.0, pan: 0.0, looped: false };
+        let cs2_runtime::AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start(request, gate).unwrap() else { panic!("pending driver"); };
+        player.sound_channels.insert(7, SoundChannelState { resource: Some("second.ogg".into()),
+            pending_start: Some(sound_async::PendingSoundStart { started: std::time::Instant::now(), owner: child,
+                index: 157, value: 1, configured: Some(AudioChannel::Voice), transition: None,
+                operation: sound_async::Operation::Start(ticket) }), ..Default::default() });
+        for _ in 0..3 { assert!(player.advance_host_frame_with_retries(1_000).unwrap()); }
+        assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 12);
+        assert_eq!(player.task_vms[&child].instruction_pointer, 12);
+        completion.send(Ok(())).unwrap();
+        for _ in 0..100 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            if player.sound_channels[&7].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&7].handle.is_some());
+        assert!(player.task_vms[&child].instruction_pointer > 12);
+        assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 12, "unrelated root keeps its own pending native");
+        let _ = root_completion.send(Ok(()));
+    }
+
+    #[test]
+    fn async_audio_synchronous_sound_message_retains_its_dispatch_cursor() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::SoundEffect);
+        let root = player.current_task_id;
+        let sound = player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let mut code = Vec::new();
+        for value in [sound, 183, 6, 1] {
+            let operand = cs2_script::Operand::immediate(value);
+            code.push(0x25); code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
+        }
+        code.push(0x2b);
+        for value in [69, 16] {
+            let operand = cs2_script::Operand::immediate(value);
+            code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
+        }
+        code.push(0x3b);
+        player.vm = Some(Vm::from_program(KcsProgram::from_code(&code, vec![0; 256], 64).unwrap()).unwrap());
+        for _ in 0..3 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 24);
+        }
+        completion.send(Ok(())).unwrap();
+        for _ in 0..100 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            if player.sound_channels[&6].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&6].handle.is_some());
+        assert!(player.vm.as_ref().unwrap().instruction_pointer > 24);
+    }
+
+    #[test]
+    fn async_audio_linked_operation_waits_for_every_owned_channel() {
+        let (_temp, mut player, first) = gated_audio_player(AudioChannel::SoundEffect);
+        let (second, gate) = std::sync::mpsc::channel();
+        let request = AudioRequest { channel: AudioChannel::SoundEffect, resource: "linked.ogg".into(), volume: 1.0, pan: 0.0, looped: false };
+        let cs2_runtime::AudioStart::Pending(ticket) = player.audio_host.begin_test_pending_start(request, gate).unwrap() else { panic!("pending driver"); };
+        player.sound_channels.insert(38, SoundChannelState { resource: Some("linked.ogg".into()),
+            pending_start: Some(sound_async::PendingSoundStart { started: std::time::Instant::now(), owner: player.current_task_id,
+                index: 157, value: 1, configured: Some(AudioChannel::SoundEffect), transition: None,
+                operation: sound_async::Operation::Start(ticket) }), ..Default::default() });
+        first.send(Ok(())).unwrap();
+        for _ in 0..100 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            if player.sound_channels[&6].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&6].handle.is_some());
+        assert!(player.sound_channels[&38].pending_start.is_some());
+        assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 12, "the first completion must not acknowledge both channels");
+        second.send(Ok(())).unwrap();
+        for _ in 0..100 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            if player.sound_channels[&38].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&38].handle.is_some());
+        assert!(player.vm.as_ref().unwrap().instruction_pointer > 12);
+    }
+
+    #[test]
+    fn async_audio_resume_handles_an_endpoint_finishing_before_ack_consumption() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::SoundEffect);
+        let ticket = match player.sound_channels[&6].pending_start.as_ref().unwrap().operation {
+            sound_async::Operation::Start(ticket) => ticket, _ => unreachable!(),
+        };
+        completion.send(Ok(())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let playback = loop {
+            if let Some(playback) = player.audio_host.poll_play(ticket).unwrap() { break playback; }
+            assert!(std::time::Instant::now() < deadline); std::thread::yield_now();
+        };
+        let cs2_runtime::AudioControl::Pending(resume) = player.audio_host.begin_pause(playback.handle, false).unwrap()
+            else { panic!("pending resume"); };
+        // The fake endpoint stays alive until Stop; this simulates it retiring
+        // after accepting Resume but before the game consumes its reply.
+        let cs2_runtime::AudioControl::Pending(retired) = player.audio_host.begin_stop(playback.handle).unwrap()
+            else { panic!("pending retirement"); };
+        {
+            let state = player.sound_channels.get_mut(&6).unwrap();
+            state.handle = Some(playback.handle);
+            state.paused = true;
+            state.pending_start.as_mut().unwrap().operation = sound_async::Operation::Resume(resume, 0);
+        }
+        for _ in 0..100 {
+            assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+            if player.sound_channels[&6].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        assert!(player.sound_channels[&6].handle.is_none());
+        assert!(!player.sound_channels[&6].paused);
+        assert!(player.vm.as_ref().unwrap().instruction_pointer > 12);
+        player.audio_host.cancel_control(retired).unwrap();
+    }
+
+    #[test]
+    fn async_audio_timeout_keeps_sound_effect_nonfatal() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::SoundEffect);
+        assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+        completion.send(Err(RuntimeError::AudioStartTimeout("mock 500ms device startup".into()))).unwrap();
+        for _ in 0..100 {
+            player.advance_host_frame_with_retries(1_000).unwrap();
+            if player.sound_channels[&6].pending_start.is_none() { break; }
+            std::thread::yield_now();
+        }
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        assert!(player.sound_channels[&6].handle.is_none());
+        assert!(player.vm.as_ref().unwrap().instruction_pointer > 12);
+    }
+
+    #[test]
+    fn async_audio_timeout_preserves_voice_failure() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::Voice);
+        assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+        completion.send(Err(RuntimeError::AudioStartTimeout("mock voice failure".into()))).unwrap();
+        let mut failure = None;
+        for _ in 0..100 {
+            if let Err(error) = player.advance_host_frame_with_retries(1_000) { failure = Some(error); break; }
+            std::thread::yield_now();
+        }
+        assert!(failure.unwrap().to_string().contains("KCS"));
+    }
+
+    #[test]
+    fn async_audio_cancellation_does_not_reissue_start() {
+        let (_temp, mut player, completion) = gated_audio_player(AudioChannel::SoundEffect);
+        assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+        let owner = player.current_task_id;
+        player.with_host(|host| Ok(host.cancel_audio_channel_start(6)?)).unwrap();
+        assert!(player.data_services.sound_async.cancelled.contains(&owner));
+        assert!(player.advance_host_frame_with_retries(1_000).unwrap());
+        assert!(player.sound_channels[&6].pending_start.is_none());
+        assert!(player.sound_channels[&6].handle.is_none());
+        assert!(player.vm.as_ref().unwrap().instruction_pointer > 12);
+        let _ = completion.send(Ok(()));
+    }
 
     #[test]
     fn kanmi_native925_keeps_verified_profiles_and_arity() {

@@ -32,6 +32,8 @@ pub struct HostPerfDetails {
     sample_lists: bool,
     gpu_output: GpuOutputSample,
     emote_gpu: EmoteGpuSample,
+    warmup_notes: Vec<String>,
+    audio_async_notes: Vec<String>,
 }
 
 struct Capture(Option<HostPerfDetails>);
@@ -74,6 +76,14 @@ impl HostPerfDetails {
         let text_reserve = text_summary.as_ref().map_or(0, |row| {
             row.len() + " detail_wire_dropped=\n".len() + MAX_TEXT.ilog10() as usize + 1
         });
+        for note in &self.warmup_notes {
+            append_row_reserving(&mut rows,
+                &format!("resource_warmup session={session} frame={frame} call={call} {note}"), text_reserve);
+        }
+        for note in &self.audio_async_notes {
+            append_row_reserving(&mut rows,
+                &format!("audio_async session={session} frame={frame} call={call} {note}"), text_reserve);
+        }
         self.tasks.sort_by_key(|sample| std::cmp::Reverse(sample.us));
         self.lists.sort_by_key(|sample| std::cmp::Reverse(sample.us));
         for task in &self.tasks {
@@ -163,6 +173,26 @@ impl HostPerfDetails {
         }
         rows
     }
+}
+
+// Portable notes travel through the existing host profile wire; the platform
+// bridge owns logcat output. Keep both row count and message length bounded.
+pub(super) fn resource_warmup_note(note: &str) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot && detail.warmup_notes.len() < 4 {
+            detail.warmup_notes.push(note.chars().take(192)
+                .map(|character| if character.is_control() { ' ' } else { character }).collect());
+        }
+    });
+}
+
+pub(super) fn audio_async_note(note: &str) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot && detail.audio_async_notes.len() < 8 {
+            detail.audio_async_notes.push(note.chars().take(192)
+                .map(|character| if character.is_control() { ' ' } else { character }).collect());
+        }
+    });
 }
 
 // Report issued transfer bytes, including failed submissions, with elapsed

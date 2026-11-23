@@ -326,7 +326,9 @@ impl HeadlessPlayer {
     }
 
     pub fn apply_host_input(&mut self, event: InputEvent) -> Result<()> {
-        if self.frame_in_progress() && !matches!(event, InputEvent::FocusChanged(_) | InputEvent::QuitRequested) {
+        if (self.frame_in_progress() || self.audio_input_deferred)
+            && !matches!(event, InputEvent::FocusChanged(_) | InputEvent::QuitRequested)
+        {
             if self.data_services.pending_host_input.len() >= 4096 {
                 anyhow::bail!("platform input queue exceeds 4096 events");
             }
@@ -378,6 +380,7 @@ impl HeadlessPlayer {
     }
 
     pub(super) fn apply_pending_host_input(&mut self) -> Result<()> {
+        if self.audio_input_deferred { return Ok(()); }
         while let Some(event) = self.data_services.pending_host_input.pop_front() {
             self.apply_host_input(event)?;
         }
@@ -399,7 +402,7 @@ impl HeadlessPlayer {
         let continued = self.frame_in_progress();
         self.run_frames(1, instruction_budget)?;
         let completed = !self.frame_in_progress() && (continued || self.state.clock.frame != before);
-        if completed { self.state.input.commit(); }
+        if completed && !self.audio_input_deferred { self.state.input.commit(); }
         Ok(completed)
     }
 

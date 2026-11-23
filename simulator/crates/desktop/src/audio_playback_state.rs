@@ -228,6 +228,10 @@ impl DesktopAudioHost {
     }
     fn parameters(&self, id: u64) -> Option<&Arc<AudioParameters>> { self.playback(id).map(|p| &p._parameters) }
     pub(crate) fn freeze_checkpoint(&self) -> cs2_runtime::RuntimeResult<CapturedAudioState> {
+        if !self.pending.is_empty() || !self.controls.is_empty() || !self.ogg.controls.is_empty() || !self.wav.controls.is_empty() || !self.ogg.pending.is_empty() || !self.wav.pending.is_empty()
+            || self.ogg.retiring.iter().chain(&self.wav.retiring).any(|p| p.thread.as_ref().is_some_and(|t| !t.is_finished())) {
+            return Err(error("SOUND checkpoint has an unacknowledged or retiring device start"));
+        }
         if self.handles.len() > 64 || self.ogg.active.len() + self.wav.active.len() != self.handles.len() {
             return Err(error("SOUND checkpoint host/backend ownership differs"));
         }
@@ -266,7 +270,7 @@ impl DesktopAudioHost {
         if saved.version != 1 || saved.playbacks.len() > 64 { return Err(error("unsupported physical audio checkpoint")); }
         let ogg_resolve = self.resolve.clone(); let wav_resolve = self.resolve.clone();
         let mut host = DesktopAudioHost { resolve: self.resolve.clone(), ogg: WavAudioHost::new(move |name| ogg_resolve(name)),
-            wav: WavAudioHost::new(move |name| wav_resolve(name)), handles: HashMap::new() };
+            wav: WavAudioHost::new(move |name| wav_resolve(name)), handles: HashMap::new(), pending: HashMap::new(), controls: HashMap::new() };
         host.ogg.suspended = self.ogg.suspended; host.wav.suspended = self.wav.suspended;
         for (id, mut playback) in saved.playbacks {
             if id == 0 || id == u64::MAX || playback.resource.is_empty() || playback.resource.len() > 4096 || playback.resource.contains('\0') {

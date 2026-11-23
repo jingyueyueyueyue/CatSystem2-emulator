@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 
 #[path = "fes_snapshot.rs"]
 mod fes_snapshot;
+#[path = "fes_lookahead.rs"]
+mod fes_lookahead;
+pub use fes_lookahead::{FesStaticCommand, FesStaticLookahead};
 
 const MAX_FES_CALL_DEPTH: usize = 128;
 const MAX_FES_BLOCKS: usize = 1_000_000;
