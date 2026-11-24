@@ -5402,32 +5402,8 @@ impl LoggingHost<'_> {
                 "native 1002 requires exactly 8 argument bytes",
             )),
             605..=607 | 844 => self.legacy_sound_native(index, arguments, vm),
-            359 if arguments.len() == 16
-                && self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA) =>
-            {
-                self.campanella_configuration_export(arguments, vm)
-            }
-            359 if arguments.len() == 16 => {
-                self.ensure_legacy_sound_settings()?;
-                for (index, block) in self.system_config_blocks.iter().enumerate() {
-                    let address = word(index * 4).unwrap();
-                    if vm.read(address, 1).is_ok() {
-                        vm.write(address, block)?;
-                    }
-                }
-                Ok(NativeReturn::Continue)
-            }
-            360 if arguments.len() == 12 => {
-                self.ensure_legacy_sound_settings()?;
-                for (index, block) in self.system_config_blocks.iter_mut().take(3).enumerate() {
-                    let address = word(index * 4).unwrap();
-                    if vm.read(address, 1).is_ok() {
-                        let bytes = vm.read(address, block.len())?;
-                        block.copy_from_slice(&bytes);
-                    }
-                }
-                Ok(NativeReturn::Continue)
-            }
+            359 if arguments.len() == 16 => self.configuration_export(arguments, vm),
+            360 if arguments.len() == 12 => self.configuration_import(arguments, vm),
             359 | 360 => Err(cs2_script::ScriptError::InvalidStructuredText {
                 offset: 0,
                 message: "system native argument byte count is invalid",

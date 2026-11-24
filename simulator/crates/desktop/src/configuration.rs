@@ -12,10 +12,42 @@ use super::{DesktopSoundConfig, DesktopSoundPart, HeadlessPlayer, LoggingHost, L
 pub(super) const CAMPANELLA_BOOT_PATH: &[&[u8]] = &[b"document", b"sysstr", b"boot"];
 const CAMPANELLA_ADV_SHA256: &str = "5e55b26f8c9637054486a3fe303e25f863a29ae5deda96554e2dc9517e320b22";
 const CAMPANELLA_CONFIG_LENGTHS: [usize; 4] = [0xb28, 0x20, 0x1c, 0x0c];
+const TUNABAN_CONFIG_LENGTHS: [usize; 4] = [0xb28, 0x20, 0x18, 0x0c];
 
-fn campanella_sound_block(modern: &[u8]) -> cs2_script::Result<[u8; 0xb28]> {
+// Copy lengths from the registered 359/360 wrappers of each original PE.
+fn configuration_lengths(sha: Option<&str>) -> [usize; 4] {
+    match sha {
+        Some(super::css_model::SHA | "985096b6064e35c7f48c080aa9008d67442fc0df7e33fec7210fe13fefc1dc4f") =>
+            TUNABAN_CONFIG_LENGTHS,
+        Some(CAMPANELLA_SHA) => CAMPANELLA_CONFIG_LENGTHS,
+        Some(super::css_model::UTATE_SHA) => [0xb28, 0x34, 0x1c, 0x0c],
+        Some(
+            "f6af7437475b8c066be973245aa79688bea510ca1192264add4f1914ebee4c0e"
+            | "012c71635932c241cde4df986377516279a50b907166757e89ea7b86ff3f813f"
+            | "9f3a5ad0ed22074420685f1e2a3bc92436d68289c7bac854d5f7d7331dc3ef67"
+            | "ac226c8455eff72114d6b1b9929fae01ac49ba90b8ba579f049f179c4c6dd8d5"
+            | "b70a802a74c49a5d6f429114f81d878f83e25a4acbcb2778c6f4d5f68528de7b",
+        ) => [0xb28, 0x38, 0x1c, 0x0c],
+        Some(
+            "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c"
+            | "f36f63798eb27b1eb6742c2fe7c3a13f172a249ee6623a12fc79fd8c3dee3cfe",
+        ) => [0x15fc, 0x38, 0x1c, 0x0c],
+        Some(
+            "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f"
+            | "c47c9d883126f641ce07d92eb57b6ac9833fe7495996001c12c68c55b99974d3"
+            | "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1"
+            | "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78"
+            | "7bd9f6dcc7d62868d4ad9cc68d5580452e71bd907540ec4f993d960d051d2c45"
+            | "a540b1dec1185a63cc68c4d283b6bc99bcce8de219e1bead3b8d113577de4027"
+            | "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3",
+        ) => [0x15fc, 0x3c, 0x1c, 0x0c],
+        _ => [0x15fc, 0x48, 0x20, 0x0c],
+    }
+}
+
+fn legacy_sound_block(modern: &[u8]) -> cs2_script::Result<[u8; 0xb28]> {
     let raw_volumes = modern.get(0x15d4..0x15e8)
-        .ok_or_else(|| native_state_error("Campanella sound configuration source is truncated"))?;
+        .ok_or_else(|| native_state_error("sound configuration source is truncated"))?;
     let mut legacy = [0; 0xb28];
     legacy[..20].copy_from_slice(&modern[..20]);
     for channel in 0..32 {
@@ -36,16 +68,46 @@ fn campanella_sound_block(modern: &[u8]) -> cs2_script::Result<[u8; 0xb28]> {
     Ok(legacy)
 }
 
-fn write_campanella_configuration(
-    blocks: &[Vec<u8>; 4], addresses: [u32; 4], vm: &mut Vm,
+fn write_system_configuration(
+    blocks: &[Vec<u8>; 4], addresses: [u32; 4], lengths: [usize; 4], vm: &mut Vm,
 ) -> cs2_script::Result<()> {
-    let sound = campanella_sound_block(&blocks[0])?;
+    let legacy_sound = (lengths[0] == 0xb28).then(|| legacy_sound_block(&blocks[0])).transpose()?;
     for (index, address) in addresses.into_iter().enumerate() {
-        let block = if index == 0 { sound.as_slice() } else { &blocks[index] };
+        let block = match (index, &legacy_sound) {
+            (0, Some(sound)) => sound.as_slice(),
+            _ => &blocks[index],
+        };
         if vm.read(address, 1).is_ok() {
-            let bytes = block.get(..CAMPANELLA_CONFIG_LENGTHS[index])
-                .ok_or_else(|| native_state_error("Campanella configuration source is truncated"))?;
+            let bytes = block.get(..lengths[index])
+                .ok_or_else(|| native_state_error("configuration source is truncated"))?;
             vm.write(address, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_system_configuration(
+    blocks: &mut [Vec<u8>; 4], addresses: [u32; 3], lengths: [usize; 4], vm: &Vm,
+) -> cs2_script::Result<()> {
+    for (index, address) in addresses.into_iter().enumerate() {
+        if vm.read(address, 1).is_err() {
+            continue;
+        }
+        let bytes = vm.read(address, lengths[index])?;
+        let modern = &mut blocks[index];
+        if index == 0 && lengths[0] == 0xb28 {
+            modern[..20].copy_from_slice(&bytes[..20]);
+            for channel in 0..32 {
+                let source = 20 + 0x58 * channel;
+                let target = 20 + 116 * channel;
+                modern[target..target + 40].copy_from_slice(&bytes[source..source + 40]);
+                modern[target + 40..target + 80].fill(0);
+                modern[target + 40..target + 56].copy_from_slice(&bytes[source + 40..source + 56]);
+                modern[target + 84..target + 116].copy_from_slice(&bytes[source + 56..source + 0x58]);
+            }
+            modern[0x15d4..0x15e8].copy_from_slice(&bytes[0xb14..]);
+        } else {
+            modern[..bytes.len()].copy_from_slice(&bytes);
         }
     }
     Ok(())
@@ -61,7 +123,7 @@ fn campanella_native359_preserves_motion_slots_and_copy_order() {
     vm.write(0x8000_1168, &0x15f_u32.to_le_bytes()).unwrap();
     let untouched = vm.read(0x8000_0bc8, 0x16a0 - 0xbc8).unwrap();
 
-    write_campanella_configuration(&blocks, [0x8000_0098, 0x8000_0b80, 0x8000_0ba0, 0x8000_0bbc], &mut vm).unwrap();
+    write_system_configuration(&blocks, [0x8000_0098, 0x8000_0b80, 0x8000_0ba0, 0x8000_0bbc], configuration_lengths(Some(CAMPANELLA_SHA)), &mut vm).unwrap();
 
     assert_eq!(vm.read(0x8000_0097, 2).unwrap(), [0xa5, 0x11]);
     assert_eq!(vm.read(0x8000_0b80, 0x20).unwrap(), [0x22; 0x20]);
@@ -84,7 +146,7 @@ fn campanella_native359_maps_sound_fields_to_legacy_offsets() {
     modern[0x15d4..0x15e8].fill(0x9a);
     modern[0x15e8..].fill(0xbc);
 
-    let legacy = campanella_sound_block(&modern).unwrap();
+    let legacy = legacy_sound_block(&modern).unwrap();
     let channel = 20 + 0x58 * 31;
     assert_eq!(&legacy[..20], &[0x12; 20]);
     assert_eq!(&legacy[channel..channel + 40], &[0x34; 40]);
@@ -92,6 +154,41 @@ fn campanella_native359_maps_sound_fields_to_legacy_offsets() {
     assert_eq!(&legacy[channel + 54..channel + 56], &[0; 2]);
     assert_eq!(&legacy[channel + 56..channel + 0x58], &[0x78; 32]);
     assert_eq!(&legacy[0xb14..], &[0x9a; 20]);
+}
+
+#[cfg(test)]
+#[test]
+fn tunaban_configuration_preserves_scene_planes_and_modern_only_fields() {
+    let mut blocks = [vec![0x11; 5628], vec![0x22; 72], vec![0x33; 32], vec![0x44; 12]];
+    let mut vm = Vm::new();
+    vm.bind_external(vec![0xa5; 0x13400]).unwrap();
+    let addresses = [0x8001_1d88, 0x8001_2870, 0x8001_2890, 0x8001_28a8];
+    let planes = 0x8001_2ae8;
+    let plane_data = vm.read(planes, 0x20 * 56).unwrap();
+    let lengths = configuration_lengths(Some(super::css_model::SHA));
+    write_system_configuration(&blocks, addresses, lengths, &mut vm).unwrap();
+    assert_eq!(vm.read(planes, plane_data.len()).unwrap(), plane_data);
+    assert_eq!(vm.read(addresses[1], 0x20).unwrap(), [0x22; 0x20]);
+    assert_eq!(vm.read(addresses[2], 0x18).unwrap(), [0x33; 0x18]);
+    assert_eq!(vm.read(addresses[3], 0x0c).unwrap(), [0x44; 0x0c]);
+    assert_eq!(vm.read(addresses[3] + 0x0c, 1).unwrap(), [0xa5]);
+
+    vm.write(0x8000_0100, &[0x55; 0xb28]).unwrap();
+    vm.write(addresses[1], &[0x66; 0x20]).unwrap();
+    vm.write(addresses[2], &[0x77; 0x18]).unwrap();
+    read_system_configuration(&mut blocks, [0x8000_0100, addresses[1], addresses[2]], lengths, &vm).unwrap();
+    let channel = 20 + 31 * 116;
+    assert_eq!(&blocks[0][channel..channel + 56], &[0x55; 56]);
+    assert_eq!(&blocks[0][channel + 56..channel + 80], &[0; 24]);
+    assert_eq!(&blocks[0][channel + 80..channel + 84], &[0x11; 4]);
+    assert_eq!(&blocks[0][channel + 84..channel + 116], &[0x55; 32]);
+    assert_eq!(&blocks[0][channel + 116..channel + 120], &[0x11; 4]);
+    assert_eq!(&blocks[0][0x15d4..0x15e8], &[0x55; 20]);
+    assert_eq!(&blocks[0][0x15e8..], &[0x11; 20]);
+    assert_eq!(&blocks[1][..0x20], &[0x66; 0x20]);
+    assert_eq!(&blocks[1][0x20..], &[0x22; 40]);
+    assert_eq!(&blocks[2][..0x18], &[0x77; 0x18]);
+    assert_eq!(&blocks[2][0x18..], &[0x33; 8]);
 }
 
 pub(super) fn campanella_boot_first_path(
@@ -207,7 +304,7 @@ impl ConfigurationState {
 }
 
 impl LoggingHost<'_> {
-    pub(super) fn campanella_configuration_export(
+    pub(super) fn configuration_export(
         &mut self, arguments: &[u8], vm: &mut Vm,
     ) -> cs2_script::Result<NativeReturn> {
         self.ensure_legacy_sound_settings()?;
@@ -215,12 +312,35 @@ impl LoggingHost<'_> {
         for (index, address) in addresses.iter_mut().enumerate() {
             *address = super::read_u32(arguments, index * 4)?;
         }
-        write_campanella_configuration(self.system_config_blocks, addresses, vm)?;
-        self.events.push(LogicEvent {
-            frame: self.frame,
-            kind: "campanella-config-export".into(),
-            detail: format!("native=359 addresses={addresses:#x?} lengths={CAMPANELLA_CONFIG_LENGTHS:#x?}"),
-        });
+        let sha = self.css_task_sha().or(self.data_services.particle_message_pe_sha256);
+        let lengths = configuration_lengths(sha);
+        write_system_configuration(self.system_config_blocks, addresses, lengths, vm)?;
+        if lengths != configuration_lengths(None) {
+            self.events.push(LogicEvent {
+                frame: self.frame,
+                kind: match sha {
+                    Some(CAMPANELLA_SHA) => "campanella-config-export",
+                    Some(super::css_model::SHA) => "tunaban-config-export",
+                    _ => "game-config-export",
+                }.into(),
+                detail: format!("native=359 addresses={addresses:#x?} lengths={lengths:#x?}"),
+            });
+        }
+        Ok(NativeReturn::Continue)
+    }
+
+    pub(super) fn configuration_import(
+        &mut self, arguments: &[u8], vm: &Vm,
+    ) -> cs2_script::Result<NativeReturn> {
+        self.ensure_legacy_sound_settings()?;
+        let addresses = [
+            super::read_u32(arguments, 0)?,
+            super::read_u32(arguments, 4)?,
+            super::read_u32(arguments, 8)?,
+        ];
+        let sha = self.css_task_sha().or(self.data_services.particle_message_pe_sha256);
+        let lengths = configuration_lengths(sha);
+        read_system_configuration(self.system_config_blocks, addresses, lengths, vm)?;
         Ok(NativeReturn::Continue)
     }
 

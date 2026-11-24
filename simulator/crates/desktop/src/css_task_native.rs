@@ -28,6 +28,15 @@ const COMMANDS: &[(&str, u32, bool)] = &[
     ("3b359fc2d737d5ceed454d6b65e6e5b5e6dfb4a24cf88ee361df86e454203f18", 428, true),
     ("6f75ae3877e018de1982a68f1089c127870d895d748c6290dd2ee85cd8daa4de", 428, true),
     ("1f3288d5fd5408bee4d395faab708aca78c9eeaa6c172dc06dcce09c844ba9d5", 437, true),
+    // Additional shipped ordinary tables. Concrete receiver checks still apply.
+    ("7bd9f6dcc7d62868d4ad9cc68d5580452e71bd907540ec4f993d960d051d2c45", 421, true),
+    ("a540b1dec1185a63cc68c4d283b6bc99bcce8de219e1bead3b8d113577de4027", 423, true),
+    ("cfb7f74ac3674962a8d982fe7e0ee53b3306fb47362653db794ad6dcb0fcb35d", 431, true),
+    ("f36f63798eb27b1eb6742c2fe7c3a13f172a249ee6623a12fc79fd8c3dee3cfe", 407, true),
+    ("b70a802a74c49a5d6f429114f81d878f83e25a4acbcb2778c6f4d5f68528de7b", 400, true),
+    ("985096b6064e35c7f48c080aa9008d67442fc0df7e33fec7210fe13fefc1dc4f", 341, false),
+    ("a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3", 412, false),
+    ("5869b7d03a636c200f5042f0c3fc37878a362615bf724f58d47aec5eb8b2d44c", 437, false),
 ];
 
 pub(super) fn identified_pe_sha256(sha: &str) -> Option<&'static str> {
