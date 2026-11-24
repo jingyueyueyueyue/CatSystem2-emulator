@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 mod text;
-use text::{load_font, draw_message_text};
+use text::load_font;
 mod audio;
 mod audio_decode;
 mod wav_decode;
@@ -97,7 +97,7 @@ mod emocon_native;
 mod string_native;
 mod file_native;
 mod portable_host;
-pub use portable_host::HostFrameTiming;
+pub use portable_host::{HostFrameTiming, HostPresentationFrame};
 mod perf_detail;
 mod visual_progress;
 mod host_work_budget;
@@ -111,6 +111,10 @@ mod achievement_native;
 pub use achievement_native::LocalAchievement;
 mod window_control;
 pub use window_control::HostWindowRequest;
+mod fes_window;
+pub use fes_window::{HostCursorImage, HostTextEntry};
+#[cfg(windows)]
+mod fes_window_windows;
 mod ui_resources;
 mod settings_menu_native;
 #[cfg(windows)]
@@ -133,6 +137,7 @@ mod fes_controls;
 mod fes_text;
 mod fes_sound;
 mod fes_globals;
+mod fes_gallery;
 mod fes_settings;
 mod configuration;
 mod save_native;
@@ -167,6 +172,7 @@ mod calendar_native;
 mod clipboard_native;
 mod frame_capture;
 mod scene_compositor;
+mod scene_snapshot;
 mod dictionary_native;
 mod task_wrapper_native;
 mod top_task_native;
@@ -354,7 +360,17 @@ struct DesktopSoundPart {
     play_enabled: i32,
     mute: i32,
     voice_mute: i32,
+    defaults: DesktopSoundDefaults,
     children: Vec<DesktopSoundPart>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DesktopSoundDefaults {
+    volume: Option<i32>,
+    play: Option<i32>,
+    system_voice: Option<i32>,
+    voice_volume: Option<i32>,
+    mute: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -368,6 +384,7 @@ struct DesktopSoundConfig {
     master_skip_volume: Option<i32>,
     master_mute: i32,
     master_voice_mute: i32,
+    defaults: DesktopSoundDefaults,
     user_overrides: BTreeMap<Vec<u8>, DesktopSoundOverride>,
 }
 
@@ -3755,7 +3772,7 @@ struct LoggingHost<'a> {
     movie_resources: &'a mut BTreeMap<u32, String>,
     sound_channels: &'a mut BTreeMap<u32, SoundChannelState>,
     sound_groups: &'a [SoundGroup],
-    sound_config: &'a DesktopSoundConfig,
+    sound_config: &'a mut DesktopSoundConfig,
     script_random: &'a mut ScriptRandom,
     menu_item_requests: &'a mut Vec<(u32, u32)>,
     debug_mode: u32,
@@ -3841,7 +3858,11 @@ impl RandomStream {
 }
 
 impl Host for LoggingHost<'_> {
-    fn should_yield(&self) -> bool { host_work_budget::exhausted() }
+    fn should_yield(&self) -> bool { host_work_budget::should_yield() }
+
+    fn renew_instruction_budget(&self, budget: usize) -> bool {
+        host_work_budget::renew_instruction_budget(budget)
+    }
 
     fn call(
         &mut self,
@@ -5149,6 +5170,13 @@ impl LoggingHost<'_> {
                         handle
                     })
                     .unwrap_or(0);
+                if let Some(slot) = filename.strip_prefix("save").and_then(|name| name.strip_suffix(".dat"))
+                    && let Ok(slot) = slot.parse::<u32>()
+                {
+                    self.events.push(LogicEvent { frame: self.frame, kind: "save-slot-read".into(),
+                        detail: format!("task={} pc={:#x} slot={slot} handle={handle}",
+                            self.current_task_id, vm.instruction_pointer) });
+                }
                 if let (Some(kind), Some(digest)) = (slot_event, digest) {
                     self.events.push(LogicEvent { frame: self.frame, kind: kind.into(),
                         detail: format!("native=247 slot=0 file={filename:?} handle={handle} sha256={digest}") });
@@ -7062,6 +7090,7 @@ pub struct HeadlessPlayer {
     frame_phase: PlayerFramePhase,
     visual_progress: visual_progress::VisualProgress,
     host_work_budget: Option<std::time::Duration>,
+    host_frame_budget_yielded: bool,
     host_tick_pacer: Option<host_pacing::TickPacer>,
     particle_frame_cursor: Option<i32>,
     external_size: usize,
@@ -7127,7 +7156,7 @@ pub struct HeadlessPlayer {
 impl HeadlessPlayer {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_internal(path.as_ref(), None, cs2_runtime::resource_router::GameLanguage::Automatic,
-            ScriptRandom::default())
+            ScriptRandom::default(), None)
     }
 
     /// Open an isolated diagnostic player with a repeatable random stream.
@@ -7135,7 +7164,7 @@ impl HeadlessPlayer {
         path: impl AsRef<Path>, save_root: impl AsRef<Path>,
     ) -> Result<Self> {
         Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()),
-            cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::default())
+            cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::default(), None)
     }
 
     /// Open an interactive session with a caller-owned save directory.
@@ -7143,12 +7172,20 @@ impl HeadlessPlayer {
         path: impl AsRef<Path>, save_root: impl AsRef<Path>, language: cs2_runtime::resource_router::GameLanguage,
     ) -> Result<Self> {
         Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()), language,
-            ScriptRandom::for_session())
+            ScriptRandom::for_session(), None)
+    }
+
+    pub fn open_with_android_memory(
+        path: impl AsRef<Path>, save_root: impl AsRef<Path>, language: cs2_runtime::resource_router::GameLanguage,
+        available_memory_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_internal(path.as_ref(), Some(save_root.as_ref().to_path_buf()), language,
+            ScriptRandom::for_session(), Some(available_memory_bytes))
     }
 
     fn open_internal(
         path: &Path, save_root: Option<PathBuf>, language: cs2_runtime::resource_router::GameLanguage,
-        script_random: ScriptRandom,
+        script_random: ScriptRandom, available_memory_bytes: Option<u64>,
     ) -> Result<Self> {
         let (root, scan) = measure_host_operation(HostPhase::OpenScan, || -> Result<_> {
             let root = GameRoot::open(path).context("open game directory")?;
@@ -7164,7 +7201,18 @@ impl HeadlessPlayer {
         } else {
             1
         };
-        let save_root = save_root.unwrap_or_else(|| save_root_for(&scan.engine.signature));
+        let save_root = save_root.unwrap_or_else(|| {
+            let current = save_root_for(&scan.engine.signature);
+            if current.is_dir() {
+                return current;
+            }
+            scan.engine
+                .legacy_save_signature
+                .as_deref()
+                .map(save_root_for)
+                .filter(|previous| previous.is_dir())
+                .unwrap_or(current)
+        });
         let mut sound_config = sound_config;
         sound_config.load_overrides(&save_root);
         let audio_host = audio_host_for_resources(&scan.resources);
@@ -7187,6 +7235,7 @@ impl HeadlessPlayer {
             frame_phase: PlayerFramePhase::Start,
             visual_progress: visual_progress::VisualProgress::default(),
             host_work_budget: None,
+            host_frame_budget_yielded: false,
             host_tick_pacer: None,
             particle_frame_cursor: None,
             external_size: 0,
@@ -7270,18 +7319,28 @@ impl HeadlessPlayer {
         player.data_services.newton_legacy_gbk =
             cst_context_native::verified_newton_text_profile(&player.scan.resources);
         player.external_size = discover_heap_size(&player.scan.resources);
+        let totsuzen_companion =
+            fes_tasks::verified_totsuzen_companion(&player.scan, player.default_entry.as_deref());
         player.configured_shared_slots =
-            fes_tasks::startup_shared_slots(&player.scan, player.default_entry.as_deref());
+            fes_tasks::startup_shared_slots(&player.scan, totsuzen_companion.is_some());
         player.auto_select = discover_auto_select(&player.scan.resources);
         player.data_services.native_profile = player.scan.engine.primary_executable.as_ref()
             .and_then(|binary| cs2_runtime::native_profile::profile_for_pe_sha256(&binary.sha256, None));
+        if let Some(available) = available_memory_bytes {
+            player.enable_host_fast_forward(available);
+        }
         if let Some(binary) = player.scan.engine.primary_executable.as_ref() {
+            player.data_services.task_native_profile =
+                cs2_runtime::native_task_profile::exact_task_native_profile(&binary.sha256);
             player.data_services.tasks.message_lists.identify(&binary.sha256);
             player.data_services.ordinary.identify(&binary.sha256);
             player.data_services.css_task_pe_sha256 = css_task_native::identified_pe_sha256(&binary.sha256);
             player.data_services.particle_external.identify(&binary.sha256);
             player.data_services.emote.initialize(&player.scan.resources, &binary.sha256)
                 .context("initialize identified E-mote CPU backend")?;
+        }
+        if let Some(companion) = totsuzen_companion {
+            player.data_services.tasks.message_lists.identify_verified_companion(companion);
         }
         player.data_services.tasks.fes.install_cpu_hooks();
         player.data_services.tasks.install_buffer_receiver(15, list_native::receive);
@@ -7686,11 +7745,14 @@ impl HeadlessPlayer {
                 self.visual_progress.frame_clock_sampled = self.data_services.top_clock.sampled;
             }
             self.audio_host.poll().context("poll asynchronous audio completions")?;
-            self.update_script_prefetch();
-            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-            self.data_services.ordinary.stage_preloaded_model();
             if !self.audio_input_deferred {
                 self.apply_pending_host_input().context("consume queued platform input")?;
+            }
+            self.sync_host_fast_forward().context("apply fast-forward resource policy")?;
+            self.update_script_prefetch();
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            if !self.data_services.fast_forward {
+                self.data_services.ordinary.stage_preloaded_model();
             }
             self.particle_frame_cursor = None;
             self.state.clock.frame = self.state.clock.frame.saturating_add(1);
@@ -7819,7 +7881,7 @@ impl HeadlessPlayer {
                     movie_resources: &mut self.movie_resources,
                     sound_channels: &mut self.sound_channels,
                     sound_groups: &self.sound_groups,
-                    sound_config: &self.sound_config,
+                    sound_config: &mut self.sound_config,
                     script_random: &mut self.script_random,
                     menu_item_requests: &mut self.menu_item_requests,
                     debug_mode: self.debug_mode,
@@ -8040,6 +8102,12 @@ impl HeadlessPlayer {
             self.frame_phase = PlayerFramePhase::Render;
             }
             }
+            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+            if !self.preflight_scene_emote_poses()? {
+                // Keep the last complete canvas until a new or incompatible
+                // actor's first pose arrives. All earlier phases ran already.
+                break;
+            }
             self.render_scene().context("render logical scene")?;
             self.capture_completed_frame();
             self.commit_host_device_keys_frame();
@@ -8124,7 +8192,13 @@ impl HeadlessPlayer {
         })?;
         if !self.host_input_selection_routed() && selected != self.input_task.selected_region {
             if let Some(previous) = self.input_task.selected_region {
-                if !self.queue_control_region_focus(previous, false)? {
+                // The typed picker drops disabled buttons without an UNFOCUS
+                // callback. The fallback must not notify a stale selection.
+                if !self.queue_control_region_focus(previous, false)?
+                    && self.input_task.regions.iter().any(|region| {
+                        region.id() == previous && region.words[8] != 0
+                    })
+                {
                     self.data_services.tasks.fes.queue_region_focus(previous, false)?;
                 }
             }
@@ -8197,7 +8271,27 @@ impl HeadlessPlayer {
         self.scene_compositor.revision
     }
 
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    fn preflight_scene_emote_poses(&mut self) -> Result<bool> {
+        let _timing = measure_host_phase(HostPhase::ComposeEmote);
+        let exact = self.data_services.frame_capture.enabled != 0
+            || self.data_services.tasks.render.has_composition();
+        self.data_services.emote.preflight_scene_pose_jobs(
+            &self.scene_nodes, self.state.clock.frame, exact,
+        )
+            .context("check interactive E-mote scene dependencies")
+    }
+
     fn render_scene(&mut self) -> Result<()> {
+        let result = self.compose_scene();
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        self.data_services.emote.finish_scene_pose_jobs();
+        result
+    }
+
+    fn compose_scene(&mut self) -> Result<()> {
+        use scene_snapshot::SceneSnapshot;
+
         let _timing = measure_host_phase(HostPhase::Compose);
         let previous_revision = self.scene_compositor.revision.take();
         let mut graphics_snapshot = self.scene_compositor.graphics_frame.take().filter(|buffer| {
@@ -8222,9 +8316,14 @@ impl HeadlessPlayer {
             let mut output = Canvas::new(self.canvas.width(), self.canvas.height())?;
             output.clear(Color::rgba(0, 0, 0, 255));
             let mut effects = std::mem::take(&mut self.data_services.tasks.render);
+            let mut snapshot = None;
             let result = effects.compose(&mut output, &mut |target, lower, upper| {
+                if snapshot.is_none() {
+                    snapshot = Some(SceneSnapshot::capture(self, false)?);
+                }
+                let snapshot = snapshot.as_ref().unwrap();
                 std::mem::swap(&mut self.canvas, target);
-                let result = self.render_scene_depth_range(lower, upper, false, &mut graphics_snapshot);
+                let result = self.render_scene_depth_range(snapshot, lower..upper, &mut graphics_snapshot);
                 std::mem::swap(&mut self.canvas, target);
                 result
             });
@@ -8254,7 +8353,10 @@ impl HeadlessPlayer {
                 }
                 return Ok(());
             }
-            self.render_scene_depth_range(f32::NEG_INFINITY, f32::INFINITY, prefix_cached, &mut graphics_snapshot)?;
+            let snapshot = SceneSnapshot::capture(self, prefix_cached)?;
+            self.render_scene_depth_range(
+                &snapshot, f32::NEG_INFINITY..f32::INFINITY, &mut graphics_snapshot,
+            )?;
         }
         self.movie_host.draw_exclusive_movie(&mut self.canvas)
             .context("compose exclusive movie surface")?;
@@ -8278,146 +8380,18 @@ impl HeadlessPlayer {
     /// Draw a normal scene slice into the already selected back/work buffer.
     /// Persistent logical VRAM is sampled separately and never cleared here.
     fn render_scene_depth_range(
-        &mut self, lower: f32, upper: f32, prefix_cached: bool,
+        &mut self, snapshot: &scene_snapshot::SceneSnapshot,
+        range: std::ops::Range<f32>,
         graphics_snapshot: &mut Option<RgbaFrame>,
     ) -> Result<()> {
-        if !prefix_cached && let Some(frame) = &self.image_frame {
-            let _timing = measure_host_phase(HostPhase::ComposeLayers);
-            self.canvas
-                .draw_frame(frame, &ImageDrawOptions::new(Point::new(0, 0)))
-                .map_err(|error| anyhow::anyhow!(error))?;
-        }
-        if let Some(fes) = &self.fes {
-            let _timing = measure_host_phase(HostPhase::ComposeLayers);
-            let mut fes_queue = RenderQueue::new();
-            for layer in fes.media.values() {
-                let animation_visible = layer
-                    .animation_display
-                    .is_none_or(|display| display.visible != 0);
-                if !layer.visible || !animation_visible || !layer.is_drawable() {
-                    continue;
-                }
-                let opacity = layer
-                    .animation_display
-                    .map(|display| {
-                        display
-                            .compose((0.0, 0.0), i32::from(layer.opacity), 1)
-                            .blend
-                            .clamp(0, 255) as u8
-                    })
-                    .unwrap_or(layer.opacity);
-                let Some(plane) = layer.plane.as_ref().and_then(|name| fes.planes.get(name)) else {
-                    if layer.plane.is_some() {
-                        continue;
-                    }
-                    let Some(image) = layer.image.as_ref() else {
-                        continue;
-                    };
-                    let mut options = ImageDrawOptions::new(layer.draw_position(&fes.planes));
-                    options.opacity = opacity;
-                    fes_queue.push(RenderNode::new(
-                        layer.priority,
-                        RenderCommand::Frame {
-                            frame: image.clone(),
-                            options,
-                        },
-                    ));
-                    continue;
-                };
-                if !plane.visible {
-                    continue;
-                }
-                let Some(image) = layer.image.as_ref() else {
-                    continue;
-                };
-                let mut options = ImageDrawOptions::new(layer.draw_position(&fes.planes));
-                options.opacity =
-                    ((u16::from(opacity) * u16::from(plane.opacity) + 127) / 255) as u8;
-                options.clip = Some(Rect::new(
-                    plane.position.x,
-                    plane.position.y,
-                    plane.size[0],
-                    plane.size[1],
-                ));
-                fes_queue.push(RenderNode::new(
-                    layer.priority,
-                    RenderCommand::Frame {
-                        frame: image.clone(),
-                        options,
-                    },
-                ));
-            }
-            self.canvas
-                .render_queue(&fes_queue)
-                .map_err(|error| anyhow::anyhow!(error))?;
-        }
-        if !prefix_cached {
-            let _timing = measure_host_phase(HostPhase::ComposeLayers);
-            let mut image_queue = RenderQueue::new();
-            for ((kind, bank), layers) in &self.cst_images {
-                for image in layers {
-                    let mut options = ImageDrawOptions::new(image.draw_position());
-                    options.opacity = image.opacity;
-                    image_queue.push(RenderNode::new(
-                        image_priority(*kind, *bank),
-                        RenderCommand::Frame {
-                            frame: image.image.clone(),
-                            options,
-                        },
-                    ));
-                }
-            }
-            self.canvas
-                .render_queue(&image_queue)
-                .map_err(|error| anyhow::anyhow!(error))?;
-        }
-        if let Some(cst) = &self.cst
-            && !self.font.is_empty()
-        {
-            let _timing = measure_host_phase(HostPhase::ComposeText);
-            let (speaker, text) = cst.display_text();
-            draw_message_text(&mut self.canvas, &self.font, &speaker, &text, cst.display_encoding())?;
-        }
-        let mut drawable_depths = BTreeMap::new();
-        for node in self.scene_nodes.values() {
-            if node.kind == 61 {
-                let base = self.data_services.effekseer.manager.plane_base(node.id)?;
-                drawable_depths.insert(node.id, base[2]);
-                continue;
-            }
-            if self.movie_host.plane_target_handle(node.id).is_none() {
-                continue;
-            }
-            let mut depth = self
-                .movie_host
-                .movie_plane_depth(node.id)
-                .unwrap_or(5000.);
-            if let Some(properties) = self.movie_host.planes.properties.get(&node.id)
-                && let Some(offset) = properties.parent_offset
-                && let Some(parent) = self.scene_nodes.get(&node.parent)
-            {
-                let parent_base = self
-                    .movie_host
-                    .planes
-                    .properties
-                    .get(&parent.id)
-                    .map_or(5000., |properties| properties.base[2]);
-                depth = parent_base + offset[2];
-            }
-            drawable_depths.insert(node.id, depth);
-        }
-        let nodes = self
-            .data_services
-            .planes
-            .draw_order_with_depths(&self.scene_nodes, &drawable_depths);
+        snapshot.draw_legacy_layers(&mut self.canvas)?;
+        let nodes = snapshot.drawables(&range);
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         let mut emote_batch = if gpu_raster::emote_batch_requested() {
-            let candidates: Vec<_> = nodes.iter().filter_map(|id| {
-                let node = self.scene_nodes.get(id)?;
-                if node.kind != 54 || !node.visible || !node.initialized { return None }
-                let depth = drawable_depths.get(id).copied().unwrap_or(node.position[2]);
-                (lower <= depth && depth < upper).then_some(node)
-            }).collect();
+            let candidates: Vec<_> = nodes.clone()
+                .filter(|drawable| drawable.kind == 54)
+                .map(|drawable| &self.scene_nodes[&drawable.id])
+                .collect();
             if candidates.is_empty() {
                 None
             } else {
@@ -8430,24 +8404,12 @@ impl HeadlessPlayer {
                 Some(batch)
             }
         } else { None };
-        let mut scene_text = measure_host_operation(HostPhase::ComposeText, || {
-            fes_text::scene_projections(&self.data_services, lower, upper)
-        }).into_iter().peekable();
+        let mut scene_text = snapshot.text(&range).peekable();
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         let (gpu_planes, mut pending_planes) = (gpu_raster::available(), Vec::new());
-        for id in nodes {
-            let Some(node) = self.scene_nodes.get(&id) else {
-                continue;
-            };
-            if !node.visible || !node.initialized {
-                continue;
-            }
-            if matches!(node.kind, 35..=39) { continue; }
-            let depth = drawable_depths.get(&id).copied().unwrap_or_else(|| {
-                if node.kind == 2 { plane_native::plane_depth(node, &self.data_services.planes) }
-                else { node.position[2] }
-            });
-            if !(lower <= depth && depth < upper) { continue; }
+        for drawable in nodes {
+            let id = drawable.id;
+            let depth = drawable.depth;
             while scene_text.peek().is_some_and(|layer| (layer.priority as f32) < depth) {
                 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
                 self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
@@ -8455,13 +8417,12 @@ impl HeadlessPlayer {
                 let layer = scene_text.next().unwrap();
                 layer.draw(&mut self.canvas)?;
                 if self.data_services.story_trace {
-                    self.data_services.fes_text.note_rebellions_novel_composed(&layer, self.state.clock.frame);
+                    self.data_services.fes_text.note_rebellions_novel_composed(layer, self.state.clock.frame);
                 }
             }
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
             if gpu_planes {
-                let node = &self.scene_nodes[&id];
-                let independent = !drawable_depths.contains_key(&id)
+                let independent = !drawable.foreign_depth
                     && !self.particles.contains_key(&id)
                     && !self.data_services.css_models.owners.contains_key(&id)
                     && !self.data_services.css_models.utate_models.contains_key(&id)
@@ -8469,22 +8430,22 @@ impl HeadlessPlayer {
                     && !self.data_services.tasks.javascript.owns_plane(id)
                     && self.kx_geometry(id).is_none();
                 if independent {
-                    if node.kind == 2 {
+                    if drawable.kind == 2 {
                         pending_planes.push(id);
                         continue;
                     }
-                    if matches!(node.kind, 0 | 1 | 6 | 8 | 11..=13 | 15 | 16 | 32..=34 | 40..=49 | 55 | 62 | 63) {
+                    if matches!(drawable.kind, 0 | 1 | 6 | 8 | 11..=13 | 15 | 16 | 32..=34 | 40..=49 | 55 | 62 | 63) {
                         continue;
                     }
                 }
                 self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
             }
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-            let _scene_draw = gpu_raster::scene_draw_scope(id, self.scene_nodes.get(&id).map_or(0, |node| node.kind));
+            let _scene_draw = gpu_raster::scene_draw_scope(id, drawable.kind);
             if particle_native::draw_ordinary_task(
                 id, &mut self.canvas, &self.particles,
                 &self.movie_host.planes.projection, &self.movie_host.planes.cameras,
-                lower, upper,
+                range.start, range.end,
             )? { continue; }
             if self.data_services.css_models.draw(id, &mut self.canvas, &self.scan.resources, self.script_encoding)? { continue; }
             if self.data_services.particle_external.draw(id, &mut self.canvas, &self.particles)? { continue; }
@@ -8523,7 +8484,7 @@ impl HeadlessPlayer {
             {
                 continue;
             }
-            let phase = if node.kind == 2 { HostPhase::ComposePlane } else { HostPhase::ComposeLayers };
+            let phase = if drawable.kind == 2 { HostPhase::ComposePlane } else { HostPhase::ComposeLayers };
             let drew_plane = measure_host_operation(phase, || {
                 let canvas_source = if node.kind == 2 && self.data_services.planes.state(id)
                     .is_some_and(|state| state.shape == plane_native::PlaneShape::Canvas)
@@ -8562,10 +8523,10 @@ impl HeadlessPlayer {
         for layer in scene_text {
             layer.draw(&mut self.canvas)?;
             if self.data_services.story_trace {
-                self.data_services.fes_text.note_rebellions_novel_composed(&layer, self.state.clock.frame);
+                self.data_services.fes_text.note_rebellions_novel_composed(layer, self.state.clock.frame);
             }
         }
-        self.render_message_objects_range(lower, upper).context("compose message object depth range")?;
+        self.render_message_objects_range(range.start, range.end).context("compose message object depth range")?;
         Ok(())
     }
 
@@ -8719,7 +8680,7 @@ pub fn run() -> Result<()> {
 fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     HeadlessPlayer::enable_host_gpu_raster();
     let mut player = HeadlessPlayer::open_internal(
-        path, None, cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::for_session(),
+        path, None, cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::for_session(), None,
     ).with_context(|| format!("open game directory `{}`", path.display()))?;
     player.capture_script_evidence = false;
     player.enable_host_window_requests();
@@ -8728,6 +8689,7 @@ fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     player.set_host_input_update_rate(60);
     player.set_host_iteration_work_budget(Some(std::time::Duration::from_millis(4)));
     player.enable_host_async_images();
+    player.enable_host_emote_pose_jobs();
     player.load_startup()?;
     Ok(player)
 }
@@ -8800,7 +8762,18 @@ fn apply_window_pointer_request(
     player: &mut HeadlessPlayer,
     window: &winit::window::Window,
     input: &mut WindowInputState,
+    event_loop: &winit::event_loop::ActiveEventLoop,
 ) -> Result<()> {
+    if let Some(image) = player.take_host_cursor_image() {
+        if let Some(image) = image {
+            let cursor = winit::window::CustomCursor::from_rgba(
+                image.rgba, image.width, image.height, image.hotspot[0], image.hotspot[1],
+            )?;
+            window.set_cursor(event_loop.create_custom_cursor(cursor));
+        } else {
+            window.set_cursor(winit::window::CursorIcon::Default);
+        }
+    }
     if let Some(visible) = player.take_host_cursor_visibility_request() {
         window.set_cursor_visible(visible);
     }
@@ -8823,6 +8796,10 @@ fn apply_window_pointer_request(
 fn apply_window_control_requests(
     player: &mut HeadlessPlayer, window: &winit::window::Window, fullscreen: &mut bool,
 ) -> Result<()> {
+    if let Some(request) = player.take_host_text_entry() {
+        let result = fes_window_windows::show(settings_menu_windows::hwnd(window)?, &request)?;
+        player.complete_host_text_entry(request.id, result)?;
+    }
     settings_menu_windows::apply_general_policy(player, window)?;
     settings_menu_windows::consume_menu_commands(player, window)?;
     while let Some(request) = player.take_host_window_request() {
@@ -8842,6 +8819,7 @@ fn apply_window_control_requests(
             HostWindowRequest::Menu => settings_menu_windows::install_menu(player, window)?,
             HostWindowRequest::MenuConfirmation => settings_menu_windows::confirm_menu(player, window)?,
             HostWindowRequest::SystemVolume => settings_menu_windows::open_system_volume(player, window)?,
+            HostWindowRequest::MenuInfo => settings_menu_windows::show_fes_menu_info(player, window)?,
         }
     }
     Ok(())
@@ -9327,7 +9305,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
 #[cfg(all(windows, feature = "gpu"))]
 pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -9336,8 +9314,8 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
     struct WindowApp {
         player: Option<HeadlessPlayer>,
         path: PathBuf,
-        window: Option<std::sync::Arc<Window>>,
-        gpu: Option<WindowGpu>,
+        presenter: Option<window_media::WindowPresenter>,
+        window: Option<Arc<Window>>,
         input: WindowInputState,
         pacer: window_media::WindowPacer,
         diagnostics: WindowDiagnostics,
@@ -9379,7 +9357,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     return;
                 }
             };
-            let gpu = match WindowGpu::new(window.clone(), [width, height]) {
+            let mut gpu = match WindowGpu::new(window.clone(), [width, height]) {
                 Ok(gpu) => gpu,
                 Err(error) => {
                     self.error = Some(format!("initialize GPU host: {error:#}"));
@@ -9387,9 +9365,25 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     return;
                 }
             };
+            let target = Arc::clone(&window);
+            let presenter = match window_media::WindowPresenter::start(move |frame| {
+                let size = target.inner_size();
+                if size.width == 0 || size.height == 0 { return Ok(false); }
+                if [size.width, size.height] != [gpu.config.width, gpu.config.height] {
+                    gpu.resize(size.width, size.height);
+                }
+                gpu.draw(frame.rgba())
+            }) {
+                Ok(presenter) => presenter,
+                Err(error) => {
+                    self.error = Some(format!("{error:#}"));
+                    event_loop.exit();
+                    return;
+                }
+            };
             window.set_ime_allowed(true);
             self.player = Some(player);
-            self.gpu = Some(gpu);
+            self.presenter = Some(presenter);
             self.window = Some(window);
         }
 
@@ -9437,10 +9431,9 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     self.pacer.reset(Instant::now());
                     window.request_redraw();
                 }
-                WindowEvent::Resized(size) => {
-                    if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.resize(size.width, size.height);
-                    }
+                WindowEvent::Resized(_) => {
+                    if let Some(presenter) = &self.presenter { presenter.discard_pending(); }
+                    window.request_redraw();
                 }
                 WindowEvent::RedrawRequested => {
                     if size.width == 0 || size.height == 0 { return; }
@@ -9448,7 +9441,8 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     if let Some(player) = self.player.as_mut() {
                         match advance_window_frame(player, window, &mut self.diagnostics) {
                             Ok(true) => self.pacer.completed(Instant::now()),
-                            Ok(false) => self.pacer.retry(Instant::now(), player.frame_in_progress()),
+                            Ok(false) => self.pacer.retry(Instant::now(),
+                                player.frame_in_progress(), player.host_frame_retry_delay_ms()),
                             Err(error) => {
                                 self.error = Some(format!("{error:#}"));
                                 event_loop.exit();
@@ -9461,10 +9455,9 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                         }
                         let presentation = (|| -> Result<()> {
                             apply_window_control_requests(player, window, &mut self.fullscreen)?;
-                            apply_window_pointer_request(player, window, &mut self.input)?;
-                            let frame = window_media::prepare(player);
-                            if let Some(gpu) = self.gpu.as_mut() {
-                                if gpu.draw(frame.rgba)? { frame.acknowledge()?; }
+                            apply_window_pointer_request(player, window, &mut self.input, event_loop)?;
+                            if let Some(presenter) = &self.presenter {
+                                presenter.publish(window_media::prepare(player))?;
                             }
                             Ok(())
                         })();
@@ -9481,6 +9474,11 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            if let Some(presenter) = &self.presenter && let Err(error) = presenter.check() {
+                self.error = Some(format!("present frame: {error:#}"));
+                event_loop.exit();
+                return;
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.pacer.next));
             if let Some(window) = self.window.as_ref() {
                 if Instant::now() >= self.pacer.next {
@@ -9498,7 +9496,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         player: None,
         path: path.as_ref().to_path_buf(),
         window: None,
-        gpu: None,
+        presenter: None,
         input: WindowInputState::default(),
         pacer: window_media::WindowPacer::default(),
         diagnostics: WindowDiagnostics::default(),
@@ -9517,7 +9515,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(all(windows, not(feature = "gpu")))]
 pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -9526,7 +9524,8 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
     struct WindowApp {
         player: Option<HeadlessPlayer>,
         path: PathBuf,
-        window: Option<Window>,
+        presenter: Option<window_media::WindowPresenter>,
+        window: Option<Arc<Window>>,
         input: WindowInputState,
         pacer: window_media::WindowPacer,
         diagnostics: WindowDiagnostics,
@@ -9562,7 +9561,21 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                 .with_inner_size(winit::dpi::LogicalSize::new(f64::from(width), f64::from(height)));
             match event_loop.create_window(attributes) {
                 Ok(window) => {
+                    let window = Arc::new(window);
+                    let target = Arc::clone(&window);
+                    let mut bgra = Vec::new();
+                    let presenter = match window_media::WindowPresenter::start(move |frame| {
+                        blit_rgba_to_window(&target, frame.rgba(), frame.size(), &mut bgra)
+                    }) {
+                        Ok(presenter) => presenter,
+                        Err(error) => {
+                            self.error = Some(format!("{error:#}"));
+                            event_loop.exit();
+                            return;
+                        }
+                    };
                     window.set_ime_allowed(true);
+                    self.presenter = Some(presenter);
                     self.window = Some(window);
                     self.player = Some(player);
                 }
@@ -9617,14 +9630,18 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     self.pacer.reset(Instant::now());
                     window.request_redraw();
                 }
-                WindowEvent::Resized(_) => window.request_redraw(),
+                WindowEvent::Resized(_) => {
+                    if let Some(presenter) = &self.presenter { presenter.discard_pending(); }
+                    window.request_redraw();
+                }
                 WindowEvent::RedrawRequested => {
                     if size.width == 0 || size.height == 0 { return; }
                     if Instant::now() < self.pacer.next { return; }
                     if let Some(player) = self.player.as_mut() {
                         match advance_window_frame(player, window, &mut self.diagnostics) {
                             Ok(true) => self.pacer.completed(Instant::now()),
-                            Ok(false) => self.pacer.retry(Instant::now(), player.frame_in_progress()),
+                            Ok(false) => self.pacer.retry(Instant::now(),
+                                player.frame_in_progress(), player.host_frame_retry_delay_ms()),
                             Err(error) => {
                                 self.error = Some(format!("{error:#}"));
                                 event_loop.exit();
@@ -9637,10 +9654,11 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                         }
                         let presentation = (|| -> Result<()> {
                             apply_window_control_requests(player, window, &mut self.fullscreen)?;
-                            apply_window_pointer_request(player, window, &mut self.input)?;
-                            let frame = window_media::prepare(player);
-                            blit_rgba_to_window(window, frame.rgba, player.logical_size())?;
-                            frame.acknowledge()
+                            apply_window_pointer_request(player, window, &mut self.input, event_loop)?;
+                            if let Some(presenter) = &self.presenter {
+                                presenter.publish(window_media::prepare(player))?;
+                            }
+                            Ok(())
                         })();
                         if let Err(error) = presentation {
                             self.error = Some(format!("present frame: {error:#}"));
@@ -9655,6 +9673,11 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            if let Some(presenter) = &self.presenter && let Err(error) = presenter.check() {
+                self.error = Some(format!("present frame: {error:#}"));
+                event_loop.exit();
+                return;
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.pacer.next));
             if let Some(window) = self.window.as_ref() {
                 if Instant::now() >= self.pacer.next {
@@ -9672,6 +9695,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         player: None,
         path: path.as_ref().to_path_buf(),
         window: None,
+        presenter: None,
         input: WindowInputState::default(),
         pacer: window_media::WindowPacer::default(),
         diagnostics: WindowDiagnostics::default(),
@@ -9720,7 +9744,9 @@ fn pointer_message_for_surface(
 }
 
 #[cfg(all(windows, not(feature = "gpu")))]
-fn blit_rgba_to_window(window: &winit::window::Window, rgba: &[u8], logical_size: [u32; 2]) -> Result<()> {
+fn blit_rgba_to_window(
+    window: &winit::window::Window, rgba: &[u8], logical_size: [u32; 2], bgra: &mut Vec<u8>,
+) -> Result<bool> {
     use windows_sys::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, ReleaseDC, SRCCOPY,
         StretchDIBits, PatBlt, BLACKNESS,
@@ -9730,7 +9756,7 @@ fn blit_rgba_to_window(window: &winit::window::Window, rgba: &[u8], logical_size
     let size = window.inner_size();
     let [width, height] = logical_size;
     if size.width == 0 || size.height == 0 || width == 0 || height == 0 {
-        return Ok(());
+        return Ok(false);
     }
     if rgba.len() != width as usize * height as usize * 4 {
         bail!("frame pixel count does not match logical canvas dimensions")
@@ -9740,14 +9766,9 @@ fn blit_rgba_to_window(window: &winit::window::Window, rgba: &[u8], logical_size
         bail!("winit did not provide a Win32 HWND")
     };
     let hwnd = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
-    let hdc = unsafe { GetDC(hwnd) };
-    if hdc == 0 {
-        bail!("GetDC failed")
-    }
-
-    let mut bgra = Vec::with_capacity(rgba.len());
-    for pixel in rgba.chunks_exact(4) {
-        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    bgra.resize(rgba.len(), 0);
+    for (target, pixel) in bgra.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        target.copy_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
     }
     let bitmap = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -9768,6 +9789,10 @@ fn blit_rgba_to_window(window: &winit::window::Window, rgba: &[u8], logical_size
     let viewport = cs2_renderer::Viewport::new(size.width, size.height, width, height,
         cs2_renderer::ViewportMode::Fit).map_err(|error| anyhow::anyhow!(error))?;
     let [left, top, view_width, view_height] = viewport.destination();
+    let hdc = unsafe { GetDC(hwnd) };
+    if hdc == 0 {
+        bail!("GetDC failed")
+    }
     let result = unsafe {
         PatBlt(hdc, 0, 0, size.width as i32, size.height as i32, BLACKNESS);
         StretchDIBits(
@@ -9790,7 +9815,7 @@ fn blit_rgba_to_window(window: &winit::window::Window, rgba: &[u8], logical_size
     if result == 0 || result == -1 {
         bail!("StretchDIBits failed")
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -10784,7 +10809,7 @@ fn parse_desktop_sound_config(bytes: &[u8]) -> Result<DesktopSoundConfig> {
         })
         .transpose()?
         .unwrap_or_default();
-    Ok(DesktopSoundConfig {
+    let mut config = DesktopSoundConfig {
         source_loaded: true,
         parts,
         master_volume: master.and_then(|node| sound_integer(sound_child(node, b"volume"))),
@@ -10798,8 +10823,17 @@ fn parse_desktop_sound_config(bytes: &[u8]) -> Result<DesktopSoundConfig> {
         master_voice_mute: master
             .and_then(|node| sound_integer(sound_child(node, b"voicemute")))
             .unwrap_or(0),
+        defaults: DesktopSoundDefaults::default(),
         user_overrides: BTreeMap::new(),
-    })
+    };
+    config.defaults = DesktopSoundDefaults {
+        volume: config.master_volume,
+        play: config.master_play_enabled,
+        system_voice: config.master_system_voice,
+        voice_volume: config.master_voice_volume,
+        mute: Some(config.master_mute),
+    };
+    Ok(config)
 }
 
 fn parse_desktop_sound_part(
@@ -10826,6 +10860,7 @@ fn parse_desktop_sound_part(
         play_enabled: sound_integer(sound_child(node, b"play")).unwrap_or(-1),
         mute: sound_integer(sound_child(node, b"mute")).unwrap_or(0),
         voice_mute: sound_integer(sound_child(node, b"voicemute")).unwrap_or(0),
+        defaults: DesktopSoundDefaults::default(),
         children: Vec::new(),
     };
     if let Some(parent) = parent {
@@ -10853,6 +10888,13 @@ fn parse_desktop_sound_part(
             }
         }
     }
+    part.defaults = DesktopSoundDefaults {
+        volume: Some(part.volume),
+        play: Some(part.play_enabled),
+        system_voice: Some(part.system_voice),
+        voice_volume: Some(part.voice_volume),
+        mute: Some(part.mute),
+    };
     if let Some(children) = sound_child(node, b"part") {
         part.children = children
             .children
@@ -12771,14 +12813,15 @@ mod tests {
         let vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 64], 32).unwrap()).unwrap();
         player.data_services.tasks.register_external_task(player.current_task_id, 0, &player.data_services.language.languages).unwrap();
         player.vm = Some(vm);
-        {
-            let _budget = host_work_budget::Scope::enter(std::time::Duration::ZERO);
-            player.run_frames(1, 1000).unwrap();
-        }
+        player.set_host_iteration_work_budget(Some(std::time::Duration::ZERO));
+        assert!(!player.advance_host_frame_with_retries(1000).unwrap());
+        assert_eq!(player.host_frame_retry_delay_ms(), 0);
         assert!(player.frame_in_progress(), "deadline must leave the invocation unfinished");
         assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 0);
         let tick = player.state.clock.elapsed_ticks;
-        player.run_frames(1, 1000).unwrap();
+        player.set_host_iteration_work_budget(None);
+        assert!(player.advance_host_frame(1000).unwrap());
+        assert_eq!(player.host_frame_retry_delay_ms(), 1);
         assert!(!player.frame_in_progress());
         assert_eq!(player.state.clock.elapsed_ticks, tick, "retry cannot consume another game tick");
         assert_eq!(player.events.iter().filter(|event| event.kind == "native-call" && event.detail.starts_with("index=0 ")).count(), 1);
@@ -12816,6 +12859,80 @@ mod tests {
     }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn scene_snapshot_preserves_feedback_depth_and_completed_capture() -> Result<()> {
+        let temp = TempDir::new();
+        let profile = temp.0.join("profile");
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, profile.clone())?;
+        let size = [8, 4];
+        player.canvas = Canvas::new(size[0], size[1])?;
+        player.graphics_canvas = Canvas::new(size[0], size[1])?;
+        let previous = Color::rgba(255, 0, 255, 255);
+        let live = Color::rgba(0, 255, 0, 255);
+        let foreground = Color::rgba(255, 255, 0, 255);
+        player.graphics_canvas.clear(previous);
+
+        let mut lower = SceneNode::new(90, 2, 0, "logical canvas".into());
+        player.data_services.planes.initialize_list_plane(&mut lower, [4, 4]);
+        player.data_services.planes.set_list_plane_visible(&mut lower, true);
+        player.scene_nodes.insert(lower.id, lower);
+        for (id, x, width, color) in [(91, 4., 4., 0xff00_00ff), (92, 6., 2., 0xffff_0000)] {
+            let mut node = SceneNode::new(id, 2, 0, "foreground".into());
+            node.position[0] = x;
+            node.size = [width, 4.];
+            node.color = color;
+            node.visible = true;
+            node.initialized = true;
+            player.scene_nodes.insert(id, node);
+        }
+        player.render_scene()?;
+        assert_eq!(player.canvas.pixel(1, 1)?, previous);
+        assert_eq!(player.canvas.pixel(7, 1)?, Color::rgba(255, 0, 0, 255));
+
+        player.graphics_canvas.clear(live);
+        player.scene_nodes.get_mut(&92).unwrap().color = 0xffff_ff00;
+        fs::create_dir_all(profile.join("capture"))?;
+        let (effect, origin) = player.with_host(|host| {
+            let id = host.create_task_object(38, 0, b"feedback", b"")?;
+            let source = host.back_buffer.context("previous completed frame")?;
+            let source = RgbaFrame::from_rgba8(size[0], size[1], source.pixels().to_vec())?;
+            host.data_services.tasks.render.replace_auxiliary_target(0, source)?;
+            let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], Vec::new(), 0)?)?;
+            let record = [id, 0, 5000f32.to_bits(), 2].map(u32::to_le_bytes).concat();
+            host.render_tasks_native(527, &record, &mut vm)?;
+            host.render_tasks_native(528, &[id, 1].map(u32::to_le_bytes).concat(), &mut vm)?;
+            let name = vm.allocate_region(b"capture\0")?;
+            host.frame_capture_native(&[1, name, 0].map(u32::to_le_bytes).concat(), &vm)?;
+            Ok((id, host.data_services.tasks.task_clock(id).unwrap().origin))
+        })?;
+
+        player.render_scene()?;
+        assert_eq!(player.canvas.pixel(1, 1)?, previous);
+        assert_eq!(player.canvas.pixel(7, 1)?, foreground);
+        player.capture_completed_frame();
+        assert_eq!(
+            fs::read(profile.join("capture/capture_0000000000.bmp"))?,
+            cs2_renderer::encode_capture_bmp(&player.canvas)?,
+        );
+
+        player.data_services.tasks.set_task_clock(effect, origin.wrapping_add(2))?;
+        player.with_host(|host| {
+            host.render_tasks_native(529, &effect.to_le_bytes(), &mut Vm::new())?;
+            Ok(())
+        })?;
+        player.render_scene()?;
+        assert_eq!(player.canvas.pixel(1, 1)?, live);
+        assert_eq!(player.canvas.pixel(7, 1)?, foreground);
+        player.capture_completed_frame();
+        assert_eq!(player.data_services.frame_capture.next_index, 2);
+        let completed = fs::read(profile.join("capture/capture_0000000001.bmp"))?;
+
+        player.data_services.tasks.render = Default::default();
+        player.render_scene()?;
+        assert_eq!(completed, cs2_renderer::encode_capture_bmp(&player.canvas)?);
+        Ok(())
+    }
 
     fn gated_audio_player(channel_type: AudioChannel) -> (TempDir, HeadlessPlayer, std::sync::mpsc::Sender<cs2_runtime::RuntimeResult<()>>) {
         let temp = TempDir::new();
@@ -13086,9 +13203,9 @@ mod tests {
         }).unwrap();
     }
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(pub(super) PathBuf);
     impl TempDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -13334,7 +13451,7 @@ mod tests {
             movie_resources: &mut BTreeMap::new(),
             sound_channels: &mut sound_channels,
             sound_groups: &[],
-            sound_config: &DesktopSoundConfig::default(),
+            sound_config: &mut DesktopSoundConfig::default(),
             script_random: &mut script_random,
             menu_item_requests: &mut Vec::new(),
             debug_mode: 0,
@@ -13834,7 +13951,7 @@ mod tests {
             movie_resources: &mut BTreeMap::new(),
             sound_channels: &mut sound_channels,
             sound_groups: &[],
-            sound_config: &DesktopSoundConfig::default(),
+            sound_config: &mut DesktopSoundConfig::default(),
             script_random: &mut script_random,
             menu_item_requests: &mut menu_item_requests,
             debug_mode: 0x1234_5678,
@@ -14029,7 +14146,7 @@ mod tests {
             movie_resources: &mut BTreeMap::new(),
             sound_channels: &mut sound_channels,
             sound_groups: &[],
-            sound_config: &DesktopSoundConfig::default(),
+            sound_config: &mut DesktopSoundConfig::default(),
             script_random: &mut script_random,
             menu_item_requests: &mut menu_item_requests,
             debug_mode: 0,
@@ -14162,6 +14279,41 @@ mod tests {
     }
 
     #[test]
+    fn disabled_fes_button_does_not_receive_fallback_unfocus() {
+        for enabled in [false, true] {
+            let temp = TempDir::new();
+            let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
+            let owner = player.current_task_id;
+            let document = FesDocument {
+                sections: [
+                    (b"DEFINE".as_slice(), b"BUTTON button".as_slice()),
+                    (b"START", b"wait 20"),
+                    (b"button.UNFOCUS", b"exit 42"),
+                ].into_iter().enumerate().map(|(offset, (header, line))| cs2_script::FesSection {
+                    header: header.to_vec(),
+                    lines: vec![cs2_script::FesLine { offset, bytes: line.to_vec() }],
+                }).collect(),
+            };
+            player.with_host(|host| {
+                Ok(host.begin_direct_fes_entry(owner, document, Default::default())?)
+            }).unwrap();
+            player.run_frames(1, 10_000).unwrap();
+            let button = player.with_host(|host| {
+                Ok(fes_task_platform::navigation_binding(host, owner, b"button", 0).unwrap().0.value as u32)
+            }).unwrap();
+            let region = player.input_task.regions.iter_mut().find(|region| region.id() == button).unwrap();
+            region.words[3..7].copy_from_slice(&[10, 10, 20, 20]);
+            region.words[8] = u32::from(enabled);
+            player.input_task.selected_region = Some(button);
+
+            player.dispatch_pending_task_input().unwrap();
+            assert_ne!(player.input_task.selected_region, Some(button));
+            player.run_frames(2, 10_000).unwrap();
+            assert_eq!(player.data_services.tasks.fes.direct_exit_code(owner), enabled.then_some(42));
+        }
+    }
+
+    #[test]
     fn held_mouse_down_only_queues_one_click_and_fast_separate_taps_survive() {
         let temp = TempDir::new();
         let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save")).unwrap();
@@ -14203,7 +14355,7 @@ mod tests {
                 section(b"START", &[
                     b"if (_CLICK_L_==button[1])",
                     b"button[1] delete",
-                    b"if (button[1]==0 && button[0]!=0)",
+                    b"if (button[1]==_CLICK_L_ && button[0]!=0)",
                     b"exit 42",
                     b"else",
                     b"exit 99",
@@ -14219,7 +14371,7 @@ mod tests {
         assert_eq!(player.data_services.tasks.fes.direct_exit_code(owner), None);
 
         let auxiliary = player.data_services.tasks.fes.platform.auxiliary_button(owner).unwrap();
-        player.with_host(|host| {
+        let region = player.with_host(|host| {
             let (target, _, _) = fes_task_platform::navigation_binding(host, owner, b"button", 1)
                 .expect("Start bank has a live region");
             let region = target.value as u32;
@@ -14237,11 +14389,17 @@ mod tests {
             let driver = host.data_services.tasks.fes.runtime(owner).unwrap().driver.as_ref().unwrap();
             assert_eq!(driver.interpreter.named["_CLICK_L_"][&0], region as i32);
             assert_eq!(driver.interpreter.named["button"][&1], region as i32);
-            Ok(())
+            Ok(region)
         }).unwrap();
 
         player.run_frames(1, 10_000).unwrap();
         assert_eq!(player.data_services.tasks.fes.direct_exit_code(owner), Some(42));
+        assert!(player.input_task.regions.iter().all(|entry| entry.id() != region));
+        player.with_host(|host| {
+            assert!(fes_task_platform::navigation_binding(host, owner, b"button", 1).is_none());
+            assert!(fes_task_platform::navigation_binding(host, owner, b"button", 0).is_some());
+            Ok(())
+        }).unwrap();
     }
 
     #[test]
@@ -14450,7 +14608,7 @@ mod tests {
                 movie_resources: &mut newton.movie_resources,
                 sound_channels: &mut newton.sound_channels,
                 sound_groups: &newton.sound_groups,
-                sound_config: &newton.sound_config,
+                sound_config: &mut newton.sound_config,
                 script_random: &mut newton.script_random,
                 menu_item_requests: &mut newton.menu_item_requests,
                 debug_mode: newton.debug_mode,

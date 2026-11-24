@@ -1689,7 +1689,7 @@ pub(super) fn apply_effect(
     effect: &FesDriverEffect,
     shared: &mut ExpressionState,
 ) -> Result<Option<bool>> {
-    if let Some(done) = super::fes_driver::main_flow::controls_flow::apply_effect(host, view, driver, effect)? {
+    if let Some(done) = super::fes_driver::main_flow::controls_flow::apply_effect(host, view, runtime, driver, effect)? {
         return Ok(Some(done));
     }
     let mut store = std::mem::take(&mut host.data_services.fes_controls);
@@ -2266,14 +2266,14 @@ fn prepare_slider(object: &mut Bank, reloaded: bool) -> Result<()> {
         object.scroll.minimum_extent = part(1).wrapping_add(part(2));
         object.scroll.rebuild_geometry()?;
         object.scroll.travel = [0, extent.wrapping_sub(object.scroll.knob_extent)];
-        object.control_image = Some(compose_scroll(
+        object.control_image = compose_scroll(
             source,
             &object.source_bytes,
             if reloaded { 0 } else { object.state as u32 },
             axis,
             object.scroll.knob_extent,
             object.scroll.minimum_extent,
-        )?);
+        )?;
     }
     Ok(())
 }
@@ -2829,7 +2829,7 @@ fn compose_scroll(
     axis: usize,
     extent: i32,
     minimum: i32,
-) -> Result<RgbaFrame> {
+) -> Result<Option<RgbaFrame>> {
     let mut parts = Vec::new();
     for part in [1, 0, 2] {
         let image = source
@@ -2858,6 +2858,11 @@ fn compose_scroll(
     } else {
         [cross, length]
     };
+    // A missing POS2 frame leaves the rectangle empty. Some sprite sets also
+    // omit individual states, leaving no cross-axis pixels to submit.
+    if size.contains(&0) {
+        return Ok(None);
+    }
     checked_size(size)?;
     let mut canvas = Canvas::new(size[0], size[1])?;
     let mut at: i32 = 0;
@@ -2902,10 +2907,10 @@ fn compose_scroll(
             Rect::new(0, 0, image.width(), image.height()),
         )?;
     }
-    Ok(
+    Ok(Some(
         RgbaFrame::from_rgba8(size[0], size[1], canvas.pixels().to_vec())?
             .with_raw_metadata(FrameMetadata::raster([0; 2])),
-    )
+    ))
 }
 
 fn copy_scaled_bottom(

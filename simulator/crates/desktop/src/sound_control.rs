@@ -30,6 +30,37 @@ pub(super) fn audio_channel_for_type(kind: &[u8]) -> Option<AudioChannel> {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn sound_is_bgm(&self, resource: &str) -> bool {
+        self.configured_sound_channel(resource, false)
+            .unwrap_or_else(|| sound_audio_channel(resource)) == AudioChannel::Bgm
+    }
+
+    pub(super) fn release_fast_forward_sounds(&mut self) -> cs2_script::Result<()> {
+        let channels: Vec<_> = self.sound_channels.iter().filter_map(|(&channel, state)| {
+            if state.pending_start.as_ref().is_some_and(|pending| matches!(pending.operation,
+                crate::sound_async::Operation::StopForLoad(_) | crate::sound_async::Operation::PrepareLoad))
+            {
+                return None;
+            }
+            let resource = state.resource.as_deref()?;
+            (state.task.is_speech || !self.sound_is_bgm(resource)).then_some(channel)
+        }).collect();
+        for channel in channels {
+            self.cancel_audio_channel_start(channel)?;
+            if let Some(handle) = self.sound_channels[&channel].handle
+                && let cs2_runtime::AudioControl::Pending(ticket) = self.audio_host.begin_stop(handle)
+                    .map_err(|cause| self.sound_host_error(cause))?
+            {
+                self.audio_host.cancel_control(ticket).map_err(|cause| self.sound_host_error(cause))?;
+            }
+            let state = self.sound_channels.get_mut(&channel).unwrap();
+            let owner = state.task.owner;
+            state.release();
+            state.task.owner = owner;
+        }
+        Ok(())
+    }
+
     pub(super) fn configured_sound_channel(&self, resource: &str, speech: bool) -> Option<AudioChannel> {
         if speech {
             return Some(AudioChannel::Voice);
@@ -292,6 +323,12 @@ impl LoggingHost<'_> {
         value: u32,
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
+        if index == 157 && self.data_services.fast_forward
+            && self.sound_channels.get(&channel).is_some_and(|state|
+                state.task.is_speech || state.resource.as_deref().is_some_and(|name| !self.sound_is_bgm(name)))
+        {
+            return Ok(NativeReturn::Continue);
+        }
         if let Some(result) = self.begin_async_sound_control(index, channel, value)? {
             return Ok(result);
         }

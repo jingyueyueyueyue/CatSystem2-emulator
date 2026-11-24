@@ -13,10 +13,6 @@ use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, cp932_to_utf8, expand_kcs_format, native_state_error, native_state_error_owned, read_u32, trim_nul};
 use super::perf_detail::{ImageSourceStage, ImageSourceStep, SlowTask};
 
-#[cfg(test)]
-#[path = "image_material_async_tests.rs"]
-mod async_tests;
-
 const MAX_FILE: usize = 64 * 1024 * 1024;
 const MAX_PIXELS: usize = 128 * 1024 * 1024;
 const MAX_CACHE: usize = 256 * 1024 * 1024;
@@ -69,6 +65,8 @@ pub(super) struct ImageManager {
     capacity: usize,
     /// Constructor initializes +0x108 to one. Native 682 stores all bits.
     force_cache: u32,
+    resident_byte_budget: bool,
+    fast_forward: bool,
     bytes: usize,
     rgba_bytes: usize,
     frames: BTreeMap<String, (usize, RgbaFrame)>,
@@ -98,6 +96,7 @@ impl Default for ImageManager {
             async_enabled: false,
             image_loads: Default::default(), prepared_material: None,
             initialized: false, enabled: false, capacity: 0, force_cache: 1,
+            resident_byte_budget: false, fast_forward: false,
             bytes: 0, rgba_bytes: 0, frames: BTreeMap::new(), recency: VecDeque::new(),
             animation_aliases: Default::default(), aliases_initialized: false,
             resource_layers: BTreeMap::new(),
@@ -116,6 +115,34 @@ impl super::HeadlessPlayer {
 }
 
 impl ImageManager {
+    pub(super) fn enable_resident_byte_budget(&mut self) {
+        self.resident_byte_budget = true;
+        self.trim_resident(0);
+    }
+
+    pub(super) fn set_fast_forward(&mut self, active: bool) {
+        self.fast_forward = active;
+        if active { self.trim_resident(0); }
+    }
+
+    fn resident_limit(&self) -> usize {
+        if self.fast_forward { self.capacity.min(32 * 1024 * 1024) } else { self.capacity }
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(oldest) = self.recency.pop_back() else { return false; };
+        let (bytes, frame) = self.frames.remove(&oldest).expect("image cache recency entry");
+        self.bytes -= bytes;
+        self.rgba_bytes -= frame.pixels().len();
+        true
+    }
+
+    fn trim_resident(&mut self, incoming: usize) {
+        while self.rgba_bytes.saturating_add(incoming) > self.resident_limit() {
+            if !self.evict_oldest() { break; }
+        }
+    }
+
     pub(super) fn pending_image_owners(&self) -> impl Iterator<Item = u32> + '_ { self.image_loads.owners() }
     pub(super) fn has_pending_image_loads(&self) -> bool { self.image_loads.has_pending() }
     pub(super) fn cancel_image_load(&mut self, owner: u32) { self.image_loads.cancel(owner); }
@@ -175,13 +202,14 @@ impl ImageManager {
             return Ok(());
         }
         let cost = cache_cost(frame)?;
-        // Original evicts while current + new >= capacity, including equality.
-        // A sole oversized entry is allowed after all old entries are gone.
-        while self.bytes.checked_add(cost).is_none_or(|sum| sum >= self.capacity) {
-            let Some(oldest) = self.recency.pop_back() else { break; };
-            if let Some((bytes, frame)) = self.frames.remove(&oldest) {
-                self.bytes -= bytes;
-                self.rgba_bytes -= frame.pixels().len();
+        if self.resident_byte_budget {
+            let rgba = frame.pixels().len();
+            if rgba > self.resident_limit() || cost > MAX_CACHE { return Ok(()); }
+            self.trim_resident(rgba);
+        } else {
+            // The original manager allows a sole entry larger than its native budget.
+            while self.bytes.checked_add(cost).is_none_or(|sum| sum >= self.capacity) {
+                if !self.evict_oldest() { break; }
             }
         }
         let total = self.bytes.checked_add(cost).filter(|&bytes| bytes <= MAX_CACHE)
@@ -703,7 +731,8 @@ impl LoggingHost<'_> {
             let _detail = scope("image_manager_init");
             self.ensure_image_manager()?;
         }
-        let cache = request_cache || self.data_services.image_manager.force_cache != 0;
+        let manager = &self.data_services.image_manager;
+        let cache = request_cache || manager.force_cache != 0 || manager.fast_forward;
         let cached = {
             let _detail = scope("image_frame_cache_lookup");
             let _stage = ImageSourceStep::new(ImageSourceStage::CacheLookup);
@@ -1020,6 +1049,97 @@ fn cache_cost(frame: &RgbaFrame) -> Result<usize> {
     } else { row };
     row.checked_mul(frame.height() as usize)
         .ok_or_else(|| native_state_error("image cache native allocation size overflow"))
+}
+
+#[cfg(test)]
+mod fast_forward_tests {
+    use super::*;
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> anyhow::Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "cs2-image-manager-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fast_forward_twenty_image_cache_cycles() -> anyhow::Result<()> {
+        let scratch = Scratch::new()?;
+        let backgrounds = scratch.0.join("bg");
+        std::fs::create_dir(&backgrounds)?;
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&vec![0; 512 * 512 * 3], 512, 512, image::ExtendedColorType::Rgb8)?;
+        for round in 1..=20 {
+            for index in 0..8 {
+                std::fs::write(backgrounds.join(format!("{round}-{index}.jpg")), &jpeg)?;
+            }
+        }
+        let mut player = super::super::HeadlessPlayer::open_with_save_root(&scratch.0, &scratch.0)?;
+        let mut router = cs2_runtime::resource_router::ResourceRouter::default();
+        router.slots[0] = cs2_runtime::resource_router::ResourceSlot {
+            prefix: "bg".encode_utf16().collect(),
+            loose_directory: "bg".encode_utf16().collect(),
+            loose_enabled: true,
+            archive: None,
+        };
+        player.scan.resources.set_resource_router(router)?;
+        assert_eq!(player.enable_host_fast_forward(6 * 1024_u64.pow(3)), 768 * 1024 * 1024);
+        let manager = &mut player.data_services.image_manager;
+        manager.initialized = true;
+        manager.enabled = true;
+        manager.force_cache = 0;
+        manager.capacity = 4 * 1024 * 1024;
+        let ctrl = cs2_runtime::InputKey::Keyboard(17);
+        let mut peak = 0;
+        let mut evictions = 0;
+        for round in 1..=20 {
+            player.apply_host_input(cs2_runtime::InputEvent::KeyDown(ctrl))?;
+            assert!(player.advance_host_frame(1000)?);
+            assert!(player.data_services.fast_forward);
+            for index in 0..8 {
+                let before = player.data_services.image_manager.frames.len();
+                if index == 4 {
+                    let name = format!("bg/{round}-0.jpg");
+                    player.with_host(|host| Ok(host.load_managed_image_projection(&name, 0)?))?;
+                }
+                let name = format!("bg/{round}-{index}.jpg");
+                let frame = player.with_host(|host| Ok(host.load_managed_image_projection(&name, 0)?))?
+                    .expect("mock background should decode");
+                assert_eq!(frame.metadata().bit_depth, 24);
+                let manager = &player.data_services.image_manager;
+                if index == 4 {
+                    assert!(manager.shared_frame(&format!("bg/{round}-0.jpg"), 0).is_some());
+                    assert!(manager.shared_frame(&format!("bg/{round}-1.jpg"), 0).is_none());
+                }
+                peak = peak.max(manager.rgba_bytes);
+                evictions += before + 1 - manager.frames.len();
+                player.advance_host_frame(1000)?;
+            }
+            player.apply_host_input(cs2_runtime::InputEvent::KeyUp(ctrl))?;
+            assert!(player.advance_host_frame(1000)?);
+            assert!(!player.data_services.fast_forward);
+        }
+        println!("fast_forward cycles=20 decoded_backgrounds=160 lru_hits_checked=20 peak_decoded_bytes={peak} evictions={evictions}");
+        assert_eq!(peak, 4 * 1024 * 1024);
+        assert_eq!(evictions, 156);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

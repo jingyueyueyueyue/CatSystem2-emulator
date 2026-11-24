@@ -29,6 +29,7 @@ thiserror = "2"
 fontdue = { path = "vendor/fontdue-0.9.3" }
 lewton = { path = "vendor/lewton-0.10.2" }
 ttf-parser = { path = "vendor/ttf-parser-0.21.1" }
+wgpu-hal = { path = "vendor/wgpu-hal-27.0.4" }
 
 [profile.release]
 lto = "thin"

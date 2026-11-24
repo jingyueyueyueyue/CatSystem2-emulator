@@ -6,6 +6,7 @@ use crate::fes_tasks::FesTaskStore;
 pub(crate) fn supported_object(kind: &[u8]) -> bool {
     // SAVEPANEL also requires its dedicated source/pending codec in CPU7.
     matches!(kind, b"BASE" | b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"PLANE" | b"CPLANE" | b"SAVEPANEL")
+        || super::gallery_tables::is_gallery_kind(kind)
 }
 
 impl FesTaskPlatform {

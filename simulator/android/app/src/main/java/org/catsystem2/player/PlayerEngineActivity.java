@@ -4,6 +4,8 @@ import static org.catsystem2.player.PlayerActivity.*;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
@@ -14,6 +16,7 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.MatrixCursor;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -46,6 +49,7 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.text.InputType;
+import android.text.InputFilter;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.widget.BaseAdapter;
@@ -84,8 +88,11 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
 
     private static final int SELECT_GAME = 1;
     private static final int EXPORT_DIAGNOSTICS = 2;
+    private static final long DIAGNOSTIC_INTERVAL_MS = 5000;
+    private static final long DIAGNOSTIC_LOG_LIMIT = 4 * 1024 * 1024;
     private static final int FRAME_CHANGED = 1;
     private static final int FRAME_UNCHANGED = 4;
+    private static final int FRAME_MOVIE = 5;
     private static final int GAME_MENU_EFFECT_SETTINGS = 40027;
     private static final int GAME_MENU_MESSAGE_LIST = 40047;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -95,6 +102,8 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private boolean surfaceNeedsDetach;
     private HandlerThread playerThread;
     private Handler worker;
+    private HandlerThread presenterThread;
+    private Handler presenter;
     private volatile AndroidTweetHost tweetHost;
     private FrameLayout root;
     private SurfaceView surfaceView;
@@ -110,7 +119,12 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private Button exitGame;
     private Button keyboard;
     private FrameLayout playbackControls;
+    private long heldCtrlSession;
     private boolean exportingDiagnostics;
+    private boolean debugDiagnostics;
+    private long nextDiagnostic;
+    private volatile long nativeStepStarted;
+    private long reportedStep;
     private long gameKeyboardSession;
     private boolean gameKeyboardWasVisible;
     private long inputConnectionId;
@@ -141,6 +155,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private Button gameMenuButton;
     private AlertDialog effectSettingsDialog;
     private AlertDialog menuConfirmationDialog;
+    private AlertDialog textEntryDialog;
     private long gameMenuRequest;
     private ArrayList<GameMenuItem> gameMenuItems;
     private final HashMap<Integer, MessageInspector> messageInspectors = new HashMap<>();
@@ -154,11 +169,16 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private boolean running;
     private boolean frameScheduled;
     private long nextFrame;
-    private boolean hasFrame;
-    private boolean framePending;
+    private boolean presenting;
+    private long latestFrame;
+    private long postedFrame;
+    private long movieFrame;
+    private long nextPresent;
     private RenderSurface presentedSurface;
     private int frameWidth, frameHeight;
     private final int[] pointerOutput = new int[2];
+    // Only the one outstanding presentation may write this receipt.
+    private final long[] presentationReceipt = new long[7];
 
     private static final class RenderSurface {
         final Surface surface;
@@ -175,6 +195,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
 
     protected final void setGameHudCollection(boolean enabled) {
         if (worker != null) worker.post(() -> nativeSetHudEnabled(enabled));
+        if (presenter != null) presenter.post(() -> nativeSetDisplayStatsEnabled(enabled));
     }
 
     protected final boolean hasGameMonitorSurface() {
@@ -184,14 +205,21 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     protected final void requestGameHudSample(java.util.function.Consumer<long[]> callback) {
         if (worker == null || destroyed || !hudSamplePending.compareAndSet(false, true)) return;
         if (!worker.post(() -> {
-            try {
+            final long handle = session;
+            final RenderSurface target = renderSurface;
+            if (handle == 0 || !running || paused || target == null || !presenter.post(() -> {
                 long[] output = new long[16];
-                synchronized (surfaceLock) {
-                    if (session == 0 || !running || paused || renderSurface == null || surfaceNeedsDetach
-                        || nativeReadHud(session, output) != 1) return;
-                }
-                callback.accept(output);
-            } finally {
+                if (paused || renderSurface != target || nativeReadDisplayStats(handle, output) != 1
+                    || !worker.post(() -> {
+                        try {
+                            if (session == handle && !paused && renderSurface == target && nativeReadHud(output) == 1) {
+                                callback.accept(output);
+                            }
+                        } finally {
+                            hudSamplePending.set(false);
+                        }
+                    })) hudSamplePending.set(false);
+            })) {
                 hudSamplePending.set(false);
             }
         })) hudSamplePending.set(false);
@@ -200,6 +228,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     protected final FrameLayout getPlayerRoot() { return root; }
 
     private void setLibraryVisible(boolean visible) {
+        if (visible) releaseHeldCtrl();
         panel.setVisibility(visible ? View.VISIBLE : View.GONE);
         onGameViewVisibilityChanged(!visible);
     }
@@ -210,6 +239,12 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         playerThread = new HandlerThread("CS2 player");
         playerThread.start();
         worker = new Handler(playerThread.getLooper());
+        debugDiagnostics = isDebuggable(this);
+        worker.post(this::recordPreviousProcessExit);
+        if (debugDiagnostics) ui.postDelayed(watchNativeStep, 1000);
+        presenterThread = new HandlerThread("CS2 Surface");
+        presenterThread.start();
+        presenter = new Handler(presenterThread.getLooper());
         root = new FrameLayout(this);
         root.setBackgroundColor(0xff000000);
         surfaceView = new PlayerSurface();
@@ -467,11 +502,59 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         return new File(getFilesDir(), "player-error.log");
     }
 
-    private void appendDiagnostic(String message) {
-        try (FileOutputStream output = new FileOutputStream(diagnosticsLog(), true)) {
+    private synchronized void appendDiagnostic(String message) {
+        File log = diagnosticsLog();
+        if (log.length() >= DIAGNOSTIC_LOG_LIMIT
+                && !log.renameTo(new File(getFilesDir(), "player-error.previous.log"))) {
+            android.util.Log.w("CS2Player", "Could not rotate player diagnostics");
+        }
+        try (FileOutputStream output = new FileOutputStream(log, true)) {
             output.write((message + "\n").getBytes(StandardCharsets.UTF_8));
         } catch (IOException ignored) {}
     }
+
+    private void runtimeDiagnostic(String message) {
+        String record = "time_ms=" + System.currentTimeMillis() + " pid=" + android.os.Process.myPid()
+            + " " + message;
+        android.util.Log.i("CS2Diag", record);
+        appendDiagnostic(record);
+    }
+
+    private void recordPreviousProcessExit() {
+        if (Build.VERSION.SDK_INT < 30) return;
+        ActivityManager manager = getSystemService(ActivityManager.class);
+        if (manager == null) return;
+        android.content.SharedPreferences history = getSharedPreferences("diagnostic-history", MODE_PRIVATE);
+        long last = history.getLong("exit_time", 0);
+        long newest = last;
+        for (ApplicationExitInfo exit : manager.getHistoricalProcessExitReasons(getPackageName(), 0, 8)) {
+            long timestamp = exit.getTimestamp();
+            if (timestamp <= last) continue;
+            newest = Math.max(newest, timestamp);
+            int reason = exit.getReason();
+            if (reason == ApplicationExitInfo.REASON_CRASH || reason == ApplicationExitInfo.REASON_CRASH_NATIVE
+                    || reason == ApplicationExitInfo.REASON_ANR || reason == ApplicationExitInfo.REASON_LOW_MEMORY) {
+                runtimeDiagnostic("previous_exit time_ms=" + timestamp + " process=" + exit.getProcessName()
+                    + " pid=" + exit.getPid() + " reason=" + reason + " status=" + exit.getStatus()
+                    + " pss_kib=" + exit.getPss() + " rss_kib=" + exit.getRss()
+                    + " description=" + exit.getDescription());
+            }
+        }
+        if (newest > last) history.edit().putLong("exit_time", newest).apply();
+    }
+
+    private final Runnable watchNativeStep = new Runnable() {
+        @Override public void run() {
+            if (destroyed) return;
+            long started = nativeStepStarted;
+            long elapsed = SystemClock.uptimeMillis() - started;
+            if (started != 0 && started != reportedStep && elapsed >= DIAGNOSTIC_INTERVAL_MS) {
+                reportedStep = started;
+                runtimeDiagnostic("native_step_wait elapsed_ms=" + elapsed);
+            }
+            ui.postDelayed(this, 1000);
+        }
+    };
 
     private void logLibraryIssue(String phase, String stage, GameLibrary.Entry entry, Exception error) {
         String source = entry.tree == null ? "legacyPath=" + entry.game.getAbsolutePath()
@@ -709,7 +792,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         running = false;
         worker.removeCallbacks(frame);
         frameScheduled = false;
-        hasFrame = framePending = false;
+        latestFrame = postedFrame = movieFrame = nextPresent = 0;
         presentedSurface = null;
         long closing = session;
         session = 0;
@@ -721,6 +804,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         } catch (RuntimeException error) {
             android.util.Log.e("CS2Player", "Closing the Tweet host failed", error);
         } finally {
+            if (closing != 0) presenter.post(this::resetPresentationSurface);
             if (closing != 0 && nativeClose(closing) < 0) {
                 android.util.Log.e("CS2Player", "Closing the native session failed: " + nativeErrorText());
             }
@@ -751,14 +835,22 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                 String details = " mode=" + mode + " key=" + entry.key + " game=" + game.getAbsolutePath()
                     + " saves=" + saves.getAbsolutePath();
                 int language = library.language(entry);
+                ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+                ActivityManager manager = getSystemService(ActivityManager.class);
+                if (manager != null) manager.getMemoryInfo(memory);
                 session = nativeOpen(game.getAbsolutePath().getBytes(StandardCharsets.UTF_8),
-                    saves.getAbsolutePath().getBytes(StandardCharsets.UTF_8), language);
+                    saves.getAbsolutePath().getBytes(StandardCharsets.UTF_8), language, memory.lowMemory ? 0 : memory.availMem);
                 if (session == 0) {
                     IOException error = new IOException(nativeErrorText());
                     logLibraryIssue(isolated ? "launch-isolated" : "launch", "native-open" + details, entry, error);
                     throw error;
                 }
                 android.util.Log.i("CS2Player", "Opened " + game + " language=" + language);
+                if (debugDiagnostics) {
+                    nextDiagnostic = 0;
+                    runtimeDiagnostic("opened session=" + session + " mode=" + mode + " key=" + entry.key
+                        + " title=" + entry.title + " language=" + language);
+                }
                 if (isolated) {
                     String record = "library phase=launch stage=native-open result=opened" + details;
                     android.util.Log.i("CS2Player", record);
@@ -811,27 +903,57 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         worker.postAtTime(frame, Math.max(SystemClock.uptimeMillis(), nextFrame));
     }
 
-    private void presentFrame(RenderSurface target) throws IOException {
-        int result;
-        synchronized (surfaceLock) {
-            if (renderSurface != target || paused || !isCurrent(sessionGeneration)) return;
-            if (!detachSurfaceLocked() || !target.surface.isValid()) {
-                nextFrame = SystemClock.uptimeMillis() + 16;
-                return;
+    private void requestPresentation(RenderSurface target) {
+        if (presenting || session == 0 || !running || paused || target == null || latestFrame == 0
+            || !isCurrent(sessionGeneration) || (postedFrame == latestFrame && presentedSurface == target)) return;
+        long generation = sessionGeneration;
+        long handle = session;
+        presenting = presenter.postAtTime(() -> {
+            int result;
+            synchronized (surfaceLock) {
+                if (renderSurface != target || paused || !isCurrent(generation)
+                    || !detachSurfaceLocked() || !target.surface.isValid()) {
+                    result = -2;
+                } else {
+                    result = nativePresent(handle, target.surface, presentationReceipt);
+                    if (result != 0 && !target.surface.isValid()) result = -2;
+                }
             }
-            result = nativePresent(session, target.surface);
-            if (result == -2 || !target.surface.isValid()) {
-                nextFrame = SystemClock.uptimeMillis() + 16;
-                return;
-            }
+            final int status = result;
+            final String failure = status != 0 && status != -2 ? nativeErrorText() : null;
+            worker.post(() -> finishPresentation(generation, handle, target, status, failure));
+        }, Math.max(SystemClock.uptimeMillis(), nextPresent));
+    }
+
+    private void finishPresentation(long generation, long handle, RenderSurface target, int result,
+                                    String failure) {
+        presenting = false;
+        if (session != handle || !isCurrent(generation)) {
+            requestPresentation(renderSurface);
+            return;
         }
-        if (result != 0) throw new IOException("画面提交失败 (" + result + ")：" + nativeErrorText());
+        if (result == -2) {
+            nextPresent = SystemClock.uptimeMillis() + 16;
+            requestPresentation(renderSurface);
+            return;
+        }
+        if (result != 0) {
+            stopWithError("游戏运行中断", new IOException("画面提交失败 (" + result + ")：" + failure));
+            return;
+        }
+        nextPresent = 0;
+        postedFrame = presentationReceipt[0];
+        nativeRecordPresent(handle, presentationReceipt);
         onGameFrameSubmitted();
-        framePending = false;
-        if (presentedSurface == target) return;
+        if (movieFrame != 0 && postedFrame >= movieFrame) {
+            movieFrame = 0;
+            scheduleFrame();
+        }
+        if (paused) return;
+        boolean targetChanged = presentedSurface != target;
         presentedSurface = target;
-        final long generation = sessionGeneration;
-        final long handle = session;
+        requestPresentation(renderSurface);
+        if (!targetChanged) return;
         ui.post(() -> {
             if (!isCurrent(generation) || messageUiSession != handle || renderSurface != target || gameReady) return;
             launchingTitle = null;
@@ -849,14 +971,17 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             final long generation = sessionGeneration;
             if (!running || paused || target == null || !isCurrent(generation) || session == 0) return;
             try {
-                if (framePending || (hasFrame && presentedSurface != target)) {
-                    presentFrame(target);
-                    scheduleFrame();
-                    return;
+                requestPresentation(target);
+                if (movieFrame != 0) return;
+                if (debugDiagnostics) nativeStepStarted = SystemClock.uptimeMillis();
+                int state;
+                try {
+                    state = nativeStep(session, 20000);
+                } finally {
+                    nativeStepStarted = 0;
                 }
-                int state = nativeStep(session, 20000);
-                if (state == FRAME_CHANGED || state == FRAME_UNCHANGED) onGameTickCompleted();
-                if (state == 3) android.util.Log.w("CS2Player", "Game tick stalled:\n" + nativeErrorText());
+                if (state == FRAME_CHANGED || state == FRAME_UNCHANGED || state == FRAME_MOVIE) onGameTickCompleted();
+                if (state == 3) runtimeDiagnostic("engine_tick_stalled\n" + nativeErrorText());
                 if (state < 0) throw new IOException(nativeErrorText());
                 if (state == 2) {
                     closeSession();
@@ -868,6 +993,15 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                         status.setText("游戏已退出");
                     });
                     return;
+                }
+                long now = SystemClock.uptimeMillis();
+                if (debugDiagnostics && now >= nextDiagnostic) {
+                    nextDiagnostic = now + DIAGNOSTIC_INTERVAL_MS;
+                    byte[] snapshot = nativeDiagnostic(session);
+                    if (snapshot != null) runtimeDiagnostic("engine_state step_result=" + state
+                        + " frame_published=" + latestFrame + " frame_presented=" + postedFrame
+                        + " native_heap_bytes=" + android.os.Debug.getNativeHeapAllocatedSize()
+                        + "\n" + new String(snapshot, StandardCharsets.UTF_8));
                 }
                 byte[] lists = nativeMessageLists(session);
                 if (lists != null) {
@@ -904,6 +1038,18 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                     if (data.hasRemaining()) throw new IOException("对话框请求包含多余数据");
                     ui.post(() -> showHostDialog(dialogSession, requestId, title, text));
                 }
+                final byte[] entry = nativeTextEntry(session);
+                if (entry != null) {
+                    final long entrySession = session;
+                    final ByteBuffer data = ByteBuffer.wrap(entry).order(ByteOrder.LITTLE_ENDIAN);
+                    if (data.remaining() < 16) throw new IOException("Text entry is truncated");
+                    final long request = data.getLong();
+                    final int limit = messageWord(data);
+                    final boolean allowCancel = messageWord(data) != 0;
+                    final String title = messageString(data), initial = messageString(data);
+                    if (data.hasRemaining() || limit < 1 || limit > 1023) throw new IOException("Invalid text entry");
+                    ui.post(() -> showTextEntry(entrySession, request, title, initial, limit, allowCancel));
+                }
                 int pointer = nativePointer(session, pointerOutput);
                 if (pointer < 0) throw new IOException(nativeErrorText());
                 if (pointer == 1) {
@@ -917,13 +1063,36 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                     final long cursorSession = session;
                     ui.post(() -> {
                         if (!destroyed && messageUiSession == cursorSession) {
-                            PointerIcon icon = PointerIcon.getSystemIcon(PlayerEngineActivity.this,
-                                visible ? PointerIcon.TYPE_DEFAULT : PointerIcon.TYPE_NULL);
-                            surfaceView.setPointerIcon(icon);
-                            gamePointer.setPointerIcon(icon);
                             gamePointer.setCursorVisible(visible);
                         }
                     });
+                }
+                final byte[] cursorImage = nativeCursorImage(session);
+                if (cursorImage != null) {
+                    final long cursorSession = session;
+                    final ByteBuffer image = ByteBuffer.wrap(cursorImage).order(ByteOrder.LITTLE_ENDIAN);
+                    final int width = messageWord(image);
+                    if (width == 0 && !image.hasRemaining()) {
+                        ui.post(() -> {
+                            if (!destroyed && messageUiSession == cursorSession) gamePointer.setCursorImage(null, 0, 0);
+                        });
+                    } else {
+                        final int height = messageWord(image), x = messageWord(image), y = messageWord(image);
+                        if (width < 1 || width > 256 || height < 1 || height > 256 || x < 0 || x >= width
+                            || y < 0 || y >= height || image.remaining() != width * height * 4) {
+                            throw new IOException("Invalid cursor image");
+                        }
+                        final int[] pixels = new int[width * height];
+                        for (int i = 0; i < pixels.length; i++) {
+                            int rgba = image.getInt();
+                            pixels[i] = (rgba & 0xff00ff00) | ((rgba >> 16) & 0xff) | ((rgba & 0xff) << 16);
+                        }
+                        ui.post(() -> {
+                            if (!destroyed && messageUiSession == cursorSession) {
+                                gamePointer.setCursorImage(Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888), x, y);
+                            }
+                        });
+                    }
                 }
                 int generalPolicy = nativeGeneralWindowPolicy(session);
                 if (generalPolicy < 0) throw new IOException(nativeErrorText());
@@ -939,7 +1108,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                 if (windowRequest != 0) {
                     final long windowSession = session;
                     final int command = windowRequest;
-                    if (command >= 3 && command <= 6) {
+                    if (command >= 3 && command <= 7) {
                         final byte[] payload = nativeWindowUi(windowSession);
                         if (payload == null) throw new IOException(nativeErrorText());
                         ui.post(() -> applyHostWindowUi(windowSession, command, payload));
@@ -962,7 +1131,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                         }
                     });
                 }
-                if (state == FRAME_CHANGED) {
+                if (state == FRAME_CHANGED || state == FRAME_MOVIE) {
                     int width = nativeSize(session, 0);
                     int height = nativeSize(session, 1);
                     if (width > 0 && height > 0 && (frameWidth != width || frameHeight != height)) {
@@ -975,24 +1144,24 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                             resizeSurface();
                         });
                     }
-                    hasFrame = framePending = true;
+                    if (nativePublishFrame(session, ++latestFrame) != 0) throw new IOException(nativeErrorText());
+                    if (state == FRAME_MOVIE) movieFrame = latestFrame;
+                    requestPresentation(renderSurface);
                 }
-                if (state == FRAME_CHANGED || state == FRAME_UNCHANGED) {
-                    if (framePending) presentFrame(target);
-                    if (framePending) {
-                        scheduleFrame();
-                        return;
-                    }
+                if (state == FRAME_CHANGED || state == FRAME_UNCHANGED || state == FRAME_MOVIE) {
                     // The portable fixed-step clock retains bounded tick debt.
                     // A late draw must not reset game time on every iteration.
                     int delay = nativeTickDelay(session, false);
                     if (delay < 0) throw new IOException(nativeErrorText());
                     nextFrame = SystemClock.uptimeMillis() + delay;
                 } else {
-                    // Script budget continuation stays at the same game tick.
-                    nextFrame = SystemClock.uptimeMillis() + 1;
+                    // Budget continuations yield to queued messages at the
+                    // same tick. Pending dependencies keep their poll delay.
+                    int delay = nativeRetryDelay(session);
+                    if (delay < 0) throw new IOException(nativeErrorText());
+                    nextFrame = SystemClock.uptimeMillis() + delay;
                 }
-                scheduleFrame();
+                if (movieFrame == 0) scheduleFrame();
             } catch (Exception error) { stopWithError("游戏运行中断", error); }
         }
     };
@@ -1723,6 +1892,17 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
                     new AlertDialog.Builder(this).setTitle(title).setMessage(error.toString())
                         .setPositiveButton(android.R.string.ok, null).show();
                 }
+            } else if (command == 7) {
+                String title = messageString(data), message = messageString(data);
+                if (data.hasRemaining()) throw new IOException("Menu information has trailing bytes");
+                AlertDialog dialog = new AlertDialog.Builder(this).setTitle(title).setMessage(message)
+                    .setPositiveButton(android.R.string.ok, null).create();
+                menuConfirmationDialog = dialog;
+                dialog.setOnDismissListener(ignored -> {
+                    if (menuConfirmationDialog == dialog) menuConfirmationDialog = null;
+                    submitWindowUi(handle, request, 6, 0, 0, 0);
+                });
+                dialog.show();
             } else throw new IOException("Unknown window UI command");
         } catch (Exception error) {
             worker.post(() -> { if (session == handle) stopWithError("Window UI failed", error); });
@@ -1734,6 +1914,11 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         if (handle == 0 || paused || logicalWidth <= 0 || view.getWidth() <= 0 || view.getHeight() <= 0) return true;
         int action = event.getActionMasked();
         boolean down = action == MotionEvent.ACTION_DOWN;
+        if (down && event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
+                && (event.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0) {
+            showPlaybackControls();
+            return true;
+        }
         boolean cancelled = action == MotionEvent.ACTION_CANCEL;
         boolean up = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP;
         int index = event.getActionIndex();
@@ -1910,6 +2095,46 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         } catch (RuntimeException error) { finishHostDialog(handle, request, false); }
     }
 
+    private void showTextEntry(long handle, long request, String title, String initial, int limit, boolean allowCancel) {
+        if (destroyed || messageUiSession != handle) return;
+        EditText editor = new EditText(this);
+        editor.setSingleLine(true);
+        editor.setFilters(new InputFilter[] { new InputFilter.LengthFilter(limit) });
+        editor.setText(initial);
+        editor.selectAll();
+        final byte[][] result = { null };
+        AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(title).setView(editor)
+            .setCancelable(allowCancel).setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                result[0] = editor.getText().toString().getBytes(StandardCharsets.UTF_8);
+            });
+        if (allowCancel) builder.setNegativeButton(android.R.string.cancel, null);
+        AlertDialog dialog = builder.create();
+        textEntryDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (textEntryDialog == dialog) textEntryDialog = null;
+            worker.post(() -> {
+                if (session == handle && nativeTextEntryResult(handle, request, result[0]) < 0) {
+                    stopWithError("Text entry failed", new IOException(nativeErrorText()));
+                }
+            });
+        });
+        try {
+            dialog.show();
+            editor.requestFocus();
+            if (dialog.getWindow() != null) {
+                dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+            }
+        } catch (RuntimeException error) {
+            dialog.setOnDismissListener(null);
+            if (textEntryDialog == dialog) textEntryDialog = null;
+            worker.post(() -> {
+                if (session == handle && nativeTextEntryResult(handle, request, null) < 0) {
+                    stopWithError("Text entry failed", new IOException(nativeErrorText()));
+                }
+            });
+        }
+    }
+
     /** Read-only per-URI grants for a selected game document. */
     public static final class GameFilesProvider extends ContentProvider {
         static File checkedFile(File root, File requested) throws IOException {
@@ -2071,6 +2296,12 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             menuConfirmationDialog.dismiss();
             menuConfirmationDialog = null;
         }
+        if (textEntryDialog != null) {
+            textEntryDialog.setOnDismissListener(null);
+            textEntryDialog.dismiss();
+            textEntryDialog = null;
+        }
+        if (gamePointer != null) gamePointer.setCursorImage(null, 0, 0);
         for (MessageInspector inspector : messageInspectors.values()) inspector.close();
         messageInspectors.clear();
         for (MessageInspector inspector : sceneInspectors.values()) inspector.close();
@@ -2304,6 +2535,15 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         addPlaybackAction(actions, "游戏内返回（右键）", () -> tapGameInput(handle, 1, 2, 1));
         addPlaybackAction(actions, "取消 / 返回（Esc）", () -> tapGameInput(handle, 3, 4, 27));
         addPlaybackAction(actions, "确认（Enter）", () -> tapGameInput(handle, 3, 4, 13));
+        addPlaybackAction(actions, heldCtrlSession == handle ? "松开 Ctrl" : "长按 Ctrl", () -> {
+            if (inputSession() != handle || paused || destroyed) return;
+            if (heldCtrlSession == handle) {
+                releaseHeldCtrl();
+            } else {
+                heldCtrlSession = handle;
+                sendHeldCtrl(handle, true);
+            }
+        });
         addPlaybackAction(actions, "上一页（Page Up）", () -> tapGameInput(handle, 3, 4, 33));
         addPlaybackAction(actions, "下一页（Page Down）", () -> tapGameInput(handle, 3, 4, 34));
         addPlaybackAction(actions, "软键盘", this::showGameKeyboard);
@@ -2420,6 +2660,22 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             }
         });
     }
+
+    private void releaseHeldCtrl() {
+        long handle = heldCtrlSession;
+        if (handle == 0) return;
+        heldCtrlSession = 0;
+        sendHeldCtrl(handle, false);
+    }
+
+    private void sendHeldCtrl(long handle, boolean down) {
+        worker.post(() -> {
+            if (session != handle || (down && paused)) return;
+            if (nativeInput(handle, down ? 3 : 4, 17, 0) < 0) {
+                stopWithError("Ctrl 输入失败", new IOException(nativeErrorText()));
+            }
+        });
+    }
     @Override public boolean onKeyUp(int code, KeyEvent event) {
         return key(inputSession(), code, false) || super.onKeyUp(code, event);
     }
@@ -2439,7 +2695,10 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         else if (code == KeyEvent.KEYCODE_DEL) key = 8;
         else if (code == KeyEvent.KEYCODE_SPACE) key = 32;
         else if (code == KeyEvent.KEYCODE_ESCAPE) key = 27;
-        else if (code == KeyEvent.KEYCODE_CTRL_LEFT || code == KeyEvent.KEYCODE_CTRL_RIGHT) key = 17;
+        else if (code == KeyEvent.KEYCODE_CTRL_LEFT || code == KeyEvent.KEYCODE_CTRL_RIGHT) {
+            if (heldCtrlSession == handle) return true;
+            key = 17;
+        }
         else if (code == KeyEvent.KEYCODE_DPAD_LEFT) key = 37;
         else if (code == KeyEvent.KEYCODE_DPAD_UP) key = 38;
         else if (code == KeyEvent.KEYCODE_DPAD_RIGHT) key = 39;
@@ -2466,13 +2725,30 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         private int x, y;
         private boolean shown;
         private boolean cursorVisible = true;
+        private Bitmap cursorImage;
+        private int hotspotX, hotspotY;
         GamePointer() {
             super(PlayerEngineActivity.this);
             setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         }
         void move(int x, int y) { this.x = x; this.y = y; shown = true; invalidate(); }
         void hide() { shown = false; invalidate(); }
-        void setCursorVisible(boolean visible) { cursorVisible = visible; invalidate(); }
+        void setCursorVisible(boolean visible) { cursorVisible = visible; updatePointerIcon(); }
+        void setCursorImage(Bitmap image, int x, int y) {
+            cursorImage = image;
+            hotspotX = x;
+            hotspotY = y;
+            updatePointerIcon();
+        }
+        private void updatePointerIcon() {
+            PointerIcon icon = cursorVisible && cursorImage != null
+                ? PointerIcon.create(cursorImage, hotspotX, hotspotY)
+                : PointerIcon.getSystemIcon(PlayerEngineActivity.this,
+                    cursorVisible ? PointerIcon.TYPE_DEFAULT : PointerIcon.TYPE_NULL);
+            surfaceView.setPointerIcon(icon);
+            setPointerIcon(icon);
+            invalidate();
+        }
         @Override protected void onDraw(Canvas canvas) {
             if (!shown || !cursorVisible || logicalWidth <= 0 || logicalHeight <= 0) return;
             float density = getResources().getDisplayMetrics().density;
@@ -2481,6 +2757,11 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             canvas.save();
             canvas.translate(px, py);
             canvas.scale(density, density);
+            if (cursorImage != null) {
+                canvas.drawBitmap(cursorImage, -hotspotX, -hotspotY, null);
+                canvas.restore();
+                return;
+            }
             arrow.reset();
             arrow.moveTo(0, 0); arrow.lineTo(0, 17); arrow.lineTo(4, 13);
             arrow.lineTo(8, 20); arrow.lineTo(11, 18); arrow.lineTo(7, 11);
@@ -2609,6 +2890,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     @Override public void onWindowFocusChanged(boolean focused) {
         super.onWindowFocusChanged(focused);
         if (worker == null || destroyed) return;
+        if (!focused) releaseHeldCtrl();
         final long focusSession = messageUiSession;
         if (focusSession == 0) return;
         worker.post(() -> {
@@ -2648,6 +2930,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     }
     @Override protected void onPause() {
         paused = true;
+        releaseHeldCtrl();
         activePointerId = -1;
         endGameKeyboard(true);
         if (tweetHost != null) tweetHost.paused();
@@ -2658,6 +2941,16 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         if (worker != null) worker.post(() -> {
             worker.removeCallbacks(frame);
             frameScheduled = false;
+            presentedSurface = null;
+            final long handle = session;
+            presenter.post(() -> {
+                resetPresentationSurface();
+                worker.post(() -> {
+                    if (session != handle) return;
+                    presentedSurface = null;
+                    requestPresentation(renderSurface);
+                });
+            });
             if (session != 0 && nativeInput(session, 5, 0, 0) < 0) {
                 stopWithError("暂停游戏失败", new IOException(nativeErrorText()));
             }
@@ -2671,6 +2964,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     }
     @Override protected void onDestroy() {
         destroyed = true;
+        ui.removeCallbacks(watchNativeStep);
         synchronized (surfaceLock) {
             renderSurface = null;
         }
@@ -2679,6 +2973,8 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
             try {
                 closeSession();
             } finally {
+                presenter.post(this::resetPresentationSurface);
+                presenterThread.quitSafely();
                 playerThread.quitSafely();
             }
         });
@@ -2695,12 +2991,13 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     }
 
     @Override public void surfaceDestroyed(SurfaceHolder holder) {
-        // Wait only for an in-flight buffer submit, not an engine tick or session close.
+        // SurfaceView requires the renderer to finish using this Surface
+        // before the callback returns.
         synchronized (surfaceLock) {
             renderSurface = null;
             surfaceNeedsDetach = true;
         }
-        worker.post(() -> {
+        presenter.post(() -> {
             synchronized (surfaceLock) {
                 detachSurfaceLocked();
             }
@@ -2710,6 +3007,13 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     private boolean detachSurfaceLocked() {
         if (surfaceNeedsDetach && nativeDetachSurface() == 0) surfaceNeedsDetach = false;
         return !surfaceNeedsDetach;
+    }
+
+    private void resetPresentationSurface() {
+        synchronized (surfaceLock) {
+            surfaceNeedsDetach = true;
+            detachSurfaceLocked();
+        }
     }
 
     private String nativeErrorText() { return new String(nativeError(), StandardCharsets.UTF_8); }

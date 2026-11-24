@@ -131,6 +131,20 @@ pub fn eval_expression_parameter(source: &[u8], state: &mut ExpressionState) -> 
 }
 
 pub fn eval_kcs_expression_parameter(source: &[u8], state: &mut ExpressionState) -> Result<i32> {
+    // Native 213 treats a standalone list of channel numbers, such as
+    // `[0,1]` in a CST sound command, as zero in a scalar expression.
+    let parameter = source.strip_suffix(b"%").unwrap_or(source).trim_ascii();
+    if source.len() <= MAX_EXPRESSION_BYTES
+        && let Some(items) = parameter.strip_prefix(b"[").and_then(|tail| tail.strip_suffix(b"]"))
+        && items.contains(&b',')
+        && items.split(|&byte| byte == b',').all(|item| {
+            let item = item.trim_ascii();
+            let digits = item.strip_prefix(b"-").or_else(|| item.strip_prefix(b"+")).unwrap_or(item);
+            !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+        })
+    {
+        return Ok(0);
+    }
     match eval_expression_parameter(source, state) {
         // Native 213 returns zero on a bracket mismatch, including fragments
         // such as `[2` and `3]` from an earlier comma-delimited split.
@@ -854,5 +868,21 @@ mod tests {
         assert_eq!(state.shared[0], 0);
         assert_eq!(eval_kcs_expression_parameter(b"(2+3)", &mut state).unwrap(), 5);
         assert!(eval_kcs_expression_parameter(b"$1", &mut state).is_err());
+    }
+
+    #[test]
+    fn kcs_expression_parameters_accept_standalone_channel_lists() {
+        let mut state = ExpressionState::new(1);
+        state.shared[0] = 9;
+        state.named.entry("channel".into()).or_default().insert(1, 7);
+        let original = state.clone();
+
+        for selector in [b"[0,1]".as_slice(), b" [2, -3, +4]%"] {
+            assert_eq!(eval_kcs_expression_parameter(selector, &mut state).unwrap(), 0);
+        }
+        assert!(eval_kcs_expression_parameter(b"[0,]", &mut state).is_err());
+        assert!(eval_expression_parameter(b"[0,1]", &mut state).is_err());
+        assert_eq!(eval_kcs_expression_parameter(b"channel[1]", &mut state).unwrap(), 7);
+        assert_eq!(state, original);
     }
 }

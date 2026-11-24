@@ -1,6 +1,7 @@
 //! Bounded cold M2 preparation. Workers own resources only; scene/VM publication
 //! happens exclusively when the original caller polls its retained request.
 use super::*;
+use crate::resource_preload::ModelSubscription;
 use cs2_runtime::{ResourceCandidate, emote::CpuMotionModel};
 use std::{collections::BTreeSet, sync::{Mutex, Weak, mpsc, atomic::{AtomicUsize, Ordering}}, time::{Duration, Instant}};
 
@@ -17,7 +18,12 @@ pub(super) struct Prepared {
     pub(super) version: EmoteArchiveVersion,
     identities: Vec<(ResourceCandidate, EmoteArchiveVersion)>,
     pub(super) phases_us: [u128; 4],
+    pub(super) preload_wait_us: Option<u128>,
     _charge: Option<Charge>,
+}
+pub(super) enum CachedModel {
+    Current(Arc<CpuMotionModel>),
+    Preload(ModelSubscription),
 }
 struct PlanWork {
     plan: EmoteM2ResourcePlan,
@@ -25,6 +31,20 @@ struct PlanWork {
     version: EmoteArchiveVersion,
     identities: Vec<(ResourceCandidate, EmoteArchiveVersion)>,
     config_us: u128,
+}
+impl PlanWork {
+    fn reuse(self, model: Arc<CpuMotionModel>, preload_wait_us: Option<u128>) -> Prepared {
+        Prepared {
+            plan: self.plan, model, version: self.version, identities: self.identities,
+            phases_us: [self.config_us, 0, 0, 0], preload_wait_us, _charge: None,
+        }
+    }
+}
+
+struct WaitingPreload {
+    work: PlanWork,
+    subscription: ModelSubscription,
+    started: Instant,
 }
 enum Work { Plan(Vec<u8>), Model(PlanWork) }
 enum Stage { Plan(PlanWork), Ready(Prepared) }
@@ -58,6 +78,7 @@ struct Pending {
     started: Instant,
     result: Arc<Mutex<Option<StageResult>>>,
     next: Option<Work>,
+    waiting: Option<WaitingPreload>,
 }
 struct Job {
     resources: Arc<ResourceIndex>,
@@ -109,17 +130,24 @@ impl Loads {
     }
     pub(super) fn poll(&mut self, resources: &ResourceIndex, owner: u32, target: u32,
         spec: &[u8], mode: u32, filter: u32, imports: u32,
-        mut cached: impl FnMut(&EmoteM2ResourcePlan, &EmoteArchiveVersion) -> Option<Arc<CpuMotionModel>>,
+        mut cached: impl FnMut(&EmoteM2ResourcePlan, &EmoteArchiveVersion) -> Option<CachedModel>,
     ) -> std::result::Result<Option<Prepared>, EmoteError> {
         self.check_cancelled(owner)?;
         if !self.pending.contains_key(&owner) {
             if spec.len() > MAX_FORMAT_BYTES + 1 { return Err(EmoteError::Capacity); }
             if self.pending.len() >= MAX_PENDING { return Err(EmoteError::Capacity); }
             self.pending.insert(owner, Pending { target, spec: spec.to_vec(), mode, filter, imports,
-                started: Instant::now(), result: Arc::new(Mutex::new(None)), next: Some(Work::Plan(spec.to_vec())) });
+                started: Instant::now(), result: Arc::new(Mutex::new(None)), next: Some(Work::Plan(spec.to_vec())), waiting: None });
         }
         let pending = self.pending.get_mut(&owner).unwrap();
-        let result = pending.result.try_lock().ok().and_then(|mut slot| slot.take());
+        let mut result = pending.result.try_lock().ok().and_then(|mut slot| slot.take());
+        if let Some(status) = pending.waiting.as_ref().and_then(|waiting| waiting.subscription.poll_model()) {
+            let WaitingPreload { work, started, .. } = pending.waiting.take().unwrap();
+            match status {
+                Ok(model) => result = Some(Ok(Stage::Ready(work.reuse(model, Some(started.elapsed().as_micros()))))),
+                Err(_) => pending.next = Some(Work::Model(work)),
+            }
+        }
         // A completed model remains usable after a paused application resumes;
         // the deadline applies while preparation is still unfinished.
         if pending.started.elapsed() >= TIMEOUT && !matches!(&result, Some(Ok(Stage::Ready(_)))) {
@@ -161,12 +189,23 @@ impl Loads {
                     self.pending.remove(&owner);
                     return Err(rejected("M2 preparation configuration changed"));
                 }
-                if let Some(model) = cached(&work.plan, &work.version) {
-                    Prepared { plan: work.plan, model, version: work.version, identities: work.identities,
-                        phases_us: [work.config_us, 0, 0, 0], _charge: None }
-                } else {
-                    pending.next = Some(Work::Model(work));
-                    return Ok(None);
+                match cached(&work.plan, &work.version) {
+                    Some(CachedModel::Current(model)) => work.reuse(model, None),
+                    Some(CachedModel::Preload(subscription)) => match subscription.poll_model() {
+                        Some(Ok(model)) => work.reuse(model, Some(0)),
+                        Some(Err(_)) => {
+                            pending.next = Some(Work::Model(work));
+                            return Ok(None);
+                        }
+                        None => {
+                            pending.waiting = Some(WaitingPreload { work, subscription, started: Instant::now() });
+                            return Ok(None);
+                        }
+                    },
+                    None => {
+                        pending.next = Some(Work::Model(work));
+                        return Ok(None);
+                    }
                 }
             }
             Stage::Ready(prepared) => prepared,
@@ -245,7 +284,8 @@ fn prepare(resources: &ResourceIndex, work: PlanWork, filter: u32, budget: Arc<A
     if identities.iter().any(|(candidate, version)| EmoteArchiveVersion::observe(candidate).as_ref() != Some(version)) {
         return Err(rejected("M2 resource changed during preparation"));
     }
-    Ok(Prepared { plan, model, version, identities, phases_us: [config_us, read_us, decode_us, load_us], _charge: Some(charge) })
+    Ok(Prepared { plan, model, version, identities, phases_us: [config_us, read_us, decode_us, load_us],
+        preload_wait_us: None, _charge: Some(charge) })
 }
 
 #[cfg(test)]

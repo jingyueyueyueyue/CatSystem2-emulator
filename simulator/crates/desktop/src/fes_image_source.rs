@@ -288,7 +288,9 @@ pub(crate) fn apply_image_source_command(
 ) -> Result<bool> {
     let Some(verb) = command.parameters.get(1) else { return Ok(false); };
     let load = verb.eq_ignore_ascii_case(b"load");
-    if !load && !verb.eq_ignore_ascii_case(b"setid") { return Ok(false); }
+    let unlocked_only = verb.eq_ignore_ascii_case(b"loadlist2");
+    let load_list = unlocked_only || verb.eq_ignore_ascii_case(b"loadlist");
+    if !load && !load_list && !verb.eq_ignore_ascii_case(b"setid") { return Ok(false); }
     let Some(target) = command.parameters.first() else { return Ok(false); };
     let target = if target == b"@" {
         command.object_event.as_ref().context("IMAGE source @ has no event object")?.parameter()
@@ -309,6 +311,14 @@ pub(crate) fn apply_image_source_command(
         driver.fallback_command(command, shared)?;
         return Ok(true);
     }
+    let list_source = if load_list {
+        let Some(source) = super::super::fes_gallery::image_source(driver, command, shared, unlocked_only)? else {
+            return Ok(true);
+        };
+        Some(source)
+    } else {
+        None
+    };
     let mut common_id = None;
     for bank in banks {
         let Some(definition) = usize::try_from(bank).ok()
@@ -325,7 +335,10 @@ pub(crate) fn apply_image_source_command(
             request_image_file(host, layer, command.parameters.get(2).map(Vec::as_slice).unwrap_or_default())?;
         }
         let current = layer.selected_id as u32 as i32;
-        let id = if let Some(id) = common_id { id } else {
+        let id = if let Some((filename, id)) = &list_source {
+            request_image_file(host, layer, filename)?;
+            *id
+        } else if let Some(id) = common_id { id } else {
             let id = command.parameters.get(if load { 3 } else { 2 })
                 .map(|source| driver.evaluate_parameter(source, current, shared)).transpose()?.unwrap_or(0);
             if !load { common_id = Some(id); }
@@ -346,7 +359,7 @@ pub(crate) fn update_image_sources(
     let trace = ImageSourceTrace::begin(view.id);
     let mut buttons = None;
     for (ordinal, (key, layer)) in runtime.media.iter_mut().enumerate() {
-        if !matches!(layer.kind.as_str(), "IMAGE" | "BUTTON") { continue; }
+        if !matches!(layer.kind.as_str(), "IMAGE" | "BUTTON" | "BGTABLE2") { continue; }
         {
             let _detail = SlowTask::new(view.id, || 34, "fes_img_expand_name").named(key.as_bytes(), Some(ordinal));
             let _stage = ImageSourceStep::new(ImageSourceStage::Expand);

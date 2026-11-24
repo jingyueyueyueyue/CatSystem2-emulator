@@ -12,14 +12,16 @@ pub enum HostWindowRequest {
     Menu,
     MenuConfirmation,
     SystemVolume,
+    MenuInfo,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PostedWindowCommand { ToggleFullscreen, SetWindowed(u32), Minimize, Close, Settings, GeneralSettings, Menu, Notify([u32; 4]), Open(u32), ConfirmTitle, ReturnToTitle, SystemVolume }
+enum PostedWindowCommand { ToggleFullscreen, SetWindowed(u32), Minimize, Close, Settings, GeneralSettings, Menu, Notify([u32; 4]), Open(u32), ConfirmTitle, ReturnToTitle, SystemVolume, Info(u32) }
 
 #[derive(Default)]
 pub(super) struct WindowControlState {
-    enabled: bool,
+    pub(super) enabled: bool,
+    pub(super) fes: super::fes_window::FesWindowState,
     commands: VecDeque<PostedWindowCommand>,
     requests: VecDeque<HostWindowRequest>,
     in_flight: Option<HostWindowRequest>,
@@ -30,6 +32,32 @@ pub(super) struct WindowControlState {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn post_fes_window_menu(&mut self, id: u32) -> Result<()> {
+        let command = match id {
+            0 => PostedWindowCommand::ConfirmTitle,
+            1 => PostedWindowCommand::Open(40045),
+            2 => PostedWindowCommand::Close,
+            10 => PostedWindowCommand::SetWindowed(0),
+            11 => PostedWindowCommand::SetWindowed(1),
+            12 => PostedWindowCommand::Minimize,
+            13 => PostedWindowCommand::Notify([0, 20, 0, 0]),
+            20 => PostedWindowCommand::Settings,
+            21 => PostedWindowCommand::GeneralSettings,
+            22 => PostedWindowCommand::SystemVolume,
+            30..=32 => PostedWindowCommand::Info(id),
+            _ => return Ok(()),
+        };
+        let state = &mut self.data_services.window_control;
+        if !state.enabled && id != 13 { return Ok(()); }
+        let notify = matches!(id, 0 | 22);
+        if state.commands.len() + state.requests.len() + usize::from(notify) >= 4096 {
+            bail!("window command queue is full");
+        }
+        if notify { state.commands.push_back(PostedWindowCommand::Notify([0, 159, 0, 1])); }
+        state.commands.push_back(command);
+        Ok(())
+    }
+
     pub(super) fn post_title_return(&mut self) -> cs2_script::Result<()> {
         let state = &mut self.data_services.window_control;
         if state.commands.len() + state.requests.len() >= 4096 {
@@ -185,6 +213,12 @@ impl HeadlessPlayer {
             let Some(command) = self.data_services.window_control.commands.front().copied()
                 else { return Ok(true); };
             match command {
+                PostedWindowCommand::Info(command) => {
+                    self.prepare_fes_menu_info(command)?;
+                    self.data_services.window_control.requests.push_back(HostWindowRequest::MenuInfo);
+                    self.data_services.window_control.commands.pop_front();
+                    return Ok(false);
+                }
                 PostedWindowCommand::SystemVolume => {
                     self.prepare_system_volume()?;
                     self.data_services.window_control.requests.push_back(HostWindowRequest::SystemVolume);
@@ -219,6 +253,10 @@ impl HeadlessPlayer {
                     });
                 }
                 PostedWindowCommand::Notify(packet) => {
+                    if self.loaded.is_none() && packet == [0, 20, 0, 0] {
+                        self.data_services.window_control.commands.pop_front();
+                        continue;
+                    }
                     if self.loaded.is_none() { bail!("menu notification requires the actual main task"); }
                     if self.data_services.window_control.notifying_menu
                         && !self.service_pending_root_dispatch(budget)?

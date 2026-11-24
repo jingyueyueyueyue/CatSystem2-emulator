@@ -1,16 +1,69 @@
-use super::{RASTER, Raster, buffer, device_frame, report};
+use super::{RASTER, buffer, device_frame, report};
 use anyhow::{Context, Result, bail};
 use cs2_renderer::Canvas;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 thread_local! {
     static DISPLAY_STATS_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static PRESENTATION: RefCell<PresentationState> = const { RefCell::new(PresentationState {
+        device: None, presenter: None, failed_window: None,
+    }) };
 }
 
+pub(crate) struct PresentationDevice {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    failed: Arc<AtomicBool>,
+}
+
+impl PresentationDevice {
+    pub(crate) fn is_current(device: Option<&Self>) -> bool {
+        RASTER.with_borrow(|slot| match (slot.as_ref(), device) {
+            (Some(raster), Some(device)) => Arc::ptr_eq(&raster.failed, &device.failed),
+            (None, None) => true,
+            _ => false,
+        })
+    }
+
+    pub(crate) fn current() -> Option<Self> {
+        RASTER.with_borrow(|slot| {
+            let raster = slot.as_ref()?;
+            Some(Self {
+                instance: raster.instance.clone(),
+                adapter: raster.adapter.clone(),
+                device: raster.device.clone(),
+                queue: raster.queue.clone(),
+                failed: Arc::clone(&raster.failed),
+            })
+        })
+    }
+}
+
+#[derive(Default)]
+struct PresentationState {
+    device: Option<Arc<AtomicBool>>,
+    presenter: Option<Presenter>,
+    failed_window: Option<usize>,
+}
+
+impl PresentationState {
+    fn select(&mut self, device: Option<&PresentationDevice>) -> bool {
+        let device = device.filter(|device| !device.failed.load(Ordering::Relaxed));
+        if self.device.as_ref().zip(device).is_some_and(|(old, device)| Arc::ptr_eq(old, &device.failed)) {
+            return true;
+        }
+        self.presenter = None;
+        self.failed_window = None;
+        self.device = device.map(|device| Arc::clone(&device.failed));
+        self.device.is_some()
+    }
+}
 struct PendingDisplay {
     session: u64,
     id: u32,
@@ -228,6 +281,13 @@ pub(super) struct Presenter {
     display_timing: DisplayTiming,
 }
 
+fn configure_surface(surface: &wgpu::Surface<'_>, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
+    // Reconfiguring the swapchain waits for an idle GPU. A concurrent queue
+    // submission can turn that wait into a wgpu surface validation error.
+    let _configuration = super::SURFACE_CONFIGURATION.write().unwrap_or_else(|error| error.into_inner());
+    surface.configure(device, config);
+}
+
 impl Presenter {
     fn size(window: NonNull<c_void>) -> Option<[u32; 2]> {
         let [width, height] = unsafe {
@@ -236,7 +296,7 @@ impl Presenter {
         (width > 0 && height > 0).then_some([width as u32, height as u32])
     }
 
-    fn new(raster: &Raster, window: NonNull<c_void>, [width, height]: [u32; 2]) -> Result<Self> {
+    fn new(raster: &PresentationDevice, window: NonNull<c_void>, [width, height]: [u32; 2]) -> Result<Self> {
         unsafe { ANativeWindow_acquire(window.as_ptr()) };
         let window = Window(window);
         let surface = unsafe { raster.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -257,8 +317,9 @@ impl Presenter {
             alpha_mode, view_formats: Vec::new(),
         };
         let device = &raster.device;
+        let validation = super::lock_validation_scope();
         device.push_error_scope(wgpu::ErrorFilter::Validation);
-        surface.configure(device, &config);
+        configure_surface(&surface, device, &config);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("CS2 window presentation"),
             source: wgpu::ShaderSource::Wgsl(include_str!("gpu_raster_present.wgsl").into()),
@@ -278,6 +339,7 @@ impl Presenter {
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
             bail!("configure Android Vulkan presentation: {error}");
         }
+        drop(validation);
         let layout = pipeline.get_bind_group_layout(0);
         let logical_buffer = buffer(device, 4, super::UPLOAD);
         let uniforms = buffer(device, 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
@@ -286,16 +348,18 @@ impl Presenter {
         Ok(Self { surface, window, pipeline, layout, logical_buffer, uniforms, config, display_timing })
     }
 
-    fn render(&mut self, raster: &Raster, canvas: &Canvas, session: u64, inputs: &[(u64, u64)]) -> Result<bool> {
+    fn render(&mut self, raster: &PresentationDevice, canvas: &Canvas, session: u64, inputs: &[(u64, u64)]) -> Result<bool> {
         let Some([width, height]) = Self::size(self.window.0) else { return Ok(false) };
         if [width, height] != [self.config.width, self.config.height] {
             self.config.width = width;
             self.config.height = height;
+            let validation = super::lock_validation_scope();
             raster.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            self.surface.configure(&raster.device, &self.config);
+            configure_surface(&self.surface, &raster.device, &self.config);
             if let Some(error) = pollster::block_on(raster.device.pop_error_scope()) {
                 bail!("resize Android Vulkan window: {error}");
             }
+            drop(validation);
             self.display_timing.reset();
         }
         let frame = match self.surface.get_current_texture() {
@@ -346,7 +410,7 @@ impl Presenter {
             pass.set_bind_group(0, &binding, &[]);
             pass.draw(0..3, 0..1);
         }
-        raster.queue.submit(Some(encoder.finish()));
+        super::submit_gpu_commands(&raster.queue, Some(encoder.finish()));
         self.display_timing.on_submit(&self.surface, session, inputs);
         frame.present();
         Ok(true)
@@ -355,8 +419,8 @@ impl Presenter {
 
 pub(crate) fn set_display_stats_enabled(enabled: bool) {
     if DISPLAY_STATS_ENABLED.with(|state| state.replace(enabled)) == enabled { return; }
-    RASTER.with_borrow_mut(|slot| {
-        if let Some(presenter) = slot.as_mut().and_then(|raster| raster.presenter.as_mut()) {
+    PRESENTATION.with_borrow_mut(|state| {
+        if let Some(presenter) = &mut state.presenter {
             presenter.display_timing.reset();
         }
     });
@@ -364,34 +428,29 @@ pub(crate) fn set_display_stats_enabled(enabled: bool) {
 
 pub(crate) fn display_stats() -> Option<[u64; 7]> {
     if !DISPLAY_STATS_ENABLED.with(Cell::get) { return None; }
-    RASTER.with_borrow_mut(|slot| {
-        let presenter = slot.as_mut()?.presenter.as_mut()?;
+    PRESENTATION.with_borrow_mut(|state| {
+        let presenter = state.presenter.as_mut()?;
         presenter.display_timing.poll(&presenter.surface);
         Some(presenter.display_timing.snapshot())
     })
 }
 
-pub(crate) fn candidate(window: NonNull<c_void>) -> bool {
-    RASTER.with_borrow_mut(|slot| {
-        let Some(raster) = slot.as_mut() else { return false };
-        if raster.failed.load(Ordering::Relaxed) {
-            raster.presenter = None;
-            return false;
-        }
-        raster.failed_window != Some(window.as_ptr() as usize)
+pub(crate) fn candidate(device: Option<&PresentationDevice>, window: NonNull<c_void>) -> bool {
+    PRESENTATION.with_borrow_mut(|state| {
+        state.select(device) && state.failed_window != Some(window.as_ptr() as usize)
     })
 }
 
 pub(crate) fn present_canvas(
-    window: NonNull<c_void>, canvas: &Canvas, session: u64, input_mono_us: &[(u64, u64)],
+    device: Option<&PresentationDevice>, window: NonNull<c_void>, canvas: &Canvas,
+    session: u64, input_mono_us: &[(u64, u64)],
 ) -> i32 {
-    RASTER.with_borrow_mut(|slot| {
-        let Some(raster) = slot.as_mut() else { return 1 };
-        if raster.failed.load(Ordering::Relaxed) || raster.failed_window == Some(window.as_ptr() as usize) {
-            raster.presenter = None;
+    PRESENTATION.with_borrow_mut(|state| {
+        if !state.select(device) || state.failed_window == Some(window.as_ptr() as usize) {
             return 1;
         }
-        let mut presenter = raster.presenter.take().filter(|presenter| presenter.window.0 == window);
+        let raster = device.expect("selected presentation device");
+        let mut presenter = state.presenter.take().filter(|presenter| presenter.window.0 == window);
         let result = (|| {
             if presenter.is_none() {
                 let Some(size) = Presenter::size(window) else { return Ok(false) };
@@ -401,13 +460,13 @@ pub(crate) fn present_canvas(
         })();
         match result {
             Ok(posted) => {
-                raster.presenter = presenter;
+                state.presenter = presenter;
                 if posted { 0 } else { -2 }
             }
             Err(error) => {
                 report(&format!("present=egl_fallback reason={error:#}"));
                 // `presenter` is dropped before the caller reconnects EGL.
-                raster.failed_window = Some(window.as_ptr() as usize);
+                state.failed_window = Some(window.as_ptr() as usize);
                 1
             }
         }
@@ -415,10 +474,5 @@ pub(crate) fn present_canvas(
 }
 
 pub(crate) fn detach() {
-    RASTER.with_borrow_mut(|slot| {
-        if let Some(raster) = slot.as_mut() {
-            raster.presenter = None;
-            raster.failed_window = None;
-        }
-    });
+    PRESENTATION.with_borrow_mut(|state| *state = PresentationState::default());
 }

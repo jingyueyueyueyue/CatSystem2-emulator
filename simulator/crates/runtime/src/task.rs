@@ -540,6 +540,12 @@ struct OrdinaryHost<'a, H> {
 }
 
 impl<H: Host> Host for OrdinaryHost<'_, H> {
+    fn should_yield(&self) -> bool { self.inner.should_yield() }
+
+    fn renew_instruction_budget(&self, budget: usize) -> bool {
+        self.inner.renew_instruction_budget(budget)
+    }
+
     fn call(
         &mut self,
         index: u32,
@@ -598,6 +604,55 @@ mod tests {
         assert_eq!(task.running, 0);
         assert_eq!(task.vm.as_ref().unwrap().read_u32(0).unwrap(), 7);
         assert_eq!(task.queued_messages().count(), 0);
+    }
+
+    #[test]
+    fn ordinary_task_renews_instruction_budget_and_resumes_native_retry_without_retiming() {
+        struct DeadlineHost {
+            deadline_reached: bool,
+            calls: Vec<u32>,
+        }
+
+        impl Host for DeadlineHost {
+            fn should_yield(&self) -> bool {
+                self.deadline_reached
+            }
+
+            fn renew_instruction_budget(&self, budget: usize) -> bool {
+                budget == 2 && !self.deadline_reached
+            }
+
+            fn call(&mut self, index: u32, _: &[u8], _: &mut Vm) -> cs2_script::Result<NativeReturn> {
+                self.calls.push(index);
+                if self.calls == [10, 11] {
+                    return Ok(NativeReturn::Retry);
+                }
+                Ok(NativeReturn::Continue)
+            }
+        }
+
+        let code = [
+            0x00,
+            0x2b, 3, 10, 0, 0, 0, 3, 0, 0, 0, 0,
+            0x2b, 3, 11, 0, 0, 0, 3, 0, 0, 0, 0,
+            0x2b, 3, 12, 0, 0, 0, 3, 0, 0, 0, 0,
+            0x3b,
+        ];
+        let vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 16], 16).unwrap()).unwrap();
+        let mut task = OrdinaryTask::new(5, Some(vm));
+        let mut host = DeadlineHost { deadline_reached: false, calls: Vec::new() };
+
+        assert!(!task.update(10, 3, &mut host, 2).unwrap());
+        assert_eq!(host.calls, [10, 11]);
+
+        host.deadline_reached = true;
+        assert!(!task.update(20, 5, &mut host, 2).unwrap());
+        assert_eq!(host.calls, [10, 11]);
+
+        host.deadline_reached = false;
+        assert!(task.update(30, 7, &mut host, 2).unwrap());
+        assert_eq!(host.calls, [10, 11, 11, 12]);
+        assert_eq!((task.clock.current, task.accumulated_increment, task.running), (10, 3, 0));
     }
 
     #[test]

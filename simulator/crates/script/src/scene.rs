@@ -370,6 +370,17 @@ impl FesProgram {
         self.blocks.iter().find(|block| block.name == name)
     }
 
+    fn push_empty_block(&mut self, name: &[u8]) -> usize {
+        let index = self.blocks.len();
+        self.blocks.push(FesBlock {
+            name: name.to_vec(),
+            lines: Vec::new(),
+            false_jump: Vec::new(),
+            end_jump: Vec::new(),
+        });
+        index
+    }
+
     pub fn macro_value(&self, name: &[u8]) -> Option<&[u8]> {
         self.macros.get(name).map(Vec::as_slice)
     }
@@ -400,7 +411,7 @@ impl FesProgram {
         input: &[u8],
         strings: &BTreeMap<u32, Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>> {
-        let line = expand_strings(input, strings);
+        let line = expand_fes_command_strings(input, strings);
         let line = expand_fes_macros(&line, &self.macros)?;
         Ok(fes_parameters(&line)?.into_iter()
             .map(|word| expand_strings(&word, strings)).collect())
@@ -1274,6 +1285,18 @@ fn fes_parameters(input: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(words)
 }
 
+fn expand_fes_command_strings(input: &[u8], strings: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
+    let command = split_fes_condition(input).ok().flatten().map_or(input, |(_, tail)| tail);
+    let name = command.split(u8::is_ascii_whitespace).next();
+    // Parse the placeholder before expanding prose, which can contain spaces
+    // and punctuation that would otherwise be parsed as FES syntax.
+    if name == Some(b"saveapend_str") || fes_appended_string(input) {
+        input.to_vec()
+    } else {
+        expand_strings(input, strings)
+    }
+}
+
 fn fes_appended_string(input: &[u8]) -> bool {
     let mut fields = input.split(|byte| *byte == b' ').filter(|field| !field.is_empty());
     let (Some(_), Some(b"apend"), Some(operand), None) =
@@ -1620,13 +1643,7 @@ impl FesInterpreter {
         {
             index
         } else {
-            program.blocks.push(FesBlock {
-                name: b"START".to_vec(),
-                lines: Vec::new(),
-                false_jump: Vec::new(),
-                end_jump: Vec::new(),
-            });
-            program.blocks.len() - 1
+            program.push_empty_block(b"START")
         };
         Ok(Self {
             declarations_pending,
@@ -1837,13 +1854,7 @@ impl FesInterpreter {
             {
                 return Err(error.clone());
             }
-            // An append from a string slot inserts message bytes verbatim.
-            // Parse the placeholder first so prose punctuation stays literal.
-            let expanded_strings = if fes_appended_string(&line.bytes) {
-                line.bytes.clone()
-            } else {
-                expand_strings(&line.bytes, &state.strings)
-            };
+            let expanded_strings = expand_fes_command_strings(&line.bytes, &state.strings);
             let macro_expanded = expand_fes_macros(&expanded_strings, &self.program.macros)?;
             let mut bytes = macro_expanded.as_slice();
             if let Some((condition, tail)) = split_fes_condition(bytes)? {
@@ -1892,7 +1903,14 @@ impl FesInterpreter {
                         .program
                         .blocks
                         .iter()
-                        .position(|block| block.name == *target);
+                        .position(|block| block.name == *target)
+                        .or_else(|| {
+                            // Some save/load scripts transfer to the idle
+                            // block after exit without declaring its empty body.
+                            (command == b"next" && target == b"SLEEP"
+                                && self.program.blocks.len() < MAX_FES_BLOCKS)
+                                .then(|| self.program.push_empty_block(b"SLEEP"))
+                        });
                     if command == b"call" {
                         if self.calls.len() >= MAX_FES_CALL_DEPTH {
                             return Err(scene_error(line.offset, "FES call stack is too deep"));
@@ -3289,6 +3307,48 @@ mod tests {
         ).unwrap();
         assert!(headers.block(b"\x82\xa0").is_some());
         assert!(headers.block(b"\x82\xa0.PUSH_L").is_some());
+    }
+
+    #[test]
+    fn fes_next_to_implicit_sleep_idles_and_can_be_reopened() {
+        let program = FesProgram::from_text(
+            b"#START\ncall WAIT_USER\nexit 99\n#WAIT_USER\nexit 0\nnext SLEEP\nexit 98\n",
+        )
+        .unwrap();
+        let mut interpreter = FesInterpreter::new(program).unwrap();
+        let mut state = ExpressionState::default();
+
+        interpreter.run(&mut state, 8).unwrap();
+        assert_eq!(interpreter.pending(), Some(&FesEvent::Exit(0)));
+        for _ in 0..2 {
+            interpreter.resume();
+            interpreter.run(&mut state, 8).unwrap();
+            assert_eq!(interpreter.current_block(), b"SLEEP");
+            assert_eq!(interpreter.pending(), Some(&FesEvent::Frame));
+            assert_eq!(interpreter.call_depth(), 0);
+        }
+
+        assert!(interpreter.enter_block(b"WAIT_USER"));
+        interpreter.run(&mut state, 8).unwrap();
+        assert_eq!(interpreter.pending(), Some(&FesEvent::Exit(0)));
+    }
+
+    #[test]
+    fn fes_next_uses_explicit_sleep_and_reports_other_missing_blocks() {
+        let mut state = ExpressionState::default();
+        let program = FesProgram::from_text(b"#START\nnext SLEEP\n#SLEEP\nexit 7\n").unwrap();
+        let mut interpreter = FesInterpreter::new(program).unwrap();
+        interpreter.run(&mut state, 8).unwrap();
+        assert_eq!(interpreter.pending(), Some(&FesEvent::Exit(7)));
+
+        let program = FesProgram::from_text(b"#START\nnext MISSING\n").unwrap();
+        let mut interpreter = FesInterpreter::new(program).unwrap();
+        assert!(matches!(
+            interpreter.run(&mut state, 8),
+            Err(crate::ScriptError::InvalidSceneControl {
+                message: "FES target block does not exist", ..
+            })
+        ));
     }
 
     #[test]

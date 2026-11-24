@@ -38,6 +38,7 @@ pub enum FesObjectKind {
     NovelString,
     NovelString8,
     Scroll,
+    CharacterTable2,
 }
 
 impl FesObjectKind {
@@ -86,6 +87,8 @@ impl FesObjectKind {
             Some(Self::SavePanel)
         } else if name.eq_ignore_ascii_case(b"BGTABLE2") {
             Some(Self::BackgroundTable2)
+        } else if name.eq_ignore_ascii_case(b"CHTABLE2") {
+            Some(Self::CharacterTable2)
         } else if name.eq_ignore_ascii_case(b"CHTABLE3") {
             Some(Self::CharacterTable3)
         } else if name.eq_ignore_ascii_case(b"PARTICLE") {

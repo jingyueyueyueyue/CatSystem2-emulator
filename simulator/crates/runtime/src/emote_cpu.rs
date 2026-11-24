@@ -5,7 +5,10 @@
 //! as native draw success or engine equivalence.
 
 use super::psb::{PsbDocument, PsbValue};
-use super::timeline::{self, FrameContent, LayerTimelines, lookup_layer_keyframes, sample_emote_keys, visible_layer_key};
+use super::timeline::{
+    self, FrameContent, IndexedLayer, LayerField, LayerTimelines, LocalLayerTransform, ParameterIndex,
+    lookup_layer_keyframes, sample_emote_keys, visible_layer_key,
+};
 use super::{
     CpuBezierPatch, CpuM2LipBinding, CpuM2LipCurve, CpuM2LipSidecarKind, CpuM2LiveOwner, CpuM2Load,
     CpuM2ModelSource, EmoteArchiveVersion,
@@ -15,8 +18,8 @@ use super::{
     EmoteResource, EmoteTick, MAX_FRAME_BYTES, Result, decode_emote_texture,
     emote_native_descriptor, m2plane_tint_argb,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 
 #[path = "emote_node_cache.rs"]
 mod node_cache;
@@ -25,7 +28,7 @@ use node_cache::BoundedMemo;
 #[derive(Debug)]
 struct DerivedNodeCache {
     affine: BoundedMemo<[f64; 6]>,
-    meshes: BoundedMemo<Vec<[f64; 4]>>,
+    meshes: BoundedMemo<Arc<Vec<[f64; 4]>>>,
 }
 
 impl Default for DerivedNodeCache {
@@ -339,7 +342,7 @@ impl CpuMotionModel {
         &self.document
     }
 
-    /// Affine hits/misses, mesh hits/misses, and retained payload+key bytes.
+    /// Dynamic affine hits/misses, mesh hits/misses, and their retained payload+key bytes.
     /// Counters are model-wide CPU work, not per-instance GPU timings.
     pub fn node_cache_counters(&self) -> [u64; 5] {
         let cache = self.node_cache.lock().unwrap_or_else(|error| error.into_inner());
@@ -347,19 +350,27 @@ impl CpuMotionModel {
             (cache.affine.bytes() + cache.meshes.bytes()) as u64]
     }
 
+    fn try_node_cache(&self) -> Option<MutexGuard<'_, DerivedNodeCache>> {
+        match self.node_cache.try_lock() {
+            Ok(cache) => Some(cache),
+            Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
     fn layer_affine(&self, order: [u8; 4], content: &FrameContent<'_>) -> Result<[f64; 6]> {
         if !use_node_cache() { return timeline::layer_affine(order, |name| content.get(name)); }
         let key = affine_cache_key(order, content);
         if let Some(key) = key.as_ref()
-            && let Some(value) = self.node_cache.lock().unwrap_or_else(|error| error.into_inner())
-                .affine.get(key).copied()
+            && let Some(value) = self.try_node_cache().and_then(|mut cache| cache.affine.get(key.as_slice()).copied())
         {
             return Ok(value);
         }
         let value = timeline::layer_affine(order, |name| content.get(name))?;
-        if let Some(key) = key {
-            self.node_cache.lock().unwrap_or_else(|error| error.into_inner())
-                .affine.insert(key, value, size_of::<[f64; 6]>());
+        if let Some(key) = key
+            && let Some(mut cache) = self.try_node_cache()
+        {
+            cache.affine.insert(key.into_vec(), value, size_of::<[f64; 6]>());
         }
         Ok(value)
     }
@@ -559,6 +570,38 @@ impl CpuPlayer {
         &self.model
     }
 
+    /// Capture the owned state read by `draw_primitives_resolved`. The caller
+    /// supplies variables resolved on the player thread before dispatch.
+    pub fn snapshot_for_draw(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            object: self.object.clone(),
+            motion: self.motion.clone(),
+            frame: self.frame,
+            variables: BTreeMap::new(),
+            enabled: self.enabled,
+            controller_a_raw: self.controller_a_raw,
+            controller_b_raw: self.controller_b_raw,
+            mesh_quality_scale: self.mesh_quality_scale,
+            root_affine: self.root_affine,
+            driver_transform: self.driver_transform,
+            variable_timelines: CpuVariableTimelines::default(),
+            m2_timed_variables: CpuM2TimedVariables::default(),
+            reference_timelines: self.reference_timelines.clone(),
+        }
+    }
+
+    /// Estimate the retained payload of an owned sample and matching stamp.
+    pub fn estimate_draw_snapshot_bytes(&self, variables: &BTreeMap<String, f64>) -> usize {
+        const TREE_ENTRY_OVERHEAD: usize = 8 * size_of::<usize>();
+        let variables = variables.keys().map(|name| {
+            size_of::<(String, f64)>() + TREE_ENTRY_OVERHEAD + name.len()
+        }).sum::<usize>();
+        size_of::<Self>() + size_of::<CpuPlayerRenderState>()
+            + 2 * (self.object.len() + self.motion.len()
+                + self.reference_timelines.estimated_snapshot_bytes() + variables)
+    }
+
     /// Capture all inputs sampled by primitive evaluation, including private
     /// driver overrides and independent reference clocks. Prepared geometry may
     /// only be consumed while this snapshot still matches.
@@ -747,14 +790,17 @@ impl CpuPlayer {
             target: &mut target, warnings: BTreeSet::new(), layers: 0, triangles: 0,
             active: BTreeSet::new(), references,
             reference_path: Vec::new(), reference_update: true, reference_tick_current: false,
+            visible_layers: Vec::new(),
+            parameter_values: HashMap::new(),
             reference_raw_time: self.frame,
         };
         if self.enabled {
             context.collect_motion(&self.object, &self.motion, self.frame,
                 Transform { m: self.root_affine, opacity: 255, z: 0.0 },
-                &[], 0, &[], &mut Vec::new())?;
+                &[], 0, &[], &mut Vec::new(), false)?;
         }
         context.references.finish();
+        context.references.record_visible_layers(context.visible_layers);
         let mut references = context.references;
         references.mark_tick(self.frame as f32, variables);
         self.reference_timelines = references;
@@ -830,6 +876,8 @@ impl CpuPlayer {
             reference_path: Vec::new(),
             reference_update: false,
             reference_tick_current,
+            visible_layers: Vec::new(),
+            parameter_values: HashMap::new(),
             reference_raw_time: self.frame,
         };
         // A static initial pose cannot stand in for an enabled controller,
@@ -944,26 +992,54 @@ fn append_numeric_key(value: Option<&PsbValue>, key: &mut Vec<u64>) -> Option<()
     Some(())
 }
 
-fn affine_cache_key(order: [u8; 4], content: &FrameContent<'_>) -> Option<Vec<u64>> {
+enum AffineMemoKey {
+    Held([u64; 3]),
+    Interpolated(Vec<u64>),
+}
+
+impl AffineMemoKey {
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Held(key) => key,
+            Self::Interpolated(key) => key,
+        }
+    }
+
+    fn into_vec(self) -> Vec<u64> {
+        match self {
+            Self::Held(key) => key.to_vec(),
+            Self::Interpolated(key) => key,
+        }
+    }
+}
+
+fn affine_cache_key(order: [u8; 4], content: &FrameContent<'_>) -> Option<AffineMemoKey> {
     const FIELDS: [&str; 8] = ["fx", "fy", "angle", "zx", "zy", "sx", "sy", "coord"];
-    let mut key = Vec::with_capacity(16);
-    key.extend(order.map(u64::from));
+    let order = u64::from(u32::from_ne_bytes(order));
     if let Some(base) = content.borrowed_base() {
         // The owning model retains this immutable tree. Only interpolated
         // transform overrides can change this node's local matrix.
-        key.extend([0, std::ptr::from_ref(base) as usize as u64]);
-        for (name, value) in content.overrides() {
-            if let Some(index) = FIELDS.iter().position(|field| field == name) {
-                key.push(index as u64);
-                append_numeric_key(Some(value), &mut key)?;
-            }
+        let held = [order, 0, std::ptr::from_ref(base) as usize as u64];
+        let mut overrides = content.overrides().iter().filter_map(|(name, value)| {
+            FIELDS.iter().position(|field| field == name).map(|index| (index, value))
+        }).peekable();
+        if overrides.peek().is_none() {
+            return Some(AffineMemoKey::Held(held));
         }
+        let mut key = Vec::with_capacity(16);
+        key.extend(held);
+        for (index, value) in overrides {
+            key.push(index as u64);
+            append_numeric_key(Some(value), &mut key)?;
+        }
+        Some(AffineMemoKey::Interpolated(key))
     } else {
         // Host driver transforms materialize a private content object.
-        key.push(1);
+        let mut key = Vec::with_capacity(16);
+        key.extend([order, 1]);
         for name in FIELDS { append_numeric_key(content.get(name), &mut key)?; }
+        Some(AffineMemoKey::Interpolated(key))
     }
-    Some(key)
 }
 
 #[derive(Clone, Copy)]
@@ -988,6 +1064,9 @@ impl Transform {
             self.m[1] * p[0] + self.m[3] * p[1] + self.m[5],
         ]
     }
+    fn determinant(self) -> f64 {
+        self.m[0] * self.m[3] - self.m[1] * self.m[2]
+    }
     fn then(self, child: Self) -> Self {
         let a = self.m;
         let b = child.m;
@@ -1009,6 +1088,7 @@ impl Transform {
 #[derive(Clone)]
 struct Warp {
     transform: Transform,
+    determinant: f64,
     width: f64,
     height: f64,
     ox: f64,
@@ -1025,7 +1105,7 @@ struct Warp {
 #[derive(Clone)]
 struct MeshAncestor {
     owner: usize,
-    warp: Option<Warp>,
+    warp: Option<Arc<Warp>>,
     stops_geometry: bool,
 }
 
@@ -1040,7 +1120,7 @@ struct PatchAncestor {
 impl Warp {
     fn apply(&self, global: [f64; 2]) -> Result<[f64; 2]> {
         let m = self.transform.m;
-        let determinant = m[0] * m[3] - m[1] * m[2];
+        let determinant = self.determinant;
         if determinant.abs() < 1e-12 {
             return Err(unsupported("singular Bezier patch transform"));
         }
@@ -1071,7 +1151,7 @@ fn mesh_raster_plan(
     let mut geometry = Vec::new();
     let mut stopped_anchor = None;
     for ancestor in chain.iter().rev() {
-        if let Some(warp) = &ancestor.warp {
+        if let Some(warp) = ancestor.warp.as_deref() {
             if stopped_anchor.is_none() {
                 geometry.push(warp);
             }
@@ -1094,19 +1174,22 @@ fn mesh_raster_plan(
 
 fn mesh_vertex_key(
     viewport: CpuViewport, transform: Transform, grid: CpuMeshGrid,
-    coordinates: [f64; 6], anchor_delta: [f64; 2], geometry: &[&Warp],
+    coordinates: [f64; 6], chain: &[MeshAncestor], mesh_owner: usize,
 ) -> Vec<u64> {
-    let mut key = Vec::with_capacity(24 + geometry.len() * 43);
+    let mut key = Vec::with_capacity(17 + chain.len() * 43);
     key.extend([u64::from(grid.columns), u64::from(grid.rows)]);
     key.extend(transform.m.map(f64::to_bits));
     key.extend([viewport.origin_x, viewport.origin_y, viewport.scale].map(f64::to_bits));
     key.extend(coordinates.map(f64::to_bits));
-    key.extend(anchor_delta.map(f64::to_bits));
-    key.push(geometry.len() as u64);
-    for warp in geometry {
-        key.extend(warp.transform.m.map(f64::to_bits));
-        key.extend([warp.width, warp.height, warp.ox, warp.oy].map(f64::to_bits));
-        key.extend(warp.patch.points().iter().flatten().map(|value| u64::from(value.to_bits())));
+    for ancestor in chain {
+        key.push(u64::from(ancestor.stops_geometry)
+            | (u64::from(ancestor.owner == mesh_owner) << 1)
+            | (u64::from(ancestor.warp.is_some()) << 2));
+        if let Some(warp) = ancestor.warp.as_deref() {
+            key.extend(warp.transform.m.map(f64::to_bits));
+            key.extend([warp.width, warp.height, warp.ox, warp.oy].map(f64::to_bits));
+            key.extend(warp.patch.points().iter().flatten().map(|value| u64::from(value.to_bits())));
+        }
     }
     key
 }
@@ -1124,6 +1207,10 @@ struct RenderContext<'a, T> {
     reference_path: Vec<usize>,
     reference_update: bool,
     reference_tick_current: bool,
+    visible_layers: Vec<usize>,
+    /// The variables and all parameter definitions stay immutable for this
+    /// evaluation. Other poses and reference updates start with a fresh map.
+    parameter_values: HashMap<usize, f64>,
     ///Caller player+100, distinct from sampled+104.41087 uses the raw
     ///clock when selecting a new reference on an unparameterized layer.
     reference_raw_time: f64,
@@ -1185,9 +1272,8 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
     ///3abf1..3ac2a consumes that cursor instead of advancing ordinary time.
     ///This is independent of the referencing layer's parameter selection.
     ///Color collection and both composite-mask entry paths share this clock.
-    fn motion_frame(&self, motion: &PsbValue, time: f64) -> Result<f64> {
-        let params = motion.get("parameter").and_then(PsbValue::list).unwrap_or(&[]);
-        if let Some(frame) = self.bound_parameter_clock(motion, params)? {
+    fn motion_frame(&self, motion: &PsbValue, time: f64, parameter: Option<f64>) -> Result<f64> {
+        if let Some(frame) = parameter {
             return Ok(frame);
         }
         let end = num(motion, "lastTime", 0.0)?;
@@ -1199,17 +1285,28 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         }
     }
 
-    fn bound_parameter_clock(&self, node: &PsbValue, params: &[PsbValue]) -> Result<Option<f64>> {
-        let index = match node.get("parameterize") {
-            None | Some(PsbValue::Null) => return Ok(None),
-            Some(value) => value.number().ok_or_else(|| unsupported("parameterize integer index"))?,
+    fn bound_parameter_clock(&mut self, node: &PsbValue, params: &[PsbValue]) -> Result<Option<f64>> {
+        self.parameter_clock(ParameterIndex::read(node), params)
+    }
+
+    fn parameter_clock(&mut self, index: ParameterIndex, params: &[PsbValue]) -> Result<Option<f64>> {
+        let index = match index {
+            ParameterIndex::None => return Ok(None),
+            ParameterIndex::Number(index) => index,
+            ParameterIndex::Invalid => return Err(unsupported("parameterize integer index")),
         };
         if !index.is_finite() || index.fract() != 0.0 || index < 0.0 || index >= params.len() as f64 {
             return Err(unsupported("parameterize index outside motion table"));
         }
         let parameter = &params[index as usize];
+        let identity = std::ptr::from_ref(parameter) as usize;
+        if let Some(cursor) = self.parameter_values.get(&identity) {
+            return Ok(Some(*cursor));
+        }
         let id = string(parameter, "id").ok_or_else(|| unsupported("parameter id"))?;
-        parameter_cursor(parameter, *self.variables.get(id).unwrap_or(&0.0)).map(Some)
+        let cursor = parameter_cursor(parameter, *self.variables.get(id).unwrap_or(&0.0))?;
+        self.parameter_values.insert(identity, cursor);
+        Ok(Some(cursor))
     }
 
     ///Resolve each physical reference once before primitive ordering. Its
@@ -1259,7 +1356,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         depth: usize,
     ) -> Result<()> {
         let mut primitives = Vec::new();
-        self.collect_motion(object, name, time, parent, warps, depth, &[], &mut primitives)?;
+        self.collect_motion(object, name, time, parent, warps, depth, &[], &mut primitives, false)?;
         //44c13 stores world26c in primitive+24.4810/486a sorts the complete
         //expanded color list with2dd20: ascending f32 depth. Its secondary
         //key is the common player priority (35310/42e04), equal within this
@@ -1316,31 +1413,35 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         depth: usize,
         inherited_stencils: &[OwnedStencilScope<'a>],
         primitives: &mut Vec<ColorPrimitive<'a>>,
+        capture: bool,
     ) -> Result<Vec<Arc<DrawLayer<'a>>>> {
         if depth > 64 || !self.active.insert((object.to_owned(), name.to_owned())) {
             return Err(unsupported("recursive/cyclic PSB motion reference"));
         }
         let player = self.player;
         let motion = player.model.motion(object, name)?;
-        let frame = self.motion_frame(motion, time)?;
+        let params = motion.get("parameter").and_then(PsbValue::list).unwrap_or(&[]);
+        let parameter = self.bound_parameter_clock(motion, params)?;
+        let frame = self.motion_frame(motion, time, parameter)?;
         let layers = field(motion, "layer")?
             .list()
             .ok_or_else(|| unsupported("motion layer list"))?;
-        let params = motion
-            .get("parameter")
-            .and_then(PsbValue::list)
-            .unwrap_or(&[]);
         //For a parameter-driven motion both+100/+104 equal that cursor;
         //ordinary owners retain the raw clock from the captured reference.
         let previous_raw = self.reference_raw_time;
-        self.reference_raw_time = self.bound_parameter_clock(motion, params)?.unwrap_or(previous_raw);
+        self.reference_raw_time = parameter.unwrap_or(previous_raw);
         // PSB priority indexes the entire preorder layer tree, not only the
         // roots in motion.layer. Transform collection and draw ordering are
         // separate; otherwise sprites may be omitted or children drawn twice.
+        let indexed = player.layer_timelines().and_then(|index| index.motion(motion));
+        // Pending slots and immutable metadata use the same physical preorder,
+        // including placeholders for a hidden or unsupported subtree.
+        let indexed_layers = indexed.map_or(&[][..], |index| index.layers.as_slice());
         let mut pending = Vec::new();
         for layer in layers {
             self.layer(
                 layer,
+                indexed_layers,
                 frame,
                 parent,
                 parent.opacity,
@@ -1353,8 +1454,8 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             )?;
         }
         self.bind_references(&mut pending)?;
-        let bindings = if let Some(timelines) = player.layer_timelines() {
-            timelines.stencil_bindings(motion)?
+        let bindings = if let Some(index) = indexed {
+            std::borrow::Cow::Borrowed(index.stencil_bindings(motion)?)
         } else {
             std::borrow::Cow::Owned(super::resolve_emote_stencil_bindings(motion)?)
         };
@@ -1362,33 +1463,62 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             // The clock update visits physical references in reverse order.
             // It has no primitive ranges or stencil chains to publish.
             for draw in pending.iter().rev().flatten() {
-                self.collect_reference(draw, &[], primitives)?;
+                self.collect_reference(draw, &[], primitives, false)?;
             }
             self.active.remove(&(object.to_owned(), name.to_owned()));
             self.reference_raw_time = previous_raw;
             return Ok(Vec::new());
         }
-        let order = priority_order(motion, frame, pending.len())?;
+        let uncached_order;
+        let order = match indexed.and_then(|index| index.priority.as_ref()) {
+            Some(priority) => priority.order(frame, pending.len())?,
+            None => {
+                uncached_order = priority_order_uncached(motion, frame, pending.len())?;
+                uncached_order.as_deref()
+            }
+        };
+        let positions = order.map_or(pending.len(), <[usize]>::len);
         let scope = Arc::new(MotionPrimitives {
             pending: pending.into_iter().map(|draw| draw.map(Arc::new)).collect(),
             bindings,
             ranges: OnceLock::new(),
         });
-        let mut ranges = vec![Vec::new(); scope.pending.len()];
-        let mut emitted = vec![false; scope.pending.len()];
+        let composite = scope.bindings.iter().filter(|binding| binding.stencil_type & 4 != 0);
+        let needs_ranges = composite.clone().next().is_some();
+        let mut ranges = Vec::new();
+        let mut emitted = Vec::new();
+        let mut sources = Vec::new();
+        // Color uses the pending layer directly. Only composite stencil
+        // bindings or a caller's captured reference need source ranges.
+        if needs_ranges {
+            ranges.resize_with(scope.pending.len(), Vec::new);
+            emitted.resize(scope.pending.len(), false);
+            sources.resize(scope.pending.len(), false);
+            for binding in composite {
+                for &source in &binding.source_indices {
+                    sources[source] = true;
+                }
+            }
+        }
         let mut captured = Vec::new();
         //449f7/44a33 count the priority list;44a50 reads it from its end.
         //Reference expansion stays in that insertion order before the one
         //global stable depth sort; do not sort each nested motion separately.
-        for index in order.into_iter().rev() {
+        for ordinal in (0..positions).rev() {
+            let index = order.map_or(ordinal, |order| order[ordinal]);
             let Some(draw) = scope.pending[index].as_ref() else {
                 continue;
             };
             if !matches!(draw.kind, 0 | 3 | 12) {
                 continue;
             }
-            emitted[index] = true;
-            let mut scopes = Vec::with_capacity(inherited_stencils.len() + 1);
+            if needs_ranges {
+                emitted[index] = true;
+            }
+            let source = needs_ranges && sources[index];
+            let mut scopes = Vec::with_capacity(
+                inherited_stencils.len() + usize::from(!draw.stencil_owners.is_empty()),
+            );
             if !draw.stencil_owners.is_empty() {
                 scopes.push(OwnedStencilScope {
                     owners: draw.stencil_owners.clone(),
@@ -1402,21 +1532,26 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                 //group primitive that same tail. Being an active owner does
                 //not add this group to its referenced content's color chain;
                 //its physical children below still receive it in layer().
-                let range = self.collect_reference(draw, &scopes, primitives)?;
-                captured.extend(range.iter().cloned());
-                ranges[index] = range;
+                let range = self.collect_reference(draw, &scopes, primitives, capture || source)?;
+                if capture {
+                    captured.extend(range.iter().cloned());
+                }
+                if source {
+                    ranges[index] = range;
+                }
             } else {
                 //44e2a appends the actual primitive to a caller's capture,
                 //including blank/type12 entries.50d0 filters nontextured
                 //entries at consumption; it does not invent their bounds.
-                ranges[index].push(draw.clone());
-                captured.push(draw.clone());
+                if capture {
+                    captured.push(draw.clone());
+                }
                 if draw.kind == 0 && draw.content.text("src") != Some("blank") {
                     primitives.push(ColorPrimitive { index, motion: scope.clone(), stencils: scopes });
                 }
             }
         }
-        {
+        if needs_ranges {
             //44f30 visits composite owners after reference capture.44f69
             //clears the SAME range, inserts its own primitive, then4501b
             //copies each source group's CURRENT range. Preserve source order
@@ -1451,9 +1586,9 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             }
             //44e2a/44b58 append to the caller capture in primitive insertion
             //order. Only the independent global COLOR list is depth-sorted.
+            scope.ranges.set(ranges)
+                .map_err(|_| unsupported("motion primitive ranges already published"))?;
         }
-        scope.ranges.set(ranges)
-            .map_err(|_| unsupported("motion primitive ranges already published"))?;
         self.active.remove(&(object.to_owned(), name.to_owned()));
         self.reference_raw_time = previous_raw;
         Ok(captured)
@@ -1462,13 +1597,14 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
     fn collect_reference(
         &mut self, draw: &DrawLayer<'a>, stencils: &[OwnedStencilScope<'a>],
         primitives: &mut Vec<ColorPrimitive<'a>>,
+        capture: bool,
     ) -> Result<Vec<Arc<DrawLayer<'a>>>> {
         let Some(reference) = &draw.reference else { return Ok(Vec::new()); };
         let previous = std::mem::replace(&mut self.reference_path, reference.path.clone());
         let caller_raw = std::mem::replace(&mut self.reference_raw_time, reference.raw_frame);
         let result = self.collect_motion(
             &reference.object, &reference.motion, reference.frame, draw.transform,
-            &draw.motion_parent_warps, draw.depth + 1, stencils, primitives,
+            &draw.motion_parent_warps, draw.depth + 1, stencils, primitives, capture,
         );
         self.reference_path = previous;
         self.reference_raw_time = caller_raw;
@@ -1478,6 +1614,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
     fn layer(
         &mut self,
         layer: &'a PsbValue,
+        indexed_layers: &'a [IndexedLayer],
         time: f64,
         parent: Transform,
         motion_opacity: u8,
@@ -1494,7 +1631,15 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         if self.layers > MAX_DRAW_LAYERS || depth > 128 {
             return Err(unsupported("CPU motion layer budget"));
         }
-        let kind = num(layer, "type", 2.0)? as i32;
+        let indexed = indexed_layers.get(preorder_index);
+        let number = |field: LayerField| {
+            if let Some(value) = indexed.and_then(|index| index.number(field)) {
+                return Ok(value);
+            }
+            let (name, default) = field.specification();
+            num(layer, name, default)
+        };
+        let kind = number(LayerField::Type)? as i32;
         // 44b71..44b7d admits only0/10/12 to the primitive path (3 has
         // its own reference path). Actual NEKO type1 shape/anchor markers
         // are leaves: they occupy a physical/priority index but emit no
@@ -1508,23 +1653,29 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             hide_children(layer, pending)?;
             return Ok(());
         }
-        if kind == 3 && num(layer, "motionIndependentLayerInherit", 0.0)? != 0.0 {
+        if kind == 3 && number(LayerField::ReferenceInherit)? != 0.0 {
             self.warnings.insert("independent reference layer inheritance is not recovered".into());
         }
-        if num(layer, "coordinate", 0.0)? != 0.0 {
+        if number(LayerField::Coordinate)? != 0.0 {
             self.warnings
                 .insert("nonlocal coordinate mode is not recovered".into());
         }
-        let parameter_time = self.bound_parameter_clock(layer, params)?;
+        let parameter_index = indexed.map_or_else(|| ParameterIndex::read(layer), |index| index.parameter);
+        let parameter_time = self.parameter_clock(parameter_index, params)?;
         let at = parameter_time.unwrap_or(time);
-        let timelines = self.player.layer_timelines();
-        let (previous, next) = lookup_layer_keyframes(layer, at as f32, timelines)?;
+        let (previous, next) = lookup_layer_keyframes(layer, at as f32, indexed)?;
         if self.reference_update {
             // References inherit the physical layer path and clocks here.
             // Their geometry and stencil inputs are only consumed at draw time.
             let Some((content, frame_begin)) = visible_layer_key(previous)? else {
                 return hide_children(layer, pending);
             };
+            // Reuse an older pose only while the same physical layers remain
+            // visible, including referenced motions and stencil geometry.
+            self.visible_layers.push(std::ptr::from_ref(layer) as usize);
+            if number(LayerField::StencilType)? != 0.0 {
+                self.visible_layers.push(std::ptr::from_ref(content) as usize);
+            }
             if kind == 3 {
                 pending[preorder_index] = Some(DrawLayer {
                     kind, content: FrameContent::borrowed(content), transform: parent, warps: Vec::new(),
@@ -1536,7 +1687,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             }
             if let Some(children) = layer.get("children").and_then(PsbValue::list) {
                 for child in children {
-                    self.layer(child, time, parent, motion_opacity, &[], &[], params,
+                    self.layer(child, indexed_layers, time, parent, motion_opacity, &[], &[], params,
                         depth + 1, &[], pending)?;
                 }
             }
@@ -1557,25 +1708,49 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                 transform.apply(content.to_mut())?;
             }
         }
-        let coord = numbers(content.get("coord"))?;
-        let opacity = timeline::opacity(content.get("opa"))?;
-        let order = match timelines {
-            Some(timelines) => timelines.transform_order(layer)?,
-            None => timeline::transform_order(layer)?,
+        let local_slot = if use_node_cache() && content.is_unmodified() {
+            previous.and_then(|key| key.local_transform)
+        } else {
+            None
         };
+        let resolved = if let Some(resolved) = local_slot.and_then(|slot| slot.get()) {
+            resolved
+        } else {
+            let coord = numbers(content.get("coord"))?;
+            let opacity = timeline::opacity(content.get("opa"))?;
+            let order = match indexed {
+                Some(indexed) => indexed.transform_order()?,
+                None => timeline::transform_order(layer)?,
+            };
+            // Immutable key slots have their own exact transform. Other
+            // samples retain the exact-input cache for interpolated values.
+            let matrix = if local_slot.is_some() {
+                timeline::layer_affine(order, |name| content.get(name))?
+            } else {
+                self.player.model.layer_affine(order, &content)?
+            };
+            let resolved = LocalLayerTransform {
+                matrix, opacity, depth: coord.get(2).copied().unwrap_or(0.0) as f32,
+            };
+            if let Some(slot) = local_slot {
+                slot.publish(resolved);
+            }
+            resolved
+        };
+        let opacity = resolved.opacity;
         let local = Transform {
-            m: self.player.model.layer_affine(order, &content)?,
+            m: resolved.matrix,
             opacity,
             //3eaea..3eb84: in XY mode, parent affine transforms X/Y;
             //Z is added independently and later orders color primitives.
-            z: coord.get(2).copied().unwrap_or(0.0) as f32,
+            z: resolved.depth,
         };
         let mut transform = parent.then(local);
         //3eb9b..3ebd0: bit400 selects the effective physical parent's
         //DWORD284; without it the normal motion uses its implicit root,
         //not that physical parent. Nested references copy their caller's
         //effective opacity into that root at41929..41953.
-        let inherit_mask = num(layer, "inheritMask", 0x020007fc_u32 as f64)?;
+        let inherit_mask = number(LayerField::InheritMask)?;
         if inherit_mask.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&inherit_mask) {
             return Err(unsupported("invalid layer inheritMask DWORD"));
         }
@@ -1587,7 +1762,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         }
         let mut own_warp = None;
         let mut own_raw = None;
-        let mesh_sync = num(layer, "meshSyncChildMask", 0.0)?;
+        let mesh_sync = number(LayerField::MeshSync)?;
         if mesh_sync.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&mesh_sync) {
             return Err(unsupported("invalid meshSyncChildMask DWORD"));
         }
@@ -1597,12 +1772,8 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                 .insert("meshSyncChildMask bits other than8 remain unrecovered".into());
         }
         let mesh_combine =
-            num(layer, "meshTransform", 0.0)? != 0.0 && num(layer, "meshCombine", 0.0)? != 0.0;
-        let inherited_mesh = layer
-            .get("inheritMask")
-            .and_then(PsbValue::number)
-            .map(|mask| mask as u32 & 0x02000000 != 0)
-            .unwrap_or(true);
+            number(LayerField::MeshTransform)? != 0.0 && number(LayerField::MeshCombine)? != 0.0;
+        let inherited_mesh = inherit_mask as u32 & 0x02000000 != 0;
         let stops_geometry = !inherited_mesh && !warps.is_empty();
         if let Some(mesh) = content.get("mesh") {
             let points = numbers(mesh.get("bp"))?;
@@ -1628,17 +1799,18 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                         }
                     }
                     own_raw = Some(raw);
-                    own_warp = Some(Warp {
+                    own_warp = Some(Arc::new(Warp {
                         transform,
+                        determinant: transform.determinant(),
                         width: dims[0],
                         height: dims[1],
                         ox: dims[2],
                         oy: dims[3],
                         patch,
-                        division: mesh_division(layer)?,
+                        division: mesh_division(number(LayerField::MeshDivision)?)?,
                         propagate_to_children: mesh_sync & 8 != 0,
-                    });
-                    if num(layer, "meshTransform", 0.0)? != 1.0 {
+                    }));
+                    if number(LayerField::MeshTransform)? != 1.0 {
                         self.warnings
                             .insert("BP with non-one meshTransform is not recovered".into());
                     }
@@ -1659,7 +1831,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         //driver transfers only the current effective parent pointer2c4,
         //after any consumed-parent rewiring, before adding this layer's
         //own BP/c1. Keep original owner identities and world transforms.
-        let motion_parent_warps = draw_warps.clone();
+        let motion_parent_warps = if kind == 3 { draw_warps.clone() } else { Vec::new() };
         //402e2 tests sampled_frame+10 (hidden), at layer+b0+index*d4+10.
         //It does not test layer+2c0 (the propagated mesh activity flag).
         //Hidden samples returned above; a visible BP owner remains eligible
@@ -1690,9 +1862,9 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             && content.text("src") != Some("blank")
             && draw_warps.iter().any(|ancestor| ancestor.warp.is_some())
         {
-            if num(layer, "meshTransform", 0.0)? == 1.0 {
+            if number(LayerField::MeshTransform)? == 1.0 {
                 let dims = self.mesh_dimensions(&content)?;
-                let division = num(layer, "meshDivision", -1.0)?;
+                let division = number(LayerField::MeshDivision)?;
                 if division < 0.0
                     || division.fract() != 0.0
                     || division > 65535.0
@@ -1747,7 +1919,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             stencil_owners: stencil_owners.to_vec(),
         });
         let mut child_stencils = stencil_owners.to_vec();
-        if num(layer, "stencilType", 0.0)? != 0.0 {
+        if number(LayerField::StencilType)? != 0.0 {
             child_stencils.push(preorder_index);
         }
         //3f5db selects a physical parent only when its c0/c1 is active;
@@ -1780,6 +1952,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             for child in children {
                 self.layer(
                     child,
+                    indexed_layers,
                     //3d6f8..3d712 selects each layer's own parameter+28
                     //or the motion clock+104. A physical parent's parameter
                     //cursor affects its transform, not a child's clock.
@@ -2003,8 +2176,6 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         //Layer color, opacity and color blending do not attenuate texture
         //alpha in this pass; the actual texture still supplies GREATER64.
         let raster_opacity = if is_mask { 1.0 } else { f64::from(transform.opacity) / 255.0 };
-        let (geometry, anchor_delta) =
-            mesh_raster_plan(warps, mesh_owner, transform.point([0.0, 0.0]))?;
         let grid = if !warps.iter().any(|ancestor| ancestor.warp.is_some()) {
             CpuMeshGrid {
                 columns: 1,
@@ -2026,31 +2197,40 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         // Tiny unwarped quads are cheaper to rebuild. Larger grids reuse the
         // exact resolved world/ancestor inputs across ticks and mask passes.
         let cache_key = (use_node_cache() && vertex_count > 4).then(|| mesh_vertex_key(self.viewport, transform, grid,
-            [left, top, width, height, ox, oy], anchor_delta, &geometry));
-        let cached = cache_key.as_ref().and_then(|key| self.player.model.node_cache.lock()
-            .unwrap_or_else(|error| error.into_inner()).meshes.get(key).cloned());
+            [left, top, width, height, ox, oy], warps, mesh_owner));
+        let model = &self.player.model;
+        let cached = cache_key.as_ref().and_then(|key| {
+            model.try_node_cache().and_then(|mut cache| cache.meshes.get(key).cloned())
+        });
         let vertices = if let Some(vertices) = cached {
-            vertices
+            vertices.as_ref().clone()
         } else {
+            let (geometry, anchor_delta) =
+                mesh_raster_plan(warps, mesh_owner, transform.point([0.0, 0.0]))?;
             let mut vertices = Vec::with_capacity(vertex_count);
             for y in 0..=grid.rows {
+                let q = y as f64 / grid.rows as f64;
+                let local_y = q * height - oy;
+                let texture_y = top + q * height;
                 for x in 0..=grid.columns {
                     let u = x as f64 / grid.columns as f64;
-                    let q = y as f64 / grid.rows as f64;
-                    let mut point = transform.point([u * width - ox, q * height - oy]);
+                    let mut point = transform.point([u * width - ox, local_y]);
                     for warp in &geometry { point = warp.apply(point)?; }
                     point[0] += anchor_delta[0];
                     point[1] += anchor_delta[1];
                     vertices.push([
                         self.viewport.origin_x + point[0] * self.viewport.scale,
                         self.viewport.origin_y + point[1] * self.viewport.scale,
-                        left + u * width, top + q * height,
+                        left + u * width, texture_y,
                     ]);
                 }
             }
             if let Some(key) = cache_key {
-                self.player.model.node_cache.lock().unwrap_or_else(|error| error.into_inner())
-                    .meshes.insert(key, vertices.clone(), vertices.capacity() * size_of::<[f64; 4]>());
+                let value_bytes = vertices.capacity() * size_of::<[f64; 4]>();
+                let cached = Arc::new(vertices.clone());
+                if let Some(mut cache) = model.try_node_cache() {
+                    cache.meshes.insert(key, cached, value_bytes);
+                }
             }
             vertices
         };
@@ -2067,8 +2247,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
     }
 }
 
-fn mesh_division(layer: &PsbValue) -> Result<u32> {
-    let division = num(layer, "meshDivision", -1.0)?;
+fn mesh_division(division: f64) -> Result<u32> {
     if division < 0.0 || division.fract() != 0.0 || division > 65535.0 {
         return Err(unsupported("invalid original meshDivision"));
     }
@@ -2096,32 +2275,110 @@ fn hide_children(layer: &PsbValue, pending: &mut Vec<Option<DrawLayer<'_>>>) -> 
     Ok(())
 }
 
-fn priority_order(motion: &PsbValue, time: f64, count: usize) -> Result<Vec<usize>> {
-    let list = motion
-        .get("priority")
-        .and_then(PsbValue::list)
-        .unwrap_or(&[]);
-    let selected = list
-        .iter()
-        //34e42 parses priority/count174.3b617/3b61c and3c54a limit its
-        //current cursor to count-2 as well: the terminal null priority is
-        //a boundary, not an instruction to erase all color/mask sources.
-        .take(if list.len() >= 2 { list.len() - 1 } else { list.len() })
-        .filter(|f| num(f, "time", 0.0).is_ok_and(|n| n <= time))
-        .last();
-    if let Some(content) = selected.and_then(|v| v.get("content")) {
-        if matches!(content, PsbValue::Null) {
-            return Ok(Vec::new());
-        }
-        let indexes = numbers(Some(content))?;
+#[derive(Debug)]
+pub(super) struct PriorityTimeline {
+    keys: Vec<(f64, Result<Option<PriorityOrder>>)>,
+}
+
+#[derive(Debug)]
+struct PriorityOrder {
+    indices: Vec<usize>,
+    last_index: Option<usize>,
+}
+
+impl PriorityOrder {
+    fn read(key: &PsbValue) -> Result<Option<Self>> {
+        let Some(content) = key.get("content") else { return Ok(None); };
+        let indices: Vec<_> = numbers(Some(content))?.into_iter().map(|value| value as usize).collect();
         let mut seen = BTreeSet::new();
-        let order: Vec<usize> = indexes.into_iter().map(|v| v as usize).collect();
-        if order.iter().any(|&i| i >= count || !seen.insert(i)) {
+        let mut last_index = None;
+        for &index in &indices {
+            if !seen.insert(index) {
+                return Err(unsupported("priority layer indices"));
+            }
+            last_index = last_index.max(Some(index));
+        }
+        Ok(Some(Self { indices, last_index }))
+    }
+
+    fn check_count(&self, count: usize) -> Result<()> {
+        if self.last_index.is_some_and(|index| index >= count) {
             return Err(unsupported("priority layer indices"));
         }
-        return Ok(order);
+        Ok(())
     }
-    Ok((0..count).collect())
+}
+
+impl PriorityTimeline {
+    pub(super) fn prepare(motion: &PsbValue, remaining_bytes: &mut usize) -> Option<Self> {
+        let current_keys = current_priority_keys(motion);
+        let key_bytes = size_of::<(f64, Result<Option<PriorityOrder>>)>();
+        if current_keys.len().saturating_mul(key_bytes) > *remaining_bytes {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(current_keys.len());
+        let mut used_bytes = keys.capacity() * key_bytes;
+        for key in current_keys {
+            let Ok(time) = num(key, "time", 0.0) else { continue; };
+            let entry_count = match key.get("content") {
+                Some(PsbValue::List(values)) => values.len(),
+                Some(PsbValue::Integers(values)) => values.len(),
+                _ => 0,
+            };
+            if used_bytes.saturating_add(entry_count.saturating_mul(size_of::<usize>())) > *remaining_bytes {
+                return None;
+            }
+            let order = PriorityOrder::read(key);
+            used_bytes = used_bytes.saturating_add(Self::order_storage_bytes(&order));
+            if used_bytes > *remaining_bytes {
+                return None;
+            }
+            keys.push((time, order));
+        }
+        *remaining_bytes -= used_bytes;
+        Some(Self { keys })
+    }
+
+    fn order(&self, time: f64, count: usize) -> Result<Option<&[usize]>> {
+        // Search backward in source order. The source may contain equal or
+        // unsorted times, and invalid time fields are omitted from the index.
+        let Some((_, selected)) = self.keys.iter().rfind(|(begin, _)| *begin <= time) else {
+            return Ok(None);
+        };
+        let Some(order) = selected.as_ref().map_err(Clone::clone)? else { return Ok(None); };
+        order.check_count(count)?;
+        Ok(Some(&order.indices))
+    }
+
+    pub(super) fn estimated_storage_bytes(&self) -> usize {
+        self.keys.capacity() * size_of::<(f64, Result<Option<PriorityOrder>>)>()
+            + self.keys.iter().map(|(_, order)| Self::order_storage_bytes(order)).sum::<usize>()
+    }
+
+    fn order_storage_bytes(order: &Result<Option<PriorityOrder>>) -> usize {
+        match order {
+            Ok(Some(order)) => order.indices.capacity() * size_of::<usize>(),
+            Err(EmoteError::Backend(message)) => message.capacity(),
+            _ => 0,
+        }
+    }
+}
+
+fn current_priority_keys(motion: &PsbValue) -> &[PsbValue] {
+    let keys = motion.get("priority").and_then(PsbValue::list).unwrap_or(&[]);
+    // The terminal key is a boundary whenever there is an earlier key.
+    &keys[..keys.len() - usize::from(keys.len() >= 2)]
+}
+
+fn priority_order_uncached(motion: &PsbValue, time: f64, count: usize) -> Result<Option<Vec<usize>>> {
+    let Some(key) = current_priority_keys(motion).iter().rfind(|key| {
+        num(key, "time", 0.0).is_ok_and(|begin| begin <= time)
+    }) else {
+        return Ok(None);
+    };
+    let Some(order) = PriorityOrder::read(key)? else { return Ok(None); };
+    order.check_count(count)?;
+    Ok(Some(order.indices))
 }
 
 fn edge(a: [f64; 4], b: [f64; 4], x: f64, y: f64) -> f64 {
@@ -2815,13 +3072,38 @@ pub struct CpuPlayerRenderState {
 
 impl CpuPlayerRenderState {
     pub fn matches(&self, player: &CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>) -> bool {
-        Weak::ptr_eq(&self.model, &Arc::downgrade(&player.model))
-            && self.object == player.object && self.motion == player.motion
-            && self.pose == RasterPose::new(player, viewport)
-            && self.time_units == viewport.time_units_per_frame.to_bits()
-            && self.controllers == [player.controller_a_raw, player.controller_b_raw]
+        self.same_draw_parameters(player, viewport)
+            && self.pose.time == player.frame.to_bits()
             && super::timeline::same_variable_bits(&self.variables, variables)
             && self.references.same_render_state(&player.reference_timelines)
+    }
+
+    /// Match persistent render context when sampling an older visual pose.
+    /// The host must additionally check any scene and task presentation barriers.
+    pub fn same_display_context(
+        &self, player: &CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>,
+    ) -> bool {
+        self.matches(player, viewport, variables)
+            || (self.same_draw_parameters(player, viewport)
+            && self.references.has_tick(f64::from_bits(self.pose.time) as f32, &self.variables)
+            && player.reference_timelines.has_tick(player.frame as f32, variables)
+            && self.references.same_selected_owners(&player.reference_timelines)
+            )
+    }
+
+    fn same_draw_parameters(&self, player: &CpuPlayer, viewport: CpuViewport) -> bool {
+        let current = RasterPose::new(player, viewport);
+        self.model.as_ptr() == Arc::as_ptr(&player.model)
+            && self.object == player.object
+            && self.motion == player.motion
+            && self.pose.size == current.size
+            && self.pose.mapping == current.mapping
+            && self.pose.enabled == current.enabled
+            && self.pose.mesh_quality == current.mesh_quality
+            && self.pose.affine == current.affine
+            && self.pose.driver_transform == current.driver_transform
+            && self.time_units == viewport.time_units_per_frame.to_bits()
+            && self.controllers == [player.controller_a_raw, player.controller_b_raw]
     }
 }
 
@@ -3040,6 +3322,9 @@ pub struct CpuEmoteBackend {
     models: BTreeMap<(Vec<u8>, u32), Vec<Weak<CpuMotionModel>>>,
     archived_models: Vec<ArchivedModel>,
     recent_m2_model: Option<RecentM2Model>,
+    retained_m2_models: Vec<(RecentM2Model, usize)>,
+    retained_m2_budget: usize,
+    retained_m2_bytes: usize,
     raster_scratch: Vec<u8>,
     rasterizer: Option<HostRasterizer>,
     surface_mixer: Option<super::EmoteSurfaceMixer>,
@@ -3060,6 +3345,9 @@ impl CpuEmoteBackend {
             models: BTreeMap::new(),
             archived_models: Vec::new(),
             recent_m2_model: None,
+            retained_m2_models: Vec::new(),
+            retained_m2_budget: 0,
+            retained_m2_bytes: 0,
             raster_scratch: Vec::new(),
             rasterizer: None,
             surface_mixer: None,
@@ -3087,6 +3375,27 @@ impl CpuEmoteBackend {
 
     pub fn set_resources(&mut self, resources: Box<dyn CpuEmoteResources>) {
         self.resources = Some(resources);
+    }
+
+    pub fn set_m2_retention_budget(&mut self, bytes: usize) {
+        self.retained_m2_budget = bytes;
+        while self.retained_m2_bytes > bytes {
+            let (_, charge) = self.retained_m2_models.pop().expect("retained M2 budget accounting");
+            self.retained_m2_bytes -= charge;
+        }
+    }
+
+    fn retain_m2_model(&mut self, version: EmoteArchiveVersion, filter: u32, model: &Arc<CpuMotionModel>) {
+        if self.retained_m2_budget == 0 || self.retained_m2_models.iter().any(|(entry, _)|
+            entry.version == version && entry.filter == filter)
+        {
+            return;
+        }
+        let bytes = model.estimated_storage_bytes();
+        if bytes <= self.retained_m2_budget.saturating_sub(self.retained_m2_bytes) {
+            self.retained_m2_models.push((RecentM2Model { version, filter, model: model.clone() }, bytes));
+            self.retained_m2_bytes += bytes;
+        }
     }
     pub fn set_surface_tinter(&mut self, tinter: HostSurfaceTinter) {
         self.surface_tinter = Some(tinter);
@@ -3622,14 +3931,19 @@ impl EmoteBackend for CpuEmoteBackend {
             state.surface.request(Some(duration), frame, true);
         }
         if let Some(version) = version {
-            let model = Arc::downgrade(&state.player.as_ref().unwrap().model);
+            let shared = &state.player.as_ref().unwrap().model;
+            let model = Arc::downgrade(shared);
             let filter = state.resource_filter;
             self.archived_models.retain(|entry| {
                 entry.model.strong_count() != 0
                     && !(entry.filter == filter && (entry.version == version
                         || Weak::ptr_eq(&entry.model, &model)))
             });
-            self.archived_models.push(ArchivedModel { version, filter, model });
+            self.archived_models.push(ArchivedModel { version: version.clone(), filter, model });
+            if self.retained_m2_budget != 0 {
+                let shared = shared.clone();
+                self.retain_m2_model(version, filter, &shared);
+            }
         }
         if self.recent_m2_model.as_ref().is_some_and(|entry|
             Arc::ptr_eq(&self.players[&task].player.as_ref().unwrap().model, &entry.model))
@@ -3660,6 +3974,8 @@ impl EmoteBackend for CpuEmoteBackend {
         self.archived_models.iter()
             .filter(|entry| entry.filter == filter && &entry.version == version)
             .find_map(|entry| entry.model.upgrade())
+            .or_else(|| self.retained_m2_models.iter().find(|(entry, _)|
+                entry.filter == filter && &entry.version == version).map(|(entry, _)| entry.model.clone()))
             .or_else(|| self.recent_m2_model.as_ref().filter(|entry|
                 entry.filter == filter && &entry.version == version).map(|entry| entry.model.clone()))
     }
@@ -4243,6 +4559,35 @@ impl EmoteBackend for CpuEmoteBackend {
         Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut captured);
         Ok(captured)
     }
+    fn render_sampled_scene_rgba(
+        &mut self, task: u32, sample: &CpuPlayer, variables: &BTreeMap<String, f64>,
+    ) -> Result<EmoteRasterFrame> {
+        let state = self.players.get_mut(&task).ok_or(EmoteError::UnknownTask(task))?;
+        state.surface.discard_invalid_device_frames();
+        if state.surface.frame().is_some() {
+            return Err(unsupported("sampled E-mote pose crosses a live surface transition"));
+        }
+        let mut warnings = Vec::new();
+        state.append_owner_warnings(&mut warnings);
+        check_strict_warnings(&warnings)?;
+        self.viewport.check()?;
+        let mut frame = match self.rasterizer.and_then(|rasterizer| {
+            rasterizer(sample, self.viewport, variables).filter(EmoteRasterFrame::is_valid)
+        }) {
+            Some(frame) => frame,
+            None => sample.render_resolved(self.viewport, variables, std::mem::take(&mut self.raster_scratch))?
+                .into_strict()?,
+        };
+        // The off-screen transition owner must observe what was displayed,
+        // and the current driver's exact raster cache keeps its own identity.
+        if let Some(bytes) = state.surface.remember(frame.clone()).and_then(EmoteRasterFrame::try_recycle)
+            && bytes.capacity() > self.raster_scratch.capacity()
+        {
+            self.raster_scratch = bytes;
+        }
+        Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut frame);
+        Ok(frame)
+    }
     fn playback_info(&self, task: u32) -> Result<EmotePlaybackInfo> {
         let state = self
             .players
@@ -4327,6 +4672,20 @@ impl EmoteBackend for CpuEmoteBackend {
             .surface.set_default(duration);
         Ok(())
     }
+    fn hold_idle_scene_tick(&mut self, task: u32, now: u32) -> bool {
+        let Some(state) = self.players.get_mut(&task) else { return false; };
+        if state.player.as_ref().is_none_or(CpuPlayer::driver_busy)
+            || state.surface.pending() || state.surface.blending()
+            || state.m2_owner.as_ref().is_some_and(|owner|
+                owner.action.busy() || owner.value_table.chain_count() != 0 || !owner.pending_timed.is_empty())
+        {
+            return false;
+        }
+        // Consume the host clock while keeping the idle motion at its last pose.
+        state.original_clock.advance(now);
+        true
+    }
+
     fn surface_holds_tick(&self, task: u32, now: u32) -> Result<bool> {
         Ok(self.players.get(&task).ok_or(EmoteError::UnknownTask(task))?
             .surface.holds_at(now))
@@ -4358,6 +4717,53 @@ mod tests {
     fn object<const N: usize>(fields: [(&str, PsbValue); N]) -> PsbValue {
         PsbValue::Object(fields.into_iter().map(|(name, value)| (name.into(), value)).collect())
     }
+
+    #[test]
+    fn priority_index_preserves_source_order_fallback_and_deferred_errors() -> Result<()> {
+        let key = |time, content| object([("time", PsbValue::Integer(time)), ("content", content)]);
+        let indices = |values| PsbValue::Integers(values);
+        let motion = object([("priority", PsbValue::List(vec![
+            key(2, indices(vec![1, 0])),
+            key(9, indices(vec![0, 0])),
+            key(3, PsbValue::Null),
+            object([("time", PsbValue::Integer(4))]),
+            key(5, indices(vec![3, 0])),
+            key(8, PsbValue::String("malformed".into())),
+            object([("time", PsbValue::String("malformed".into())), ("content", PsbValue::Null)]),
+            key(10, indices(vec![2, 2])),
+            key(11, indices(vec![999])),
+        ]))]);
+        let mut bytes = 4096;
+        let index = PriorityTimeline::prepare(&motion, &mut bytes).unwrap();
+        assert_eq!(4096 - bytes, index.estimated_storage_bytes());
+        assert!(PriorityTimeline::prepare(&motion, &mut 1).is_none());
+
+        let expectations = [
+            (1.0, 2, Ok(None)),
+            (2.0, 2, Ok(Some(vec![1, 0]))),
+            (3.0, 2, Ok(Some(vec![]))),
+            (4.0, 2, Ok(None)),
+            (6.0, 4, Ok(Some(vec![3, 0]))),
+            (6.0, 3, Err(unsupported("priority layer indices"))),
+            (9.0, 4, Err(unsupported("expected vector/list"))),
+            (11.0, 4, Err(unsupported("priority layer indices"))),
+        ];
+        for (time, count, expected) in expectations {
+            assert_eq!(priority_order_uncached(&motion, time, count), expected);
+            assert_eq!(index.order(time, count).map(|value| value.map(<[usize]>::to_vec)), expected);
+        }
+
+        let unordered = object([("priority", PsbValue::List(vec![
+            key(9, indices(vec![0])),
+            key(5, indices(vec![1])),
+            key(1, PsbValue::Null),
+        ]))]);
+        let index = PriorityTimeline::prepare(&unordered, &mut bytes).unwrap();
+        assert_eq!(index.order(10.0, 2)?, Some(&[1][..]));
+        assert_eq!(priority_order_uncached(&unordered, 10.0, 2)?, Some(vec![1]));
+        Ok(())
+    }
+
 
     fn backend() -> Result<CpuEmoteBackend> {
         let sprite = object([
@@ -4400,21 +4806,29 @@ mod tests {
     }
 
     #[test]
-    fn node_affine_cache_survives_ticks_but_parent_transform_still_moves_pixels() -> Result<()> {
+    fn held_key_affine_survives_ticks_but_parent_transform_still_moves_pixels() -> Result<()> {
         let backend = backend()?;
         let mut player = backend.player(1)?.clone();
+        let model = player.model.clone();
+        let motion = model.motion(&player.object, &player.motion)?;
+        let layer = &field(motion, "layer")?.list().unwrap()[0];
+        let track = model.layer_timelines.as_deref()
+            .and_then(|timelines| timelines.motion(motion))
+            .and_then(|index| index.layers.first());
+        let (key, _) = lookup_layer_keyframes(layer, 0.0, track)?;
+        let slot = key.unwrap().local_transform.unwrap();
+        assert!(slot.get().is_none());
         let original = player.render_strict(backend.viewport)?;
-        let first = player.model.node_cache_counters();
-        assert!(first[1] > 0);
+        let resolved = slot.get().unwrap();
+        assert_eq!(resolved.matrix, Transform::identity().m);
         player.frame = 1.0;
         let repeated = player.render_strict(backend.viewport)?;
         assert_eq!(original.rgba(), repeated.rgba());
-        assert!(player.model.node_cache_counters()[0] > first[0]);
         player.set_root_affine([1.0, 0.0, 0.0, 1.0, 1.0, 0.0])?;
         let moved = player.render_strict(backend.viewport)?;
         assert_ne!(original.rgba(), moved.rgba());
-        // Identical local fields can be reused; the world parent is still applied.
-        assert!(player.model.node_cache_counters()[0] > first[0]);
+        assert_eq!(slot.get().unwrap().matrix, resolved.matrix);
+        assert_eq!(model.node_cache_counters()[..2], [0, 0]);
         Ok(())
     }
 
@@ -4425,14 +4839,41 @@ mod tests {
         let grid = CpuMeshGrid { columns: 4, rows: 4 };
         let transform = Transform::identity();
         let coords = [0.0, 0.0, 10.0, 20.0, 0.0, 0.0];
-        let key = mesh_vertex_key(viewport, transform, grid, coords, [0.0; 2], &[]);
+        let key = mesh_vertex_key(viewport, transform, grid, coords, &[], 0);
         let mut moved = transform; moved.m[4] = 1.0;
-        assert_ne!(key, mesh_vertex_key(viewport, moved, grid, coords, [0.0; 2], &[]));
+        assert_ne!(key, mesh_vertex_key(viewport, moved, grid, coords, &[], 0));
+        let mut faded = transform; faded.opacity = 31;
+        assert_eq!(key, mesh_vertex_key(viewport, faded, grid, coords, &[], 0));
         let mut resized = viewport; resized.scale = 1.5;
-        assert_ne!(key, mesh_vertex_key(resized, transform, grid, coords, [0.0; 2], &[]));
+        assert_ne!(key, mesh_vertex_key(resized, transform, grid, coords, &[], 0));
         let mut next_icon = coords; next_icon[0] = 20.0;
-        assert_ne!(key, mesh_vertex_key(viewport, transform, grid, next_icon, [0.0; 2], &[]));
-        assert_ne!(key, mesh_vertex_key(viewport, transform, grid, coords, [0.5, 0.0], &[]));
+        assert_ne!(key, mesh_vertex_key(viewport, transform, grid, next_icon, &[], 0));
+        let parent = MeshAncestor { owner: 1, warp: None, stops_geometry: true };
+        let chain = [parent];
+        let parent_key = mesh_vertex_key(viewport, transform, grid, coords, &chain, 0);
+        assert_ne!(key, parent_key);
+        assert_ne!(parent_key, mesh_vertex_key(viewport, transform, grid, coords, &chain, 1));
+    }
+
+    #[test]
+    fn visual_pose_context_requires_current_and_equivalent_visible_layers() -> Result<()> {
+        let backend = backend()?;
+        let viewport = backend.viewport;
+        let mut player = backend.player(1)?.clone();
+        player.update_reference_timelines()?;
+        let variables = player.effective_variables()?;
+        let visible = player.render_state_snapshot(viewport, &variables);
+        let snapshot = player.snapshot_for_draw();
+        assert!(visible.matches(&snapshot, viewport, &variables));
+        player.advance_frames(1.0)?;
+        assert!(!visible.same_display_context(&player, viewport, &variables));
+        player.update_reference_timelines()?;
+        assert!(visible.same_display_context(&player, viewport, &variables));
+        player.set_variable("mouth", 1.0)?;
+        player.update_reference_timelines()?;
+        let hidden = player.effective_variables()?;
+        assert!(!visible.same_display_context(&player, viewport, &hidden));
+        Ok(())
     }
 
     #[test]
@@ -4535,6 +4976,33 @@ mod tests {
     }
 
     #[test]
+    fn fast_forward_twenty_idle_pose_cycles() -> Result<()> {
+        let mut backend = backend()?;
+        backend.original_task_clock = true;
+        backend.advance(1, EmoteTick { task_elapsed: 2, lip_elapsed: None, increment: 0 })?;
+        for round in 0..20 {
+            let clock = 3 + round * 9;
+            let player = backend.player(1)?;
+            let viewport = backend.viewport;
+            let variables = player.effective_variables()?;
+            let held = player.render_state_snapshot(viewport, &variables);
+            for now in clock..clock + 8 {
+                assert!(backend.hold_idle_scene_tick(1, now));
+                assert!(held.matches(backend.player(1)?, viewport, &variables));
+            }
+            let before = backend.player(1)?.frame;
+            backend.advance(1, EmoteTick { task_elapsed: clock + 8, lip_elapsed: None, increment: 0 })?;
+            let player = backend.player(1)?;
+            assert!(!held.matches(player, viewport, &player.effective_variables()?));
+            let clock = backend.playback_info(1)?.original_clock_fields;
+            assert_eq!(clock[0] - clock[1], 1, "resume advances one tick");
+            assert_ne!(player.frame, before);
+        }
+        println!("fast_forward cycles=20 idle_ticks_held=160 resumed=20");
+        Ok(())
+    }
+
+    #[test]
     fn m2_archive_model_lookup_checks_version_and_filter_before_and_after_release() -> Result<()> {
         use crate::{ResourceCandidate, ResourceLocation};
         let path = std::env::temp_dir().join(format!("cs2-emote-archive-cache-{}", std::process::id()));
@@ -4572,6 +5040,25 @@ mod tests {
         backend.players.get_mut(&2).unwrap().texture_filter_raw = 0;
         assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_some());
         assert!(backend.cached_m2_model(2, b"actor.psz", &changed).is_none());
+
+        let model = backend.cached_m2_model(2, b"actor.psz", &version).unwrap();
+        let charge = model.estimated_storage_bytes();
+        backend.set_m2_retention_budget(charge - 1);
+        backend.retain_m2_model(version.clone(), 0, &model);
+        assert_eq!(backend.retained_m2_bytes, 0);
+        backend.set_m2_retention_budget(charge);
+        backend.retain_m2_model(version.clone(), 0, &model);
+        backend.retain_m2_model(version.clone(), 0, &model);
+        backend.recent_m2_model = None;
+        drop(model);
+        assert_eq!(backend.retained_m2_bytes, charge);
+        assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_some());
+        assert!(backend.cached_m2_model(2, b"actor.psz", &changed).is_none());
+        backend.players.get_mut(&2).unwrap().texture_filter_raw = 2;
+        assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_none());
+        backend.set_m2_retention_budget(0);
+        backend.players.get_mut(&2).unwrap().texture_filter_raw = 0;
+        assert!(backend.cached_m2_model(2, b"actor.psz", &version).is_none());
         Ok(())
     }
 

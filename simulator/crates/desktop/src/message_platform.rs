@@ -123,12 +123,14 @@ pub(super) struct FesButtonOwnerDispatch {
     navigation: Option<super::fes_driver::main_flow::NavigationDispatch>,
     input: Option<super::fes_driver::FesDriverInput>,
     response: Option<u32>,
+    send_selection: bool,
     clear_selection: bool,
     refresh: bool,
     named: Option<(&'static str, i32)>,
     syskey: bool,
     record: usize,
     record_object_handler: bool,
+    record_default_handler: bool,
     stage: u8,
 }
 
@@ -1331,9 +1333,10 @@ impl LoggingHost<'_> {
                                 pending.record += 1;
                                 continue;
                             }
-                            let (target, object_handler, _) =
+                            let (target, object_handler, default_handler) =
                                 self.resolve_fes_button_handler(owner, record.target, b"PUSH_L")?;
                             pending.record_object_handler = object_handler;
+                            pending.record_default_handler = default_handler;
                             pending.input = Some(super::fes_driver::FesDriverInput {
                                 code: 0,
                                 target: Some(target),
@@ -1354,6 +1357,9 @@ impl LoggingHost<'_> {
                             if pending.record_object_handler {
                                 pending.response = None;
                             }
+                            if pending.record_object_handler || pending.record_default_handler {
+                                pending.send_selection = false;
+                            }
                             pending.input = None;
                             pending.record += 1;
                             continue;
@@ -1369,6 +1375,9 @@ impl LoggingHost<'_> {
                         pending.stage = 3;
                     }
                     3 => {
+                        if pending.send_selection {
+                            self.send_fes_button_selection(owner, command.sender as u32)?;
+                        }
                         if pending.clear_selection && self.input_task.alive {
                             self.clear_input_region_selection();
                         }
@@ -1403,6 +1412,20 @@ impl LoggingHost<'_> {
                 .insert(owner, pending);
         }
         result.map(Some)
+    }
+
+    fn send_fes_button_selection(&mut self, owner: u32, button: u32) -> Result<()> {
+        let value = self.data_services.tasks.fes.runtime(owner)
+            .and_then(|runtime| runtime.driver.as_ref())
+            .ok_or_else(|| invalid("FES BUTTON selection needs its live interpreter"))?
+            .send_button_selection();
+        self.receive_input_button_command(
+            cs2_runtime::TaskCommand {
+                target: button as i32, sender: owner as i32, code: 94, data: [0, value, 1],
+            },
+            &mut Default::default(), &mut 0, 1,
+        )?;
+        Ok(())
     }
 
     fn prepare_fes_button_owner(
@@ -1458,6 +1481,7 @@ impl LoggingHost<'_> {
         };
         let mut input = None;
         let mut response = None;
+        let mut send_selection = false;
         let mut clear_selection = false;
         let mut refresh = true;
         let mut named = None;
@@ -1494,6 +1518,7 @@ impl LoggingHost<'_> {
                 }
             }
             9 | 10 => {
+                send_selection = true;
                 let key = command.data[1];
                 let target = if command.code == 9 {
                     state.raw_state = match self.data_services.messages.input_event_mask {
@@ -1538,6 +1563,7 @@ impl LoggingHost<'_> {
                     let (dispatch, reply) = super::fes_driver::main_flow::prepare_navigation(
                         self, owner, key, &mut state,
                     ).map_err(|error| super::fes_driver::main_flow::input_error(self, owner, error))?;
+                    send_selection = dispatch.pointer.is_none() && dispatch.control.is_none();
                     navigation = Some(dispatch);
                     response = reply;
                 } else {
@@ -1557,6 +1583,7 @@ impl LoggingHost<'_> {
                 } else {
                     Some(1)
                 };
+                send_selection &= !object_handler && !default_handler;
                 clear_selection = command.code == 10
                     && matches!(command.data[1], 0 | 1)
                     && (object_handler || default_handler);
@@ -1585,12 +1612,14 @@ impl LoggingHost<'_> {
             navigation,
             input,
             response,
+            send_selection,
             clear_selection,
             refresh,
             named,
             syskey,
             record: 0,
             record_object_handler: false,
+            record_default_handler: false,
             stage: 0,
         })
     }
@@ -3576,7 +3605,12 @@ impl LoggingHost<'_> {
             })?;
             let mut output = 0;
             match command {
-                180 | 181 | 206..=209 | 225..=227 => {
+                180 | 181 | 206..=209 => self.dispatch_sound_load_record(
+                    sound,
+                    command,
+                    pending.record.as_deref_mut().expect("sound load record prepared"),
+                ),
+                225..=227 => {
                     if !self.dispatch_sound_task_command(
                         sound,
                         cs2_runtime::TaskCommand {
@@ -3751,9 +3785,9 @@ impl LoggingHost<'_> {
         Ok(NativeReturn::Continue)
     }
 
-    pub(super) fn move_fes_navigation_pointer(&mut self, owner: u32, point: [i32; 2]) -> Result<()> {
+    pub(super) fn move_fes_pointer(&mut self, owner: u32, point: [i32; 2], frames: u32) -> Result<()> {
         let packed = u32::from(point[0] as u16) | (u32::from(point[1] as u16) << 16);
-        let data = [1, packed, 0];
+        let data = [frames, packed, 0];
         if let Some(input) = self.input_task.owner_id {
             let command = cs2_runtime::TaskCommand {
                 target: input as i32,
@@ -3772,18 +3806,18 @@ impl LoggingHost<'_> {
         Ok(())
     }
 
+    pub(super) fn fes_auto_pointer_enabled(&mut self) -> Result<bool> {
+        self.ensure_fes_settings().map_err(|_| {
+            invalid("pointer movement cannot read the real EFFECT/auto_c setting")
+        })?;
+        self.system_config_blocks[2].get(12..16)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) != 0)
+            .ok_or_else(|| invalid("pointer control option block is truncated"))
+    }
+
     fn request_device_pointer(&mut self, input: Option<u32>, code: u32, data: [u32; 3]) -> Result<()> {
-        if code == 138 {
-            self.ensure_fes_settings().map_err(|_| {
-                invalid("pointer movement cannot read the real EFFECT/auto_c setting")
-            })?;
-            let auto_cursor = self.system_config_blocks[2]
-                .get(12..16)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                .ok_or_else(|| invalid("pointer control option block is truncated"))?;
-            if auto_cursor == 0 {
-                return Ok(());
-            }
+        if code == 138 && !self.fes_auto_pointer_enabled()? {
+            return Ok(());
         }
         // UTATE43ab1f/43ab32 go directly to coordinate conversion and the
         // saved smooth-move fields; this version has no foreground gate.

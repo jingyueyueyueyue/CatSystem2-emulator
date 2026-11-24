@@ -20,19 +20,23 @@ enum {
     PERF_COMPOSE_PLANE, PERF_COMPOSE_KX, PERF_COMPOSE_RESOURCE_REDRAW, PERF_PHASES,
     PERF_BATCH = 8
 };
-enum { FRAME_CHANGED = 1, FRAME_UNCHANGED = 4 };
+enum { FRAME_CHANGED = 1, FRAME_UNCHANGED = 4, FRAME_MOVIE = 5 };
 
 typedef struct {
     uint64_t phase_ns[PERF_PHASES];
 } HostFrameTiming;
 
-extern uint64_t cs2_android_open_profiled_v4(const char *, const char *, int32_t, int32_t, HostFrameTiming *);
+extern uint64_t cs2_android_open_profiled_v5(const char *, const char *, int32_t, int32_t, HostFrameTiming *, uint64_t);
 extern int32_t cs2_android_close(uint64_t);
 extern int32_t cs2_android_step_profiled_v4(uint64_t, uint32_t, HostFrameTiming *, const char **,
                                            uint64_t, uint64_t, const char **);
+extern const char *cs2_android_diagnostic(uint64_t);
 extern int32_t cs2_android_size(uint64_t, uint32_t);
 extern int32_t cs2_android_take_pointer(uint64_t, int32_t *);
 extern int32_t cs2_android_take_cursor_visibility(uint64_t);
+extern int32_t cs2_android_cursor_image(uint64_t, const uint8_t **, size_t *);
+extern int32_t cs2_android_text_entry(uint64_t, const uint8_t **, size_t *);
+extern int32_t cs2_android_text_entry_result(uint64_t, uint64_t, int32_t, const uint8_t *, size_t);
 extern int32_t cs2_android_take_window_request(uint64_t);
 extern int32_t cs2_android_general_window_policy(uint64_t);
 extern int32_t cs2_android_general_window_caption(uint64_t, const uint8_t **, size_t *);
@@ -57,14 +61,17 @@ extern int32_t cs2_android_dialog(uint64_t, const uint8_t **, size_t *);
 extern int32_t cs2_android_dialog_result(uint64_t, uint64_t, int32_t);
 extern int32_t cs2_android_input(uint64_t, uint32_t, int32_t, int32_t);
 extern int32_t cs2_android_tick_delay(uint64_t, int32_t);
+extern int32_t cs2_android_retry_delay(uint64_t);
 extern int32_t cs2_android_enqueue_input(uint64_t, uint32_t, int32_t, int32_t, uint64_t, int64_t, uint64_t);
 extern int32_t cs2_android_take_consumed_input(uint64_t, uint64_t *, uint64_t *, int64_t *, uint64_t *);
 extern int32_t cs2_android_text(uint64_t, uint32_t, const uint8_t *, size_t, int32_t, int32_t);
-extern int32_t cs2_android_copy_frame(uint64_t, uint8_t *, int32_t, int32_t, int32_t);
-extern int32_t cs2_android_frame_posted(uint64_t);
+extern int32_t cs2_android_copy_frame(uint8_t *, int32_t, int32_t, int32_t);
+extern int32_t cs2_android_publish_frame(uint64_t, uint64_t);
+extern int32_t cs2_android_begin_presentation(uint64_t, uint64_t *, int32_t *, int32_t *);
+extern int32_t cs2_android_end_presentation(int32_t);
 extern int32_t cs2_android_gpu_timing(uint64_t *, uint64_t *);
 extern int32_t cs2_android_vulkan_candidate(void *);
-extern int32_t cs2_android_present_vulkan(uint64_t, void *);
+extern int32_t cs2_android_present_vulkan(void *);
 extern void cs2_android_detach_vulkan(void);
 extern void cs2_android_vulkan_display_stats_enable(int32_t);
 extern int32_t cs2_android_vulkan_display_stats(uint64_t *);
@@ -83,14 +90,23 @@ typedef struct {
     HostFrameTiming timing;
 } PerfTick;
 
+enum { PERF_FRAME_HISTORY = 64, PRESENT_FIELDS = 7 };
+
+typedef struct {
+    uint64_t revision;
+    PerfTick tick;
+} PerfFrame;
+
 typedef struct {
     uint64_t handle;
     uint64_t opened_from_ns;
     uint64_t last_post_ns;
+    uint64_t last_post_revision;
     uint64_t post_sequence;
     uint64_t frame_sequence;
     uint64_t input_sequence;
     PerfTick tick;
+    PerfFrame frames[PERF_FRAME_HISTORY];
     size_t log_size;
     size_t log_rows;
     char log_batch[4000];
@@ -180,10 +196,8 @@ static void perf_record_unchanged(void) {
     perf.tick = (PerfTick){0};
 }
 
-static void perf_record_post(uint64_t present_start, uint64_t lock_start, uint64_t copy_start,
+static void perf_record_post(const PerfTick *tick, uint64_t present_start, uint64_t lock_start, uint64_t copy_start,
                              uint64_t post_start, uint64_t posted_at, uint64_t present_end) {
-    const PerfTick no_completed_tick = {0};
-    const PerfTick *tick = perf.tick.frame ? &perf.tick : &no_completed_tick;
     const uint64_t interval = perf.last_post_ns ? (posted_at - perf.last_post_ns) / 1000 : 0;
     perf.last_post_ns = posted_at;
     perf.post_sequence++;
@@ -218,7 +232,6 @@ static void perf_record_post(uint64_t present_start, uint64_t lock_start, uint64
         perf_append_row(row, (size_t)length);
         if (perf.post_sequence == 1) perf_flush();
     }
-    if (perf.tick.frame) perf.tick = (PerfTick){0};
 }
 
 static char *path_bytes(JNIEnv *env, jbyteArray bytes) {
@@ -236,7 +249,7 @@ static char *path_bytes(JNIEnv *env, jbyteArray bytes) {
     return value;
 }
 
-JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray game, jbyteArray saves, jint language) {
+JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray game, jbyteArray saves, jint language, jlong available_memory) {
     UNUSED_TYPES;
     const uint64_t start = perf_enabled() ? perf_now_ns() : 0;
     char story_value[PROP_VALUE_MAX];
@@ -246,7 +259,8 @@ JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray gam
     uint64_t handle = 0;
     HostFrameTiming timing = {0};
     if (game_path != NULL && save_path != NULL) {
-        handle = cs2_android_open_profiled_v4(game_path, save_path, story, language, start ? &timing : NULL);
+        handle = cs2_android_open_profiled_v5(game_path, save_path, story, language, start ? &timing : NULL,
+                                             available_memory > 0 ? (uint64_t)available_memory : 0);
     }
     free(game_path);
     free(save_path);
@@ -273,8 +287,6 @@ JNIEXPORT jlong JNICALL JNI(nativeOpen)(JNIEnv *env, jclass type, jbyteArray gam
 
 JNIEXPORT jint JNICALL JNI(nativeClose)(JNIEnv *env, jclass type, jlong handle) {
     (void)env; UNUSED_TYPES;
-    cs2_android_detach_vulkan();
-    cs2_egl_close();
     hud = (HudTimings){0};
     if (perf.handle && perf.handle == (uint64_t)handle) {
         perf_flush();
@@ -306,7 +318,7 @@ JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, j
     }
     if (hud_enabled) {
         hud.tick_work_ns += finished - start;
-        if (result == FRAME_CHANGED || result == FRAME_UNCHANGED) {
+        if (result == FRAME_CHANGED || result == FRAME_UNCHANGED || result == FRAME_MOVIE) {
             hud.last_tick_ns = hud.tick_work_ns;
             hud.last_tick_at_ns = finished;
             hud.tick_work_ns = 0;
@@ -322,7 +334,7 @@ JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, j
             const size_t length = strlen(details);
             if (length > 0 && length < sizeof(perf.log_batch)) perf_append_row(details, length);
         }
-        if (result == FRAME_CHANGED || result == FRAME_UNCHANGED) {
+        if (result == FRAME_CHANGED || result == FRAME_UNCHANGED || result == FRAME_MOVIE) {
             perf.tick.frame = ++perf.frame_sequence;
             if (result == FRAME_UNCHANGED) perf_record_unchanged();
         }
@@ -333,6 +345,10 @@ JNIEXPORT jint JNICALL JNI(nativeStep)(JNIEnv *env, jclass type, jlong handle, j
 JNIEXPORT jint JNICALL JNI(nativeTickDelay)(JNIEnv *env, jclass type, jlong handle, jboolean reset) {
     (void)env; UNUSED_TYPES;
     return cs2_android_tick_delay((uint64_t)handle, reset ? 1 : 0);
+}
+JNIEXPORT jint JNICALL JNI(nativeRetryDelay)(JNIEnv *env, jclass type, jlong handle) {
+    (void)env; UNUSED_TYPES;
+    return cs2_android_retry_delay((uint64_t)handle);
 }
 JNIEXPORT jint JNICALL JNI(nativeSize)(JNIEnv *env, jclass type, jlong handle, jint axis) {
     (void)env; UNUSED_TYPES;
@@ -401,6 +417,25 @@ static jbyteArray host_payload(
     jbyteArray result = (*env)->NewByteArray(env, (jsize)length);
     if (result != NULL) (*env)->SetByteArrayRegion(env, result, 0, (jsize)length, (const jbyte *)data);
     return result;
+}
+JNIEXPORT jbyteArray JNICALL JNI(nativeCursorImage)(JNIEnv *env, jclass type, jlong handle) {
+    UNUSED_TYPES;
+    return host_payload(env, handle, cs2_android_cursor_image, "Cursor image request failed");
+}
+JNIEXPORT jbyteArray JNICALL JNI(nativeTextEntry)(JNIEnv *env, jclass type, jlong handle) {
+    UNUSED_TYPES;
+    return host_payload(env, handle, cs2_android_text_entry, "Text entry request failed");
+}
+JNIEXPORT jint JNICALL JNI(nativeTextEntryResult)(JNIEnv *env, jclass type, jlong handle,
+    jlong request, jbyteArray value) {
+    UNUSED_TYPES;
+    if (value == NULL) return cs2_android_text_entry_result((uint64_t)handle, (uint64_t)request, 0, NULL, 0);
+    uint8_t bytes[4096];
+    jsize length = (*env)->GetArrayLength(env, value);
+    if (length > (jsize)sizeof(bytes)) return -1;
+    (*env)->GetByteArrayRegion(env, value, 0, length, (jbyte *)bytes);
+    if ((*env)->ExceptionCheck(env)) return -1;
+    return cs2_android_text_entry_result((uint64_t)handle, (uint64_t)request, 1, bytes, (size_t)length);
 }
 JNIEXPORT jbyteArray JNICALL JNI(nativeMessageLists)(JNIEnv *env, jclass type, jlong handle) {
     UNUSED_TYPES;
@@ -621,27 +656,48 @@ JNIEXPORT jint JNICALL JNI(nativeText)(
     free(bytes);
     return result;
 }
-JNIEXPORT jbyteArray JNICALL JNI(nativeError)(JNIEnv *env, jclass type) {
-    UNUSED_TYPES;
-    const char *message = cs2_android_last_error();
+static jbyteArray diagnostic_bytes(JNIEnv *env, const char *message) {
+    if (message == NULL) return NULL;
     const size_t length = strlen(message);
     if (length > 2147483647u) return NULL;
     jbyteArray bytes = (*env)->NewByteArray(env, (jsize)length);
     if (bytes != NULL) (*env)->SetByteArrayRegion(env, bytes, 0, (jsize)length, (const jbyte *)message);
     return bytes;
 }
-JNIEXPORT jint JNICALL JNI(nativePresent)(JNIEnv *env, jclass type, jlong handle, jobject surface) {
+JNIEXPORT jbyteArray JNICALL JNI(nativeError)(JNIEnv *env, jclass type) {
     UNUSED_TYPES;
-    const int timed = perf.handle && perf.handle == (uint64_t)handle;
-    const bool measure = timed || hud_enabled;
-    const uint64_t present_start = measure ? perf_now_ns() : 0;
+    return diagnostic_bytes(env, cs2_android_last_error());
+}
+JNIEXPORT jbyteArray JNICALL JNI(nativeDiagnostic)(JNIEnv *env, jclass type, jlong handle) {
+    UNUSED_TYPES;
+    return diagnostic_bytes(env, cs2_android_diagnostic((uint64_t)handle));
+}
+JNIEXPORT jint JNICALL JNI(nativePublishFrame)(JNIEnv *env, jclass type, jlong handle, jlong revision) {
+    (void)env; UNUSED_TYPES;
+    const jint result = cs2_android_publish_frame((uint64_t)handle, (uint64_t)revision);
+    if (result == 0 && perf.handle == (uint64_t)handle) {
+        perf.frames[(uint64_t)revision % PERF_FRAME_HISTORY] = (PerfFrame){ (uint64_t)revision, perf.tick };
+        perf.tick = (PerfTick){0};
+    }
+    return result;
+}
+
+JNIEXPORT jint JNICALL JNI(nativePresent)(JNIEnv *env, jclass type, jlong handle, jobject surface, jlongArray output) {
+    UNUSED_TYPES;
+    if (output == NULL || (*env)->GetArrayLength(env, output) < PRESENT_FIELDS) return -1;
+    const uint64_t present_start = perf_now_ns();
     uint64_t lock_start = 0, copy_start = 0, post_start = 0, posted_at = 0;
     if (surface == NULL) return -2;
     ANativeWindow *window = ANativeWindow_fromSurface(env, surface);
     if (window == NULL) return -2;
-    const int width = cs2_android_size((uint64_t)handle, 0);
-    const int height = cs2_android_size((uint64_t)handle, 1);
-    int result = -1;
+    uint64_t revision;
+    int32_t width, height;
+    int result = cs2_android_begin_presentation((uint64_t)handle, &revision, &width, &height);
+    if (result != 0) {
+        ANativeWindow_release(window);
+        return result;
+    }
+    result = -1;
     // The Android BufferQueue permits one producer. Disconnect EGL before
     // a Vulkan configure attempt and let Rust drop it before software fallback.
     if (cs2_android_vulkan_candidate(window)) {
@@ -649,27 +705,24 @@ JNIEXPORT jint JNICALL JNI(nativePresent)(JNIEnv *env, jclass type, jlong handle
             result = -2;
             goto finish;
         }
-        if (measure) lock_start = copy_start = post_start = perf_now_ns();
-        const int vulkan = cs2_android_present_vulkan((uint64_t)handle, window);
+        lock_start = copy_start = post_start = perf_now_ns();
+        const int vulkan = cs2_android_present_vulkan(window);
         if (vulkan <= 0) {
-            if (vulkan == 0) {
-                if (measure) posted_at = perf_now_ns();
-                result = cs2_android_frame_posted((uint64_t)handle);
-            } else result = vulkan;
+            if (vulkan == 0) posted_at = perf_now_ns();
+            result = vulkan;
             goto finish;
         }
     }
     enum Cs2EglResult backend = cs2_egl_prepare(window, width, height);
     if (backend == CS2_EGL_READY) {
         // EGL acquires a buffer inside swap, so the legacy lock column is zero.
-        if (measure) lock_start = copy_start = perf_now_ns();
-        result = cs2_android_copy_frame((uint64_t)handle, cs2_egl_pixels(), width, height, width);
+        lock_start = copy_start = perf_now_ns();
+        result = cs2_android_copy_frame(cs2_egl_pixels(), width, height, width);
         if (result == 0) {
             if (cs2_egl_draw()) {
-                if (measure) post_start = perf_now_ns();
+                post_start = perf_now_ns();
                 if (cs2_egl_swap()) {
-                    if (measure) posted_at = perf_now_ns();
-                    result = cs2_android_frame_posted((uint64_t)handle);
+                    posted_at = perf_now_ns();
                 } else {
                     backend = cs2_egl_disable();
                 }
@@ -684,39 +737,64 @@ JNIEXPORT jint JNICALL JNI(nativePresent)(JNIEnv *env, jclass type, jlong handle
     if (backend == CS2_EGL_SOFTWARE && width > 0 && height > 0
         && ANativeWindow_setBuffersGeometry(window, width, height, WINDOW_FORMAT_RGBA_8888) == 0) {
         ANativeWindow_Buffer buffer;
-        if (measure) lock_start = perf_now_ns();
+        lock_start = perf_now_ns();
         result = ANativeWindow_lock(window, &buffer, NULL);
         if (result == 0) {
-            if (measure) copy_start = perf_now_ns();
+            copy_start = perf_now_ns();
             result = buffer.format == WINDOW_FORMAT_RGBA_8888
-                ? cs2_android_copy_frame((uint64_t)handle, buffer.bits, buffer.width, buffer.height, buffer.stride)
+                ? cs2_android_copy_frame(buffer.bits, buffer.width, buffer.height, buffer.stride)
                 : -1;
-            if (measure) post_start = perf_now_ns();
+            post_start = perf_now_ns();
             const int posted = ANativeWindow_unlockAndPost(window);
-            if (measure && posted == 0) posted_at = perf_now_ns();
-            if (result == 0) result = posted == 0 ? cs2_android_frame_posted((uint64_t)handle) : posted;
+            if (posted == 0) posted_at = perf_now_ns();
+            if (result == 0) result = posted;
         }
     }
 finish:
     ANativeWindow_release(window);
-    if (result == 0 && posted_at) {
+    result = cs2_android_end_presentation(result);
+    if (result == 0) {
         const uint64_t end = perf_now_ns();
-        if (hud_enabled) {
-            hud.last_submit_at_ns = posted_at;
-            hud.present_ns = end - present_start;
-            hud.copy_ns = post_start - copy_start;
-            hud.swap_ns = posted_at - post_start;
-        }
-        if (timed) perf_record_post(present_start, lock_start, copy_start, post_start, posted_at, end);
+        const jlong fields[] = { (jlong)revision, (jlong)present_start, (jlong)lock_start,
+            (jlong)copy_start, (jlong)post_start, (jlong)posted_at, (jlong)end };
+        (*env)->SetLongArrayRegion(env, output, 0, PRESENT_FIELDS, fields);
+        if ((*env)->ExceptionCheck(env)) return -1;
     }
     return result;
+}
+
+JNIEXPORT void JNICALL JNI(nativeRecordPresent)(JNIEnv *env, jclass type, jlong handle, jlongArray input) {
+    UNUSED_TYPES;
+    jlong fields[PRESENT_FIELDS];
+    (*env)->GetLongArrayRegion(env, input, 0, PRESENT_FIELDS, fields);
+    if ((*env)->ExceptionCheck(env)) return;
+    const uint64_t revision = fields[0], start = fields[1], lock = fields[2], copy = fields[3],
+        post = fields[4], posted_at = fields[5], end = fields[6];
+    if (hud_enabled) {
+        hud.last_submit_at_ns = posted_at;
+        hud.present_ns = end - start;
+        hud.copy_ns = post - copy;
+        hud.swap_ns = posted_at - post;
+    }
+    if (perf.handle == (uint64_t)handle) {
+        if (revision > perf.last_post_revision && revision - perf.last_post_revision > 1) {
+            __android_log_print(ANDROID_LOG_DEBUG, PERF_TAG,
+                "scene_coalesced session=%" PRIu64 " revision=%" PRIu64 " skipped=%" PRIu64,
+                perf.handle, revision, revision - perf.last_post_revision - 1);
+        }
+        perf.last_post_revision = revision;
+        PerfFrame *entry = &perf.frames[revision % PERF_FRAME_HISTORY];
+        const PerfTick no_completed_tick = {0};
+        const PerfTick *tick = entry->revision == revision ? &entry->tick : &no_completed_tick;
+        perf_record_post(tick, start, lock, copy, post, posted_at, end);
+        if (entry->revision == revision) entry->revision = 0;
+    }
 }
 
 JNIEXPORT jint JNICALL JNI(nativeDetachSurface)(JNIEnv *env, jclass type) {
     (void)env; UNUSED_TYPES;
     cs2_android_detach_vulkan();
     if (!cs2_egl_close()) return -2;
-    hud.last_submit_at_ns = 0;
     return 0;
 }
 
@@ -725,27 +803,40 @@ JNIEXPORT void JNICALL JNI(nativeSetHudEnabled)(JNIEnv *env, jclass type, jboole
     if (hud_enabled == (enabled != JNI_FALSE)) return;
     hud_enabled = enabled != JNI_FALSE;
     hud = (HudTimings){0};
-    cs2_egl_set_stats_enabled(hud_enabled);
-    cs2_android_vulkan_display_stats_enable(hud_enabled);
 }
 
-JNIEXPORT jint JNICALL JNI(nativeReadHud)(JNIEnv *env, jclass type, jlong handle, jlongArray output) {
+JNIEXPORT void JNICALL JNI(nativeSetDisplayStatsEnabled)(JNIEnv *env, jclass type, jboolean enabled) {
+    (void)env; UNUSED_TYPES;
+    cs2_egl_set_stats_enabled(enabled != JNI_FALSE);
+    cs2_android_vulkan_display_stats_enable(enabled != JNI_FALSE);
+}
+
+JNIEXPORT jint JNICALL JNI(nativeReadDisplayStats)(JNIEnv *env, jclass type, jlong handle, jlongArray output) {
     UNUSED_TYPES;
-    if (!hud_enabled) return 0;
+    if (output == NULL || (*env)->GetArrayLength(env, output) < 8) return -1;
     uint64_t vulkan[7];
     const Cs2DisplayStats display = cs2_android_vulkan_display_stats(vulkan) == 1
         ? (Cs2DisplayStats){ (enum Cs2DisplaySource)vulkan[0], vulkan[1], vulkan[2], vulkan[3], vulkan[4], vulkan[5], vulkan[6] }
         : cs2_egl_display_stats();
-    uint64_t sequence = 0, gpu_ns = 0;
-    cs2_android_gpu_timing(&sequence, &gpu_ns);
     const jlong fields[] = {
         handle, (jlong)display.source, (jlong)display.generation, (jlong)display.displayed,
         (jlong)display.latest_ns, (jlong)display.queue_to_display_ns, (jlong)display.unresolved, (jlong)display.pending,
+    };
+    (*env)->SetLongArrayRegion(env, output, 0, 8, fields);
+    return (*env)->ExceptionCheck(env) ? -1 : 1;
+}
+
+JNIEXPORT jint JNICALL JNI(nativeReadHud)(JNIEnv *env, jclass type, jlongArray output) {
+    UNUSED_TYPES;
+    if (!hud_enabled) return 0;
+    uint64_t sequence = 0, gpu_ns = 0;
+    cs2_android_gpu_timing(&sequence, &gpu_ns);
+    const jlong fields[] = {
         (jlong)hud.last_submit_at_ns, (jlong)hud.present_ns, (jlong)hud.copy_ns, (jlong)hud.swap_ns,
         (jlong)hud.last_tick_ns, (jlong)hud.last_tick_at_ns, (jlong)sequence, (jlong)gpu_ns,
     };
     const jsize count = (jsize)(sizeof(fields) / sizeof(fields[0]));
-    if (output == NULL || (*env)->GetArrayLength(env, output) < count) return -1;
-    (*env)->SetLongArrayRegion(env, output, 0, count, fields);
+    if (output == NULL || (*env)->GetArrayLength(env, output) < 8 + count) return -1;
+    (*env)->SetLongArrayRegion(env, output, 8, count, fields);
     return (*env)->ExceptionCheck(env) ? -1 : 1;
 }

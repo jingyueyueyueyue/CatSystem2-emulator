@@ -6,6 +6,59 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use super::{HeadlessPlayer, PlayerFramePhase};
 
+/// Read-only output from a completed composition, with its per-frame movie
+/// receipts. A device-backed canvas retains its allocation without readback.
+pub struct HostPresentationFrame {
+    pub(super) canvas: cs2_renderer::Canvas,
+    pub(super) movies: Vec<super::movie_plane::MoviePresentation>,
+    #[cfg(all(target_os = "android", feature = "gpu-raster"))]
+    device: Option<super::gpu_raster::PresentationDevice>,
+}
+
+impl HostPresentationFrame {
+    pub fn size(&self) -> [u32; 2] {
+        [self.canvas.width(), self.canvas.height()]
+    }
+
+    pub fn rgba(&self) -> &[u8] {
+        self.canvas.pixels()
+    }
+
+    pub fn acknowledge_submission(&self) -> Result<()> {
+        for receipt in &self.movies {
+            receipt.surface.mark_submitted(receipt.playback, receipt.sequence, receipt.time)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn has_current_android_device(&self) -> bool {
+        #[cfg(feature = "gpu-raster")]
+        return super::gpu_raster::PresentationDevice::is_current(self.device.as_ref());
+        #[cfg(not(feature = "gpu-raster"))]
+        true
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_surface_candidate(&self, window: std::ptr::NonNull<std::ffi::c_void>) -> bool {
+        #[cfg(feature = "gpu-raster")]
+        return super::gpu_raster::surface_candidate(self.device.as_ref(), window);
+        #[cfg(not(feature = "gpu-raster"))]
+        { let _ = window; false }
+    }
+
+    #[cfg(target_os = "android")]
+    /// The caller must keep a live ANativeWindow reference for the call.
+    pub unsafe fn present_android_surface(
+        &self, window: std::ptr::NonNull<std::ffi::c_void>, session: u64, inputs: &[(u64, u64)],
+    ) -> i32 {
+        #[cfg(feature = "gpu-raster")]
+        return super::gpu_raster::present_canvas(self.device.as_ref(), window, &self.canvas, session, inputs);
+        #[cfg(not(feature = "gpu-raster"))]
+        { let _ = (window, session, inputs); 1 }
+    }
+}
+
 #[derive(Default)]
 #[repr(C)]
 pub struct HostFrameTiming {
@@ -124,6 +177,15 @@ pub(super) fn measure_script_detail(phase: HostPhase) -> HostPhaseTimer {
 }
 
 impl HeadlessPlayer {
+    pub fn host_presentation_frame(&mut self) -> HostPresentationFrame {
+        HostPresentationFrame {
+            canvas: self.canvas.share_snapshot(),
+            movies: self.movie_host.scene_movie_presentations(),
+            #[cfg(all(target_os = "android", feature = "gpu-raster"))]
+            device: super::gpu_raster::PresentationDevice::current(),
+        }
+    }
+
     /// Wall-clock work limits are opt-in. Offline replay stays deterministic.
     pub fn set_host_iteration_work_budget(&mut self, budget: Option<Duration>) {
         self.host_work_budget = budget;
@@ -146,6 +208,18 @@ impl HeadlessPlayer {
         super::gpu_raster::enable();
     }
 
+    #[cfg(target_os = "android")]
+    pub fn maintain_host_gpu_memory(&self) {
+        #[cfg(feature = "gpu-raster")]
+        super::gpu_raster::maintain_android_memory(!self.frame_in_progress());
+    }
+
+    /// Allow interactive frames to use completed CPU poses from background workers.
+    pub fn enable_host_emote_pose_jobs(&mut self) {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        self.data_services.emote.enable_pose_jobs();
+    }
+
     /// Release DX12 objects before the Windows thread begins TLS teardown.
     #[cfg(windows)]
     pub fn disable_host_gpu_raster() {
@@ -166,27 +240,6 @@ impl HeadlessPlayer {
         return super::gpu_raster::frame_revision(&self.canvas);
         #[cfg(not(all(feature = "gpu-raster", any(windows, target_os = "android"))))]
         None
-    }
-
-    /// The caller keeps a native window reference for this call.
-    #[cfg(target_os = "android")]
-    pub fn android_surface_candidate(window: std::ptr::NonNull<std::ffi::c_void>) -> bool {
-        #[cfg(feature = "gpu-raster")]
-        return super::gpu_raster::surface_candidate(window);
-        #[cfg(not(feature = "gpu-raster"))]
-        { let _ = window; false }
-    }
-
-    /// The caller must hold a live ANativeWindow. The presenter acquires its own
-    /// reference before retaining a surface.
-    #[cfg(target_os = "android")]
-    pub unsafe fn present_android_surface(
-        &self, window: std::ptr::NonNull<std::ffi::c_void>, session: u64, input_mono_us: &[(u64, u64)],
-    ) -> i32 {
-        #[cfg(feature = "gpu-raster")]
-        return super::gpu_raster::present_canvas(window, &self.canvas, session, input_mono_us);
-        #[cfg(not(feature = "gpu-raster"))]
-        { let _ = (window, input_mono_us); 1 }
     }
 
     #[cfg(target_os = "android")]
@@ -329,6 +382,30 @@ impl HeadlessPlayer {
         out
     }
 
+    /// Small state capture for live diagnostics. Never reads back a GPU frame.
+    pub fn host_runtime_diagnostic(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = self.host_tick_state();
+        let root_pc = self.vm.as_ref().map(|vm| vm.instruction_pointer);
+        let _ = writeln!(out, " root_pc={root_pc:x?} movie_count={}", self.movie_playbacks.len());
+        self.write_cst_runtime_diagnostic(&mut out);
+        let fes = &self.data_services.tasks.fes;
+        for (owner, name, runtime, wait_key) in fes.story_runtimes().take(16) {
+            let Some(driver) = &runtime.driver else { continue };
+            let block = String::from_utf8_lossy(driver.interpreter.current_block());
+            let (section, line) = driver.interpreter.position();
+            let _ = writeln!(out, "fes owner={owner} name={:?} block={:?} section={section} line={line} pending={} wait_key={wait_key} redraw={}",
+                String::from_utf8_lossy(&name[..name.len().min(100)]), block.chars().take(100).collect::<String>(),
+                driver.has_pending_handler(), driver.force_redraw_pending);
+        }
+        for (id, list) in fes.platform.lists.iter().take(16) {
+            let _ = writeln!(out, "list id={id} offset={:?} enabled={} submit={} force={} layers={}",
+                list.offset, list.enabled, list.submit, list.force, list.layers.len());
+        }
+        out
+    }
+
     /// Interactive hosts retain recent diagnostic context instead of keeping
     /// every native call for an entire multi-hour game in memory. CLI evidence
     /// collection leaves its original, complete event stream unchanged.
@@ -396,6 +473,44 @@ impl HeadlessPlayer {
         Ok(())
     }
 
+    pub const FAST_FORWARD_KEY: u32 = 0x11;
+
+    /// Opt into the resource policy for hosts that drive held Ctrl. A host may
+    /// pass zero to avoid reserving an optional E-mote model cache.
+    pub fn enable_host_fast_forward(&mut self, available_memory_bytes: u64) -> usize {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        self.data_services.fast_forward_enabled = true;
+        self.data_services.image_manager.enable_resident_byte_budget();
+        let model_budget = if available_memory_bytes >= 4 * GIB {
+            (available_memory_bytes / 8).min(GIB) as usize
+        } else {
+            0
+        };
+        self.data_services.emote.set_model_cache_budget(model_budget);
+        self.log.push(format!(
+            "fast_forward_policy available_bytes={available_memory_bytes} emote_cache_bytes={model_budget}"
+        ));
+        model_budget
+    }
+
+    pub(super) fn sync_host_fast_forward(&mut self) -> Result<()> {
+        let active = self.data_services.fast_forward_enabled
+            && self.state.input.key_pressed(Self::FAST_FORWARD_KEY);
+        if active != self.data_services.fast_forward {
+            if active {
+                self.with_host(|host| Ok(host.release_fast_forward_sounds()?))?;
+            }
+            self.data_services.fast_forward = active;
+            self.data_services.image_manager.set_fast_forward(active);
+            self.data_services.ordinary.set_fast_forward(active);
+            self.log.push(format!(
+                "fast_forward_state frame={} active={active}",
+                self.state.clock.frame.saturating_add(1)
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_pending_host_input(&mut self) -> Result<()> {
         if self.audio_input_deferred { return Ok(()); }
         while let Some(event) = self.data_services.pending_host_input.pop_front() {
@@ -408,8 +523,27 @@ impl HeadlessPlayer {
     /// continues, while input edge bits are committed only after that frame
     /// really finishes. The next frame consumes events queued during a yield.
     pub fn advance_host_frame(&mut self, instruction_budget: usize) -> Result<bool> {
-        let _slice = self.host_work_budget.map(super::host_work_budget::Scope::enter);
-        let instruction_budget = if self.host_work_budget.is_some() { instruction_budget.min(2048) } else { instruction_budget };
+        let slice = self.host_work_budget.map(super::host_work_budget::Scope::enter);
+        let result = self.advance_host_frame_in_slice(instruction_budget);
+        self.host_frame_budget_yielded = matches!(result, Ok(false))
+            && self.frame_phase != PlayerFramePhase::Render
+            && !self.data_services.host_pause.paused
+            && slice.as_ref().is_some_and(super::host_work_budget::Scope::yielded);
+        result
+    }
+
+    /// Schedule another host iteration immediately after a cooperative CPU
+    /// timeslice. A pending external operation gets a delay before polling.
+    pub fn host_frame_retry_delay_ms(&self) -> u32 {
+        u32::from(!self.host_frame_budget_yielded)
+    }
+
+    fn advance_host_frame_in_slice(&mut self, instruction_budget: usize) -> Result<bool> {
+        let instruction_budget = if self.host_work_budget.is_some() {
+            instruction_budget.min(super::host_work_budget::INTERACTIVE_INSTRUCTION_SLICE)
+        } else {
+            instruction_budget
+        };
         {
             let _timing = measure_host_phase(HostPhase::Script);
             if !self.advance_posted_window_commands(instruction_budget)? { return Ok(false); }
@@ -431,7 +565,11 @@ impl HeadlessPlayer {
         let start = Instant::now();
         if self.advance_host_frame(instruction_budget)? { return Ok(true); }
         for _ in 0..3 {
+            // A retained Render phase is already waiting on its first exact
+            // pose. Check it again on the next host iteration.
             if !self.frame_in_progress() || self.quit_requested() || self.data_services.host_pause.paused
+                || self.frame_phase == PlayerFramePhase::Render
+                || super::host_work_budget::exhausted()
                 || start.elapsed() >= Duration::from_millis(2)
             { break; }
             if self.advance_host_frame(instruction_budget)? { return Ok(true); }

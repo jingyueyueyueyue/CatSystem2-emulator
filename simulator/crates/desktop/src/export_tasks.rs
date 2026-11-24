@@ -307,7 +307,7 @@ impl LoggingHost<'_> {
         if !self.data_services.tasks.exports.tasks.contains_key(&id) {
             return Ok(None);
         }
-        let Some(begin) = export_message_base(self.data_services.native_profile) else {
+        let Some(begin) = export_message_base(self.data_services.task_native_profile()) else {
             if command.code < 450 {
                 return Ok(None);
             }
@@ -339,7 +339,7 @@ impl LoggingHost<'_> {
         output: &mut u32,
         vm: Option<&mut Vm>,
     ) -> cs2_script::Result<Option<TaskCommandOutcome>> {
-        let Some(begin) = export_message_base(self.data_services.native_profile) else {
+        let Some(begin) = export_message_base(self.data_services.task_native_profile()) else {
             return Ok(None);
         };
         if !matches!(packet[1], code if code == begin || code == begin + 1) {
@@ -419,10 +419,9 @@ fn sound_mode(
 }
 
 fn export_message_base(
-    profile: Option<&cs2_runtime::native_profile::FeatureProfile>,
+    profile: Option<cs2_runtime::native_task_profile::TaskNativeProfile>,
 ) -> Option<u32> {
-    let messages = cs2_runtime::native_task_profile::exact_task_native_profile(
-        profile?.pe_sha256)?.export?;
+    let messages = profile?.export?;
     let [begin, query, begin_sound] = messages;
     (query == begin + 1 && begin_sound == begin).then_some(begin)
 }

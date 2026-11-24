@@ -39,7 +39,7 @@ pub use scene::{
 
 use flate2::{Decompress, FlushDecompress, Status};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ops::Range,
     sync::{Arc, OnceLock, RwLock, RwLockReadGuard},
 };
@@ -340,7 +340,15 @@ pub struct KcsProgram {
     pub data: Vec<u8>,
     pub instructions: Vec<Instruction>,
     pub stack_size: usize,
-    boundaries: BTreeSet<usize>,
+    instruction_pages: Vec<InstructionPage>,
+}
+
+const INSTRUCTION_PAGE_BYTES: usize = u64::BITS as usize;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InstructionPage {
+    starts: u64,
+    first: u32,
 }
 
 impl KcsProgram {
@@ -474,8 +482,21 @@ impl KcsProgram {
         stack_size: usize,
         header: KcsHeader,
     ) -> Result<Self> {
-        let (instructions, boundaries) = decode_instructions(&code)?;
-        for instruction in &instructions {
+        let instructions = decode_instructions(&code)?;
+        let mut instruction_pages =
+            vec![InstructionPage::default(); code.len().div_ceil(INSTRUCTION_PAGE_BYTES)];
+        for (index, instruction) in instructions.iter().enumerate() {
+            let page = &mut instruction_pages[instruction.offset / INSTRUCTION_PAGE_BYTES];
+            if page.starts == 0 {
+                page.first = index as u32;
+            }
+            page.starts |= 1 << (instruction.offset % INSTRUCTION_PAGE_BYTES);
+        }
+        data.len()
+            .checked_add(stack_size)
+            .ok_or(ScriptError::StackOverflow)?;
+        let program = Self { header, code, data, instructions, stack_size, instruction_pages };
+        for instruction in &program.instructions {
             let target_index = match instruction.opcode {
                 0x27..=0x2a => Some(0),
                 0x34 => Some(1),
@@ -485,8 +506,7 @@ impl KcsProgram {
             if let Some(index) = target_index {
                 let operand = instruction.operands[index];
                 if operand.flags.bits() == 3
-                    && operand.payload as usize != code.len()
-                    && !boundaries.contains(&(operand.payload as usize))
+                    && !program.is_instruction_boundary(operand.payload as usize)
                 {
                     return Err(ScriptError::InvalidJump {
                         target: operand.payload as usize,
@@ -494,38 +514,34 @@ impl KcsProgram {
                 }
             }
         }
-        data.len()
-            .checked_add(stack_size)
-            .ok_or(ScriptError::StackOverflow)?;
-        Ok(Self {
-            header,
-            code,
-            data,
-            instructions,
-            stack_size,
-            boundaries,
-        })
+        Ok(program)
     }
 
     pub fn is_instruction_boundary(&self, offset: usize) -> bool {
-        offset == self.code.len() || self.boundaries.contains(&offset)
+        offset == self.code.len() || self.instruction_index(offset).is_some()
     }
 
     pub fn instruction_at(&self, offset: usize) -> Option<&Instruction> {
-        self.instructions
-            .binary_search_by_key(&offset, |instruction| instruction.offset)
-            .ok()
-            .map(|index| &self.instructions[index])
+        self.instruction_index(offset).and_then(|index| self.instructions.get(index))
+    }
+
+    fn instruction_index(&self, offset: usize) -> Option<usize> {
+        let page = self.instruction_pages.get(offset / INSTRUCTION_PAGE_BYTES)?;
+        let bit = 1u64 << (offset % INSTRUCTION_PAGE_BYTES);
+        if page.starts & bit == 0 {
+            return None;
+        }
+        // The number of earlier starts in this page is the decoded index's
+        // distance from its first instruction.
+        Some(page.first as usize + (page.starts & (bit - 1)).count_ones() as usize)
     }
 }
 
-fn decode_instructions(code: &[u8]) -> Result<(Vec<Instruction>, BTreeSet<usize>)> {
+fn decode_instructions(code: &[u8]) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
-    let mut boundaries = BTreeSet::new();
     let mut cursor = 0;
     while cursor < code.len() {
         let offset = cursor;
-        boundaries.insert(offset);
         let opcode = code[cursor];
         cursor += 1;
         let count = operand_count(opcode).ok_or(ScriptError::InvalidOpcode { offset, opcode })?;
@@ -551,7 +567,7 @@ fn decode_instructions(code: &[u8]) -> Result<(Vec<Instruction>, BTreeSet<usize>
             });
         }
     }
-    Ok((instructions, boundaries))
+    Ok(instructions)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -656,6 +672,10 @@ pub trait Host {
     fn call(&mut self, index: u32, arguments: &[u8], vm: &mut Vm) -> Result<NativeReturn>;
     /// A cooperative host-iteration budget. Default hosts remain deterministic.
     fn should_yield(&self) -> bool { false }
+
+    /// Renew an exhausted instruction slice while the host deadline permits.
+    /// Native retry and wait events return to the caller before this boundary.
+    fn renew_instruction_budget(&self, _budget: usize) -> bool { false }
 }
 
 impl<F> Host for F
@@ -1363,7 +1383,8 @@ impl Vm {
         // alive across that call and refresh the program before the next fetch.
         let mut active_program = self.program.clone();
         let mut instruction_cursor: Option<usize> = None;
-        for instruction_step in 0..budget {
+        let mut instruction_step = 0;
+        while instruction_step < budget {
             let program = active_program.as_ref().ok_or(ScriptError::NoProgram)?;
             if self.instruction_pointer == program.code.len() {
                 return Ok(Step::Halted);
@@ -1374,16 +1395,14 @@ impl Vm {
             {
                 Some(instruction) => instruction,
                 None => {
-                    let index = program
-                        .instructions
-                        .binary_search_by_key(&self.instruction_pointer, |instruction| {
-                            instruction.offset
-                        })
-                        .map_err(|_| ScriptError::InvalidInstruction {
+                    let index = program.instruction_index(self.instruction_pointer)
+                        .ok_or(ScriptError::InvalidInstruction {
                             offset: self.instruction_pointer,
                         })?;
                     instruction_cursor = Some(index);
-                    &program.instructions[index]
+                    program.instructions.get(index)
+                        .filter(|instruction| instruction.offset == self.instruction_pointer)
+                        .ok_or(ScriptError::InvalidInstruction { offset: self.instruction_pointer })?
                 }
             };
             if instruction.opcode == 0x3b {
@@ -1400,13 +1419,19 @@ impl Vm {
             if let Some(event) = self.execute(instruction, host)? {
                 return Ok(Step::Event(event));
             }
-            if opcode == NATIVE_CALL_OPCODE {
+            if opcode == NATIVE_CALL_OPCODE
+                && !self.program.as_ref().is_some_and(|current| Arc::ptr_eq(program, current))
+            {
                 active_program = self.program.clone();
                 instruction_cursor = None;
             } else if self.instruction_pointer == next_offset {
                 instruction_cursor = next_index;
             } else {
                 instruction_cursor = None;
+            }
+            instruction_step += 1;
+            if instruction_step == budget && host.renew_instruction_budget(budget) {
+                instruction_step = 0;
             }
         }
         Ok(Step::Yield)
@@ -1561,7 +1586,7 @@ impl Vm {
                     top: self.frame_top,
                     parameter_bytes,
                 });
-                self.jump(target)?;
+                self.instruction_pointer = target;
             }
             NATIVE_CALL_OPCODE => {
                 let index = self.value(a[0])?;
@@ -1751,7 +1776,7 @@ impl Vm {
         if result_length > available {
             return Err(ScriptError::ReturnValueUnderflow);
         }
-        let result_bytes = self.memory[self.sp - result_length..self.sp].to_vec();
+        let result_range = self.sp - result_length..self.sp;
         let saved = self
             .frame_base
             .checked_add(parameter_length)
@@ -1807,9 +1832,10 @@ impl Vm {
         if let Some(floor) = self.debug_variable_floors.pop() {
             self.debug.variables.truncate(floor);
         }
-        self.memory[destination..self.sp].copy_from_slice(&result_bytes);
+        self.memory.copy_within(result_range, destination);
         self.sync_stack_view();
-        self.jump(return_pc)
+        self.instruction_pointer = return_pc;
+        Ok(())
     }
 
     fn raw(&mut self, operand: Operand) -> Result<u32> {
@@ -3009,6 +3035,27 @@ mod tests {
         assert_eq!(vm.program().unwrap().code, replacement);
         assert_eq!(vm.instruction_pointer, 6);
         assert_eq!(vm.stack_bits().collect::<Vec<_>>(), vec![42]);
+    }
+
+    #[test]
+    fn instruction_lookup_preserves_boundaries_across_pages() {
+        let mut code = vec![0; 63];
+        instruction(&mut code, 0x29, &[immediate(70)]);
+        code.extend([0, 0x3b]);
+        let parsed = program(&code);
+        assert_eq!(parsed.instruction_at(63).unwrap().opcode, 0x29);
+        assert!((64..69).all(|offset| !parsed.is_instruction_boundary(offset)));
+        assert_eq!(parsed.instruction_at(69).unwrap().opcode, 0);
+        assert!(parsed.is_instruction_boundary(code.len()));
+        assert!(parsed.instruction_at(code.len()).is_none());
+        let mut vm = Vm::from_program(parsed).unwrap();
+        let mut host = TestHost { result: NativeReturn::Continue, calls: Vec::new() };
+        assert_eq!(vm.run(&mut host, 128).unwrap(), Step::Halted);
+        assert_eq!(vm.instruction_pointer, 70);
+
+        code[65..69].copy_from_slice(&64u32.to_le_bytes());
+        assert!(matches!(KcsProgram::from_code(&code, Vec::new(), 0),
+            Err(ScriptError::InvalidJump { target: 64 })));
     }
 
     #[test]

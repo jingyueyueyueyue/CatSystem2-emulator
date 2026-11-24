@@ -428,6 +428,7 @@ impl CpuEmoteResources for EmoteArchiveResources {
 #[derive(Default)]
 pub(super) struct EmoteNativeServices {
     pub(super) state: EmoteServices,
+    model_cache_budget: usize,
     target_size: Option<[u32; 2]>,
     sound_links: BTreeMap<u32, EmoteSoundLink>,
     placements: BTreeMap<u32, geometry::Placement>,
@@ -436,6 +437,10 @@ pub(super) struct EmoteNativeServices {
     spline_config: Arc<CpuM2SplineConfig>,
     action_config: Arc<CpuM2ActionConfig>,
     prepared_frames: BTreeMap<u32, EmoteRasterFrame>,
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pose_jobs: Option<crate::gpu_raster::PoseScheduler>,
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    sampled_scene_tick: Option<u64>,
     loads: load_async::Loads,
     progress: progress::Progress,
 }
@@ -592,6 +597,12 @@ impl LoggingHost<'_> {
         if state.successful_resource_imports == 0 {
             return Ok(());
         }
+        if self.data_services.fast_forward && self.data_services.frame_capture.enabled == 0
+            && !self.data_services.tasks.render.has_composition()
+            && self.data_services.emote.state.hold_idle_scene_tick(id, raw_task_elapsed)
+        {
+            return Ok(());
+        }
         if self.data_services.emote.state.surface_holds_tick(id, raw_task_elapsed).map_err(error)? {
             let random = &mut *self.script_random;
             return self.data_services.emote.state.advance_with_random(id,
@@ -641,6 +652,8 @@ impl LoggingHost<'_> {
     /// Valid after a profile mismatch as well.
     pub(super) fn emote_release_task_hook(&mut self, id: u32) -> Result<()> {
         self.data_services.emote.progress.remove(id);
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        self.data_services.emote.cancel_pose_job(id);
         self.data_services.emote.cancel_pending_loads_for(id);
         self.data_services.emote.sound_links.remove(&id);
         self.data_services.emote.placements.remove(&id);
@@ -779,6 +792,80 @@ struct Plan {
 }
 
 impl EmoteNativeServices {
+    pub(super) fn set_model_cache_budget(&mut self, bytes: usize) { self.model_cache_budget = bytes; }
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn enable_pose_jobs(&mut self) {
+        self.pose_jobs.get_or_insert_with(Default::default);
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn cancel_pose_job(&mut self, id: u32) {
+        if let Some(jobs) = &mut self.pose_jobs {
+            jobs.cancel(id);
+        }
+    }
+
+    #[cfg(all(test, feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn set_pose_test_gate(&mut self, task: u32, gate: Arc<crate::gpu_raster::PoseTestGate>) {
+        self.pose_jobs.as_mut().expect("enabled pose scheduler").set_gate(task, gate);
+    }
+
+    #[cfg(all(test, feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn displayed_pose_tick(&self, task: u32) -> Option<u64> {
+        self.pose_jobs.as_ref()?.displayed_tick(task)
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn preflight_scene_pose_jobs(
+        &mut self, nodes: &BTreeMap<u32, super::SceneNode>, tick: u64, exact: bool,
+    ) -> std::result::Result<bool, EmoteError> {
+        self.sampled_scene_tick = None;
+        let Some(jobs) = &mut self.pose_jobs else { return Ok(true); };
+        if !crate::gpu_raster::emote_batch_requested() || !crate::gpu_raster::pose_jobs_available() {
+            jobs.retain(&[]);
+            return Ok(true);
+        }
+        let mut tasks = Vec::new();
+        for node in nodes.values().filter(|node| node.kind == 54 && node.visible && node.initialized) {
+            if self.state.scene_raster_player(node.id).is_some() {
+                tasks.push(node.id);
+            }
+        }
+        if tasks.len() > 16 {
+            jobs.retain(&[]);
+            return Ok(true);
+        }
+        jobs.retain(&tasks);
+        for &task in &tasks {
+            let node = &nodes[&task];
+            self.state.set_base_argb(task, node.color)?;
+            let Some((player, viewport)) = self.state.scene_raster_player(task) else {
+                jobs.cancel(task);
+                continue;
+            };
+            let task_state = self.state.state(task).ok_or(EmoteError::UnknownTask(task))?;
+            let placement = self.placements.get(&task).ok_or(EmoteError::UnknownTask(task))?;
+            let context = crate::gpu_raster::ScenePoseContext {
+                imports: task_state.successful_resource_imports,
+                base_color: node.color,
+                color_percentages: task_state.color_percentages_raw,
+                blend: placement.blend,
+            };
+            let revision = self.progress.request(task, Some((player, viewport)));
+            jobs.request(task, tick, revision, context, player, viewport, exact);
+        }
+        jobs.dispatch(&tasks);
+        if tasks.iter().all(|&task| jobs.scene_ready(task)) {
+            self.sampled_scene_tick = Some(tick);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+    pub(super) fn finish_scene_pose_jobs(&mut self) {
+        self.sampled_scene_tick = None;
+    }
     pub(super) fn set_material_resources(&mut self, resources: Arc<ResourceIndex>) { self.loads.set_resources(resources); }
     pub(super) fn pending_load_owners(&self) -> impl Iterator<Item = u32> + '_ { self.loads.owners() }
     pub(super) fn has_pending_loads(&self) -> bool { self.loads.has_pending() }
@@ -830,6 +917,7 @@ impl EmoteNativeServices {
         let size = [dimension(&rows[0][0])?, dimension(&rows[0][1])?];
         let viewport = CpuViewport::original_neko_target(size[0], size[1]).map_err(error)?;
         let mut backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
+        backend.set_m2_retention_budget(self.model_cache_budget);
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         if crate::gpu_raster::emote_requested() {
             backend.set_rasterizer(crate::gpu_raster::draw_emote);
@@ -870,14 +958,17 @@ impl EmoteNativeServices {
         let filter = self.state.m2_texture_filter(task)
             .ok_or_else(|| unsupported(906, "M2 target has no CPU texture configuration"))?;
         let Some(prepared) = self.loads.poll(resources, owner, task, spec, mode, filter, self.state.state(task).map_or(0, |state| state.successful_resource_imports), |plan, version| {
-            self.state.cached_m2_model(task, &plan.resource_name, version).or_else(|| {
-                self.state.uses_unfiltered_m2_texture(task).then(|| ordinary.take_preloaded_model(version)).flatten()
+            self.state.cached_m2_model(task, &plan.resource_name, version).map(load_async::CachedModel::Current).or_else(|| {
+                self.state.uses_unfiltered_m2_texture(task)
+                    .then(|| ordinary.subscribe_preloaded_model(version))
+                    .flatten().map(load_async::CachedModel::Preload)
             })
         }).map_err(error)? else {
             return Ok(NativeReturn::Retry);
         };
         let commit_started = std::time::Instant::now();
         let phases_us = prepared.phases_us;
+        let preload_wait_us = prepared.preload_wait_us;
         let load_async::Prepared { plan, model, version, .. } = prepared;
         let source = CpuM2ModelSource::Shared(model, version);
         let mut secondary_variables = plan.secondary_config.default_variables().map_err(error)?;
@@ -937,8 +1028,9 @@ impl EmoteNativeServices {
         placement.profile_scale = scale[0];
         placement.scale_offset = scale_offset.map(|value| value as f32);
         self.apply_placement(task).map_err(error)?;
-        super::perf_detail::resource_warmup_note(&format!("m2_async native=906 target={task} name={} config_us={} read_us={} decode_us={} model_us={} commit_us={}",
-            String::from_utf8_lossy(&plan.resource_name), phases_us[0], phases_us[1], phases_us[2], phases_us[3], commit_started.elapsed().as_micros()));
+        super::perf_detail::resource_warmup_note(&format!("m2_async native=906 target={task} name={} config_us={} read_us={} decode_us={} model_us={} preload_hit={} preload_wait_us={} commit_us={}",
+            String::from_utf8_lossy(&plan.resource_name), phases_us[0], phases_us[1], phases_us[2], phases_us[3],
+            preload_wait_us.is_some(), preload_wait_us.unwrap_or_default(), commit_started.elapsed().as_micros()));
         Ok(NativeReturn::Continue)
     }
 
@@ -987,12 +1079,48 @@ impl EmoteNativeServices {
                 tasks.push(node.id);
             }
         }
-        if !tasks.is_empty() {
-            let players: Vec<_> = tasks.iter().filter_map(|&task| self.state.scene_raster_player(task)).collect();
+        let mut sampled = BTreeMap::new();
+        let sampled_tick = self.sampled_scene_tick;
+        if let Some(tick) = sampled_tick
+            && let Some(jobs) = &mut self.pose_jobs
+        {
+            for &task in &tasks {
+                sampled.insert(task, jobs.take(task, tick));
+            }
+        }
+        {
+            super::gpu_raster::protect_emote_models(sampled.iter().filter_map(|(&task, sample)| {
+                matches!(sample, crate::gpu_raster::ScenePose::Ready(_) | crate::gpu_raster::ScenePose::Reuse(_))
+                    .then(|| self.state.scene_raster_player(task).map(|(player, _)| player.shared_motion_model()))
+                    .flatten()
+            }));
+            let players: Vec<_> = tasks.iter().filter_map(|&task| {
+                matches!(sampled.get(&task), None | Some(crate::gpu_raster::ScenePose::Exact))
+                    .then(|| self.state.scene_raster_player(task)).flatten()
+            }).collect();
             super::gpu_raster::prepare_emote_poses(&players);
         }
         for task in tasks {
-            let frame = self.render_frame(task, size)?;
+            use crate::gpu_raster::ScenePose;
+            let frame = match sampled.remove(&task) {
+                None | Some(ScenePose::Exact) => self.render_frame(task, size)?,
+                Some(ScenePose::Reuse(frame)) => frame,
+                Some(ScenePose::Ready(pose)) => {
+                    let (player, variables) = pose.sample();
+                    let frame = {
+                        let _installed = pose.install();
+                        self.state.render_sampled_scene_rgba(task, player, variables)
+                    };
+                    let frame = self.prepare_blend_frame(task, size, frame?)?;
+                    self.progress.rendered_revision(task, &frame, Some(pose.revision()));
+                    self.pose_jobs.as_mut().expect("pose scheduler during composition")
+                        .record_render(task, sampled_tick.expect("sampled scene tick"), pose, &frame);
+                    frame
+                }
+                Some(ScenePose::Pending) => {
+                    return Err(EmoteError::Backend("sampled scene posed without completed preflight".into()));
+                }
+            };
             self.prepared_frames.insert(task, frame);
         }
         Ok(())
@@ -1226,13 +1354,20 @@ impl EmoteNativeServices {
             let _timing = SlowTask::new(resolved_target, || 54, "emote_render_rgba");
             self.state.render_rgba(resolved_target)?
         };
-        let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
-        let frame = if blend == BlendMode::SourceOver || frame.device().is_some() { frame } else {
-            // Other blend modes can depend on transparent pixels outside the pose bounds.
-            frame.into_viewport(size)?
-        };
+        let frame = self.prepare_blend_frame(resolved_target, size, frame)?;
         self.progress.rendered(resolved_target, &frame);
         Ok(frame)
+    }
+
+    fn prepare_blend_frame(
+        &self, task: u32, size: [u32; 2], frame: EmoteRasterFrame,
+    ) -> std::result::Result<EmoteRasterFrame, EmoteError> {
+        let blend = self.placements.get(&task).ok_or(EmoteError::UnknownTask(task))?.blend;
+        if blend == BlendMode::SourceOver || frame.device().is_some() {
+            return Ok(frame);
+        }
+        // Other blend modes can depend on transparent pixels outside the pose bounds.
+        frame.into_viewport(size)
     }
 
     fn submit_frame(

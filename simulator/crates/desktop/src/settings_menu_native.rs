@@ -107,6 +107,7 @@ pub(super) struct SettingsMenuState {
     general: bool,
     camouflage_title: Option<String>,
     pending_menu: Option<HostGameMenu>,
+    menu_info: Option<HostMenuConfirmation>,
     installed_menu: Option<HostGameMenu>,
     confirmation: Option<HostMenuConfirmation>,
     system_volume: Option<(u64, String)>,
@@ -436,14 +437,14 @@ impl HeadlessPlayer {
         self.set_host_joypad_enabled(edit.words[480]);
         Ok(())
     }
-    fn original_ui_resources(&self) -> Result<UiResources> {
+    pub(super) fn original_ui_resources(&self) -> Result<UiResources> {
         let binary = self.scan.engine.primary_executable.as_ref()
             .context("settings/menu receiver needs the original PE UI resources")?;
         if binary.relative_path.is_absolute() || binary.relative_path.components().any(|part|
             !matches!(part, std::path::Component::Normal(_))) { bail!("UI source escapes game root"); }
         UiResources::read(&self.scan.root.join(&binary.relative_path))
     }
-    fn resolve_ui_label(&self, text: &[u16]) -> String {
+    pub(super) fn resolve_ui_label(&self, text: &[u16]) -> String {
         String::from_utf16_lossy(&self.resolve_language_text(text))
     }
     fn next_ui_id(&mut self) -> Result<u64> {
@@ -967,6 +968,36 @@ impl HeadlessPlayer {
         }
         Ok(())
     }
+
+    pub(super) fn prepare_fes_menu_info(&mut self, command: u32) -> Result<()> {
+        let executable = self.scan.engine.primary_executable.as_ref()
+            .map(|binary| binary.relative_path.display().to_string()).unwrap_or_default();
+        let version = self.original_ui_resources().and_then(|source| source.file_version()).ok();
+        let mut message = version.map_or_else(|| executable.clone(), |version| format!("{executable}\n{version}"));
+        let title = if command == 30 { "Version" } else { "System information" };
+        if command != 30 {
+            let [width, height] = self.logical_size();
+            message.push_str(&format!("\n{} {}\n{width} × {height}", std::env::consts::OS, std::env::consts::ARCH));
+            if command == 32 {
+                message.push_str(&format!("\nCatSystem2 {:?}\n{}", self.scan.engine.variant, self.scan.engine.signature));
+            }
+        }
+        let id = self.next_ui_id()?;
+        self.data_services.window_control.ui.menu_info = Some(HostMenuConfirmation { id, title: title.into(), message });
+        Ok(())
+    }
+
+    pub fn host_fes_menu_info(&self) -> Result<HostMenuConfirmation> {
+        self.require_window_request(HostWindowRequest::MenuInfo)?;
+        self.data_services.window_control.ui.menu_info.clone().context("menu information has no snapshot")
+    }
+
+    pub fn complete_host_fes_menu_info(&mut self, id: u64) -> Result<()> {
+        if self.host_fes_menu_info()?.id != id { bail!("stale menu information identity"); }
+        self.finish_window_ui_request(HostWindowRequest::MenuInfo)?;
+        self.data_services.window_control.ui.menu_info = None;
+        Ok(())
+    }
     /// Shared little-endian payload used by the Android UI thread. Only owned
     /// strings and values cross threads, never a Rust object or VM reference.
     pub fn host_window_ui_payload(&self) -> Result<Vec<u8>> {
@@ -983,7 +1014,10 @@ impl HeadlessPlayer {
             }
         }
         let mut out = Vec::new();
-        if let Ok((id, title)) = self.host_system_volume_request() {
+        if let Ok(request) = self.host_fes_menu_info() {
+            word(&mut out, 7); out.extend_from_slice(&request.id.to_le_bytes());
+            text(&mut out, &request.title); text(&mut out, &request.message);
+        } else if let Ok((id, title)) = self.host_system_volume_request() {
             word(&mut out, 6); out.extend_from_slice(&id.to_le_bytes()); text(&mut out, &title);
         } else if let Ok(request) = self.host_menu_confirmation() {
             word(&mut out, 5); out.extend_from_slice(&request.id.to_le_bytes());

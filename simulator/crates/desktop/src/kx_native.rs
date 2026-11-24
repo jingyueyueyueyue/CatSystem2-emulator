@@ -8,6 +8,7 @@ use cs2_runtime::message_object::kx::KxMesh;
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
 use crate::{HeadlessPlayer, LoggingHost, SceneNode, expand_kcs_format};
+use crate::canvas_native::VramOverflow;
 
 const IDENTITY: [f32; 16] = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
@@ -523,7 +524,7 @@ fn draw_geometry_into(
     draw_mesh(
         output,
         &object.mesh,
-        object.canvas_wrapped.then_some(source),
+        object.canvas_wrapped.then(|| KxTexture::new(source, planes.vram_overflow.as_ref())),
         &view,
         cameras,
         projection,
@@ -599,7 +600,7 @@ type Vertex = [f64; 10];
 fn draw_mesh(
     canvas: &mut Canvas,
     mesh: &KxMesh,
-    texture: Option<&RgbaFrame>,
+    texture: Option<KxTexture<'_>>,
     view: &KxPlaneView,
     cameras: &BTreeMap<u32, crate::movie_plane::PlaneCamera>,
     projection: &crate::movie_plane_render::MoviePlaneProjection,
@@ -637,8 +638,8 @@ fn draw_mesh(
                     point[axis] += f32::from_bits(view.source_words[6 + axis]);
                 }
                 uv = [
-                    point[0] - texture.metadata().offset[0] as f32,
-                    point[1] - texture.metadata().offset[1] as f32,
+                    point[0] - texture.viewport.metadata().offset[0] as f32,
+                    point[1] - texture.viewport.metadata().offset[1] as f32,
                 ];
                 xyz = [
                     point[0] - f32::from_bits(view.source_words[6]),
@@ -730,7 +731,7 @@ fn edge(a: Vertex, b: Vertex, x: f64, y: f64) -> f64 {
 fn raster(
     canvas: &mut Canvas,
     mut vertices: [Vertex; 3],
-    texture: Option<&RgbaFrame>,
+    texture: Option<KxTexture<'_>>,
     view: &KxPlaneView,
 ) -> anyhow::Result<()> {
     for vertex in &mut vertices {
@@ -808,7 +809,7 @@ fn raster(
                         .sum::<f64>()
                         / reciprocal
                 });
-                let sample = sample(texture, uv);
+                let sample = texture.sample(uv);
                 for axis in 0..4 {
                     rgba[axis] *= sample[axis] / 255.;
                 }
@@ -827,29 +828,57 @@ fn raster(
     Ok(())
 }
 
-fn sample(frame: &RgbaFrame, uv: [f64; 2]) -> [f64; 4] {
-    if frame.width() == 0 || frame.height() == 0 {
-        return [0.; 4];
+#[derive(Clone, Copy)]
+struct KxTexture<'a> {
+    viewport: &'a RgbaFrame,
+    overflow: Option<&'a VramOverflow>,
+    size: [u32; 2],
+}
+
+impl<'a> KxTexture<'a> {
+    fn new(viewport: &'a RgbaFrame, overflow: Option<&'a VramOverflow>) -> Self {
+        let size = overflow.map_or([viewport.width(), viewport.height()], VramOverflow::dimensions);
+        Self { viewport, overflow, size }
     }
-    let x = (uv[0] - 0.5).clamp(0., f64::from(frame.width() - 1));
-    let y = (uv[1] - 0.5).clamp(0., f64::from(frame.height() - 1));
-    let x0 = x.floor() as u32;
-    let x1 = (x0 + 1).min(frame.width() - 1);
-    let y0 = y.floor() as u32;
-    let y1 = (y0 + 1).min(frame.height() - 1);
-    let dx = x - x.floor();
-    let dy = y - y.floor();
-    let mut output = [0.; 4];
-    for (x, y, weight) in [
-        (x0, y0, (1. - dx) * (1. - dy)),
-        (x1, y0, dx * (1. - dy)),
-        (x0, y1, (1. - dx) * dy),
-        (x1, y1, dx * dy),
-    ] {
-        let at = (y as usize * frame.width() as usize + x as usize) * 4;
-        for axis in 0..4 {
-            output[axis] += f64::from(frame.pixels()[at + axis]) * weight;
+
+    fn texel(&self, x: u32, y: u32) -> [u8; 4] {
+        let viewport = self.viewport;
+        if x < viewport.width() && y < viewport.height() {
+            let at = (y as usize * viewport.width() as usize + x as usize) * 4;
+            viewport.pixels()[at..at + 4].try_into().unwrap()
+        } else {
+            let color = self.overflow.and_then(|overflow| overflow.pixel(x, y))
+                .unwrap_or(Color::TRANSPARENT);
+            [color.r, color.g, color.b, color.a]
         }
     }
-    output
+
+    fn sample(&self, uv: [f64; 2]) -> [f64; 4] {
+        if self.size.contains(&0) {
+            return [0.; 4];
+        }
+        // Clamp to the virtual canvas and resolve each bilinear tap separately.
+        // A single sample can cross from the viewport into an offscreen tile.
+        let edge = self.size.map(|dimension| dimension - 1);
+        let x = (uv[0] - 0.5).clamp(0., f64::from(edge[0]));
+        let y = (uv[1] - 0.5).clamp(0., f64::from(edge[1]));
+        let x0 = x.floor() as u32;
+        let x1 = (x0 + 1).min(edge[0]);
+        let y0 = y.floor() as u32;
+        let y1 = (y0 + 1).min(edge[1]);
+        let dx = x - f64::from(x0);
+        let dy = y - f64::from(y0);
+        let mut output = [0.; 4];
+        for (x, y, weight) in [
+            (x0, y0, (1. - dx) * (1. - dy)),
+            (x1, y0, dx * (1. - dy)),
+            (x0, y1, (1. - dx) * dy),
+            (x1, y1, dx * dy),
+        ] {
+            for (value, channel) in output.iter_mut().zip(self.texel(x, y)) {
+                *value += f64::from(channel) * weight;
+            }
+        }
+        output
+    }
 }

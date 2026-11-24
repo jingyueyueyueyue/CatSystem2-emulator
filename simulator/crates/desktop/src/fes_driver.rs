@@ -39,6 +39,21 @@ mod input_tests;
 const MAX_INPUTS: usize = 4096;
 const MAX_NOTIFICATIONS: usize = 4096;
 
+#[derive(Clone, Copy)]
+pub(super) enum FesSystemReturns<'a> {
+    ButtonBlocks(&'a [u8]),
+    NestedCalls(&'a [u8]),
+}
+
+impl FesSystemReturns<'_> {
+    fn applies(&self, event: &[u8], block: &[u8]) -> bool {
+        match self {
+            Self::ButtonBlocks(name) => *name == event && matches!(block, b"SETBUTTON" | b"_SETBUTTON"),
+            Self::NestedCalls(name) => *name == event,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub(crate) struct FesDriverTarget {
@@ -238,6 +253,18 @@ pub(crate) struct FesScriptDriver {
     media_statement_result: Option<statement::FesStatementReturn>,
     /// Synchronous callbacks cannot consume the main body's ordered notices.
     notification_only: bool,
+    #[serde(default)]
+    pub(super) gallery: super::fes_gallery::Gallery,
+    #[serde(default)]
+    send_button: Option<u32>,
+    #[serde(default)]
+    pub(super) force_redraw_pending: bool,
+    #[serde(default)]
+    frame_origin: u64,
+    #[serde(default)]
+    frame_reset_at: Option<u64>,
+    #[serde(default)]
+    auto_pointer_origin: Option<[i32; 2]>,
 }
 
 /// In-memory checkpoint, including pending effects and control continuations.
@@ -281,6 +308,9 @@ impl FesScriptDriver {
             handler: None,
             waiting: None,
             last_frame: None,
+            frame_origin: 0,
+            frame_reset_at: None,
+            auto_pointer_origin: None,
             focus: None,
             task_id: 0,
             cancel_wait: false,
@@ -296,6 +326,9 @@ impl FesScriptDriver {
             media_statement: None,
             media_statement_result: None,
             notification_only: false,
+            gallery: Default::default(),
+            send_button: None,
+            force_redraw_pending: false,
         };
         // Zero is a completed child result. A fresh task has no such result.
         driver.set_child_exit_code(-1);
@@ -354,6 +387,10 @@ impl FesScriptDriver {
 
     pub(crate) fn focus(&self) -> Option<&FesDriverTarget> {
         self.focus.as_ref()
+    }
+
+    pub(super) fn send_button_selection(&self) -> u32 {
+        self.send_button.unwrap_or(1)
     }
 
     pub(crate) fn snapshot(&self) -> FesDriverSnapshot {
@@ -564,12 +601,12 @@ impl FesScriptDriver {
 
     pub(super) fn advance_system_notification(
         &mut self, frame: u64, shared: &mut ExpressionState, budget: usize,
-        bounded_block: Option<&[u8]>,
+        returns: Option<FesSystemReturns<'_>>,
     ) -> Result<FesDriverEffect> {
         let main_last_frame = self.last_frame.replace(frame);
         let main_budget_frame = self.budget_frame.take();
         let notification_only = std::mem::replace(&mut self.notification_only, true);
-        let result = self.advance_with_notification(frame, shared, budget, bounded_block);
+        let result = self.advance_with_notification(frame, shared, budget, returns);
         self.notification_only = notification_only;
         self.last_frame = main_last_frame;
         self.budget_frame = main_budget_frame;
@@ -593,7 +630,7 @@ impl FesScriptDriver {
         frame: u64,
         shared: &mut ExpressionState,
         budget: usize,
-        bounded_block: Option<&[u8]>,
+        returns: Option<FesSystemReturns<'_>>,
     ) -> Result<FesDriverEffect> {
         if self.media_statement.is_some() {
             return match self.advance_media_statement(frame, shared, budget)? {
@@ -620,7 +657,7 @@ impl FesScriptDriver {
         if self.handler.is_none() {
             self.expression.current = shared.current;
         }
-        let result = self.advance_inner(frame, budget, bounded_block);
+        let result = self.advance_inner(frame, budget, returns);
         std::mem::swap(&mut self.expression.strings, &mut shared.strings);
         std::mem::swap(&mut self.expression.shared, &mut shared.shared);
         self.budget_frame = if matches!(&result, Ok(FesDriverEffect::Yield)) {
@@ -672,8 +709,13 @@ impl FesScriptDriver {
         Ok(self.interpreter.evaluate_parameter(source, &mut self.expression)?)
     }
 
+    fn script_frame(&self, frame: u64) -> u32 {
+        if self.frame_reset_at == Some(frame) { 0 }
+        else { frame.wrapping_sub(self.frame_origin) as u32 }
+    }
+
     fn advance_inner(
-        &mut self, frame: u64, budget: usize, bounded_block: Option<&[u8]>,
+        &mut self, frame: u64, budget: usize, returns: Option<FesSystemReturns<'_>>,
     ) -> Result<FesDriverEffect> {
         if self.last_frame.is_some_and(|previous| frame < previous) {
             bail!("FES frame moved backwards; restore a driver snapshot before rewinding");
@@ -682,7 +724,11 @@ impl FesScriptDriver {
             self.clear_transient_input();
         }
         self.last_frame = Some(frame);
-        self.set_named_value("_FRAME_", 0, frame as u32 as i32);
+        if self.frame_reset_at.is_some_and(|reset| frame > reset) {
+            self.frame_reset_at = None;
+            self.frame_origin = frame.wrapping_sub(1);
+        }
+        self.set_named_value("_FRAME_", 0, self.script_frame(frame) as i32);
         if budget == 0 {
             return Ok(FesDriverEffect::Yield);
         }
@@ -712,8 +758,9 @@ impl FesScriptDriver {
                 if handler.phase == HandlerPhase::System
                     && handler.target.name.is_empty()
                     && handler.target.bank == 0
-                    && bounded_block == Some(handler.event.as_slice())
-                    && matches!(self.interpreter.current_block(), b"SETBUTTON" | b"_SETBUTTON")
+                    && returns.as_ref().is_some_and(|returns| {
+                        returns.applies(&handler.event, self.interpreter.current_block())
+                    })
                     && self.interpreter.return_call_at_block_end(handler.depth)
                 {
                     continue;
@@ -864,7 +911,7 @@ impl FesScriptDriver {
                 let value = arguments.first()
                     .map(|value| -> Result<i32> { Ok(std::str::from_utf8(value)?.parse()?) })
                     .transpose()?.unwrap_or(0) as u32;
-                (frame as u32) >= value
+                self.script_frame(frame) >= value
             }
             FesDriverWait::Control { kind, arguments, entered } if kind == b"privateflag" => {
                 let index = arguments.first()
@@ -918,6 +965,11 @@ impl FesScriptDriver {
         let arguments = &command.parameters;
         let name = arguments.first().map_or(&[][..], Vec::as_slice);
         match name {
+            b"reset_frame" => {
+                self.frame_reset_at = Some(frame);
+                self.set_named_value("_FRAME_", 0, 0);
+                Ok(None)
+            }
             b"decode" | b"baseimg" | b"config_open" if self.handler.is_some() => {
                 self.defer(FesDriverEffect::Command(command))?;
                 self.finish_handler(false).map(Some)

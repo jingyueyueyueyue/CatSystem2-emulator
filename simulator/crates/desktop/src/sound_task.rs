@@ -723,6 +723,14 @@ impl LoggingHost<'_> {
                     audio_script_error("sound load requires an explicit record buffer")
                 })?;
                 let grouped = code >= 206;
+                if saved_load.is_none() && self.data_services.fast_forward
+                    && let Some(field) = bytes.get(12..272)
+                    && let Some(end) = field.iter().position(|&byte| byte == 0)
+                    && !self.sound_is_bgm(&super::sound_native::decode_name(self.text_encoding, &field[..end])?)
+                {
+                    *output = if grouped { u32::MAX } else { 0 };
+                    return Ok(());
+                }
                 let logical = if let Some(saved) = &saved_load { saved.logical } else if grouped {
                     let key = read_u32(bytes, if code <= 207 { 4 } else { 8 })?;
                     let Some(group) = sound_group(task, code <= 207, key) else {
@@ -1241,6 +1249,10 @@ impl LoggingHost<'_> {
             }
             223 => {}
             225..=227 => {
+                if self.data_services.fast_forward {
+                    *output = if code == 225 { 0 } else { u32::MAX };
+                    return Ok(());
+                }
                 if !self.data_services.legacy_sound.jtalk {
                     if code != 225 { *output = u32::MAX; }
                     return Ok(());

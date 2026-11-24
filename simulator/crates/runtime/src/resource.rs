@@ -939,6 +939,11 @@ impl ResourceIndex {
         let Some(entry) = lookup.get(wide_query_key(name, &mut scratch)?) else { return Ok(None); };
         let (key, slot) = entry.as_ref().ok_or_else(|| RuntimeError::Archive("archive directory has no matching indexed payload".into()))?;
         let candidate = &self.candidates[key][*slot];
+        if candidate.size == 0 && self.routing.as_ref().is_some_and(|router|
+            router.ignores_empty_archive_entry(index, &candidate.name))
+        {
+            return Ok(None);
+        }
         let ResourceLocation::Archive { path, .. } = &candidate.location else { unreachable!() };
         match self.with_archive_file(path, |handle| Ok(handle.metadata.is_file())) {
             Ok(is_file) => Ok(is_file.then_some(candidate)),

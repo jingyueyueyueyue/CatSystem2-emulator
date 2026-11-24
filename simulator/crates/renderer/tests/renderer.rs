@@ -936,3 +936,26 @@ fn deferred_device_pixels_materialize_once_and_clear_skips_readback() {
     assert_eq!(canvas.pixels(), [9, 10, 11, 12]);
     assert_eq!(canvas.pixels().as_ptr(), allocation);
 }
+
+#[test]
+fn frame_snapshot_keeps_cpu_and_device_pixels_independent() {
+    use std::sync::{Arc, atomic::Ordering};
+
+    let mut canvas = Canvas::from_rgba8(1, 1, vec![1, 2, 3, 4]).unwrap();
+    let snapshot = canvas.share_snapshot();
+    assert_eq!(snapshot.pixels().as_ptr(), canvas.pixels().as_ptr());
+    canvas.pixels_mut().copy_from_slice(&[5, 6, 7, 8]);
+    assert_eq!(snapshot.pixels(), [1, 2, 3, 4]);
+
+    let source = Arc::new(TestCanvasReadback {
+        rgba: vec![20, 40, 60, 80],
+        calls: 0.into(),
+    });
+    canvas.set_deferred_device_pixels(source.clone());
+    let snapshot = canvas.share_snapshot();
+    canvas.clear(Color::rgba(9, 10, 11, 12));
+    assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(snapshot.pixels(), [20, 40, 60, 80]);
+    assert_eq!(canvas.pixels(), [9, 10, 11, 12]);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+}

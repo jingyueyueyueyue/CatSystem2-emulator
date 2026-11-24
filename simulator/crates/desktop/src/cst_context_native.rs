@@ -894,6 +894,35 @@ fn require_gbk_records(document: &CstDocument) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn repair_routed_scene_text<'a>(
+    resource: &SourcedResource,
+    mut records: impl Iterator<Item = (&'a mut u8, &'a mut Vec<u8>)>,
+) {
+    let ResourceLocation::Archive { path, .. } = &resource.source.location else { return; };
+    if !path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("update05.int")) { return; }
+    // These members in the Ikikoi translation store GBK directly after the
+    // record marker. The matching original input groups give the missing kinds.
+    let (digest, repairs): (&str, &[(usize, u8)]) = match resource.source.name.to_ascii_lowercase().as_str() {
+        "common01.cst" => ("80bf853d65d55a8683c3860ab4453973404da781bcca092589a8283d22fa4ac1", &[(46, 0x20)]),
+        "common04.cst" => ("a39a1232b1e851a459100effe0ce8854b6edc712bd566f2b15e7fab692c1fc07", &[(203, 0x20)]),
+        "eika_ind01.cst" => ("5ae10adb207b1beb02b836416538769c34691ddde647d1a3af7d72f437c8f3ba", &[(2430, 0x20), (2536, 0x20), (2936, 0x20)]),
+        "ry_ei_com01_01a.cst" => ("96d9d76f65f8b0014231c7fbd6ed109e1c36e36e7ed15750608aa3af3e9cbc6b", &[(58, 0x20)]),
+        "ry_ei_com01_02a.cst" => ("03e560f0bfc176275af67a35227699ba93a346ee3e7713725842c01b23623ee3", &[(120, 0x20)]),
+        "tane_ind02.cst" => ("02f829a725a93343109e90edeaef7c3cd75500c6d8b106f11241abc7e68877fb", &[(2017, 0x20)]),
+        "tane_ind10_ero7.cst" => ("b461633a85aaf61934a7ea62e51ab8e851a560c593b604c761d5c727c60d730d", &[(129, 0x21)]),
+        "tmg_ind07_ero2.cst" => ("47b2c353add29259e335a6db0ee6722143ab2b7a230d4fc4fd8ed452a22e0fcd", &[(731, 0x21)]),
+        _ => return,
+    };
+    if sha256(&resource.bytes) != digest { return; }
+    let mut next = 0;
+    for &(index, restored_kind) in repairs {
+        let Some((kind, text)) = records.nth(index - next) else { break; };
+        text.insert(0, *kind);
+        *kind = restored_kind;
+        next = index + 1;
+    }
+}
+
 pub(super) fn decode_cst_dialogue(bytes: &[u8], codec: ScriptTextEncoding) -> Result<Cow<'_, str>> {
     let bytes = trim_nul(bytes);
     let decoded = match codec {
@@ -1321,6 +1350,7 @@ impl LoggingHost<'_> {
         let mut encoding = self.text_encoding;
         let loaded = if signature && valid_length {
             let mut document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(bytes))?;
+            repair_routed_scene_text(&resource, document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
             let source_encoding = self.cst_scene_encoding_override(&resource);
             if let Some(source_encoding) = source_encoding {
                 if source_encoding == ScriptTextEncoding::Gbk {
@@ -2170,6 +2200,55 @@ mod source_encoding_tests {
 
     fn args(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn ikikoi_localized_cst_load_restores_the_ten_missing_record_types() -> anyhow::Result<()> {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/突然之间发现我已恋上你");
+        if !game.join("UPDATE05.int").is_file() { return Ok(()); }
+        let profile = std::env::temp_dir().join(format!("cs2-ikikoi-cst-{}", std::process::id()));
+        let mut player = crate::HeadlessPlayer::open_with_save_root(game, profile)?;
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0; 4096])?;
+        let scene_name = 0x8000_0100;
+        let destination = 0x8000_0200;
+        let scenes: &[(&[u8], &[(usize, usize, u8)])] = &[
+            (b"common01.cst\0", &[(6, 0, 0x20)]),
+            (b"common04.cst\0", &[(49, 3, 0x20)]),
+            (b"eika_ind01.cst\0", &[(446, 2, 0x20), (473, 2, 0x20), (548, 6, 0x20)]),
+            (b"ry_ei_com01_01a.cst\0", &[(22, 0, 0x20)]),
+            (b"ry_ei_com01_02a.cst\0", &[(32, 0, 0x20)]),
+            (b"tane_ind02.cst\0", &[(217, 4, 0x20)]),
+            (b"tane_ind10_ero7.cst\0", &[(31, 1, 0x21)]),
+            (b"tmg_ind07_ero2.cst\0", &[(194, 2, 0x21)]),
+        ];
+        player.with_host(|host| {
+            let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
+                anyhow::bail!("no CST context handle");
+            };
+            for &(name, repairs) in scenes {
+                let (_, source) = host.cst_resource_with_source(b"scene", trim_nul(name))?.unwrap();
+                assert!(matches!(&source.source.location, ResourceLocation::Archive { path, .. }
+                    if path.file_name().unwrap().eq_ignore_ascii_case("update05.int")));
+                let raw = CstDocument::parse(&source.bytes)?;
+                vm.write(scene_name, name)?;
+                assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
+                for &(group, index, expected_kind) in repairs {
+                    let context = &host.cst_contexts[&handle];
+                    assert_eq!(context.encoding, ScriptTextEncoding::Gbk);
+                    let record = &context.document.as_ref().unwrap().input_records(group).unwrap()[index];
+                    let raw_record = &raw.input_records(group).unwrap()[index];
+                    assert_eq!(record.kind, expected_kind);
+                    assert!(raw_record.kind >= 0x80);
+                    assert_eq!(record.text[0], raw_record.kind);
+                    assert_eq!(&record.text[1..], raw_record.text);
+                    let decoded = decode_cst_dialogue(&record.text, ScriptTextEncoding::Gbk)?.into_owned();
+                    host.read_cst_record(1037, &args(&[handle, destination, group as u32, index as u32]), &mut vm)?;
+                    assert_eq!(vm.read_string(destination)?, decoded.as_bytes());
+                }
+            }
+            Ok(())
+        })
     }
 
     #[test]

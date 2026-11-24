@@ -236,13 +236,17 @@ class PlayerActivity : PlayerEngineActivity() {
     companion object {
         init { System.loadLibrary("cs2_android_bridge") }
 
-        @JvmStatic external fun nativeOpen(game: ByteArray, saves: ByteArray, language: Int): Long
+        @JvmStatic external fun nativeOpen(game: ByteArray, saves: ByteArray, language: Int, availableMemory: Long): Long
         @JvmStatic external fun nativeClose(handle: Long): Int
         @JvmStatic external fun nativeStep(handle: Long, budget: Int): Int
         @JvmStatic external fun nativeTickDelay(handle: Long, reset: Boolean): Int
+        @JvmStatic external fun nativeRetryDelay(handle: Long): Int
         @JvmStatic external fun nativeSize(handle: Long, axis: Int): Int
         @JvmStatic external fun nativePointer(handle: Long, output: IntArray): Int
         @JvmStatic external fun nativeCursorVisibility(handle: Long): Int
+        @JvmStatic external fun nativeCursorImage(handle: Long): ByteArray?
+        @JvmStatic external fun nativeTextEntry(handle: Long): ByteArray?
+        @JvmStatic external fun nativeTextEntryResult(handle: Long, request: Long, value: ByteArray?): Int
         @JvmStatic external fun nativeWindowRequest(handle: Long): Int
         @JvmStatic external fun nativeGeneralWindowPolicy(handle: Long): Int
         @JvmStatic external fun nativeGeneralWindowCaption(handle: Long): ByteArray?
@@ -264,10 +268,15 @@ class PlayerActivity : PlayerEngineActivity() {
         @JvmStatic external fun nativeEnqueueInput(handle: Long, kind: Int, a: Int, b: Int, eventToUiMs: Long, inputUiMonoUs: Long): Int
         @JvmStatic external fun nativeTimedPrimaryDown(handle: Long, eventToUiMs: Long, uiToWorkerUs: Long): Int
         @JvmStatic external fun nativeText(handle: Long, kind: Int, text: ByteArray, start: Int, end: Int): Int
-        @JvmStatic external fun nativePresent(handle: Long, surface: Surface): Int
+        @JvmStatic external fun nativePublishFrame(handle: Long, revision: Long): Int
+        @JvmStatic external fun nativePresent(handle: Long, surface: Surface, output: LongArray): Int
+        @JvmStatic external fun nativeRecordPresent(handle: Long, output: LongArray)
         @JvmStatic external fun nativeDetachSurface(): Int
         @JvmStatic external fun nativeSetHudEnabled(enabled: Boolean)
-        @JvmStatic external fun nativeReadHud(handle: Long, output: LongArray): Int
+        @JvmStatic external fun nativeSetDisplayStatsEnabled(enabled: Boolean)
+        @JvmStatic external fun nativeReadDisplayStats(handle: Long, output: LongArray): Int
+        @JvmStatic external fun nativeReadHud(output: LongArray): Int
         @JvmStatic external fun nativeError(): ByteArray?
+        @JvmStatic external fun nativeDiagnostic(handle: Long): ByteArray?
     }
 }

@@ -8,6 +8,7 @@ use cs2_script::{NativeReturn, Vm};
 use std::collections::BTreeMap;
 
 const MAX_BYTES: u64 = 128 * 1024 * 1024;
+const HATSUMIRA: &str = "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78";
 
 #[path = "canvas_snapshot.rs"]
 mod graph;
@@ -110,7 +111,6 @@ struct PackedRegion {
 }
 
 impl VramOverflow {
-    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
     pub(super) fn dimensions(&self) -> [u32; 2] {
         [self.tile[0] * self.grid[0], self.tile[1] * self.grid[1]]
     }
@@ -467,11 +467,13 @@ impl CanvasNativeState {
             from_local[0] + to[0].wrapping_sub(destination[0]),
             from_local[1] + to[1].wrapping_sub(destination[1]),
         ];
+        // Native 115/367's canvas path walks the decoded bitmap with a
+        // positive pitch. RgbaFrame and the destination atlas are top-down.
         for y in to[1]..to[3] {
             for x in to[0]..to[2] {
                 let sx = source_at[0] + x - to[0];
                 let sy = source_at[1] + y - to[1];
-                let color = source.pixel(sx, height - 1 - sy)?;
+                let color = source.pixel(sx, sy)?;
                 self.write_pixel(target, overflow, x, y, color)?;
             }
         }
@@ -852,11 +854,23 @@ impl LoggingHost<'_> {
                         .back_buffer
                         .as_ref()
                         .map_or(surface_size, |buffer| [buffer.width(), buffer.height()]);
+                    let shared_capture = self.css_task_sha() == Some(HATSUMIRA);
+                    if shared_capture {
+                        // Hatsumira 0x524a50 allocates one auxiliary target and
+                        // calls 0x52dc30 with slot 0 before the script changes the scene.
+                        let policy = self.frame_effect_capture_policy()?;
+                        if !self.data_services.tasks.render.prepare_effect_auxiliary(1, size, policy)? {
+                            return Ok(());
+                        }
+                    }
                     let mut output = Canvas::new(size[0], size[1])?;
                     let [lower, upper] = depth.unwrap();
                     self.draw_scene_depth_range(&mut output, lower, upper)?;
-                    // The graph snapshot is the sole pixel consumer of this capture.
-                    self.data_services.canvas_native.offscreen = Some(output);
+                    if shared_capture {
+                        self.data_services.tasks.render.replace_auxiliary_target(0, output.into_frame())?;
+                    } else {
+                        self.data_services.canvas_native.offscreen = Some(output);
+                    }
                 }
                 _ => bail!("canvas native {index} has no contract"),
             }
@@ -1124,6 +1138,32 @@ mod tests {
     use super::*;
     use crate::SceneNode;
     use crate::plane_native::{PlaneServices, draw_plane};
+
+    #[test]
+    fn ordinary_image_copy_preserves_top_down_rows_in_the_canvas_atlas() -> Result<()> {
+        let source = RgbaFrame::from_rgba8(
+            1,
+            3,
+            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
+        )?;
+        let mut canvas = Canvas::new(1, 2)?;
+        let mut overflow = None;
+        let mut state = CanvasNativeState {
+            initialized: true,
+            enabled: true,
+            active: true,
+            size: [1, 2],
+            tile: [1, 2],
+            grid: [1, 2],
+            tiles: vec![Some(Tile { depth: 32, dirty: false }); 2],
+            ..CanvasNativeState::default()
+        };
+        // Crop off the first source row and copy across the viewport edge.
+        state.copy_image(&mut canvas, &mut overflow, &source, [0, 1], [0, 1, 1, 2])?;
+        assert_eq!(canvas.pixel(0, 1)?, Color::rgb(0, 255, 0));
+        assert_eq!(overflow.unwrap().pixel(0, 2), Some(Color::rgb(0, 0, 255)));
+        Ok(())
+    }
 
     #[test]
     fn list_row_copies_match_scalar_writes() -> Result<()> {

@@ -30,8 +30,8 @@ struct Entry {
 impl Progress {
     pub(super) fn remove(&mut self, task: u32) { self.entries.remove(&task); }
 
-    pub(super) fn request(&mut self, task: u32, player: Option<(&CpuPlayer, CpuViewport)>) {
-        if !perf_detail::enabled() || (self.entries.len() >= 16 && !self.entries.contains_key(&task)) { return; }
+    pub(super) fn request(&mut self, task: u32, player: Option<(&CpuPlayer, CpuViewport)>) -> u64 {
+        if !perf_detail::enabled() || (self.entries.len() >= 16 && !self.entries.contains_key(&task)) { return 0; }
         let entry = self.entries.entry(task).or_default();
         entry.known_input = false;
         if let Some((player, viewport)) = player && let Ok(variables) = player.effective_variables() {
@@ -43,18 +43,24 @@ impl Progress {
                 entry.changed = Some(Instant::now());
             }
         }
+        entry.input_rev
     }
 
     pub(super) fn rendered(&mut self, task: u32, frame: &EmoteRasterFrame) {
+        self.rendered_revision(task, frame, None);
+    }
+
+    pub(super) fn rendered_revision(&mut self, task: u32, frame: &EmoteRasterFrame, revision: Option<u64>) {
         if !perf_detail::enabled() { return; }
         let Some(entry) = self.entries.get_mut(&task) else { return; };
+        let revision = revision.unwrap_or(entry.input_rev);
         if !entry.surface.as_ref().is_some_and(|old| old.matches(frame)) {
             entry.surface = Some(frame.diagnostic_identity());
             entry.surface_rev = entry.surface_rev.saturating_add(1);
-            entry.surface_input_rev = entry.input_rev;
+            entry.surface_input_rev = revision;
             entry.surface_changed = Some(Instant::now());
         }
-        entry.rendered_rev = entry.input_rev;
+        entry.rendered_rev = revision;
         entry.renders = entry.renders.saturating_add(1);
     }
 

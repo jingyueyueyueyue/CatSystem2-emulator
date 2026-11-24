@@ -756,13 +756,15 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
                 (receiver, ("match operation", "Operation::Prepare", "task.words = words",
                             "geometry.configure", "task.captures", "Operation::Play", "task.active = scalar",
                             "Operation::CaptureSecond", "Operation::Flag", "self.effects.tasks.insert")),
-                (compose, ("geometry.draw", "pixels::composite", "target.pixels_mut().copy_from_slice")),
+                (compose, ("geometry.draw", "pixels::composite")),
                 (composition, ("self.effects.compose",)),
                 (raw_receiver, (".effect_command", "propagate: descriptor.operation == Operation::Delegate")),
                 (register, ("geometry::Geometry::new", "self.effects.tasks.insert")),
             ]:
                 if not all(token in rust_mask(body) for token in required):
                     raise ValueError("frame effect descriptor lost its reviewed receiver/composition path")
+            if not re.search(r"target\.pixels_mut\(\)\.copy_from_slice|\*target\s*=\s*frame\s*;", rust_mask(compose)):
+                raise ValueError("frame effect composition lost its canvas commit")
             declaration = re.search(r"\bconst\s+DESCRIPTORS\s*:[^=]+=\s*&\s*\[", module.mask)
             if not declaration:
                 raise ValueError("frame effect descriptor table is absent")
@@ -953,7 +955,9 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
             module.arms.append(Arm(str(index), "", {index}, body,
                                    module.line(opening), module.line(opening), path))
         if re.search(r"if\s+super::message_native::is_body_native\s*\(\s*index\s*\)", function_mask):
-            if not re.search(r"return\s+super::message_native::call_message_body_native\s*\(\s*index\s*,", function_mask):
+            direct = re.search(r"return\s+super::message_native::call_message_body_native\s*\(\s*index\s*,", function_mask)
+            traced = re.search(r"let\s+result\s*=\s*super::message_native::call_message_body_native\s*\(\s*index\s*,[^;]+\?;.+?return\s+Ok\(result\);", function_mask, re.S)
+            if not (direct or traced):
                 raise ValueError("message body predicate has no concrete wrapper forwarding")
             body_module = message_parent["module"]
             helper, helper_line = body_module.function("call_message_body_native")
@@ -1222,7 +1226,12 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
             require(host, "protect", ("self.bridge", "platform::seal", "platform::unseal", "bridge.issue"))
             require(host, "issue", ("state.pending.insert", "state.closed", "wake.wait", "state.pending.remove"))
             android = load("simulator/crates/android/src/lib.rs")
-            require(android, "cs2_android_open", ("player.enable_host_tweet_queue", "player.load_startup"))
+            open_body, _ = android.function("cs2_android_open")
+            if "open_game(game, saves," in rust_mask(open_body):
+                require(android, "cs2_android_open_profiled_v4", ("open_game(game, saves,",))
+                require(android, "open_game", ("player.enable_host_tweet_queue", "player.load_startup"))
+            else:
+                require(android, "cs2_android_open", ("player.enable_host_tweet_queue", "player.load_startup"))
             require(android, "cs2_android_tweet", ("player.take_host_tweet_request", "sessions.tweet"))
             require(android, "cs2_android_tweet_result", (".complete_host_tweet_request", "sessions.players.get_mut"))
             require(android, "cs2_android_tweet_cancel", (".cancel_host_tweet_requests", "sessions.players.get_mut"))
@@ -1243,11 +1252,19 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
                 "simulator/android/app/src/main/java/org/catsystem2/player/TweetActivity.java": (
                     "editor.finish(true", "editor.finish(false", "editor.forget()",
                     "onSaveInstanceState", "AndroidTweetHost.nativeCount", "editor.draft"),
-                "simulator/android/app/src/main/java/org/catsystem2/player/PlayerActivity.java": (
-                    "new AndroidTweetHost", "tweetHost.close()", "tweetHost.paused()", "tweetHost.resumed()"),
                 "simulator/android/app/src/main/AndroidManifest.xml": (
                     "android.permission.INTERNET", ".TweetActivity"),
             }
+            engine_activity = "simulator/android/app/src/main/java/org/catsystem2/player/PlayerEngineActivity.java"
+            if engine_activity in blobs:
+                android_sources[engine_activity] = (
+                    "new AndroidTweetHost", "AndroidTweetHost host = tweetHost", "host.close()",
+                    "tweetHost.paused()", "tweetHost.resumed()",
+                )
+            else:
+                android_sources["simulator/android/app/src/main/java/org/catsystem2/player/PlayerActivity.java"] = (
+                    "new AndroidTweetHost", "tweetHost.close()", "tweetHost.paused()", "tweetHost.resumed()",
+                )
             for path, tokens in android_sources.items():
                 text = blobs[path].decode("utf-8-sig")
                 if not all(token in text for token in tokens):
@@ -2064,6 +2081,12 @@ def reserved_constant_bindings(blobs: dict[str, bytes]) -> dict[int, list[dict]]
     return dict(bindings)
 
 
+def logging_host_source(data: bytes) -> RustSource:
+    text = data.decode("utf-8-sig")
+    name = "dispatch_kcs_native" if re.search(r"\bfn\s+dispatch_kcs_native\s*\(", text) else "call"
+    return RustSource(text, call_function=name)
+
+
 def analyze(root: Path) -> dict:
     paths = [DESKTOP, AUDIT, LEDGER, REF + "kcs.md", REF + "native-calls.md",
              REF + "native-calls.tsv", REF + "native-calls-comparison.tsv",
@@ -2119,7 +2142,7 @@ def analyze(root: Path) -> dict:
     blobs = {name: (root / name).read_bytes() for name in paths}
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in blobs.items()}
     archived_sources = archive_source_blobs(root, blobs, hashes)
-    source = RustSource(blobs[DESKTOP].decode("utf-8-sig"))
+    source = logging_host_source(blobs[DESKTOP])
     helper_sources = {name: source for name in source.functions}
     for path in paths:
         if path.startswith("simulator/crates/desktop/src/") and path != DESKTOP:

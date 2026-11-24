@@ -109,7 +109,13 @@ pub(crate) fn shared_font_file(path: &Path) -> io::Result<Arc<Vec<u8>>> {
 }
 
 pub(crate) fn shared_resource_font(resources: &ResourceIndex, name: &str) -> Result<Arc<Vec<u8>>> {
-    let candidate = resolve_candidate(resources, name)?;
+    shared_candidate_font(resources, resolve_candidate(resources, name)?)
+}
+
+pub(crate) fn shared_candidate_font(
+    resources: &ResourceIndex,
+    candidate: &ResourceCandidate,
+) -> Result<Arc<Vec<u8>>> {
     let version = FontVersion::candidate(candidate)?;
     let path = match &candidate.location {
         ResourceLocation::File { path } | ResourceLocation::Archive { path, .. } => path,

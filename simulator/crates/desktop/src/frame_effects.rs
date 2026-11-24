@@ -312,7 +312,7 @@ impl RenderTaskStore {
         })
     }
 
-    pub(super) fn prepare_effect_auxiliary(
+    pub(crate) fn prepare_effect_auxiliary(
         &mut self,
         count: u32,
         size: [u32; 2],
@@ -815,7 +815,7 @@ fn message_descriptor(
 }
 
 impl LoggingHost<'_> {
-    pub(super) fn frame_effect_capture_policy(&mut self) -> Result<Option<i32>> {
+    pub(crate) fn frame_effect_capture_policy(&mut self) -> Result<Option<i32>> {
         self.ensure_canvas_state()?;
         self.ensure_configuration_state()?;
         let state = &self.data_services.canvas_native;

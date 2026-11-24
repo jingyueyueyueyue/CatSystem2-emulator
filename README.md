@@ -15,11 +15,13 @@ CatSystem2 模拟器包含 Rust 引擎、Windows 播放器和 Android 应用。�
 | `simulator/crates/android/` | Android C ABI、会话、画面和输入桥接 |
 | `simulator/android/` | Android 应用、游戏库、Kotlin 界面、Java 播放宿主和 JNI |
 | `simulator/vendor/` | 绑定到 Cargo 的第三方依赖及许可证，见 [THIRD_PARTY.md](simulator/THIRD_PARTY.md) |
+| `simulator/vendor/wgpu-hal-27.0.4/` | wgpu 后端源码，包含 Android Adreno 的 Vulkan 命令池回收修正 |
 | `scripts/build/` | 模拟器构建、Android 安装和媒体依赖准备 |
 | `scripts/convert/` | 游戏资源及汉化补丁转换 |
 | `scripts/analysis/` | PC 回放及回归用例、Android 日志与性能分析、引擎静态检查 |
 | `games/`、`localization/` | 本地游戏原目录和翻译资料，Git 忽略 |
 | `localization/kanmi/` | 《尚有佳蜜伴恋心》的汉化归档和加载配置，Git 忽略 |
+| `localization/tunaban/` | 《ツナバン らぶみくす》的汉化归档和加载配置，Git 忽略 |
 | `reports/`、`resources/` | 本地批测清单、研究报告和参考资料，Git 忽略 |
 | `archive/YYYY-MM/` | 本地测试输出和按日期归档的游戏转换、历史探针、研究资料与旧发布工具，Git 忽略 |
 
@@ -35,7 +37,21 @@ python -B scripts/analysis/run_playthrough_batch.py --player $replay --game-root
 
 `$player` 和 `$replay` 分别是现有 Windows 播放器和回放器的路径。`--game-root` 接受现有游戏目录，单个回放的用例编号为 0。多游戏回归使用 `--inventory`、`--indices` 和 `--scenarios`。批测默认读取本地启动清单，单目录回放直接接收路径。`--player` 必须指向已有回放器。
 
+固定帧场景的 `ctrl-hold:起始帧:释放帧` 持续按住 Ctrl，两个帧号从 0 起算，释放帧需小于总帧数。[PC 开场回归清单](scripts/analysis/pc_ctrl_opening_regression.json) 可配合 `--fast-text --reuse-attempts`，根据已有回执跳过相同条件的用例。`fast_forward_state` 事件记录实际切换，`last_story_position` 记录最后的剧情位置。
+
 Android 使用已安装的模拟器，从游戏库选中平板上已导入的原游戏目录。需要采集真机日志或测试剧情时，使用 `scripts/analysis/android_story_replay.py` 或 `android_story_drive.py`，传入当前设备、游戏目录和已安装 APK 的身份。
+
+### 扫描全部游戏的脚本
+
+使用现有 Windows 播放器的 `audit-batch` 盘点每个游戏目录的 CST、CSTL 和归档资源。FES 与 KCS 分析脚本可继续定位指令、调用点及宿主分派。将 `$report` 设为带日期的归档路径前缀，父目录需已存在。
+
+```powershell
+$gameRoots = @(Get-ChildItem -LiteralPath games -Directory | ForEach-Object FullName)
+& $player audit-batch --output "$report-scenes.json" @gameRoots
+python -B -X utf8 scripts/analysis/fes_command_inventory.py --output "$report-fes.json"
+python -B -X utf8 scripts/analysis/kcs_call_inventory.py --all-games --output "$report-kcs"
+python -B -X utf8 scripts/analysis/kcs_dispatch_inventory.py "$report-kcs.json" --output "$report-dispatch"
+```
 
 ## 构建模拟器
 
@@ -64,3 +80,13 @@ python -B -X utf8 scripts/convert/restore_kanmi_localization.py $launcher $scene
 ```
 
 将生成的两个文件放到与原版 `scene.int` 同一目录。播放器会按 GBK 加载补丁里的对白和说话人姓名。
+
+### ツナバン らぶみくす
+
+`$game` 指向包含原汉化补丁的 `scene/` 和 `uif_config.json` 的游戏目录。`$fontLicense` 指向 Noto Sans CJK 的 OFL 许可证。旧版消息窗口使用 CP932，转换会按原编码打包剧情，并根据 UIF 替字规则从 Noto Sans CJK SC 生成配套字形。
+
+```powershell
+python -B scripts/convert/build_tunaban_localization.py $game archive/2026-11/20261122_NotoSansCJK-Regular.ttc localization/tunaban --font-number 2 --license $fontLicense
+```
+
+将生成的 `tunaban_cn.int` 和 `cs2-localization.json` 部署到游戏根目录，播放器通过补丁配置加载汉化剧情和字形。

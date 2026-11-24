@@ -240,7 +240,9 @@ impl LoggingHost<'_> {
         self.dispatch_sound_load_record(saved.task, saved.code, &mut record).map(Some)
     }
 
-    fn dispatch_sound_load_record(&mut self, task: u32, code: u32, record: &mut [u8]) -> cs2_script::Result<NativeReturn> {
+    pub(super) fn dispatch_sound_load_record(
+        &mut self, task: u32, code: u32, record: &mut [u8],
+    ) -> cs2_script::Result<NativeReturn> {
         let mut output = 0;
         if !self.dispatch_sound_task_command(task, TaskCommand {
                 target: task as i32, sender: self.current_task_id as i32, code, data: [0; 3],
@@ -353,6 +355,10 @@ impl LoggingHost<'_> {
             saved
         } else {
             if self.data_services.sound_async.cancelled.remove(&owner) { return Ok(NativeReturn::Value(0)); }
+            if self.data_services.fast_forward && names.iter().all(|name| !self.sound_is_bgm(name)) {
+                crate::perf_detail::audio_async_note(&format!("event=fast_forward_skip owner={owner} channel={channel} candidates={names:?}"));
+                return Ok(NativeReturn::Value(0));
+            }
             self.cancel_audio_channel_start(channel)?;
             let mut state = self.sound_channels.remove(&channel).unwrap_or_default();
             let saved = PendingSoundLoad { channel, names, selector, duration, group: None, source: None, material: None };
@@ -412,6 +418,11 @@ impl LoggingHost<'_> {
                 self.data_services.sound_async.loads.remove(&owner);
                 return Ok(NativeReturn::Value(0));
             };
+            if self.data_services.fast_forward && !self.sound_is_bgm(&resource) {
+                self.data_services.sound_async.loads.remove(&owner);
+                crate::perf_detail::audio_async_note(&format!("event=fast_forward_skip owner={owner} channel={channel} resource={resource:?}"));
+                return Ok(NativeReturn::Value(0));
+            }
             let Some(version) = cs2_runtime::emote::EmoteArchiveVersion::observe(&candidate) else {
                 self.data_services.sound_async.loads.remove(&owner);
                 self.note_sound_resource_failure("load", &resource, "sound material source is unavailable");
@@ -427,6 +438,11 @@ impl LoggingHost<'_> {
             crate::perf_detail::audio_async_note(&format!("event=material_queued owner={owner} channel={channel} resource={resource:?}"));
         }
         let source = saved.source.as_ref().unwrap().clone();
+        if self.data_services.fast_forward && !self.sound_is_bgm(&source.resource) {
+            self.data_services.sound_async.loads.remove(&owner);
+            self.sound_channels.get_mut(&channel).unwrap().pending_start = None;
+            return Ok(NativeReturn::Value(0));
+        }
         let started = self.sound_channels[&channel].pending_start.as_ref()
             .filter(|pending| pending.owner == owner).map(|pending| pending.started)
             .ok_or_else(|| audio_script_error("pending sound material lost its channel reservation"))?;
@@ -530,11 +546,14 @@ impl LoggingHost<'_> {
         if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
         if let Some(result) = self.resume_plain_sound_load()? { return Ok(result); }
         // Name resolution occurs before selector validation and group lookup.
-        let _names = self.sound_resource_names(name)?;
+        let names = self.sound_resource_names(name)?;
         if !matches!(selector, 1 | 2) {
             return Err(audio_script_error(
                 "native 936 selector has no defined return value",
             ));
+        }
+        if self.data_services.fast_forward && names.iter().all(|name| !self.sound_is_bgm(name)) {
+            return Ok(NativeReturn::Value(u32::MAX));
         }
         if let Some(task) = self.default_sound_task()? {
             return self
@@ -982,6 +1001,43 @@ mod async_load_tests {
     }
 
     #[test]
+    fn legacy_sound_prepare_waits_for_material_before_returning() {
+        use cs2_script::{Host, KcsProgram};
+
+        let (_scratch, mut player, cleanup) = player();
+        let root = player.current_task_id;
+        player.sound_groups.push(crate::SoundGroup { key: 17, id: 0, label: b"effects".to_vec(), range: [9, 9] });
+        let sound = player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?)).unwrap();
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 512], 64).unwrap()).unwrap();
+        vm.write(64, b"sound/replacement.wav\0").unwrap();
+
+        for (index, words, channel, expected) in [
+            (155, &[8_u32, 0, 64, 1][..], 8, 1),
+            (604, &[17, 0, 64, 1, 1][..], 9, 9),
+        ] {
+            let args = words.iter().copied().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            let result = player.with_host(|host| Ok(host.call(index, &args, &mut vm)?)).unwrap();
+            assert_eq!(result, NativeReturn::Retry, "native {index} returned before loading");
+            assert_eq!(player.data_services.sound_async.task_loads[&root].task, sound);
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = player.with_host(|host| Ok(host.call(index, &args, &mut vm)?)).unwrap();
+                if result != NativeReturn::Retry {
+                    assert_eq!(result, NativeReturn::Value(expected));
+                    break;
+                }
+                assert!(Instant::now() < deadline, "native {index} did not finish loading");
+                std::thread::yield_now();
+            }
+            assert_eq!(player.sound_channels[&channel].resource.as_deref(), Some("sound/replacement.wav"));
+            assert!(player.data_services.sound_async.loads.is_empty());
+            assert!(player.data_services.sound_async.task_loads.is_empty());
+        }
+        let _ = cleanup.send(Ok(()));
+    }
+
+    #[test]
     fn native936_cancelled_retry_never_reclaims_a_new_owners_saturated_channel() {
         use cs2_script::{Host, KcsProgram};
         let (_scratch, mut player, old_cleanup) = player();
@@ -1038,6 +1094,50 @@ mod async_load_tests {
         bytes.extend_from_slice(b"data"); bytes.extend_from_slice(&2_u32.to_le_bytes()); bytes.extend_from_slice(&0_i16.to_le_bytes());
         bytes
     }
+
+    #[test]
+    fn fast_forward_twenty_sound_cycles() -> anyhow::Result<()> {
+        let scratch = crate::tests::TempDir::new();
+        std::fs::create_dir(scratch.0.join("sound"))?;
+        std::fs::write(scratch.0.join("sound/voice.wav"), wave())?;
+        std::fs::write(scratch.0.join("sound/bgm.wav"), wave())?;
+        let mut player = HeadlessPlayer::open_with_save_root(&scratch.0, scratch.0.join("profile"))?;
+        let mut router = cs2_runtime::resource_router::ResourceRouter::default();
+        router.slots[0] = cs2_runtime::resource_router::ResourceSlot {
+            prefix: "sound".encode_utf16().collect(), loose_directory: "sound".encode_utf16().collect(),
+            loose_enabled: true, archive: None,
+        };
+        player.scan.resources.set_resource_router(router)?;
+        player.enable_host_fast_forward(0);
+        let ctrl = cs2_runtime::InputKey::Keyboard(17);
+        let load = |player: &mut HeadlessPlayer, channel, name: &[u8]| -> anyhow::Result<NativeReturn> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = player.with_host(|host| Ok(host.load_sound_resolved_name(channel, name, 1, 0)?))?;
+                if result != NativeReturn::Retry { return Ok(result); }
+                anyhow::ensure!(Instant::now() < deadline, "audio preparation timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        for _ in 0..20 {
+            assert_eq!(player.with_host(|host| Ok(host.load_sound_resolved_name(8, b"sound/voice.wav", 1, 0)?))?, NativeReturn::Retry);
+            player.apply_host_input(cs2_runtime::InputEvent::KeyDown(ctrl))?;
+            assert!(player.advance_host_frame(1000)?);
+            assert!(player.sound_channels.get(&6).is_none_or(|state| state.prepared_audio.is_none()));
+            assert_eq!(load(&mut player, 8, b"sound/voice.wav")?, NativeReturn::Value(0));
+            assert!(player.sound_channels[&8].pending_start.is_none());
+            assert_eq!(load(&mut player, 6, b"sound/voice.wav")?, NativeReturn::Value(0));
+            assert_eq!(load(&mut player, 7, b"sound/bgm.wav")?, NativeReturn::Value(1));
+            assert_eq!(load(&mut player, 7, b"sound/voice.wav")?, NativeReturn::Value(0));
+            assert_eq!(player.sound_channels[&7].resource.as_deref(), Some("sound/bgm.wav"));
+            player.apply_host_input(cs2_runtime::InputEvent::KeyUp(ctrl))?;
+            assert!(player.advance_host_frame(1000)?);
+            assert_eq!(load(&mut player, 6, b"sound/voice.wav")?, NativeReturn::Value(1));
+        }
+        println!("fast_forward cycles=20 new_voice_skipped=40 pending_voice_skipped=20 bgm_prepared=20 bgm_preserved=20 voice_resumed=20");
+        Ok(())
+    }
+
     fn player() -> (Scratch, HeadlessPlayer, mpsc::Sender<cs2_runtime::RuntimeResult<()>>) {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let directory = std::env::temp_dir().join(format!("cs2-async-load-{}-{stamp}", std::process::id()));

@@ -86,7 +86,7 @@ impl HeadlessPlayer {
             movie_resources: &mut self.movie_resources,
             sound_channels: &mut self.sound_channels,
             sound_groups: &self.sound_groups,
-            sound_config: &self.sound_config,
+            sound_config: &mut self.sound_config,
             script_random: &mut self.script_random,
             menu_item_requests: &mut self.menu_item_requests,
             debug_mode: self.debug_mode,

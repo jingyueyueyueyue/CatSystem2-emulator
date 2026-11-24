@@ -1,9 +1,5 @@
 //! Type-34 task ownership and ordinary 447/448/449. Script control is supplied
 //! by fes_driver; rendering/input effects use explicit platform callbacks.
-#[cfg(test)]
-#[path = "fes_sound_async_tests.rs"]
-mod real_sound_async_tests;
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use cs2_script::{
@@ -13,7 +9,7 @@ use cs2_script::{
 
 use super::fes_driver::{
     FesChildKind, FesDriverEffect, FesDriverInput, FesDriverTarget, FesDriverWait,
-    FesMediaNotificationScope, FesNamedBlockCall, FesScriptDriver, FesSendCallback,
+    FesMediaNotificationScope, FesNamedBlockCall, FesScriptDriver, FesSendCallback, FesSystemReturns,
 };
 use super::native_tasks::NativeSubtreeContinuation;
 use super::{
@@ -54,13 +50,15 @@ pub(super) const NEWTON_MESSAGE_FES: (u64, &str) =
 const NEWTON_CINEMA_FES: (u64, &str) =
     (3030, "707cf6541aff274d25f7bfc1647ab9518013dd279fce50a9bc0f7bcc8deddd09");
 
-pub(super) fn startup_shared_slots(scan: &cs2_runtime::GameScan, entry: Option<&str>) -> usize {
+pub(super) fn startup_shared_slots(scan: &cs2_runtime::GameScan, verified_legacy_slots: bool) -> usize {
     super::discover_shared_slots(&scan.resources)
-        .or_else(|| verified_shared_slot_default(scan, entry))
+        .or_else(|| verified_legacy_slots.then_some(LEGACY_SHARED_SLOTS))
         .unwrap_or(512)
 }
 
-fn verified_shared_slot_default(scan: &cs2_runtime::GameScan, entry: Option<&str>) -> Option<usize> {
+pub(super) fn verified_totsuzen_companion(
+    scan: &cs2_runtime::GameScan, entry: Option<&str>,
+) -> Option<&'static str> {
     const PACKED: &str = "35ec21bcfcee0f324206e945eef1c082e35fd8af594ea0e738a46cd941f5b3f3";
     const COMPANION: &str = "d158c8915d4982c82badc631b4f92e1f140b246df5929ff2d9924d242c66765c";
     const PRODUCER: &str = "3294c9b35ec41e6ce157444a637d9529a0cd9876bdfbc126733e8ddc397b76cf";
@@ -79,13 +77,93 @@ fn verified_shared_slot_default(scan: &cs2_runtime::GameScan, entry: Option<&str
         return None;
     }
     let producer = super::read_entry_with_fallback(&scan.resources, entry?).ok()?;
-    (sha256(&producer) == PRODUCER).then_some(LEGACY_SHARED_SLOTS)
+    (sha256(&producer) == PRODUCER).then_some(COMPANION)
 }
 
 #[cfg(test)]
 mod shared_variable_tests {
     use super::*;
     use cs2_script::expression::eval_expression;
+
+    #[test]
+    fn fes_background_button_controls_and_named_block_redraw() -> anyhow::Result<()> {
+        use cs2_runtime::TaskCommand;
+
+        let root = std::env::temp_dir().join(format!("cs2-fes-button-controls-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&root)?;
+        let result = HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = result?;
+        player.with_host(|host| {
+            let owner = host.current_task_id;
+            let mut offset = 0;
+            let mut section = |header: &[u8], lines: &[&[u8]]| FesSection {
+                header: header.to_vec(),
+                lines: lines.iter().map(|line| {
+                    let result = FesLine { offset, bytes: line.to_vec() };
+                    offset += line.len() + 1;
+                    result
+                }).collect(),
+            };
+            let document = FesDocument { sections: vec![
+                section(b"START", &[b"force_redraw", b"wait 100"]),
+                section(b"SET_RAW", &[b"sendbtn -7"]),
+                section(b"REDRAW", &[b"force_redraw"]),
+                section(b"CLEAR_RAW", &[b"sendbtn 0"]),
+                section(b"DEFAULT_RAW", &[b"sendbtn"]),
+                section(b"DELETE", &[b"deletebgbutton"]),
+            ] };
+            host.begin_direct_fes_entry(owner, document, SharedExternalStorage::default())?;
+            assert!(host.advance_direct_fes_entry(owner, 0, 4096)?);
+            let store = &host.data_services.tasks.fes;
+            let list = store.slots[&owner].object.as_ref().unwrap().list.as_ref().unwrap().task;
+            let background = store.platform.auxiliary_button(owner).unwrap();
+            assert!(store.runtime(owner).unwrap().driver.as_ref().unwrap().force_redraw_pending);
+            assert!(store.platform.lists[&list].submit);
+            assert!(host.call_fes_named_block(owner, owner, 0, b"SET_RAW", None, 4096)?);
+            let store = &host.data_services.tasks.fes;
+            let state = &store.platform.lists[&list];
+            assert!(state.submit && !state.force && state.enabled);
+            assert!(!store.runtime(owner).unwrap().driver.as_ref().unwrap().force_redraw_pending);
+
+            host.data_services.tasks.fes.platform.lists.get_mut(&list).unwrap().submit = false;
+            assert!(host.call_fes_named_block(owner, owner, 0, b"REDRAW", None, 4096)?);
+            let state = &host.data_services.tasks.fes.platform.lists[&list];
+            assert!(!state.submit && !state.force && state.enabled);
+            host.data_services.tasks.fes.platform.lists.get_mut(&list).unwrap().submit = true;
+
+            let other = host.create_task_object(6, owner, b"regular button", b"")?;
+            crate::fes_task_platform::register_region(host, other, 1, [1, 1, 2, 2], true)?;
+            let selected = |host: &LoggingHost<'_>, id| {
+                host.input_task.regions.iter().find(|region| region.id() == id).unwrap().words[7]
+            };
+            let button_event = |code| TaskCommand {
+                target: owner as i32, sender: background as i32, code, data: [background, 0, 0],
+            };
+            assert_eq!(host.receive_fes_button_owner(button_event(9), 4096)?, Some(true));
+            assert_eq!(selected(host, background), -7i32 as u32);
+            host.input_task.regions.iter_mut().find(|region| region.id() == other).unwrap().words[7] = 13;
+            assert!(host.call_fes_named_block(owner, owner, 0, b"CLEAR_RAW", None, 4096)?);
+            assert_eq!(host.receive_fes_button_owner(button_event(10), 4096)?, Some(true));
+            assert_eq!(selected(host, background), 0);
+            assert_eq!(selected(host, other), 13);
+            assert!(host.call_fes_named_block(owner, owner, 0, b"DEFAULT_RAW", None, 4096)?);
+            assert_eq!(host.receive_fes_button_owner(button_event(9), 4096)?, Some(true));
+            assert_eq!(selected(host, background), 1);
+            assert_eq!(selected(host, other), 0);
+
+            assert!(host.call_fes_named_block(owner, owner, 0, b"DELETE", None, 4096)?);
+            assert!(host.advance_direct_fes_entry(owner, 0, 4096)?);
+            assert!(host.data_services.tasks.fes.platform.auxiliary_button(owner).is_none());
+            assert!(!host.input_task.regions.iter().any(|region| region.id() == background));
+            assert!(host.input_task.regions.iter().any(|region| region.id() == other));
+            assert!(host.call_fes_named_block(owner, owner, 0, b"DELETE", None, 4096)?);
+            assert!(host.advance_direct_fes_entry(owner, 0, 4096)?);
+            assert!(host.data_services.tasks.fes.platform.auxiliary_button(owner).is_none());
+            Ok(())
+        })
+    }
 
     #[test]
     fn fes_start_uses_callers_high_shared_slot_without_widening_other_banks() -> anyhow::Result<()> {
@@ -810,21 +888,44 @@ impl HeadlessPlayer {
 }
 
 impl LoggingHost<'_> {
+    pub(super) fn apply_fes_external_variable(
+        &mut self, owner: u32, driver: &mut FesScriptDriver, effect: &FesDriverEffect,
+        shared: &mut ExpressionState,
+    ) -> anyhow::Result<bool> {
+        let FesDriverEffect::Command(command) = effect else { return Ok(false); };
+        let Some(verb @ (b"getexvar" | b"setexvar")) = command.parameters.first().map(Vec::as_slice)
+        else { return Ok(false); };
+        let Some(name) = command.parameters.get(1).map(|name| nul(name)) else { return Ok(true); };
+        let operand = command.parameters.get(2);
+        if verb == b"getexvar" && operand.is_none() { return Ok(true); }
+        let value = operand.map(|source| driver.evaluate_parameter(source, command.context.current, shared))
+            .transpose()?.unwrap_or_default();
+        let slot = self.data_services.tasks.fes.slots.get_mut(&owner)
+            .ok_or_else(|| native_state_error("FES external variable has no owner"))?;
+        if verb == b"setexvar" {
+            slot.named_dwords.insert(name.to_vec(), value as u32);
+        } else if let Some(destination) = shared.shared.get_mut(value as usize) {
+            *destination = slot.named_dwords.get(name).copied().unwrap_or(0) as i32;
+        }
+        Ok(true)
+    }
+
     pub(super) fn fes_control_native(
         &mut self, index: u32, args: &[u8], vm: &Vm,
     ) -> Result<NativeReturn> {
         let target = read_u32(args, 0)?;
-        cs2_runtime::native_task_profile::exact_task_native_profile(
-            self.data_services.native_profile.map_or("", |profile| profile.pe_sha256))
-            .and_then(|profile| profile.fes_control)
+        let command = match index {
+            450 => 0,
+            666 => 1,
+            _ => return Err(cs2_script::ScriptError::UnimplementedNativeCall { index }),
+        };
+        self.data_services.task_native_profile()
+            .and_then(|profile| profile.fes_control[command])
             .ok_or_else(|| native_state_error("FES control wrapper needs its fixed PE descriptor"))?;
         if index == 450 {
             let name = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
             return self.select_fes_entry(target, nul(&name))
                 .map(|found| NativeReturn::Value(u32::from(found)));
-        }
-        if index != 666 {
-            return Err(cs2_script::ScriptError::UnimplementedNativeCall { index });
         }
         if self.fes_target(target)?
             && self.data_services.tasks.fes.context_initialized(target)
@@ -2035,14 +2136,19 @@ impl FesTask {
         if daydream_mes_push {
             guard_daydream_mes_push(&mut driver.interpreter.program);
         }
-        // A nested SETBUTTON return belongs to the notification that called it.
-        let bounded_block = (daydream_mes_push
+        let returns = if self.hatsumira_message_returns(host, &mut driver, key, value, block, context_free) {
+            Some(FesSystemReturns::NestedCalls(block))
+        } else if daydream_mes_push
             || (message_button_notification(key, value, block, context_free)
             && (self.verified_bounded_message_driver(host, &mut driver, block)
                 || self.verified_newton_message_driver(host, &mut driver)))
             || (neko_message_notification(key, value, block, context_free)
-                && self.verified_neko_message_driver(host, &mut driver)))
-            .then_some(block);
+                && self.verified_neko_message_driver(host, &mut driver))
+        {
+            Some(FesSystemReturns::ButtonBlocks(block))
+        } else {
+            None
+        };
         let result = (|| {
             self.apply_data_commands(host, &mut driver);
             if !self.system.as_ref().unwrap().entered {
@@ -2100,6 +2206,9 @@ impl FesTask {
                         }
                         self.system.as_mut().unwrap().media_done = true;
                     }
+                    if key == 343 {
+                        self.finish_named_block_redraw(host, &mut driver)?;
+                    }
                     if key == 19 {
                         self.finish_configuration(host)?;
                     }
@@ -2110,9 +2219,7 @@ impl FesTask {
                     Some(effect) => effect,
                     None => with_expression(host, |_, shared| {
                         let _detail = super::perf_detail::SlowTask::new(self.id, || 34, "fes_interpreter");
-                        driver.advance_system_notification(
-                            now as u64, shared, budget - iteration, bounded_block,
-                        )
+                        driver.advance_system_notification(now as u64, shared, budget - iteration, returns)
                     })
                     .map_err(|error| host.fes_task_error(self.id, error))?,
                 };
@@ -2432,6 +2539,19 @@ impl FesTask {
         driver.newton_message_fes_source = Some(is_newton_message_fes_source(host, candidate, bytes));
         driver.sudden_message_fes_source = Some(super::fes_task_platform::is_sudden_message_fes(bytes));
         Ok(runtime)
+    }
+
+    fn hatsumira_message_returns(
+        &self, host: &LoggingHost<'_>, driver: &mut FesScriptDriver,
+        key: u32, bank: u32, block: &[u8], context_free: bool,
+    ) -> bool {
+        // MES_SHOW initializes the buttons and MES_DRAW calls STRDRAW.
+        // Both must unwind their helpers before returning to WAIT_USER.
+        host.css_task_sha() == Some(super::story_trace::story_trace_12::PE)
+            && context_free && bank == 0
+            && ((key == 343 && block.starts_with(b"MES_"))
+                || (key == 19 && block == b"MES_CHANGECONFIG"))
+            && self.verified_bounded_message_driver(host, driver, block)
     }
 
     fn verified_bounded_message_driver(
@@ -2903,6 +3023,7 @@ impl FesTask {
                     Ok(EffectResult::Pending)
                 } else {
                     let (message, parent, receipt) = (*message, *parent, call.clone());
+                    self.finish_named_block_redraw(host, driver)?;
                     self.deliver_fes_send(host, driver, effect, message, parent, Some(receipt))
                 }
             }
@@ -2915,6 +3036,28 @@ impl FesTask {
                 .map_err(|error| host.fes_task_error(self.id, error))?;
         }
         result
+    }
+
+    fn finish_named_block_redraw(
+        &self,
+        host: &mut LoggingHost<'_>,
+        driver: &mut FesScriptDriver,
+    ) -> Result<()> {
+        if !driver.force_redraw_pending || self.paused != 0 {
+            return Ok(());
+        }
+        // The named block has already updated its layers. Republish a visible
+        // list without changing the submission switch owned by list commands
+        // and transitions. A hidden list keeps its updated offscreen pixels.
+        if let Some(binding) = &self.list
+            && host.data_services.tasks.fes.platform.lists.get(&binding.task)
+                .is_some_and(|list| list.enabled && list.submit)
+        {
+            super::fes_task_platform::compose_list(host, binding.task, true)
+                .map_err(|error| host.fes_task_error(self.id, error))?;
+        }
+        driver.force_redraw_pending = false;
+        Ok(())
     }
 
     fn deliver_fes_send(
@@ -2976,14 +3119,20 @@ impl FesTask {
         now: u32,
         budget: usize,
     ) -> Result<bool> {
-        let bounded_block = (neko_message_notification(343, call.bank, &call.name, call.object.is_none())
-            && self.verified_neko_message_driver(host, driver)).then_some(call.name.as_slice());
+        let context_free = call.object.is_none();
+        let returns = if self.hatsumira_message_returns(host, driver, 343, call.bank, &call.name, context_free) {
+            Some(FesSystemReturns::NestedCalls(&call.name))
+        } else {
+            (neko_message_notification(343, call.bank, &call.name, context_free)
+                && self.verified_neko_message_driver(host, driver))
+                .then_some(FesSystemReturns::ButtonBlocks(&call.name))
+        };
         for iteration in 0..budget {
             let mut effect = match work.effect.take() {
                 Some(effect) => effect,
                 None if !driver.has_media_notification_work() => return Ok(true),
                 None => with_expression(host, |_, shared|
-                    driver.advance_system_notification(now as u64, shared, 1, bounded_block))
+                    driver.advance_system_notification(now as u64, shared, 1, returns))
                     .map_err(|error| host.fes_task_error(self.id, error))?,
             };
             sync_locals(host, self.id, driver);
@@ -3376,6 +3525,8 @@ fn bounded_message_fes_identity(host: &LoggingHost<'_>) -> Option<(u64, &'static
         DAYDREAM_MESSAGE_FES
     } else if host.css_task_sha() == Some(labyrinth::PE) {
         (labyrinth::MESWND.0 as u64, labyrinth::MESWND.1)
+    } else if host.css_task_sha() == Some(super::story_trace::story_trace_12::PE) {
+        (6047, super::story_trace::story_trace_12::MESWND)
     } else {
         return None;
     };
@@ -3470,7 +3621,7 @@ fn message_button_notification_rejects_other_shapes() {
     assert!(!message_button_notification(343, 0, b"MES_ISDRAW", true));
 }
 
-fn parse_document(bytes: &[u8]) -> Result<FesDocument> {
+pub(super) fn parse_document(bytes: &[u8]) -> Result<FesDocument> {
     let _timing = measure_host_phase(HostPhase::ScriptParse);
     if bytes.len() > MAX_FES_BYTES {
         return Err(native_state_error("FES data exceeds 64 MiB"));

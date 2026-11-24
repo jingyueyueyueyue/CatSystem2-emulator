@@ -1,11 +1,13 @@
 //! Exact-input, byte-bounded memoization for derived node transforms and meshes.
 //! Values never contain player clocks, controller state or resource references.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(super) struct BoundedMemo<V> {
-    entries: HashMap<Vec<u64>, (V, usize, u64)>,
+    entries: HashMap<Arc<[u64]>, (V, usize, u64)>,
+    recency: BTreeMap<u64, Arc<[u64]>>,
     bytes: usize,
     limit: usize,
     clock: u64,
@@ -15,14 +17,24 @@ pub(super) struct BoundedMemo<V> {
 
 impl<V> BoundedMemo<V> {
     pub(super) fn new(limit: usize) -> Self {
-        Self { entries: HashMap::new(), bytes: 0, limit, clock: 0, hits: 0, misses: 0 }
+        Self {
+            entries: HashMap::new(),
+            recency: BTreeMap::new(),
+            bytes: 0,
+            limit,
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
     }
 
     pub(super) fn get(&mut self, key: &[u64]) -> Option<&V> {
         self.clock = self.clock.saturating_add(1);
         if let Some((value, _, used)) = self.entries.get_mut(key) {
             self.hits += 1;
+            let key = self.recency.remove(used).expect("memo recency entry");
             *used = self.clock;
+            self.recency.insert(*used, key);
             Some(value)
         } else {
             self.misses += 1;
@@ -31,18 +43,20 @@ impl<V> BoundedMemo<V> {
     }
 
     pub(super) fn insert(&mut self, key: Vec<u64>, value: V, value_bytes: usize) {
-        let bytes = value_bytes.saturating_add(key.capacity().saturating_mul(8));
+        let bytes = value_bytes.saturating_add(key.len().saturating_mul(size_of::<u64>()));
         if bytes > self.limit { return; }
-        if let Some((_, old_bytes, _)) = self.entries.remove(key.as_slice()) {
+        if let Some((_, old_bytes, used)) = self.entries.remove(key.as_slice()) {
             self.bytes -= old_bytes;
+            self.recency.remove(&used);
         }
         // The entry limit also bounds map overhead for many tiny transforms.
         while self.bytes.saturating_add(bytes) > self.limit || self.entries.len() >= 2048 {
-            let Some(oldest) = self.entries.iter().min_by_key(|(_, (_, _, used))| *used)
-                .map(|(key, _)| key.clone()) else { break; };
+            let Some((_, oldest)) = self.recency.pop_first() else { break; };
             if let Some((_, old_bytes, _)) = self.entries.remove(&oldest) { self.bytes -= old_bytes; }
         }
         self.clock = self.clock.saturating_add(1);
+        let key: Arc<[u64]> = key.into();
+        self.recency.insert(self.clock, key.clone());
         self.entries.insert(key, (value, bytes, self.clock));
         self.bytes += bytes;
     }

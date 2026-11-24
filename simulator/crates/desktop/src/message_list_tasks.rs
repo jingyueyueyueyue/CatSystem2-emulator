@@ -46,6 +46,12 @@ impl MessageListStore {
         self.base = message_base_for_pe(sha256);
     }
 
+    pub(crate) fn identify_verified_companion(&mut self, sha256: &str) {
+        if self.base.is_none() {
+            self.identify(sha256);
+        }
+    }
+
     pub(super) fn register(&mut self, id: u32) {
         self.tasks.insert(id, MessageListTask {
             source: 0, source_snapshot: None, open: false, visible: false, rows: Vec::new(), scan: None,

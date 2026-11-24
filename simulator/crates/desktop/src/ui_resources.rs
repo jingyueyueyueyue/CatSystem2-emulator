@@ -38,6 +38,22 @@ fn word(bytes: &[u8], at: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes.get(at..end).context("truncated PE UI header")?.try_into()?))
 }
 impl UiResources {
+    pub(super) fn file_version(&self) -> Result<String> {
+        let mut reader = Reader::new(self.resource(16, 1)?);
+        reader.word()?;
+        let value_size = reader.word()?;
+        reader.word()?;
+        if reader.text()? != "VS_VERSION_INFO".encode_utf16().collect::<Vec<_>>() || value_size < 52 {
+            bail!("invalid PE version resource");
+        }
+        reader.align();
+        if reader.dword()? != 0xFEEF04BD { bail!("invalid PE fixed version signature"); }
+        reader.dword()?;
+        let high = reader.dword()?;
+        let low = reader.dword()?;
+        Ok(format!("{}.{}.{}.{}", high >> 16, high & 0xffff, low >> 16, low & 0xffff))
+    }
+
     /// Original physical-code menus are byte-code +32-byte CP932 label rows.
     /// Tokens identify each table across address rebasing; FF terminates it.
     pub fn input_code_labels(&self, token: &str) -> Result<Vec<(u32, Vec<u16>)>> {

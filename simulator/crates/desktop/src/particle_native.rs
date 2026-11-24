@@ -442,8 +442,11 @@ impl LoggingHost<'_> {
             }
             return Ok(Some(TaskCommandOutcome { done: true, propagate: false }));
         }
-        if !(271..=327).contains(&command.code) { return Ok(None); }
-        let base = command_base(self)?;
+        let base = match command_base(self) {
+            Ok(base) => base,
+            Err(error) if (271..=327).contains(&command.code) => return Err(error),
+            Err(_) => return Ok(None),
+        };
         let Some(offset) = command.code.checked_sub(base).filter(|offset| *offset < 8) else {
             return Ok(None);
         };
@@ -689,6 +692,7 @@ impl super::HeadlessPlayer {
             return Ok(());
         }
         self.data_services.particle_message_pe_sha256 = Some(HAPPINESS_PLAIN);
+        self.data_services.tasks.message_lists.identify_verified_companion(HAPPINESS_PLAIN);
         self.log.push("particle ABI: exact Happiness2 producer KCS + verified plain companion table; packed executable table unverified".into());
         Ok(())
     }
@@ -756,6 +760,23 @@ fn snapshot_points(snapshot: &particle_vm::ParticleRenderSnapshot) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunaban_parameter_command_reaches_the_particle_receiver() -> anyhow::Result<()> {
+        let root = crate::tests::TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&root.0, root.0.join("save"))?;
+        player.data_services.particle_message_pe_sha256 = identified_pe_sha256(crate::css_model::SHA);
+        player.with_host(|host| {
+            let target = host.create_task_object(16, 0, b"particle", b"")?;
+            let parameters = [42; 128];
+            let program = cs2_script::KcsProgram::from_code(&[0x3b], parameters.to_vec(), 128)?;
+            let mut vm = Vm::from_program(program)?;
+            let arguments = [target, 0].map(u32::to_le_bytes).concat();
+            assert_eq!(host.control_particle_native(275, &arguments, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.particles[&target].parameters, parameters);
+            Ok(())
+        })
+    }
 
     #[test]
     fn kanmi_particle_producer_keeps_raw_numbering_unidentified() {

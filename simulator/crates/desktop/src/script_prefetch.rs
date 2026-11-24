@@ -6,6 +6,10 @@ use crate::resource_preload::AheadRequest;
 
 impl HeadlessPlayer {
     pub(super) fn update_script_prefetch(&mut self) {
+        if self.data_services.fast_forward {
+            self.data_services.ordinary.update_prefetch(&self.scan.resources, &[], &[]);
+            return;
+        }
         let mut requests = Vec::new();
         let mut boundaries = Vec::new();
         if let Some(driver) = self.fes.as_ref().and_then(|runtime| runtime.driver.as_ref()) {

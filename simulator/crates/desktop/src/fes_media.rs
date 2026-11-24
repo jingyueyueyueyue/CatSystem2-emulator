@@ -29,7 +29,6 @@ pub(super) use image_source::{apply_difimage_attribute, apply_difimage_reference
     apply_image_source_command, request_image_file, update_image_sources};
 pub(crate) use image_source::{initialize_image_idn, source_image, release_image_source,
     release_image_sources, validate_image_source_bindings, source_draw_options, prepare_raw_image_source};
-#[cfg(test)]
 pub(super) fn install_ordinary_frame(layer: &mut FesMediaLayer, image: cs2_renderer::RgbaFrame) {
     image_source::install_ordinary_frame(layer, image);
 }
@@ -155,7 +154,8 @@ impl FesRuntime {
             .map(|source| driver.evaluate_parameter(source, command.context.current, expression))
             .transpose()?;
         let subcommand = ascii_command(subcommand)?;
-        if subcommand == "getsize" && driver.adapter.object(name_bytes).is_some_and(|object|
+        if matches!(subcommand.as_str(), "getsize" | "getbase" | "getoffset")
+            && driver.adapter.object(name_bytes).is_some_and(|object|
             object.definition.kind_name == b"IMAGE"
         ) {
             let bank = match bank {
@@ -167,12 +167,19 @@ impl FesRuntime {
             };
             let targets = self.driver_media_targets(&name, name_bytes, Some(bank), driver)?;
             let [Target::Image(key)] = targets.as_slice() else { return Ok(true); };
-            let [width, height] = self.media[key].navigation.size;
+            let layer = &self.media[key];
+            let [x, y] = match subcommand.as_str() {
+                "getbase" => layer.image_base,
+                "getoffset" => layer.image_offset,
+                _ => layer.navigation.size,
+            };
+            let values = [x, y, 0];
+            let count = if subcommand == "getsize" { 3 } else { 2 };
             let mut destinations = [-1; 3];
-            for (destination, source) in destinations.iter_mut().zip(&command.parameters[2..]) {
+            for (destination, source) in destinations[..count].iter_mut().zip(&command.parameters[2..]) {
                 *destination = driver.evaluate_parameter(source, command.context.current, expression)?;
             }
-            for (destination, value) in destinations.into_iter().zip([width, height, 0]) {
+            for (&destination, value) in destinations[..count].iter().zip(values) {
                 if let Some(slot) = expression.shared.get_mut(destination as usize) {
                     *slot = value;
                 }
@@ -180,7 +187,7 @@ impl FesRuntime {
             events.push(LogicEvent {
                 frame,
                 kind: "fes-media".into(),
-                detail: format!("object={name:?} bank={bank} command=getsize size={width},{height}"),
+                detail: format!("object={name:?} bank={bank} command={subcommand} value={x},{y}"),
             });
             return Ok(true);
         }
@@ -438,7 +445,7 @@ impl FesRuntime {
             || driver.adapter.object(bytes).is_some_and(|object| {
                 matches!(
                     object.definition.kind_name.as_slice(),
-                    b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"PLANE" | b"CPLANE"
+                    b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"PLANE" | b"CPLANE" | b"BGTABLE2" | b"CHTABLE2" | b"CHTABLE3"
                 )
             })
             || self
@@ -1129,7 +1136,7 @@ fn number(
 }
 
 fn media_kind(layer: &FesMediaLayer) -> bool {
-    matches!(layer.kind.as_str(), "IMAGE" | "CIMAGE" | "DIFIMAGE" | "BUTTON")
+    matches!(layer.kind.as_str(), "IMAGE" | "CIMAGE" | "DIFIMAGE" | "BUTTON" | "BGTABLE2" | "CHTABLE2" | "CHTABLE3")
 }
 
 fn internal_layer(kind: &str, name: &str) -> FesMediaLayer {

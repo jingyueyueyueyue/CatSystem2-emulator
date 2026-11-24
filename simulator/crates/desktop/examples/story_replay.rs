@@ -23,6 +23,20 @@ enum Action {
 }
 
 fn main() -> Result<()> {
+    let mut error_status = "scenario_error";
+    let result = replay_command(&mut error_status);
+    #[cfg(windows)]
+    if error_status == "engine_error" {
+        HeadlessPlayer::disable_host_gpu_raster();
+    }
+    if let Err(cause) = &result {
+        eprintln!("replay error: {cause:#}");
+        println!("replay_status={error_status}");
+    }
+    result
+}
+
+fn replay_command(error_status: &mut &'static str) -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next().context("game directory required")?;
     if first == "--source-sha256" {
@@ -45,21 +59,12 @@ fn main() -> Result<()> {
         let flags: Vec<_> = args.collect();
         ensure!(flags.iter().all(|flag| flag.to_str().is_some_and(is_route_diagnostic)),
             "route mode accepts only trace-native and inspect-log diagnostics");
-        let controller = story_route::Controller::read(&path).inspect_err(|_| {
-            println!("replay_status=scenario_error");
-        })?;
+        let controller = story_route::Controller::read(&path)?;
         (Some(controller), flags)
     } else {
         (None, args.collect())
     };
-    let result = replay(game, &output, frames, flags.into_iter(), route.as_mut());
-    #[cfg(windows)]
-    HeadlessPlayer::disable_host_gpu_raster();
-    if let Err(cause) = &result {
-        eprintln!("replay error: {cause:#}");
-        println!("replay_status=engine_error");
-    }
-    result
+    replay(game, &output, frames, flags.into_iter(), route.as_mut(), error_status)
 }
 
 fn is_route_diagnostic(flag: &str) -> bool {
@@ -73,12 +78,14 @@ fn replay(
     frames: u64,
     args: impl Iterator<Item = std::ffi::OsString>,
     mut route: Option<&mut story_route::Controller>,
+    error_status: &mut &'static str,
 ) -> Result<()> {
     let state_mode = route.is_some();
     if let Some(route) = &route {
         println!("replay route={:?}", route.label());
     }
     let mut inputs = BTreeMap::new();
+    let mut ctrl_windows = BTreeMap::new();
     let mut required_hits = BTreeMap::<u64, u32>::new();
     let mut same_frame_taps = BTreeSet::new();
     let mut captures = BTreeSet::new();
@@ -283,6 +290,14 @@ fn replay(
             session_random = true;
             continue;
         }
+        if let Some(window) = values.strip_prefix("ctrl-hold:") {
+            let (start, end) = window.split_once(':').context("expected ctrl-hold:start:end")?;
+            let start = start.parse::<u64>().context("invalid Ctrl hold start frame")?;
+            let end = end.parse::<u64>().context("invalid Ctrl hold end frame")?;
+            ensure!(start < end && end < frames, "Ctrl hold must satisfy start < end < {frames}");
+            ensure!(ctrl_windows.insert(start, end).is_none(), "duplicate Ctrl hold at frame {start}");
+            continue;
+        }
         if values == "no-final-capture" {
             capture_final = false;
             continue;
@@ -355,6 +370,14 @@ fn replay(
     for frame in &same_frame_taps {
         ensure!(matches!(inputs.get(frame), Some(Action::Pointer { button: Some(_), .. })),
             "tap at frame {frame} needs a scheduled pointer click");
+    }
+    let ctrl = InputKey::Keyboard(HeadlessPlayer::FAST_FORWARD_KEY);
+    if !ctrl_windows.is_empty() {
+        ensure!(!inputs.values().any(|action| *action == Action::Key(ctrl)),
+            "Ctrl hold cannot be combined with individual Ctrl presses");
+        ensure!(ctrl_windows.iter().zip(ctrl_windows.keys().skip(1)).all(|((_, end), next)| end < next),
+            "Ctrl holds must be separated by at least one released frame");
+        ensure!(guarded_body.is_none(), "guarded legacy body actions require the original input timeline");
     }
     if eye08_title.is_some() {
         ensure!(!state_mode && guarded_body.is_none() && inputs.is_empty(),
@@ -443,8 +466,11 @@ fn replay(
                 "legacy body action requires the known guarded entry timeline");
     }
 
+    *error_status = "engine_error";
     let measure = std::env::var_os("CS2_REPLAY_PERF").is_some_and(|value| value == "1");
     let detail = measure && std::env::var_os("CS2_REPLAY_PERF_DETAIL").is_some_and(|value| value == "1");
+    let interactive = measure && std::env::var_os("CS2_REPLAY_INTERACTIVE").is_some_and(|value| value == "1");
+    let fixed_retry_sleep = std::env::var_os("CS2_REPLAY_FIXED_RETRY_SLEEP").is_some_and(|value| value == "1");
     if measure {
         HeadlessPlayer::enable_host_gpu_raster();
     }
@@ -454,10 +480,18 @@ fn replay(
     } else {
         HeadlessPlayer::open_with_save_root(game, profile)?
     };
+    if !ctrl_windows.is_empty() {
+        player.enable_host_fast_forward(0);
+    }
     let mut happiness_load = happiness_resume_sha.map(|digest| happiness::Load::new(&player, digest)).transpose()?;
     player.enable_host_window_requests();
     player.initialize_general_window_host(1)?;
     player.set_host_input_update_rate(60);
+    if interactive {
+        player.enable_host_emote_pose_jobs();
+        player.enable_host_async_images();
+        player.set_host_iteration_work_budget(Some(std::time::Duration::from_millis(4)));
+    }
     player.enable_host_system_open_queue();
     player.enable_host_tweet_queue();
     player.enable_host_dialog_queue();
@@ -470,6 +504,7 @@ fn replay(
     let mut sent_logs = 0;
     let mut windowed = 1;
     let mut release = None;
+    let mut release_ctrl_at = None;
     let mut release_pending = None;
     let mut last_story = None;
     let mut logged_fonts = BTreeSet::new();
@@ -483,6 +518,15 @@ fn replay(
     let mut happiness_save: Option<happiness::Save> = None;
     let mut ordinary_save: Option<yukikoi_save::Save> = None;
     for completed in 0..frames {
+        let tick_started = std::time::Instant::now();
+        if release_ctrl_at == Some(completed) {
+            player.apply_host_input(InputEvent::KeyUp(ctrl))?;
+            release_ctrl_at = None;
+        }
+        if let Some(&end) = ctrl_windows.get(&completed) {
+            player.apply_host_input(InputEvent::KeyDown(ctrl))?;
+            release_ctrl_at = Some(end);
+        }
         let releasing = release.is_some_and(|(frame, _)| completed == frame);
         if releasing {
             let (_, key) = release.take().unwrap();
@@ -738,6 +782,7 @@ fn replay(
             }
         }
         let mut retries = 0;
+        let mut retry_sleep = std::time::Duration::ZERO;
         loop {
             let result = if measure {
                 let start = std::time::Instant::now();
@@ -840,7 +885,12 @@ fn replay(
                 break;
             }
             retries += 1;
-            if retries >= 128 {
+            let stalled = if interactive {
+                tick_started.elapsed() >= std::time::Duration::from_secs(2)
+            } else {
+                retries >= 128
+            };
+            if stalled {
                 if state_mode {
                     capture(&player, output, completed).ok();
                 }
@@ -848,6 +898,20 @@ fn replay(
                 println!("replay_status=frame_stalled");
                 return Ok(());
             }
+            if interactive {
+                let delay = if fixed_retry_sleep { 1 } else { player.host_frame_retry_delay_ms() };
+                if delay != 0 {
+                    let wait_started = std::time::Instant::now();
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(delay)));
+                    retry_sleep += wait_started.elapsed();
+                }
+            }
+        }
+        if interactive {
+            eprintln!(
+                "replay_tick frame={completed} call=0 ready_us={} retry_sleep_us={} retries={retries}",
+                tick_started.elapsed().as_micros(), retry_sleep.as_micros(),
+            );
         }
         if let Some(controller) = route.as_deref_mut() {
             controller.observe_frame(&player);
@@ -994,6 +1058,12 @@ fn replay(
         {
             capture(&player, output, frame)?;
         }
+        if interactive {
+            let interval = std::time::Duration::from_nanos(1_000_000_000 / 60);
+            if let Some(remaining) = interval.checked_sub(tick_started.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+        }
     }
     if state_mode || guarded_body.is_some() || eye08_title.is_some() {
         eprintln!("replay wait: {}", player.host_replay_wait_diagnostics());
@@ -1062,6 +1132,28 @@ fn capture(player: &HeadlessPlayer, output: &Path, frame: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_frame_inputs_are_scenario_errors_before_opening_the_game() {
+        for (args, expected) in [
+            (&["3600:13"][..], "input frame 3600 outside run"),
+            (&["menu:3600:1"][..], "menu action frame 3600 outside run"),
+            (&["30:13", "30:17"][..], "duplicate input at frame 30"),
+            (&["tap:45"][..], "tap at frame 45 needs a scheduled pointer click"),
+        ] {
+            let mut error_status = "scenario_error";
+            let result = replay(
+                PathBuf::from("unused-game"),
+                Path::new("unused-output"),
+                3600,
+                args.iter().copied().map(std::ffi::OsString::from),
+                None,
+                &mut error_status,
+            );
+            assert_eq!(result.unwrap_err().to_string(), expected);
+            assert_eq!(error_status, "scenario_error");
+        }
+    }
 
     #[test]
     fn route_diagnostics_cannot_send_input_or_capture_images() {

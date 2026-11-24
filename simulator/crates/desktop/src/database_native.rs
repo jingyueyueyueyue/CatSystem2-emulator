@@ -5,6 +5,8 @@ use cs2_formats::database::DatabaseFile;
 use cs2_script::{NativeReturn, Result, Vm};
 use cs2_script::data_snapshot::{DatabaseObjectSnapshot, DatabaseRowSnapshot};
 use super::{LoggingHost, expand_kcs_format, native_state_error, read_u32, trim_nul};
+use super::fes_driver::{FesDriverEffect, FesScriptDriver};
+use cs2_script::ExpressionState;
 
 #[derive(Default)]
 pub(super) struct DatabaseStore {
@@ -57,6 +59,121 @@ impl DatabaseStore {
         }
         Ok(Self { objects })
     }
+}
+
+/// The FES dictionary wrappers accept the same handle that KCS 869 returns.
+/// KCS unlocks and CSS save/restore therefore affect FES immediately.
+pub(super) fn apply_fes_effect(
+    host: &mut LoggingHost<'_>,
+    driver: &mut FesScriptDriver,
+    effect: &FesDriverEffect,
+    shared: &mut ExpressionState,
+) -> anyhow::Result<bool> {
+    let FesDriverEffect::Command(command) = effect else { return Ok(false); };
+    let [verb, operands @ ..] = command.parameters.as_slice() else { return Ok(false); };
+    let verb = verb.to_ascii_lowercase();
+    let count = match verb.as_slice() {
+        b"dic_find" => 6,
+        b"dic_title" | b"dic_update" => 4,
+        b"dic_appear" | b"dic_max_appear" | b"dic_id" | b"dic_ind" => 3,
+        b"dic_update_clear" => 2,
+        _ => return Ok(false),
+    };
+    if operands.len() < count { return Ok(true); }
+    let mut number = |index: usize| driver.evaluate_parameter(&operands[index], command.context.current, shared);
+    let handle = number(0)? as u32;
+    let Some(object) = host.data_services.databases.objects.get_mut(&handle) else {
+        return Ok(true);
+    };
+
+    let is_find = verb == b"dic_find";
+    let first = if count > 2 { number(1)? } else { 0 };
+    let second = if count >= 4 { number(2)? } else { 0 };
+    if is_find {
+        let ordinal = number(3)? as usize;
+        let bound = |bytes: &[u8]| {
+            // The localized Newton tips script retains EUC-JP kana boundaries.
+            // Convert those two-byte constants to the database's CP932 order.
+            if host.data_services.newton_legacy_gbk
+                && let [0xa4, trail @ 0xa1..=0xf3] = bytes
+            {
+                return 0x829f + u16::from(trail - 0xa1);
+            }
+            dictionary_head(bytes)
+        };
+        let start = bound(&operands[4]);
+        let end = bound(&operands[5]);
+        let found = object.rows.keys()
+            .skip_while(|key| !(start..=end).contains(&dictionary_head(key)))
+            .take_while(|key| dictionary_head(key) <= end)
+            .nth(ordinal);
+        write_fes_string(shared, second, found.map_or_else(Vec::new, Vec::clone));
+        write_fes_number(shared, first, u32::from(found.is_some()));
+        return Ok(true);
+    }
+    let key = normalize_key(trim_nul(&operands[count - 1]))?;
+    let row = object.rows.get(&key);
+    match verb.as_slice() {
+        b"dic_appear" => write_fes_number(shared, first, row.map_or(0, |row| row.state[0])),
+        b"dic_max_appear" => {
+            let mask = row.map_or(0, |row| row.indications.iter().take(24).enumerate()
+                .filter(|(_, text)| !text.is_empty())
+                .fold(0, |mask, (bit, _)| mask | (1 << bit)));
+            write_fes_number(shared, first, mask);
+        }
+        b"dic_id" => {
+            let ordinal = object.rows.keys().position(|index| *index == key).map_or(0, |i| i + 1);
+            write_fes_number(shared, first, ordinal as u32);
+        }
+        b"dic_title" => {
+            write_fes_string(shared, first, row.map_or_else(Vec::new, |row| row.title.clone()));
+            write_fes_string(shared, second, row.map_or_else(Vec::new, |row| row.short_title.clone()));
+        }
+        b"dic_ind" => {
+            let mut output = Vec::new();
+            if let Some(row) = row {
+                for (bit, text) in row.indications.iter().take(24).enumerate() {
+                    if row.state[0] & (1 << bit) != 0 && !text.is_empty() {
+                        output.extend_from_slice(&object.separators[1]);
+                        output.extend_from_slice(text);
+                        output.extend_from_slice(&object.separators[2]);
+                    }
+                }
+            }
+            write_fes_string(shared, first, output);
+        }
+        b"dic_update" => {
+            let [_, updated_bits, new] = row.map_or([0; 3], |row| row.state);
+            write_fes_number(shared, second, updated_bits);
+            write_fes_number(shared, first, new);
+        }
+        b"dic_update_clear" => {
+            if let Some(row) = object.rows.get_mut(&key) {
+                if row.state[1..] != [0, 0] {
+                    row.state[1..].fill(0);
+                    object.dirty = true;
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(true)
+}
+
+fn dictionary_head(bytes: &[u8]) -> u16 {
+    match bytes {
+        [lead @ (0x81..=0x9f | 0xe0..=0xfc), trail, ..] => u16::from_be_bytes([*lead, *trail]),
+        [byte, ..] => u16::from(*byte),
+        [] => 0,
+    }
+}
+
+fn write_fes_number(shared: &mut ExpressionState, index: i32, value: u32) {
+    if let Some(slot) = shared.shared.get_mut(index as usize) { *slot = value as i32; }
+}
+
+fn write_fes_string(shared: &mut ExpressionState, index: i32, value: Vec<u8>) {
+    if index >= 0 { shared.strings.insert(index as u32, value); }
 }
 
 impl LoggingHost<'_> {
@@ -249,4 +366,90 @@ fn normalize_key(key: &[u8]) -> Result<Vec<u8>> {
         } else { cursor += 1; }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HeadlessPlayer;
+    use cs2_script::Host;
+
+    #[test]
+    fn fes_dictionary_queries_real_newton_qdb_and_kcs_unlocks() -> anyhow::Result<()> {
+        let game_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games/\u{725b}\u{987f}\u{4e0e}\u{82f9}\u{679c}\u{6811}");
+        if !game_root.join("tips.qdb").is_file() { return Ok(()); }
+        let root = std::env::temp_dir().join(format!(
+            "cs2-dictionary-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let fixture = Fixture(root);
+        std::fs::create_dir(fixture.0.join("qdb"))?;
+        std::fs::copy(game_root.join("tips.qdb"), fixture.0.join("qdb/tips.qdb"))?;
+        std::fs::write(fixture.0.join("startup.xml"), b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><document><INT><int00><name>database</name><int>qdb.int</int><ext>qdb</ext><dir>qdb</dir></int00></INT></document>")?;
+        let mut player = HeadlessPlayer::open_with_save_root(&fixture.0, fixture.0.join("profile"))?;
+        let owner = player.current_task_id;
+        let (handle, ordinal, id) = player.with_host(|host| {
+            let mut vm = Vm::new();
+            vm.load_program(cs2_script::KcsProgram::from_code(&[0x3b], vec![0; 256], 64)?, vec![])?;
+            vm.write(8, b"tips\0")?;
+            vm.write(24, b"\\n\0")?;
+            vm.write(40, b"[\0")?;
+            vm.write(56, b"]\0")?;
+            let args = [8_u32, 24, 40, 56].map(u32::to_le_bytes).concat();
+            let NativeReturn::Value(handle) = host.call(869, &args, &mut vm)? else {
+                anyhow::bail!("KCDB create failed");
+            };
+            anyhow::ensure!(host.data_services.databases.objects[&handle].rows.len() > 100);
+            vm.write(72, b"\x82\xa0\x82\xa2\0")?;
+            let args = [handle, 0, 72].map(u32::to_le_bytes).concat();
+            host.call(871, &args, &mut vm)?;
+            let rows = &host.data_services.databases.objects[&handle].rows;
+            let key = b"\x82\xa0\x82\xa2";
+            let ordinal = rows.keys().filter(|index| (0x82a0..=0x82a8).contains(&dictionary_head(index)))
+                .position(|index| index.as_slice() == key).unwrap();
+            let id = rows.keys().position(|index| index.as_slice() == key).unwrap() + 1;
+            Ok((handle, ordinal, id))
+        })?;
+        let lines = [
+            format!("$99 = {handle}").into_bytes(),
+            b"strvar 20 \x82\xa0".to_vec(),
+            b"strvar 21 \x82\xa8".to_vec(),
+            format!("dic_find $99 40 30 {ordinal} $str20 $str21").into_bytes(),
+            b"dic_id $99 41 $str30".to_vec(),
+            b"dic_appear $99 42 $str30".to_vec(),
+            b"dic_max_appear $99 43 $str30".to_vec(),
+            b"dic_title $99 31 32 $str30".to_vec(),
+            b"dic_ind $99 33 $str30".to_vec(),
+            b"dic_update $99 44 45 $str30".to_vec(),
+            b"dic_update_clear $99 $str30".to_vec(),
+            b"dic_update $99 46 47 $str30".to_vec(),
+            b"wait 1".to_vec(),
+        ];
+        let document = cs2_script::FesDocument {
+            sections: vec![cs2_script::FesSection {
+                header: b"START".to_vec(),
+                lines: lines.into_iter().enumerate().map(|(offset, bytes)|
+                    cs2_script::FesLine { offset, bytes }).collect(),
+            }],
+        };
+        player.with_host(|host| Ok(host.begin_direct_fes_entry(owner, document, Default::default())?))?;
+        player.run_frames(1, 10_000)?;
+        player.with_host(|host| {
+            let state = &host.data_services.databases.objects[&handle].rows[b"\x82\xa0\x82\xa2".as_slice()].state;
+            assert_eq!(*state, [1, 0, 0]);
+            assert_eq!(host.shared_values[40..48], [1, id as u32, 1, 1, 1, 1, 0, 0]);
+            assert_eq!(host.string_values.get(&30).map(Vec::as_slice), Some(b"\x82\xa0\x82\xa2".as_slice()));
+            assert_eq!(host.string_values.get(&31).map(Vec::as_slice), Some(b"\x88\xa4".as_slice()));
+            assert_eq!(host.string_values.get(&32).map(Vec::as_slice), Some(b"\x82\xa0\x82\xa2".as_slice()));
+            assert!(host.string_values.get(&33).is_some_and(|value| value.starts_with(b"[")));
+            Ok(())
+        })?;
+        Ok(())
+    }
 }

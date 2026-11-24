@@ -894,16 +894,26 @@ pub(super) fn prepare_release_owner(host: &mut LoggingHost<'_>, owner: u32) -> R
 fn load_record(host: &mut LoggingHost<'_>, record: &mut SoundBank) -> Result<bool> {
     let Some(mut stage) = record.load_stage else { return Ok(true); };
     if stage == 0 {
-        if record.file.is_empty() {
+        // Input callbacks can replace FILE while this bank is suspended in
+        // stage 1. The media cursor still owns that earlier load. Finish its
+        // receiver before releasing the channel and starting the new request.
+        if let Some(result) = host.resume_task_sound_load()? {
+            if result == NativeReturn::Retry { return Ok(false); }
+            if !record.group.is_empty() {
+                let NativeReturn::Value(channel) = result else { bail!("SOUND grouped load did not return a channel"); };
+                record.channel = channel as i32;
+            }
+        }
+        if record.file.is_empty() || (record.channel != -1 && record.load_values[0] == 0) {
             control(host, 156, record.channel, 0)?;
-            if host.task_waits_for_audio(host.current_task_id) { return Ok(false); }
+            if host.poll_task_audio_start(host.current_task_id)? == Some(NativeReturn::Retry) {
+                return Ok(false);
+            }
+        }
+        if record.file.is_empty() {
             record.load_stage = None;
             record.dirty = true;
             return Ok(true);
-        }
-        if record.channel != -1 && record.load_values[0] == 0 {
-            control(host, 156, record.channel, 0)?;
-            if host.task_waits_for_audio(host.current_task_id) { return Ok(false); }
         }
         record.load_stage = Some(1);
         stage = 1;

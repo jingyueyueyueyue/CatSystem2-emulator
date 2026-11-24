@@ -32,6 +32,7 @@ pub struct HostPerfDetails {
     sample_lists: bool,
     gpu_output: GpuOutputSample,
     emote_gpu: EmoteGpuSample,
+    emote_scene: EmoteSceneSample,
     warmup_notes: Vec<String>,
     audio_async_notes: Vec<String>,
     visual_notes: Vec<(&'static str, String)>,
@@ -76,6 +77,15 @@ impl HostPerfDetails {
         }
         if let Some(row) = self.gpu_output.row(session, frame, call) {
             let _ = append_row_reserving(&mut rows, &row, text_reserve);
+        }
+        let scene = self.emote_scene;
+        if scene.updated + scene.held + scene.static_held != 0 {
+            let row = format!(
+                "emote_scene session={session} frame={frame} call={call} updated={} held={} static_held={} stale={} max_lag={} max_age_us={}",
+                scene.updated, scene.held, scene.static_held, scene.stale, scene.max_lag,
+                scene.max_age.as_micros(),
+            );
+            append_row_reserving(&mut rows, &row, text_reserve);
         }
         if self.emote_gpu.poses != 0 {
             let sample = self.emote_gpu;
@@ -273,6 +283,35 @@ struct EmoteGpuSample {
     parallel_copy_bytes: usize,
 }
 
+#[derive(Default)]
+struct EmoteSceneSample {
+    updated: usize,
+    held: usize,
+    static_held: usize,
+    stale: usize,
+    max_lag: u64,
+    max_age: Duration,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_scene_pose(updated: bool, changing: bool, tick_lag: u64, age: Duration) {
+    DETAIL.with_borrow_mut(|slot| {
+        let Some(detail) = slot else { return };
+        let sample = &mut detail.emote_scene;
+        if updated {
+            sample.updated += 1;
+        } else if changing {
+            sample.held += 1;
+        } else {
+            sample.static_held += 1;
+            return;
+        }
+        sample.stale += usize::from(tick_lag > 2 || age > Duration::from_millis(50));
+        sample.max_lag = sample.max_lag.max(tick_lag);
+        sample.max_age = sample.max_age.max(age);
+    });
+}
+
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
 pub(super) fn emote_prep_parallel(wall: Duration, join: Duration, copy_bytes: usize) {
     DETAIL.with_borrow_mut(|slot| {
@@ -397,6 +436,15 @@ pub(super) fn emote_gpu_pose(
             for (total, elapsed) in sample.elapsed.iter_mut().zip(elapsed) {
                 *total += elapsed;
             }
+        }
+    });
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_gpu_encode_elapsed(elapsed: Duration) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            detail.emote_gpu.elapsed[2] += elapsed;
         }
     });
 }

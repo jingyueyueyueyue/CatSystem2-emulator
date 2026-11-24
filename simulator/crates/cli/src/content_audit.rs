@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use cs2_formats::{AnmFile, HgFile, MpegProgramStream, OggVorbis};
-use cs2_runtime::{ArchiveStatus, GameRoot, ResourceIndex};
+use cs2_formats::{AnmFile, CstlTable, HgFile, MpegProgramStream, OggVorbis};
+use cs2_runtime::{ArchiveStatus, GameRoot, ResourceIndex, ResourceLocation};
 use cs2_script::{CstDocument, FesProgram, KcsProgram};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -45,6 +45,12 @@ pub struct ArchiveAudit {
 pub struct ScriptAudit {
     pub kcs_files: u64,
     pub cst_files: u64,
+    pub cstl_files: u64,
+    pub cst_record_kinds: BTreeMap<String, u64>,
+    pub cst_commands: BTreeMap<String, CstCommandAudit>,
+    pub cstl_languages: BTreeMap<String, u64>,
+    pub cstl_rows: u64,
+    pub cstl_with_trailing_bytes: u64,
     pub fes_files: u64,
     pub anm_files: u64,
     pub parse_failures: u64,
@@ -53,6 +59,13 @@ pub struct ScriptAudit {
     /// Keep program identity and instruction offsets: numeric slots alone
     /// cannot distinguish ordinary, motion and particle callback tables.
     pub kcs_programs: Vec<KcsProgramAudit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CstCommandAudit {
+    pub occurrences: u64,
+    pub first_resource: String,
+    pub first_record: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,9 +163,15 @@ pub fn audit_game(path: &Path) -> Result<GameAudit> {
             extension_bytes(file.relative_path.as_os_str().to_string_lossy().as_bytes());
         if let Some(extension) = extension {
             *resource_counts.entry(extension.clone()).or_insert(0) += 1;
-            if matches!(extension.as_str(), "kcs" | "cst" | "fes" | "anm") {
+            if matches!(extension.as_str(), "kcs" | "cst" | "cstl" | "fes" | "anm") {
                 let name = file.relative_path.to_string_lossy().to_string();
-                match resources.read(&name) {
+                let path = resources.root().join(&file.relative_path);
+                let candidate = resources.candidates(&name).iter().find(|candidate| {
+                    matches!(&candidate.location, ResourceLocation::File { path: source } if *source == path)
+                });
+                let bytes = candidate.context("loose file is absent from the resource index")
+                    .and_then(|candidate| resources.read_candidate(candidate).map_err(Into::into));
+                match bytes {
                     Ok(bytes) => {
                         audit_script(&bytes, &extension, &name, &mut scripts, &mut diagnostics)
                     }
@@ -225,7 +244,7 @@ pub fn audit_game(path: &Path) -> Result<GameAudit> {
                 String::from_utf8_lossy(&entry.raw_name)
             );
             match extension.as_str() {
-                "kcs" | "cst" | "fes" | "anm" => {
+                "kcs" | "cst" | "cstl" | "fes" | "anm" => {
                     match resources.read_archive_entry_at(archive_index, entry_index) {
                         Ok(bytes) => {
                             audit_script(&bytes, &extension, &name, &mut scripts, &mut diagnostics)
@@ -345,7 +364,26 @@ fn audit_script(
         "cst" => {
             audit.cst_files += 1;
             CstDocument::parse(bytes)
-                .map(|_| ())
+                .map(|document| {
+                    for (index, record) in document.records.iter().enumerate() {
+                        *audit.cst_record_kinds.entry(format!("{:#04x}", record.kind)).or_default() += 1;
+                        if record.kind == 0x30 {
+                            audit_cst_command(&record.text, name, index, &mut audit.cst_commands);
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }
+        "cstl" => {
+            audit.cstl_files += 1;
+            CstlTable::parse_prefix(bytes)
+                .map(|(table, consumed)| {
+                    for language in table.languages {
+                        *audit.cstl_languages.entry(language).or_default() += 1;
+                    }
+                    audit.cstl_rows += table.messages.len() as u64;
+                    audit.cstl_with_trailing_bytes += u64::from(consumed < bytes.len());
+                })
                 .map_err(|error| error.to_string())
         }
         "fes" => {
@@ -369,6 +407,37 @@ fn audit_script(
             message: format!("{extension} parse failed: {message}"),
         });
     }
+}
+
+fn audit_cst_command(
+    mut bytes: &[u8], name: &str, index: usize, commands: &mut BTreeMap<String, CstCommandAudit>,
+) {
+    loop {
+        bytes = bytes.trim_ascii_start();
+        let Some(head) = cst_command_head(bytes) else { break };
+        commands.entry(head).or_insert_with(|| CstCommandAudit {
+            occurrences: 0,
+            first_resource: name.to_owned(),
+            first_record: index,
+        }).occurrences += 1;
+        let Some(condition) = bytes.strip_prefix(b"if").map(<[u8]>::trim_ascii_start)
+            .filter(|tail| tail.first() == Some(&b'(')) else { break };
+        let mut depth = 0;
+        let Some(end) = condition.iter().position(|byte| match byte {
+            b'(' => { depth += 1; false }
+            b')' => { depth -= 1; depth == 0 }
+            _ => false,
+        }) else { break };
+        bytes = &condition[end + 1..];
+    }
+}
+
+fn cst_command_head(bytes: &[u8]) -> Option<String> {
+    if bytes.first() == Some(&b'#') {
+        return Some("#assignment".into());
+    }
+    let head = bytes.split(|byte| byte.is_ascii_whitespace() || *byte == b'(').next()?;
+    (!head.is_empty()).then(|| String::from_utf8_lossy(head).to_ascii_lowercase())
 }
 
 fn host_table_hint(resource: &str) -> &'static str {

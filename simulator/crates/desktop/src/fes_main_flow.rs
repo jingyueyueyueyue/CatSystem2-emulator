@@ -491,14 +491,8 @@ pub(crate) fn prepare_navigation(host: &mut LoggingHost<'_>, owner: u32, key: u3
     // Own the actual point before releasing the immutable scene borrow.
     let target_point = |index: usize| -> Result<(FesDriverTarget, [i32; 2])> {
         let button = &buttons[index];
-        let layer = &runtime.media[&button.key];
-        let mut point = [0, 1].map(|axis| button.position[axis].wrapping_add(layer.navigation.offset[axis]));
-        if let Some(plane) = layer.plane.as_deref().and_then(|name| runtime.driver_plane_key(name))
-            .filter(|name| runtime.planes[*name].expose != 0) {
-            let view = FesTaskView { id: owner, parent: 0, context: Vec::new(), list: None, now: 0, paused: 0 };
-            let words = crate::fes_motion::plane_render_properties(host, &view, runtime, plane)?;
-            for axis in 0..2 { point[axis] = point[axis].wrapping_add(x86_integer(f32::from_bits(words[6 + axis]))); }
-        }
+        let view = FesTaskView { id: owner, parent: 0, context: Vec::new(), list: None, now: 0, paused: 0 };
+        let point = button_pointer_point(host, &view, runtime, &button.key, button.position)?;
         Ok((button.target.clone(), point))
     };
     let prepared = selected.or(next).map(target_point).transpose()?;
@@ -507,6 +501,18 @@ pub(crate) fn prepare_navigation(host: &mut LoggingHost<'_>, owner: u32, key: u3
         dispatch.pointer = Some(point);
         Ok((dispatch, None))
     } else { Ok((dispatch, response)) }
+}
+
+pub(super) fn button_pointer_point(host: &LoggingHost<'_>, view: &FesTaskView, runtime: &FesRuntime,
+    key: &str, origin: [i32; 2]) -> Result<[i32; 2]> {
+    let layer = &runtime.media[key];
+    let mut point = [0, 1].map(|axis| origin[axis].wrapping_add(layer.navigation.offset[axis]));
+    if let Some(plane) = layer.plane.as_deref().and_then(|name| runtime.driver_plane_key(name))
+        .filter(|name| runtime.planes[*name].expose != 0) {
+        let words = crate::fes_motion::plane_render_properties(host, view, runtime, plane)?;
+        for axis in 0..2 { point[axis] = point[axis].wrapping_add(x86_integer(f32::from_bits(words[6 + axis]))); }
+    }
+    Ok(point)
 }
 
 pub(crate) fn advance_navigation(host: &mut LoggingHost<'_>, owner: u32,
@@ -526,7 +532,7 @@ pub(crate) fn advance_navigation(host: &mut LoggingHost<'_>, owner: u32,
     }
     if pending.stage == 1 {
         if let Some(point) = pending.pointer {
-            host.move_fes_navigation_pointer(owner, point)?;
+            host.move_fes_pointer(owner, point, 1)?;
         }
         pending.stage = 2;
     }

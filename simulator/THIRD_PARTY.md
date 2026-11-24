@@ -66,6 +66,17 @@ The local copy checks the packet mode index in the sample-count estimator.
 The original license is in `vendor/lewton-0.10.2/LICENSE` and is included
 in Android packages.
 
+## wgpu hardware abstraction layer
+
+The Vulkan and DX12 backends use wgpu-hal 27.0.4 under MIT or Apache-2.0.
+The local copy comes from commit `af91efa93da2af9366b252ed7b9a089175f4874e`
+with registry checksum
+`5b21cb61c57ee198bc4aff71aeadff4cbb80b927beb912506af9c780d64313ce`.
+On Android Adreno, the encoder recycles its Rust state and retires each Vulkan
+command pool once its buffers are idle.
+Both original licenses are retained under `vendor/wgpu-hal-27.0.4/` and
+included in Android packages.
+
 ## Other fixed research references
 
 The commit, origin and hash of retained license files for all eight snapshots

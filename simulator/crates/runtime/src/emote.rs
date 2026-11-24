@@ -613,6 +613,11 @@ pub trait EmoteBackend: Send {
         self.advance(task, tick)
     }
     fn render_rgba(&mut self, task: u32) -> Result<EmoteRasterFrame>;
+    fn render_sampled_scene_rgba(
+        &mut self, _task: u32, _sample: &CpuPlayer, _variables: &BTreeMap<String, f64>,
+    ) -> Result<EmoteRasterFrame> {
+        Err(EmoteError::Backend("backend does not support sampled scene poses".into()))
+    }
     fn scene_raster_player(&self, _task: u32) -> Option<(&CpuPlayer, CpuViewport)> {
         None
     }
@@ -731,6 +736,7 @@ pub trait EmoteBackend: Send {
     fn surface_holds_tick(&self, _task: u32, _now: u32) -> Result<bool> {
         Err(EmoteError::Backend("backend does not expose M2 surface ownership".into()))
     }
+    fn hold_idle_scene_tick(&mut self, _task: u32, _now: u32) -> bool { false }
     /// Original M2Plane+388 is ARGB, defaultffffffff in constructor237cf0.
     /// Hosts propagate actual task color here; this is separate from native919.
     fn set_base_argb(&mut self, _task: u32, _argb: u32) -> Result<()> {
@@ -1010,12 +1016,24 @@ impl EmoteServices {
         Ok(())
     }
 
+    pub fn hold_idle_scene_tick(&mut self, task: u32, now: u32) -> bool {
+        self.backend.as_mut().is_some_and(|backend| backend.hold_idle_scene_tick(task, now))
+    }
+
     pub fn render_rgba(&mut self, task: u32) -> Result<EmoteRasterFrame> {
         self.require_task(task)?;
         self.backend
             .as_mut()
             .ok_or(EmoteError::MissingBackend)?
             .render_rgba(task)
+    }
+
+    pub fn render_sampled_scene_rgba(
+        &mut self, task: u32, sample: &CpuPlayer, variables: &BTreeMap<String, f64>,
+    ) -> Result<EmoteRasterFrame> {
+        self.require_task(task)?;
+        self.backend.as_mut().ok_or(EmoteError::MissingBackend)?
+            .render_sampled_scene_rgba(task, sample, variables)
     }
 
     pub fn scene_raster_player(&self, task: u32) -> Option<(&CpuPlayer, CpuViewport)> {

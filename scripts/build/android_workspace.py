@@ -761,6 +761,9 @@ def build_apk(sdk: Path, output: Path, attempt: BuildAttempt, *, skip_media: boo
                  general_notices / "fontdue-LICENSE-MIT.txt")
     shutil.copy2(simulator / "vendor/lewton-0.10.2/LICENSE",
                  general_notices / "lewton-LICENSE.txt")
+    for license_name in ("LICENSE.MIT", "LICENSE.APACHE"):
+        shutil.copy2(simulator / "vendor/wgpu-hal-27.0.4" / license_name,
+                     general_notices / f"wgpu-hal-{license_name}.txt")
     env["CS2_ANDROID_MEDIA_LIBS"] = ascii_path(media_libraries).as_posix()
     env["CS2_ANDROID_MEDIA_NOTICES"] = ascii_path(media_notices).as_posix()
     profile = profile or ("android-integration" if attempt.integration else "release")

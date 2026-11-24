@@ -1,24 +1,23 @@
-//! Android C ABI. A Java worker thread owns each player and all its calls.
-//! The small NDK JNI bridge borrows Surface pixels; no original game code is
-//! loaded. Failed operations retain their diagnostic and return an error.
+//! Android C ABI. The engine thread owns each player. The Surface thread
+//! consumes immutable completed frames and owns Vulkan/EGL presentation.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
-use cs2_desktop::{HeadlessPlayer, HostFrameTiming, HostPerfDetails};
+use cs2_desktop::{HeadlessPlayer, HostFrameTiming, HostPerfDetails, HostPresentationFrame};
 use cs2_runtime::{InputEvent, InputKey};
 use cs2_runtime::message_object::MessageTextInputEvent;
 use cs2_runtime::resource_router::GameLanguage;
 
 #[derive(Default)]
 struct Sessions {
-    next: u64,
     players: BTreeMap<u64, HeadlessPlayer>,
-    displayed_frames: BTreeMap<u64, DisplayedFrame>,
+    published_frames: BTreeMap<u64, Arc<PresentationFrame>>,
     story_traces: BTreeMap<u64, StoryTrace>,
     error: CString,
+    diagnostic: CString,
     perf_details: CString,
     clipboard: CString,
     clipboard_units: Vec<u16>,
@@ -33,44 +32,41 @@ struct Sessions {
     stalled_steps: usize,
 }
 
-#[derive(Default)]
-struct DisplayedFrame {
-    size: [u32; 2],
-    rgba: Vec<u8>,
-    device_revision: Option<u64>,
-}
-
-impl DisplayedFrame {
-    fn matches(&self, size: [u32; 2], rgba: &[u8]) -> bool {
-        self.device_revision.is_none() && self.size == size && self.rgba == rgba
-    }
-
-    fn record(&mut self, size: [u32; 2], rgba: &[u8]) {
-        self.rgba.clear();
-        self.rgba.extend_from_slice(rgba);
-        self.size = size;
-        self.device_revision = None;
-    }
-
-    fn matches_player(&self, player: &HeadlessPlayer) -> bool {
-        if let Some(revision) = player.host_device_frame_revision() {
-            return self.device_revision == Some(revision);
-        }
-        self.device_revision.is_none() && self.matches(player.logical_size(), player.frame_rgba())
-    }
-
-    fn record_player(&mut self, player: &HeadlessPlayer) {
-        if let Some(revision) = player.host_device_frame_revision() {
-            self.device_revision = Some(revision);
-            self.rgba.clear();
-        } else {
-            self.record(player.logical_size(), player.frame_rgba());
-        }
-    }
-}
-
 const FRAME_CHANGED: i32 = 1;
 const FRAME_UNCHANGED: i32 = 4;
+const FRAME_MOVIE: i32 = 5;
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+struct PresentationFrame {
+    id: u64,
+    revision: u64,
+    device_revision: Option<u64>,
+    frame: HostPresentationFrame,
+}
+
+impl PresentationFrame {
+    fn matches_player(&self, player: &HeadlessPlayer) -> bool {
+        // Publish backend changes even if the visible frame is unchanged. The
+        // presentation thread can then release the retired device and surface.
+        #[cfg(target_os = "android")]
+        if !self.frame.has_current_android_device() {
+            return false;
+        }
+        match (self.device_revision, player.host_device_frame_revision()) {
+            (Some(previous), Some(current)) => previous == current,
+            (None, None) => self.frame.size() == player.logical_size() && self.frame.rgba() == player.frame_rgba(),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FrameOutput {
+    latest: Option<Arc<PresentationFrame>>,
+    inputs: VecDeque<(u64, u64)>,
+}
+
+static FRAME_OUTPUT: Mutex<BTreeMap<u64, FrameOutput>> = Mutex::new(BTreeMap::new());
 
 const STORY_HEARTBEAT_FRAMES: u64 = 30;
 const STORY_SCENE_LIMIT: usize = 256;
@@ -180,6 +176,7 @@ fn resolve_inputs_without_present(id: u64, reason: &str) {
 
 thread_local! {
     static SESSIONS: RefCell<Sessions> = RefCell::new(Sessions::default());
+    static PRESENTATION_FRAME: RefCell<Option<(Arc<PresentationFrame>, VecDeque<(u64, u64)>)>> = const { RefCell::new(None) };
 }
 
 fn call<T: Copy>(failure: T, operation: impl FnOnce(&mut Sessions) -> Result<T, String>) -> T {
@@ -191,11 +188,44 @@ fn call<T: Copy>(failure: T, operation: impl FnOnce(&mut Sessions) -> Result<T, 
                 sessions.error = CString::new(error.replace('\0', " ")).unwrap_or_default();
                 failure
             }
-            Err(_) => {
-                sessions.error = CString::new("Android player operation panicked").unwrap();
+            Err(payload) => {
+                let message = payload.downcast_ref::<String>().map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic payload");
+                sessions.error = CString::new(format!("Android player operation panicked: {message}").replace('\0', " "))
+                    .unwrap_or_default();
                 failure
             }
         }
+    })
+}
+
+fn runtime_diagnostic(id: u64, player: &HeadlessPlayer, error: bool) -> String {
+    use std::fmt::Write;
+
+    let mut output = format!("session={id} {}", player.host_runtime_diagnostic());
+    let events = player.events();
+    let mut important: Vec<_> = events.iter().rev().filter(|event| {
+        event.kind == "save-slot-read" || error && event.kind.ends_with("-error")
+    }).take(8).collect();
+    important.reverse();
+    let tail = if error { &events[events.len().saturating_sub(20)..] } else { &[] };
+    for event in important.into_iter().filter(|event| !tail.iter().any(|other| std::ptr::eq(*event, other)))
+        .chain(tail)
+    {
+        let detail: String = event.detail.chars().take(400).collect();
+        let _ = writeln!(output, "event frame={} {} {detail}", event.frame, event.kind);
+    }
+    output
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_diagnostic(id: u64) -> *const c_char {
+    call(std::ptr::null(), |sessions| {
+        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
+        sessions.diagnostic = CString::new(runtime_diagnostic(id, player, false).replace('\0', " "))
+            .unwrap_or_default();
+        Ok(sessions.diagnostic.as_ptr())
     })
 }
 
@@ -207,7 +237,7 @@ unsafe fn path(value: *const c_char) -> Result<String, String> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cs2_android_open(game: *const c_char, saves: *const c_char, story: i32) -> u64 {
-    unsafe { open_game(game, saves, story, GameLanguage::Automatic) }
+    unsafe { open_game(game, saves, story, GameLanguage::Automatic, 0) }
 }
 
 #[unsafe(no_mangle)]
@@ -218,12 +248,22 @@ pub extern "C" fn cs2_android_tick_delay(id: u64, reset: i32) -> i32 {
     })
 }
 
-unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, language: GameLanguage) -> u64 {
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_retry_delay(id: u64) -> i32 {
+    call(-1, |sessions| {
+        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
+        Ok(player.host_frame_retry_delay_ms() as i32)
+    })
+}
+
+unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, language: GameLanguage,
+    available_memory: u64,
+) -> u64 {
     call(0, |sessions| {
         let game = unsafe { path(game)? };
         let saves = unsafe { path(saves)? };
         HeadlessPlayer::enable_host_gpu_raster();
-        let mut player = HeadlessPlayer::open_with_game_language(&game, &saves, language)
+        let mut player = HeadlessPlayer::open_with_android_memory(&game, &saves, language, available_memory)
             .map_err(|error| format!("Open game: {error:#}"))?;
         player.disable_script_evidence_capture();
         player.enable_host_window_requests();
@@ -233,6 +273,7 @@ unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, langu
         player.set_host_input_update_rate(60);
         player.set_host_iteration_work_budget(Some(std::time::Duration::from_millis(4)));
         player.enable_host_async_images();
+        player.enable_host_emote_pose_jobs();
         player.enable_host_system_open_queue();
         player.enable_host_tweet_queue();
         player.enable_host_dialog_queue();
@@ -241,9 +282,11 @@ unsafe fn open_game(game: *const c_char, saves: *const c_char, story: i32, langu
         }
         player.load_startup().map_err(|error| format!("Load startup: {error:#}"))?;
         player.enable_host_tick_pacing();
-        let id = sessions.next.checked_add(1).ok_or("Android session ids exhausted")?;
-        sessions.next = id;
-        for note in player.log().iter().filter(|note| note.starts_with("font_prewarm ")).take(1) {
+        let id = NEXT_SESSION.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| "Android session ids exhausted")?;
+        for note in player.log().iter().filter(|note| note.starts_with("font_prewarm ")
+            || note.starts_with("fast_forward_policy "))
+        {
             input_report(&format!("{note} session={id}"));
         }
         sessions.players.insert(id, player);
@@ -272,12 +315,20 @@ pub unsafe extern "C" fn cs2_android_gpu_timing(sequence: *mut u64, elapsed_ns: 
 pub unsafe extern "C" fn cs2_android_open_profiled_v4(
     game: *const c_char, saves: *const c_char, story: i32, language: i32, timing: *mut HostFrameTiming,
 ) -> u64 {
+    unsafe { cs2_android_open_profiled_v5(game, saves, story, language, timing, 0) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_open_profiled_v5(
+    game: *const c_char, saves: *const c_char, story: i32, language: i32, timing: *mut HostFrameTiming,
+    available_memory: u64,
+) -> u64 {
     let language = match language {
         1 => GameLanguage::Japanese,
         2 => GameLanguage::Localized,
         _ => GameLanguage::Automatic,
     };
-    let open = || unsafe { open_game(game, saves, story, language) };
+    let open = || unsafe { open_game(game, saves, story, language, available_memory) };
     if let Some(timing) = unsafe { timing.as_mut() } {
         let (id, sample) = HostFrameTiming::capture(open);
         *timing = sample;
@@ -293,7 +344,11 @@ pub extern "C" fn cs2_android_close(id: u64) -> i32 {
         let mut player = sessions.players.remove(&id).ok_or("Android session is absent")?;
         player.cancel_host_tweet_requests();
         let saved = player.persist_host_configuration();
-        sessions.displayed_frames.remove(&id);
+        sessions.published_frames.remove(&id);
+        let discarded = FRAME_OUTPUT.lock().ok().and_then(|mut output| output.remove(&id));
+        if let Some(output) = discarded {
+            report_unresolved_inputs(id, output.inputs, "close");
+        }
         sessions.story_traces.remove(&id);
         sessions.message_revisions.remove(&id);
         sessions.scene_revisions.remove(&id);
@@ -660,6 +715,8 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
         drain_pending_input(id, player)?;
+        #[cfg(target_os = "android")]
+        player.maintain_host_gpu_memory();
         let step = if let Some(timing) = unsafe { timing.as_mut() } {
             let mut advance = || HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
             let (result, sample) = if let Some(output) = detail_rows {
@@ -680,24 +737,15 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
         };
         let completed = match step {
             Ok(completed) => completed,
-            Err(error) => {
-                let events = player.events();
-                let recent = events[events.len().saturating_sub(8)..].iter()
-                    .map(|event| format!("frame={} {} {}", event.frame, event.kind, event.detail))
-                    .collect::<Vec<_>>().join("\n");
-                return Err(format!("Script: {error:#}\n{recent}"));
-            }
+            Err(error) => return Err(format!("Script: {error:#}\n{}", runtime_diagnostic(id, player, true))),
         };
         if completed {
             sessions.stalled_steps = 0;
         } else {
             sessions.stalled_steps += 1;
             if sessions.stalled_steps == 128 {
-                let events = player.events();
-                let recent = events[events.len().saturating_sub(12)..].iter()
-                    .map(|event| format!("frame={} {} {}", event.frame, event.kind, event.detail))
-                    .collect::<Vec<_>>().join("\n");
-                sessions.error = CString::new(format!("{}\n{recent}", player.host_tick_state()).replace('\0', " ")).unwrap_or_default();
+                sessions.error = CString::new(runtime_diagnostic(id, player, true).replace('\0', " "))
+                    .unwrap_or_default();
                 return Ok(3);
             }
         }
@@ -706,9 +754,9 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
             2
         } else if !completed {
             0
-        } else if !player.has_unsubmitted_movie_frame().map_err(|cause| cause.to_string())?
-            && sessions.displayed_frames.get(&id).is_some_and(|frame| frame.matches_player(player))
-        {
+        } else if player.has_unsubmitted_movie_frame().map_err(|cause| cause.to_string())? {
+            FRAME_MOVIE
+        } else if sessions.published_frames.get(&id).is_some_and(|frame| frame.matches_player(player)) {
             FRAME_UNCHANGED
         } else {
             FRAME_CHANGED
@@ -770,6 +818,62 @@ pub extern "C" fn cs2_android_take_cursor_visibility(id: u64) -> i32 {
     })
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_cursor_image(id: u64, output: *mut *const u8, length: *mut usize) -> i32 {
+    call(-1, |sessions| {
+        if output.is_null() || length.is_null() { return Err("Cursor image output is null".into()); }
+        let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
+        let Some(image) = player.take_host_cursor_image() else { return Ok(0); };
+        let bytes = &mut sessions.window_ui;
+        bytes.clear();
+        if let Some(image) = image {
+            for value in [image.width, image.height, image.hotspot[0], image.hotspot[1]] {
+                bytes.extend_from_slice(&u32::from(value).to_le_bytes());
+            }
+            bytes.extend_from_slice(&image.rgba);
+        } else { bytes.extend_from_slice(&0u32.to_le_bytes()); }
+        unsafe { *output = bytes.as_ptr(); *length = bytes.len(); }
+        Ok(1)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_text_entry(id: u64, output: *mut *const u8, length: *mut usize) -> i32 {
+    call(-1, |sessions| {
+        if output.is_null() || length.is_null() { return Err("Text-entry output is null".into()); }
+        let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
+        let Some(request) = player.take_host_text_entry() else { return Ok(0); };
+        let bytes = &mut sessions.window_ui;
+        bytes.clear();
+        append_message_bytes(bytes, &request.id.to_le_bytes())?;
+        append_message_bytes(bytes, &(request.limit as u32).to_le_bytes())?;
+        append_message_bytes(bytes, &u32::from(request.allow_cancel).to_le_bytes())?;
+        for value in [request.title, request.initial] {
+            append_message_bytes(bytes, &(value.len() as u32).to_le_bytes())?;
+            append_message_bytes(bytes, value.as_bytes())?;
+        }
+        unsafe { *output = bytes.as_ptr(); *length = bytes.len(); }
+        Ok(1)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_text_entry_result(id: u64, request: u64, accepted: i32,
+    text: *const u8, length: usize) -> i32 {
+    call(-1, |sessions| {
+        if !(0..=1).contains(&accepted) || length > 4096 || (length != 0 && text.is_null()) {
+            return Err("Invalid text-entry result".into());
+        }
+        let bytes = if length == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(text, length) } };
+        let value = if accepted == 0 { None } else {
+            Some(std::str::from_utf8(bytes).map_err(|_| "Text-entry result is not UTF-8")?.to_owned())
+        };
+        sessions.players.get_mut(&id).ok_or("Android session is absent")?
+            .complete_host_text_entry(request, value).map_err(|error| format!("Text entry: {error:#}"))?;
+        Ok(0)
+    })
+}
+
 /// Shared General policy: bit0 inhibits screen power-off, bit1 enables camouflage.
 #[unsafe(no_mangle)]
 pub extern "C" fn cs2_android_general_window_policy(id: u64) -> i32 {
@@ -806,6 +910,7 @@ pub extern "C" fn cs2_android_take_window_request(id: u64) -> i32 {
             Some(cs2_desktop::HostWindowRequest::Menu) => 4,
             Some(cs2_desktop::HostWindowRequest::MenuConfirmation) => 5,
             Some(cs2_desktop::HostWindowRequest::SystemVolume) => 6,
+            Some(cs2_desktop::HostWindowRequest::MenuInfo) => 7,
         })
     })
 }
@@ -857,6 +962,7 @@ pub extern "C" fn cs2_android_window_ui_action(
                 player.complete_host_system_volume(request, if a != 0 { Ok(()) }
                     else { Err("Android Settings.ACTION_SOUND_SETTINGS was rejected by the actual host".into()) })
             }
+            6 => player.complete_host_fes_menu_info(request),
             _ => return Err("Invalid window UI action".into()),
         };
         result.map_err(|error| format!("Window UI result: {error:#}"))?;
@@ -992,11 +1098,10 @@ pub unsafe extern "C" fn cs2_android_text(
 /// pixels, as specified by ANativeWindow_Buffer, and may exceed the width.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cs2_android_copy_frame(
-    id: u64, buffer: *mut u8, width: i32, height: i32, stride: i32,
+    buffer: *mut u8, width: i32, height: i32, stride: i32,
 ) -> i32 {
-    call(-1, |sessions| {
-        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
-        let [logical_width, logical_height] = player.logical_size();
+    with_presentation(-1, |frame, _| {
+        let [logical_width, logical_height] = frame.frame.size();
         if buffer.is_null() || width != logical_width as i32 || height != logical_height as i32 || stride < width {
             return Err("Android surface buffer does not match the logical frame".into());
         }
@@ -1004,7 +1109,7 @@ pub unsafe extern "C" fn cs2_android_copy_frame(
         let length = stride_bytes.checked_mul(height as usize).filter(|&n| n <= 512 * 1024 * 1024)
             .ok_or("Android surface exceeds its size limit")?;
         let destination = unsafe { std::slice::from_raw_parts_mut(buffer, length) };
-        let pixels = player.frame_rgba();
+        let pixels = frame.frame.rgba();
         let row_bytes = logical_width as usize * 4;
         for row in 0..logical_height as usize {
             destination[row * stride_bytes..row * stride_bytes + row_bytes]
@@ -1015,43 +1120,130 @@ pub unsafe extern "C" fn cs2_android_copy_frame(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cs2_android_frame_posted(id: u64) -> i32 {
+pub extern "C" fn cs2_android_publish_frame(id: u64, revision: u64) -> i32 {
     call(-1, |sessions| {
-        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
-        player.acknowledge_movie_frame().map_err(|cause| cause.to_string())?;
-        sessions.displayed_frames.entry(id).or_default().record_player(player);
+        let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
+        let frame = player.host_presentation_frame();
+        let [width, height] = frame.size();
+        if u64::from(width) * u64::from(height) * 4 > 512 * 1024 * 1024 {
+            return Err("Android frame exceeds its size limit".into());
+        }
+        let published = Arc::new(PresentationFrame {
+            id, revision, device_revision: player.host_device_frame_revision(), frame,
+        });
+        sessions.published_frames.insert(id, Arc::clone(&published));
+        let inputs = INPUT_QUEUES.lock().map_err(|_| "Android input mailbox is poisoned")?
+            .photon_pending.remove(&id).unwrap_or_default();
+        let (old, overflow) = {
+            let mut output = FRAME_OUTPUT.lock().map_err(|_| "Android frame mailbox is poisoned")?;
+            let output = output.entry(id).or_default();
+            let overflow = append_presentation_inputs(&mut output.inputs, inputs);
+            let old = output.latest.replace(published);
+            (old, overflow)
+        };
+        drop(old);
+        report_unresolved_inputs(id, overflow, "queue_overflow");
         Ok(0)
+    })
+}
+
+fn report_unresolved_inputs(id: u64, inputs: impl IntoIterator<Item = (u64, u64)>, reason: &str) {
+    for (input_id, input) in inputs {
+        input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason={reason}"));
+    }
+}
+
+fn append_presentation_inputs(
+    queue: &mut VecDeque<(u64, u64)>, inputs: VecDeque<(u64, u64)>,
+) -> Vec<(u64, u64)> {
+    queue.extend(inputs);
+    let discarded = queue.len().saturating_sub(64);
+    queue.drain(..discarded).collect()
+}
+
+fn with_presentation<T: Copy>(
+    failure: T,
+    operation: impl FnOnce(&PresentationFrame, &mut VecDeque<(u64, u64)>) -> Result<T, String>,
+) -> T {
+    call(failure, |_| PRESENTATION_FRAME.with_borrow_mut(|slot| {
+        let (frame, inputs) = slot.as_mut().ok_or("Android presentation has no frame")?;
+        operation(frame, inputs)
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cs2_android_begin_presentation(
+    id: u64, revision: *mut u64, width: *mut i32, height: *mut i32,
+) -> i32 {
+    call(-1, |_| {
+        if revision.is_null() || width.is_null() || height.is_null() {
+            return Err("Android presentation output pointer is absent".into());
+        }
+        let next = {
+            let mut output = FRAME_OUTPUT.lock().map_err(|_| "Android frame mailbox is poisoned")?;
+            output.get_mut(&id).and_then(|output| {
+                Some((Arc::clone(output.latest.as_ref()?), std::mem::take(&mut output.inputs)))
+            })
+        };
+        let Some((frame, inputs)) = next else { return Ok(-2); };
+        let [w, h] = frame.frame.size();
+        unsafe {
+            revision.write(frame.revision);
+            width.write(w as i32);
+            height.write(h as i32);
+        }
+        PRESENTATION_FRAME.with_borrow_mut(|slot| *slot = Some((frame, inputs)));
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_end_presentation(result: i32) -> i32 {
+    call(-1, |_| {
+        let (frame, mut inputs) = PRESENTATION_FRAME.with_borrow_mut(Option::take)
+            .ok_or("Android presentation has no frame")?;
+        if result == -2 {
+            let discarded = FRAME_OUTPUT.lock().ok().and_then(|mut output| {
+                let output = output.get_mut(&frame.id)?;
+                let discarded = append_presentation_inputs(&mut inputs, std::mem::take(&mut output.inputs));
+                output.inputs = std::mem::take(&mut inputs);
+                Some(discarded)
+            });
+            report_unresolved_inputs(frame.id, discarded.unwrap_or_default(), "queue_overflow");
+            report_unresolved_inputs(frame.id, inputs, "close");
+        } else {
+            report_unresolved_inputs(frame.id, inputs, "vulkan_unavailable");
+        }
+        if result == 0 {
+            frame.frame.acknowledge_submission().map_err(|error| format!("{error:#}"))?;
+        }
+        Ok(result)
     })
 }
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "C" fn cs2_android_vulkan_candidate(window: *mut std::ffi::c_void) -> i32 {
-    i32::from(std::ptr::NonNull::new(window).is_some_and(HeadlessPlayer::android_surface_candidate))
+    with_presentation(0, |frame, _| {
+        Ok(i32::from(std::ptr::NonNull::new(window).is_some_and(|window| {
+            frame.frame.android_surface_candidate(window)
+        })))
+    })
 }
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cs2_android_present_vulkan(id: u64, window: *mut std::ffi::c_void) -> i32 {
-    let mut inputs = INPUT_QUEUES.lock().ok()
-        .and_then(|mut queues| queues.photon_pending.remove(&id))
-        .map(Vec::from).unwrap_or_default();
-    let result = call(-1, |sessions| {
-        let player = sessions.players.get(&id).ok_or("Android session is absent")?;
+pub extern "C" fn cs2_android_present_vulkan(window: *mut std::ffi::c_void) -> i32 {
+    with_presentation(-1, |frame, inputs| {
         let Some(window) = std::ptr::NonNull::new(window) else { return Ok(-2) };
-        Ok(unsafe { player.present_android_surface(window, id, &inputs) })
-    });
-    if result == -2 && !inputs.is_empty() {
-        if let Ok(mut queues) = INPUT_QUEUES.lock() {
-            inputs.extend(queues.photon_pending.remove(&id).into_iter().flatten());
-            queues.photon_pending.insert(id, VecDeque::from(inputs));
+        let result = unsafe {
+            frame.frame.present_android_surface(window, frame.id, inputs.make_contiguous())
+        };
+        if result == 0 {
+            inputs.clear();
         }
-    } else if result != 0 {
-        for (input_id, input) in inputs {
-            input_report(&format!("input_photon_unresolved session={id} input_id={input_id} input_mono_us={input} reason=vulkan_unavailable"));
-        }
-    }
-    result
+        Ok(result)
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -1084,21 +1276,15 @@ pub extern "C" fn cs2_android_last_error() -> *const c_char {
 
 #[cfg(test)]
 mod frame_tests {
-    use super::DisplayedFrame;
+    use super::*;
 
     #[test]
-    fn suppresses_only_identical_frames_at_the_same_dimensions() {
-        let pixels = [0, 1, 2, 255, 3, 4, 5, 255];
-        let mut frame = DisplayedFrame::default();
-        assert!(!frame.matches([2, 1], &pixels));
-        frame.record([2, 1], &pixels);
-        assert!(frame.matches([2, 1], &pixels));
-        assert!(!frame.matches([1, 2], &pixels));
-        let mut changed = pixels;
-        changed[7] = 254;
-        assert!(!frame.matches([2, 1], &changed));
-        frame.record([2, 1], &changed);
-        assert!(frame.matches([2, 1], &changed));
+    fn presentation_retries_keep_input_order_within_the_queue_limit() {
+        let mut retry = (0..40).map(|id| (id, id + 1)).collect();
+        let pending = (40..80).map(|id| (id, id + 1)).collect();
+        let discarded = append_presentation_inputs(&mut retry, pending);
+        assert_eq!(discarded, (0..16).map(|id| (id, id + 1)).collect::<Vec<_>>());
+        assert_eq!(retry, (16..80).map(|id| (id, id + 1)).collect::<VecDeque<_>>());
     }
 }
 

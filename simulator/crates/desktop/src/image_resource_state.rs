@@ -84,6 +84,7 @@ impl ImageManager {
         self.initialized = p.initialized; self.enabled = p.enabled; self.capacity = p.capacity;
         self.force_cache = p.force_cache; self.bytes = p.bytes; self.rgba_bytes = p.rgba_bytes;
         self.frames = p.frames; self.recency = p.recency;
+        if self.resident_byte_budget { self.trim_resident(0); }
         self.aliases_initialized = p.aliases_initialized; self.animation_aliases = p.aliases;
         // resource_layers was prepared from canonical resources separately.
     }

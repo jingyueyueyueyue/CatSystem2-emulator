@@ -1,8 +1,10 @@
 //! Bounded, fixed-endian serde wire for the versioned host graph. Map keys
 //! retain their actual type (including resource-name bytes and tuple keys).
-//! Structs use declaration order; changing their layout requires a graph version.
+//! Structs use declaration order. Defaults on the FES driver allow trailing
+//! fields to be added without invalidating earlier driver checkpoints.
 use serde::{Deserialize, Serialize, de, ser};
 use std::fmt;
+use std::ops::RangeInclusive;
 
 const LIMIT: usize = super::MAX_GRAPH_BYTES;
 #[derive(Debug)]
@@ -135,9 +137,11 @@ impl<'de> Reader<'de> {
         let len = u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| bad())?) as usize;
         if len > LIMIT { return Err(bad()); } Ok(len)
     }
-    fn sequence<V: de::Visitor<'de>>(&mut self, visitor: V, expected: Option<usize>, map: bool) -> Result<V::Value> {
+    fn sequence<V: de::Visitor<'de>>(
+        &mut self, visitor: V, expected: Option<RangeInclusive<usize>>, map: bool,
+    ) -> Result<V::Value> {
         let len = self.count()?;
-        if expected.is_some_and(|expected| expected != len) || self.depth >= 128 { return Err(bad()); }
+        if expected.is_some_and(|expected| !expected.contains(&len)) || self.depth >= 128 { return Err(bad()); }
         self.depth += 1;
         let mut access = Access { reader: self, left: len.checked_mul(if map { 2 } else { 1 }).ok_or_else(bad)? };
         let result = if map { visitor.visit_map(&mut access) } else { visitor.visit_seq(&mut access) };
@@ -208,10 +212,18 @@ impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
     fn deserialize_unit_struct<V: de::Visitor<'de>>(self, _: &'static str, visitor: V) -> Result<V::Value> { visitor.visit_unit() }
     fn deserialize_newtype_struct<V: de::Visitor<'de>>(self, _: &'static str, visitor: V) -> Result<V::Value> { visitor.visit_newtype_struct(self) }
     fn deserialize_seq<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> { self.sequence(visitor, None, false) }
-    fn deserialize_tuple<V: de::Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(len), false) }
-    fn deserialize_tuple_struct<V: de::Visitor<'de>>(self, _: &'static str, len: usize, visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(len), false) }
+    fn deserialize_tuple<V: de::Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(len..=len), false) }
+    fn deserialize_tuple_struct<V: de::Visitor<'de>>(self, _: &'static str, len: usize, visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(len..=len), false) }
     fn deserialize_map<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> { self.sequence(visitor, None, true) }
-    fn deserialize_struct<V: de::Visitor<'de>>(self, _: &'static str, fields: &'static [&'static str], visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(fields.len()), false) }
+    fn deserialize_struct<V: de::Visitor<'de>>(
+        self, name: &'static str, fields: &'static [&'static str], visitor: V,
+    ) -> Result<V::Value> {
+        let len = fields.len();
+        // Six trailing FES driver fields were appended to the original graph
+        // layout. Their serde defaults decode checkpoints written before them.
+        let minimum = if name == "FesScriptDriver" { len.saturating_sub(6) } else { len };
+        self.sequence(visitor, Some(minimum..=len), false)
+    }
     fn deserialize_enum<V: de::Visitor<'de>>(self, _: &'static str, _: &'static [&'static str], visitor: V) -> Result<V::Value> {
         let index = u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| bad())?);
         visitor.visit_enum(Enum { reader: self, index })
@@ -232,6 +244,6 @@ impl<'de> de::VariantAccess<'de> for &mut Reader<'de> {
     type Error = Error;
     fn unit_variant(self) -> Result<()> { Ok(()) }
     fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> { seed.deserialize(self) }
-    fn tuple_variant<V: de::Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(len), false) }
-    fn struct_variant<V: de::Visitor<'de>>(self, fields: &'static [&'static str], visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(fields.len()), false) }
+    fn tuple_variant<V: de::Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(len..=len), false) }
+    fn struct_variant<V: de::Visitor<'de>>(self, fields: &'static [&'static str], visitor: V) -> Result<V::Value> { self.sequence(visitor, Some(fields.len()..=fields.len()), false) }
 }

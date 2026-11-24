@@ -17,7 +17,32 @@ use super::native_tasks::WipeStep;
 #[path = "gpu_raster_present.rs"]
 mod present;
 #[cfg(target_os = "android")]
-pub(super) use present::{candidate as surface_candidate, detach, display_stats, present_canvas, set_display_stats_enabled};
+#[path = "gpu_raster_memory.rs"]
+mod memory;
+#[cfg(target_os = "android")]
+pub(super) use memory::maintain as maintain_android_memory;
+#[cfg(target_os = "android")]
+pub(super) use present::{PresentationDevice, candidate as surface_candidate, detach, display_stats, present_canvas, set_display_stats_enabled};
+
+// wgpu 27 keeps validation scopes on the device stack. Cold shader creation
+// and Surface setup must pair their push/pop across the two Android threads.
+// Normal frame encoding and submission never acquire this lock.
+#[cfg(target_os = "android")]
+fn lock_validation_scope() -> std::sync::MutexGuard<'static, ()> {
+    static VALIDATION_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    VALIDATION_SCOPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(target_os = "android")]
+static SURFACE_CONFIGURATION: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn submit_gpu_commands(
+    queue: &wgpu::Queue, commands: impl IntoIterator<Item = wgpu::CommandBuffer>,
+) -> wgpu::SubmissionIndex {
+    #[cfg(target_os = "android")]
+    let _configuration = SURFACE_CONFIGURATION.read().unwrap_or_else(|error| error.into_inner());
+    queue.submit(commands)
+}
 
 #[path = "gpu_emote.rs"]
 mod emote_raster;
@@ -103,10 +128,16 @@ pub(super) fn emote_missing_raster_reason() -> &'static str {
     RASTER_STATUS.with(|status| missing_emote_raster_reason(status.get()))
 }
 
-pub(super) fn enable() {
+pub(super) fn enable() -> bool {
+    #[cfg(target_os = "android")]
+    memory::clear_recovery();
     RASTER.with_borrow_mut(|slot| {
         *slot = match Raster::new() {
-            Ok(raster) => {
+            Ok(mut raster) => {
+                if raster.direct_output_enabled() {
+                    // Device startup is outside the first particle or movie frame.
+                    let _ = raster.prepare_scene_triangles("prewarm");
+                }
                 set_raster_status(RasterStatus::Ready);
                 Some(raster)
             }
@@ -116,7 +147,8 @@ pub(super) fn enable() {
                 None
             }
         };
-    });
+        slot.is_some()
+    })
 }
 
 #[cfg(windows)]
@@ -133,15 +165,21 @@ pub(super) fn available() -> bool {
 pub(super) use emote_raster::{
     begin_emote_batch, blend_emote, draw_emote, expand_emote_surface, mix_emote_surfaces,
     draw_emote_surface, prepare_emote_poses, prepare_emote_surfaces, prewarm_emote, stage_emote_model,
-    tint_emote_surface,
+    tint_emote_surface, PoseScheduler, ScenePose, ScenePoseContext, pose_jobs_available,
+    protect_emote_models,
 };
+#[cfg(test)]
+pub(super) use emote_raster::PoseTestGate;
 
 pub(super) fn textured_planes_requested() -> bool {
     // Device sampling uses f32. Keep the f64 path available for pixel comparisons.
     #[cfg(target_os = "android")]
     return !android_property(c"debug.cs2.textured_planes", |value| value == b"0").unwrap_or(false);
     #[cfg(windows)]
-    return std::env::var("CS2_GPU_TEXTURED_PLANES").as_deref() == Ok("1");
+    return std::env::var_os("CS2_GPU_TEXTURED_PLANES").map_or_else(
+        || RASTER.with_borrow(|slot| slot.as_ref().is_some_and(Raster::direct_output_enabled)),
+        |value| value == "1",
+    );
 }
 
 #[cfg(windows)]
@@ -605,6 +643,8 @@ struct Raster {
     instance: wgpu::Instance,
     #[cfg(target_os = "android")]
     adapter: wgpu::Adapter,
+    #[cfg(target_os = "android")]
+    memory: memory::MemoryMaintenance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -625,7 +665,7 @@ struct Raster {
     readback: wgpu::Buffer,
     timing: Option<GpuTiming>,
     emote: Option<emote_raster::EmoteRaster>,
-    scene_triangles: Option<scene_triangles::SceneRaster>,
+    scene_triangles: Option<Result<scene_triangles::SceneRaster, String>>,
     reported_emote_result: Option<bool>,
     emote_initialization_failed: bool,
     scratch: Vec<u8>,
@@ -638,16 +678,18 @@ struct Raster {
     reported_atlas_fallback: bool,
     #[cfg(all(test, windows))]
     test_direct_output: bool,
-    #[cfg(target_os = "android")]
-    presenter: Option<present::Presenter>,
-    #[cfg(target_os = "android")]
-    failed_window: Option<usize>,
 }
 
 impl Drop for Raster {
     fn drop(&mut self) {
         // Frames can outlive the renderer through runtime pose/transition
         // caches. Retiring this generation invalidates those device snapshots.
+        #[cfg(target_os = "android")]
+        if self.memory.retired {
+            // The current transition and frame mailbox can still refer to
+            // device pixels when pressure moves new draws to the CPU.
+            return;
+        }
         self.failed.store(true, Ordering::Relaxed);
     }
 }
@@ -722,7 +764,7 @@ impl CanvasReadback for DeviceFrame {
         let readback = buffer(&self.device, size, DOWNLOAD);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&self.buffer, 0, &readback, 0, size);
-        let submitted = self.queue.submit(Some(encoder.finish()));
+        let submitted = submit_gpu_commands(&self.queue, Some(encoder.finish()));
         let slice = readback.slice(..);
         let (send, receive) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |value| { let _ = send.send(value); });
@@ -870,9 +912,7 @@ impl Raster {
             #[cfg(target_os = "android")]
             adapter,
             #[cfg(target_os = "android")]
-            presenter: None,
-            #[cfg(target_os = "android")]
-            failed_window: None,
+            memory: memory::MemoryMaintenance::default(),
             reported_batch: false, reported_plane_group: false,
         })
     }
@@ -915,7 +955,7 @@ impl Raster {
         if let Some((previous, region)) = patch {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             encoder.copy_texture_to_texture(previous.as_image_copy(), texture.as_image_copy(), texture.size());
-            self.queue.submit(Some(encoder.finish()));
+            submit_gpu_commands(&self.queue, Some(encoder.finish()));
             let x = region.x as u32;
             let y = region.y as u32;
             let start = (y as usize * size[0] as usize + x as usize) * 4;
@@ -969,7 +1009,7 @@ impl Raster {
                 offset: 0, bytes_per_row: Some(row_bytes), rows_per_image: Some(size[1]),
             },
         }, texture.as_image_copy(), texture.size());
-        self.queue.submit(Some(encoder.finish()));
+        submit_gpu_commands(&self.queue, Some(encoder.finish()));
         let view = texture.create_view(&Default::default());
         self.remember_texture(frame, texture, view);
     }
@@ -1256,7 +1296,7 @@ impl Raster {
             first_job = end_job;
         }
         if direct {
-            self.queue.submit(Some(encoder.finish()));
+            submit_gpu_commands(&self.queue, Some(encoder.finish()));
             let frame = self.publish_device_frame(bounds.size);
             canvas.set_deferred_device_pixels(frame);
             if let Some((before, seed)) = seed {
@@ -1277,7 +1317,7 @@ impl Raster {
             target_size
         };
         let measurement = ReadbackTimer::start(ReadbackKind::Packed, map_size);
-        let submission = self.queue.submit(Some(encoder.finish()));
+        let submission = submit_gpu_commands(&self.queue, Some(encoder.finish()));
         let slice = self.readback.slice(..map_size);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });

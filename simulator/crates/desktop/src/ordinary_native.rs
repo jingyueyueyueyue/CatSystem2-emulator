@@ -371,10 +371,10 @@ impl OrdinaryNativeServices {
         self.preloads.cached_with_source(name)
     }
 
-    pub(super) fn take_preloaded_model(
-        &mut self, version: &cs2_runtime::emote::EmoteArchiveVersion,
-    ) -> Option<std::sync::Arc<cs2_runtime::emote::CpuMotionModel>> {
-        self.preloads.take_model(version)
+    pub(super) fn subscribe_preloaded_model(
+        &self, version: &cs2_runtime::emote::EmoteArchiveVersion,
+    ) -> Option<super::resource_preload::ModelSubscription> {
+        self.preloads.subscribe_model(version)
     }
 
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -385,6 +385,8 @@ impl OrdinaryNativeServices {
     }
 
     pub(super) fn drain_prefetch_notes(&mut self) -> Vec<String> { self.preloads.drain_notes() }
+
+    pub(super) fn set_fast_forward(&mut self, active: bool) { self.preloads.set_fast_forward(active); }
 
     pub(super) fn update_prefetch(&mut self, resources: &ResourceIndex,
         requests: &[super::resource_preload::AheadRequest], boundaries: &[&'static str]) {

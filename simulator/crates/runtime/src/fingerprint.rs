@@ -35,6 +35,8 @@ pub struct EngineFingerprint {
     pub primary_executable: Option<BinaryFingerprint>,
     pub engine_binaries: Vec<BinaryFingerprint>,
     pub signature: String,
+    #[serde(skip)]
+    pub legacy_save_signature: Option<String>,
 }
 
 impl EngineFingerprint {
@@ -58,8 +60,22 @@ impl EngineFingerprint {
             .collect::<Vec<_>>();
         engine_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
-        let primary_executable = executables
-            .first()
+        let previous_primary = executables.first().copied();
+        let primary_file = previous_primary.and_then(|file| {
+            if is_configuration_executable(&file.relative_path) {
+                executables
+                    .iter()
+                    .copied()
+                    .find(|candidate| {
+                        executable_rank(&candidate.relative_path).0 < 2
+                            && !is_configuration_executable(&candidate.relative_path)
+                    })
+                    .or(Some(file))
+            } else {
+                Some(file)
+            }
+        });
+        let primary_executable = primary_file
             .map(|file| binary_fingerprint(root, file))
             .transpose()?;
         let engine_binaries = engine_files
@@ -82,6 +98,11 @@ impl EngineFingerprint {
             EngineFamily::Unknown
         };
         let variant = detect_variant(resources.files(), primary_executable.as_ref());
+        let legacy_save_signature = previous_primary
+            .filter(|file| primary_file.is_some_and(|primary| primary.relative_path != file.relative_path))
+            .map(|file| binary_fingerprint(root, file))
+            .transpose()?
+            .map(|previous| signature(&family, &variant, &Some(previous), &engine_binaries));
         let signature = signature(&family, &variant, &primary_executable, &engine_binaries);
 
         Ok(Self {
@@ -90,6 +111,7 @@ impl EngineFingerprint {
             primary_executable,
             engine_binaries,
             signature,
+            legacy_save_signature,
         })
     }
 }
@@ -166,6 +188,12 @@ fn executable_rank(path: &Path) -> (u8, usize, String) {
         1
     };
     (preferred, path.components().count(), name)
+}
+
+fn is_configuration_executable(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("cs2conf.exe") || name.eq_ignore_ascii_case("cs2confx.exe")
+    })
 }
 
 fn is_engine_binary(path: &Path) -> bool {

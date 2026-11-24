@@ -17,7 +17,7 @@ const MAIN_CODE: &str = "c042279f365354ad248d2db84e20fa25a472c4b639e40c8918c1e99
 pub(crate) const SSCRIPT_CODE: &str = "cb6cbd257ae3986337adc791d8191fa3833ef164f9cfd20b22c706acfc5b4af9";
 const FLOW: &str = "679d9f5370ae5afecbadd0362df560009072cc0746770449e1def0bf255909d7";
 const TITLE: &str = "4e6e23a102f2a07446e3daa1d15e8ee2a232ac3d0380ba210d63564bc04ed9df";
-const MESWND: &str = "9a720b45d68f7014f52d5a8c78cd6c0b18ab3dacc0f9c99b9aab280efc2fbea4";
+pub(crate) const MESWND: &str = "9a720b45d68f7014f52d5a8c78cd6c0b18ab3dacc0f9c99b9aab280efc2fbea4";
 const START_REGION: u32 = 15;
 // (input wait, nonempty body), in CST group order.
 const OP001_WAITS: [(i32, usize); 62] = [
@@ -131,7 +131,7 @@ impl HeadlessPlayer {
             return Err("op001 body or wait record changed");
         }
         let (flow, flow_driver) = window(self, b"flow", b"LOOP_GAME", false).ok_or("flow/LOOP_GAME")?;
-        let (owner, driver) = window(self, b"meswnd", b"MES_SHOW", true).ok_or("meswnd/MES_SHOW/WAIT_KEY")?;
+        let (owner, driver) = window(self, b"meswnd", b"WAIT_USER", true).ok_or("meswnd/WAIT_USER/WAIT_KEY")?;
         let services = &self.data_services;
         let receiver = *self.task_parents.get(&owner).ok_or("missing message parent")?;
         if !live_child(self, flow, 0, 34) || !live_child(self, receiver, flow, 0)

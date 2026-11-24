@@ -28,10 +28,12 @@ const GBK_SCENE_ARCHIVES: [(&str, u64, &str); 3] = [
 const DAYDREAM_PATCH: (&str, u64, &str) = (
     "update03.int", 28_078_220, "cac79038baad0a266ce1e1ca75143285f2b09ad895e7b1af1af3a61df807c0f9",
 );
-const GLYPH_PATCHES: [(&str, u64, &str); 2] = [
-    ("update00.int", 3_028_489, "c7465d70274449232d3e6161f0eefdac3af4dc28351746030b20c834456da974"),
-    ("update02.int", 1_339_656, "d0bab21e300ed168cc822297c4805ef054272b50380ab4c81fbb7b25f37e043e"),
-];
+const CAMPANELLA_GLYPH_PATCH: (&str, u64, &str) = (
+    "update00.int", 3_028_489, "c7465d70274449232d3e6161f0eefdac3af4dc28351746030b20c834456da974",
+);
+const UTATE_GLYPH_PATCH: (&str, u64, &str) = (
+    "update02.int", 1_339_656, "d0bab21e300ed168cc822297c4805ef054272b50380ab4c81fbb7b25f37e043e",
+);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameLanguage {
@@ -96,6 +98,8 @@ pub struct ResourceRouter {
     island_chinese_fes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     daydream_gbk_scene_archive: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    campanella_glyph_patch: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     localized_scene_encodings: Vec<(usize, LocalizedSceneEncoding)>,
 }
@@ -127,7 +131,7 @@ impl Default for ResourceRouter {
     fn default() -> Self {
         Self { slots: vec![ResourceSlot::default(); 256], groups: Vec::new(), patches: Vec::new(),
             island_chinese_scene: None, island_chinese_fes: None, daydream_gbk_scene_archive: None,
-            localized_scene_encodings: Vec::new() }
+            campanella_glyph_patch: None, localized_scene_encodings: Vec::new() }
     }
 }
 
@@ -167,6 +171,12 @@ impl ResourceRouter {
 
     pub fn is_daydream_gbk_scene_archive(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
         Self::matches_archive(self.daydream_gbk_scene_archive, index, path)
+    }
+
+    pub(crate) fn ignores_empty_archive_entry(&self, archive: usize, name: &str) -> bool {
+        // Both versions of C301_02_end jump here, but this translation's
+        // directory points to an empty member at EOF. Keep the base scene.
+        self.campanella_glyph_patch == Some(archive) && name.eq_ignore_ascii_case("C301_03.cst")
     }
 
     pub fn localized_scene_encoding(
@@ -524,11 +534,13 @@ impl ResourceRouter {
             builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
         }
         if index.game_language() == GameLanguage::Japanese {
-            let disabled = GBK_SCENE_ARCHIVES.into_iter().skip(1).chain(GLYPH_PATCHES).chain([DAYDREAM_PATCH])
+            let disabled = GBK_SCENE_ARCHIVES.into_iter().skip(1)
+                .chain([CAMPANELLA_GLYPH_PATCH, UTATE_GLYPH_PATCH, DAYDREAM_PATCH])
                 .filter_map(|patch| builder.verified_archive(patch)).collect::<Vec<_>>();
             builder.router.patches.retain(|mount| !disabled.contains(&mount.archive));
             return Ok(builder.router);
         }
+        builder.router.campanella_glyph_patch = builder.verified_archive(CAMPANELLA_GLYPH_PATCH);
         let labyrinth_patch = base.join(crate::resource::LABYRINTH_PATCH);
         if let Some((archive, entry)) = index.archives().iter().enumerate()
             .find(|(_, entry)| entry.is_readable() && physical_path_equal(&entry.path, &labyrinth_patch))
@@ -806,6 +818,36 @@ mod localization_manifest_tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn campanella_loads_the_base_scene_after_the_localized_transition() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/祝福のカンパネラ");
+        if !root.join(CAMPANELLA_GLYPH_PATCH.0).is_file() { return; }
+        let index = crate::ResourceIndex::scan_with_language(root, GameLanguage::Localized).unwrap();
+        let select_scene = |source| {
+            index.category_names(b"scene", source).unwrap().into_iter().find_map(|name|
+                index.resolve_mode_candidate(&name, ResourceMode::LooseFirst).unwrap()).unwrap()
+        };
+        let previous = select_scene("C301_02_end");
+        assert!(matches!(&previous.location, crate::ResourceLocation::Archive { path, .. }
+            if *path == index.root().join("update00.int")));
+        let previous = cs2_script::CstDocument::parse(&index.read_candidate(previous).unwrap()).unwrap();
+        assert!(previous.records.iter().any(|record| record.kind == 0x30 && record.text == b"next C301_03"));
+
+        let empty = index.archive_candidates("C301_03.cst").find(|candidate|
+            matches!(&candidate.location, crate::ResourceLocation::Archive { path, .. }
+                if *path == index.root().join("update00.int"))).unwrap();
+        assert!(index.read_candidate(empty).unwrap().is_empty());
+
+        let scene = select_scene("C301_03");
+        assert!(matches!(&scene.location, crate::ResourceLocation::Archive { path, .. }
+            if *path == index.root().join("scene.int")));
+        let bytes = index.read_candidate(scene).unwrap();
+        let mut digest = crate::sha256::Sha256::default();
+        digest.update(&bytes);
+        assert_eq!(digest.finish(), "4b027e93e53dd26746d5220c202e47cfadadc94fc4a6277aacb8f35ca12a75e2");
+        assert!(!cs2_script::CstDocument::parse(&bytes).unwrap().records.is_empty());
+    }
 
     fn write_archive(path: &Path, name: &[u8], payload: &[u8]) {
         let mut bytes = vec![0; 80];

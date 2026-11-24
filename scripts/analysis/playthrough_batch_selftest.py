@@ -202,6 +202,29 @@ class PlaythroughBatchSelfTest(unittest.TestCase):
         self.assertEqual(result["status"], "launch_error")
         self.assertNotEqual(result["attempt_key"], key)
 
+    def test_reuse_completed_frame_run_requires_full_frames_and_evidence(self):
+        old = self.root / "playthrough" / "2026-11" / "20261124_old_playthrough"
+        old.mkdir(parents=True)
+        for name in ("20.events.log", "20.host.log", "20.0012.png"):
+            (old / name).touch()
+        key = "b" * 64
+        receipt = {
+            "index": 20, "attempt_key": key, "status": "visual_review_required", "seconds": 12,
+            "command": [str(self.player), str(self.game), str(old / "20"), "12"],
+            "output": str(old), "captures": ["20.0012.png"],
+            "stdout": str(old / "20.events.log"), "stderr": str(old / "20.host.log"),
+            "exit_code": 0, "last_frame": 12,
+        }
+        path = old / "20.json"
+        batch.write_json(path, receipt)
+        self.assertIn((20, key), batch.load_attempt_history(old.parents[1], [20]))
+        (old / "20.0012.png").unlink()
+        self.assertNotIn((20, key), batch.load_attempt_history(old.parents[1], [20]))
+        (old / "20.0012.png").touch()
+        path.unlink()
+        batch.write_json(path, {**receipt, "last_frame": 11})
+        self.assertNotIn((20, key), batch.load_attempt_history(old.parents[1], [20]))
+
     def test_missing_game_does_not_interrupt_next_case(self):
         cases = [(1, {"root": "games/missing"}, {}), (2, self.game_entry, {})]
         args = SimpleNamespace(jobs=1, frames=12, timeout=30, stall_seconds=10,

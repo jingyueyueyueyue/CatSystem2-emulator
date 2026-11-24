@@ -1,10 +1,11 @@
 use crate::host::SaveHost;
 use crate::{RuntimeError, RuntimeResult, RuntimeState};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, FileTimes, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 const SAVE_MAGIC: &str = "CS2RUNTIME";
 const SAVE_VERSION: u32 = 1;
@@ -237,8 +238,21 @@ fn ordinary_filename(slot: u32) -> String {
 
 /// Replace a private file only after its new contents have been written.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> RuntimeResult<()> {
+    replace_private_file(path, bytes, None)
+}
+
+/// Replace a file while retaining its previous modification time.
+pub fn write_private_file_with_modified_time(
+    path: &Path, bytes: &[u8], modified: SystemTime,
+) -> RuntimeResult<()> {
+    replace_private_file(path, bytes, Some(modified))
+}
+
+fn replace_private_file(
+    path: &Path, bytes: &[u8], modified: Option<SystemTime>,
+) -> RuntimeResult<()> {
     let temporary = temporary_path(path);
-    write_temporary(&temporary, bytes).map_err(|source| RuntimeError::Io {
+    write_temporary(&temporary, bytes, modified).map_err(|source| RuntimeError::Io {
         path: temporary.clone(),
         source,
     })?;
@@ -264,9 +278,18 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(filename)
 }
 
-fn write_temporary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_temporary(
+    path: &Path, bytes: &[u8], modified: Option<SystemTime>,
+) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    let result = (|| {
+        file.write_all(bytes)?;
+        if let Some(time) = modified {
+            file.set_times(FileTimes::new().set_modified(time))?;
+        }
+        file.sync_all()
+    })();
+    drop(file);
     if result.is_err() {
         let _ = fs::remove_file(path);
     }

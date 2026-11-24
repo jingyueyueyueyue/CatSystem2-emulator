@@ -406,8 +406,7 @@ impl LoggingHost<'_> {
         &mut self, command: TaskCommand, buffers: &mut TaskCommandBuffers<'_>,
         output: &mut u32, budget: usize,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let profile = match self.data_services.native_profile.and_then(|profile|
-            cs2_runtime::native_task_profile::exact_task_native_profile(profile.pe_sha256))
+        let profile = match self.data_services.task_native_profile()
         { Some(profile) => profile, None => return Ok(None) };
         let Some(codes) = profile.scene_list else { return Ok(None); };
         if command.code != codes[0]+2 { return Ok(None); }
@@ -434,8 +433,7 @@ impl LoggingHost<'_> {
         &mut self, target: u32, packet: TaskMessage, queued: bool,
         output: &mut u32, vm: Option<&mut Vm>,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let profile = match self.data_services.native_profile.and_then(|profile|
-            cs2_runtime::native_task_profile::exact_task_native_profile(profile.pe_sha256))
+        let profile = match self.data_services.task_native_profile()
         { Some(profile) => profile, None => return Ok(None) };
         if profile.scene_list.is_none_or(|codes| packet[1] != codes[0]+2) { return Ok(None); }
         let command = TaskCommand { target: target as i32, sender: packet[0] as i32,
@@ -649,9 +647,7 @@ impl LoggingHost<'_> {
 }
 
 fn task_profile(host: &LoggingHost<'_>) -> Result<cs2_runtime::native_task_profile::TaskNativeProfile> {
-    cs2_runtime::native_task_profile::exact_task_native_profile(
-        host.data_services.native_profile.map_or("", |profile| profile.pe_sha256))
-        .ok_or_else(no_profile)
+    host.data_services.task_native_profile().ok_or_else(no_profile)
 }
 fn no_profile() -> cs2_script::ScriptError {
     native_state_error("scene-tool protocol needs its exact registered PE descriptor")

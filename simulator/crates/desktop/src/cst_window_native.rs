@@ -227,16 +227,19 @@ fn load_slot(host: &LoggingHost<'_>, window: &mut HistoryWindow, slot: usize) ->
     // The internal scene starts with an empty source debug name. 325/689090
     // does not set it to the resource filename. Do not invent a cache hit.
     if name.is_empty() { return Ok(true); }
-    let Some((_, bytes)) = host.cst_resource(b"scene", &name)? else { return Ok(false); };
+    let Some((_, resource)) = host.cst_resource_with_source(b"scene", &name)? else { return Ok(false); };
+    let bytes = &resource.bytes;
     if bytes.is_empty() { return Ok(false); }
     if bytes.get(..8) != Some(b"CatScene") { return Ok(false); }
-    let packed = read_u32(&bytes, 8)? as usize;
-    let plain = read_u32(&bytes, 12)? as usize;
+    let packed = read_u32(bytes, 8)? as usize;
+    let plain = read_u32(bytes, 12)? as usize;
     if 16usize.checked_add(if packed == 0 { plain } else { packed }) != Some(bytes.len()) {
         window.slots[slot].document = None;
         return Ok(false);
     }
-    let document = CstDocument::parse(&bytes)?;
+    let mut document = CstDocument::parse(bytes)?;
+    super::cst_context_native::repair_routed_scene_text(&resource,
+        document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
     let size = document_storage(&document)?;
     let retained = window.slots.iter().enumerate().filter(|(index, _)| *index != slot)
         .filter_map(|(_, slot)| slot.document.as_ref()).try_fold(0usize, |total, document| {

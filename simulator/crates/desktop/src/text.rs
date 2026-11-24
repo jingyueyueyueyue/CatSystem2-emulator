@@ -12,7 +12,10 @@ use std::sync::{Arc, OnceLock};
 
 #[path = "font_cache.rs"]
 mod font_cache;
-pub(super) use font_cache::{FontVersion, prepare_font_face, resource_font_version, shared_font_face, shared_font_file, shared_resource_font};
+pub(super) use font_cache::{
+    FontVersion, prepare_font_face, resource_font_version, shared_candidate_font, shared_font_face,
+    shared_font_file, shared_resource_font,
+};
 
 #[path = "font_metadata.rs"]
 mod font_metadata;

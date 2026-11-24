@@ -19,7 +19,7 @@ use super::fes_driver::{
 };
 use super::fes_tasks::FesTaskView;
 use super::perf_detail::{SlowTask, TextHostTimer, TextProjection, TextStage, TextTimer, TextWork};
-use super::story_trace::{story_trace_10 as djibril10, story_trace_15 as labyrinth15};
+use super::story_trace::{story_trace_10 as djibril10, story_trace_12 as hatsumira, story_trace_15 as labyrinth15};
 use super::{FesRuntime, HeadlessPlayer, LoggingHost, LogicEvent, ScriptTextEncoding, message_backend::DesktopMessageDevice};
 
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
@@ -699,7 +699,27 @@ impl FesTextStore {
             .flatten();
         let mut yukikoi_input = None;
         match verb {
-            b"layout" => self.layout(&keys, command, driver, shared, defaults)?,
+            b"layout" => {
+                let hatsumira_font_layout = command.context.block == b"STRLAYOUT"
+                    && matches!(command.parameters.get(2).map(Vec::as_slice), Some(b"font" | b"fontind"))
+                    && host.css_task_sha() == Some(hatsumira::PE);
+                // The window can rerun STRLAYOUT while $5 still selects
+                // file fonts. In this script, "def" restores the default.
+                let reset_file_font = hatsumira_font_layout
+                    && command.offset == 0x4dd8
+                    && command.source == b"str layout fontind 1 def";
+                if hatsumira_font_layout && host.data_services.story_trace {
+                    host.events.push(LogicEvent {
+                        frame: host.frame,
+                        kind: "hatsumira-font-layout".into(),
+                        detail: format!(
+                            "owner={owner} offset={:#x} comparison={:?} command={:?} reset_file_font={reset_file_font}",
+                            command.offset, shared.shared.get(5), String::from_utf8_lossy(&command.source),
+                        ),
+                    });
+                }
+                self.layout(&keys, command, driver, shared, defaults, reset_file_font)?;
+            }
             b"insert" if self.banks[&keys[0]].novel.is_some() => {
                 for key in &keys {
                     self.banks.get_mut(key).unwrap()
@@ -1238,7 +1258,7 @@ impl FesTextStore {
 
     fn layout(
         &mut self, keys: &[Key], command: &FesDriverCommand, driver: &mut FesScriptDriver,
-        shared: &mut ExpressionState, defaults: &MessageDefaults,
+        shared: &mut ExpressionState, defaults: &MessageDefaults, reset_file_font: bool,
     ) -> Result<()> {
         let Some(verb) = command.parameters.get(2).map(Vec::as_slice) else { return Ok(()) };
         let args = &command.parameters[3..];
@@ -1287,11 +1307,15 @@ impl FesTextStore {
             return Ok(());
         }
         if matches!(verb, b"font" | b"fontind") {
-            let backend = if verb == b"fontind" {
+            let backend = if verb == b"fontind" && !reset_file_font {
                 optional_number(args, 0, 0, driver, shared)? as u32
             } else { 0 };
-            let count = if verb == b"fontind" { 4 } else { 3 };
-            let name = raw_after_spaces(&command.source, count).unwrap_or_default();
+            let name = if reset_file_font {
+                b"".as_slice()
+            } else {
+                let count = if verb == b"fontind" { 4 } else { 3 };
+                raw_after_spaces(&command.source, count).unwrap_or_default()
+            };
             for key in keys {
                 let record = self.banks.get_mut(key).unwrap();
                 let font = if name.is_empty() { defaults.font_name.clone() }
@@ -1732,6 +1756,59 @@ fn fes_text_name_only_updates_novel_speaker() {
             assert_eq!(novel.speaker, b"$fixture");
         }
     }
+}
+
+#[test]
+fn hatsumira_font_reset_uses_configured_face_after_temporary_file_font() -> Result<()> {
+    use cs2_runtime::message_object::MessageConfiguration;
+    use cs2_script::{FesDocument, FesExecutionContext};
+
+    let root = std::env::temp_dir().join(format!("cs2-hatsumira-font-{}", std::process::id()));
+    std::fs::create_dir(&root)?;
+    let player = HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+    std::fs::remove_dir(&root)?;
+    let mut player = player?;
+    let document = FesDocument { sections: Vec::new() };
+    let mut runtime = FesRuntime::new(document.clone());
+    let mut driver = FesScriptDriver::new(&document)?;
+    let mut store = FesTextStore::default();
+    let mut defaults = defaults();
+    defaults.font_name = "Fixture default".encode_utf16().collect();
+    let key = (13, b"str".to_vec(), 0);
+    store.create(13, &FesObjectDefinition {
+        offset: 0, name: key.1.clone(), kind: b"STRING".to_vec(), bank_expression: None, banks: 1,
+    }, &defaults, &mut DesktopMessageDevice::default())?;
+    let mut shared = ExpressionState::new(6);
+    shared.shared[5] = -10;
+
+    player.with_host(|host| {
+        for (profile, file, backend, face) in [
+            (hatsumira::PE, "nemukemedium.ttf", 1, "nemukemedium.ttf"),
+            (hatsumira::PE, "def", 0, "Fixture default"),
+            ("different-game", "def", 1, "def"),
+        ] {
+            host.data_services.css_task_pe_sha256 = Some(profile);
+            let source = format!("str layout fontind 1 {file}").into_bytes();
+            let command = FesDriverCommand {
+                offset: 0x4dd8,
+                parameters: source.split(|&byte| byte == b' ').map(<[u8]>::to_vec).collect(),
+                source,
+                context: FesExecutionContext {
+                    block: b"STRLAYOUT".to_vec(), position: 0, local: Vec::new(), current: 0,
+                },
+                object_event: None,
+            };
+            assert!(store.command(13, &command, &mut driver, &mut shared, &defaults,
+                ScriptTextEncoding::Cp932, &mut runtime, host)?);
+            let configuration = MessageConfiguration::from_bytes(
+                &store.banks[&key].configuration, MessageEncoding::Cp932,
+            )?;
+            assert_eq!(configuration.font_backend(), backend);
+            assert_eq!(String::from_utf16(&configuration.font_name())?, face);
+            assert_eq!(shared.shared[5], -10);
+        }
+        Ok(())
+    })
 }
 
 #[test]

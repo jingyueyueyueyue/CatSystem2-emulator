@@ -58,14 +58,16 @@ pub use host::{
 pub use native::{NativeCallRegistry, NativeHandler};
 pub use native_image_data::native_image_metadata;
 pub use native_memory::{NativeMemoryCopyMode, native_copy_between_vms, native_copy_memory};
-pub use native_sequence::NativeSequence;
+pub use native_sequence::{GalleryEntry, NativeSequence};
 pub use resource::{
     ArchiveIndex, ArchiveLayout, ArchiveResourceEntry, ArchiveStatus, BoundedReader,
     ConfigCandidate, ConfigKind, DirectoryFile, MediaResourceReader, ResourceCache, ResourceCandidate, ResourceIndex,
     ResourceLease, ResourceLeaseId, ResourceLocation, ResourceReader, ScanDiagnostic,
     ScanDiagnosticLevel,
 };
-pub use save::{FileSaveStore, SaveKind, SaveRepository, write_private_file};
+pub use save::{
+    FileSaveStore, SaveKind, SaveRepository, write_private_file, write_private_file_with_modified_time,
+};
 pub use scheduler::{
     ObjectHandle, ObjectHandleTable, RuntimeTask, TaskId, TaskScheduler, TaskStatus,
 };
@@ -283,6 +285,23 @@ mod tests {
             .insert("route".to_string(), RuntimeValue::I32(2));
         assert_serializable::<RuntimeState>();
         assert_deserializable::<RuntimeState>();
+    }
+
+    #[test]
+    fn game_executable_takes_precedence_over_configuration_tool() {
+        let temp = TempDirectory::new();
+        fs::write(temp.path.join("cs2conf.exe"), b"MZ config").unwrap();
+        fs::write(temp.path.join("cs2conf.dll"), b"MZ config DLL").unwrap();
+        let root = GameRoot::open(&temp.path).unwrap();
+        let original = root.scan().unwrap().engine;
+
+        fs::write(temp.path.join("UTATEMEGURI.exe"), b"MZ game").unwrap();
+        let current = root.scan().unwrap().engine;
+        assert_eq!(
+            current.primary_executable.unwrap().relative_path,
+            Path::new("UTATEMEGURI.exe")
+        );
+        assert_eq!(current.legacy_save_signature, Some(original.signature));
     }
 
     fn assert_serializable<T: Serialize>() {}

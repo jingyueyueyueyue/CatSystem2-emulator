@@ -689,6 +689,13 @@ impl<S: MotionServices> Host for NativeHost<'_, S> {
     fn call(&mut self, index: u32, arguments: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
         let count =
             native_argument_words(index).ok_or(ScriptError::UnimplementedNativeCall { index })?;
+        let arguments = if index == 23 && arguments.is_empty() {
+            // The original VM passes the current stack pointer even when the
+            // instruction pops no arguments. This receiver reads four words.
+            vm.native_argument_storage(count * 4)?
+        } else {
+            arguments
+        };
         if arguments.len() != count * 4 {
             return Err(invalid(
                 "motion native argument byte count does not match its ABI",
@@ -1581,4 +1588,50 @@ fn format_number(input: &[u8], cursor: &mut usize) -> Result<Option<usize>> {
         *cursor += 1;
     }
     Ok((*cursor != first).then_some(value))
+}
+
+#[cfg(test)]
+mod zero_pop_native_tests {
+    use super::*;
+    use cs2_script::Operand;
+
+    fn native_call(code: &mut Vec<u8>, index: u32, parameter_bytes: u32) {
+        code.push(0x2b);
+        for value in [index, parameter_bytes] {
+            let operand = Operand::immediate(value);
+            code.push(operand.flags.bits());
+            code.extend_from_slice(&operand.payload.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn zero_pop_native_23_reads_four_words_from_current_stack_pointer() -> Result<()> {
+        let mut code = Vec::new();
+        native_call(&mut code, 23, 0);
+        code.push(0x3b);
+
+        let data = words_as_bytes(&identity().map(f32::to_bits));
+        let program = MotionProgram::from_program(KcsProgram::from_code(&code, data, 64)?)?;
+        let mut runner = MotionRunner::from_program(program, MotionStart {
+            name: b"zero-pop-23",
+            parameters: [0; 256],
+            external_value: 0,
+            properties: [0; 36],
+            base_time: 0,
+            saved_data: &[],
+            snapshot_flags: 0,
+        })?;
+
+        let stack_pointer = runner.vm.stack_pointer();
+        let arguments = [0, 0, 0, std::f32::consts::FRAC_PI_2.to_bits()];
+        runner.write_memory(stack_pointer as u32, &words_as_bytes(&arguments))?;
+        let result = runner.update(0, &mut MotionHost::default(), 64)?;
+        assert_eq!(result, MotionProgress::Complete(Step::Halted));
+        assert_eq!(runner.vm.stack_pointer(), stack_pointer);
+        assert!(f32::from_bits(runner.vm.read_u32(0)?).abs() < 1e-6);
+        assert!((f32::from_bits(runner.vm.read_u32(4)?) - 1.0).abs() < 1e-6);
+        assert!((f32::from_bits(runner.vm.read_u32(16)?) + 1.0).abs() < 1e-6);
+        assert!(f32::from_bits(runner.vm.read_u32(20)?).abs() < 1e-6);
+        Ok(())
+    }
 }

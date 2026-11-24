@@ -85,6 +85,49 @@ fn fes_wait_voice_without_an_object_uses_the_numeric_duration() -> Result<()> {
 }
 
 #[test]
+fn reset_frame_restarts_fes_absolute_wait_and_visible_counter() -> Result<()> {
+    let (mut driver, mut shared) = driver(&[
+        b"reset_frame", b"$0 = _FRAME_", b"wait frame 2", b"$1 = _FRAME_", b"exit 42",
+    ]);
+    shared.shared.resize(2, -1);
+    assert!(matches!(driver.advance(100, &mut shared, 32)?, FesDriverEffect::Waiting { .. }));
+    assert_eq!(shared.shared[0], 0);
+    let snapshot = driver.snapshot();
+    assert!(matches!(driver.advance(100, &mut shared, 32)?, FesDriverEffect::Waiting { .. }));
+    driver.restore_snapshot(&snapshot);
+    assert!(matches!(driver.advance(105, &mut shared, 32)?, FesDriverEffect::Waiting { .. }));
+    assert!(matches!(driver.advance(106, &mut shared, 32)?, FesDriverEffect::Exit(42)));
+    assert_eq!(shared.shared[1], 2);
+    Ok(())
+}
+
+#[test]
+fn automove_and_restoremove_dispatch_ordered_pointer_requests() -> Result<()> {
+    let section = |header: &[u8], lines: &[&[u8]]| cs2_script::FesSection {
+        header: header.to_vec(),
+        lines: lines.iter().enumerate().map(|(offset, line)| cs2_script::FesLine {
+            offset, bytes: line.to_vec(),
+        }).collect(),
+    };
+    let document = FesDocument { sections: vec![
+        section(b"DEFINE", &[b"BUTTON button[2]"]),
+        section(b"START", &[b"automove button[1]", b"restoremove", b"exit 0"]),
+    ] };
+    let mut driver = FesScriptDriver::new(&document)?;
+    let mut shared = ExpressionState::default();
+    while driver.initialization_pending() {
+        driver.advance_initialization(&mut shared)?;
+    }
+    assert!(matches!(driver.advance(10, &mut shared, 32)?,
+        FesDriverEffect::ControlFlow(main_flow::controls_flow::Request::AutoMove(target))
+            if target.name == b"button" && target.bank == 1));
+    assert!(matches!(driver.advance(10, &mut shared, 32)?,
+        FesDriverEffect::ControlFlow(main_flow::controls_flow::Request::RestoreMove)));
+    assert!(matches!(driver.advance(10, &mut shared, 32)?, FesDriverEffect::Exit(0)));
+    Ok(())
+}
+
+#[test]
 fn routed_click_reaches_next_title_poll_only_once() {
     let (mut driver, mut shared) = driver(&[b"if (_CLICK_L_==17)", b"exit 42", b"endif"]);
     assert!(matches!(
@@ -268,12 +311,13 @@ fn kanmi_message_notifications_preserve_the_main_wait() -> Result<()> {
         let depth = driver.interpreter.call_depth();
         assert_eq!(depth, 1);
         assert!(driver.dispatch_system_block(block)?);
-        assert!(matches!(driver.advance_system_notification(10, &mut shared, 2, Some(block))?,
+        let returns = Some(FesSystemReturns::ButtonBlocks(block));
+        assert!(matches!(driver.advance_system_notification(10, &mut shared, 2, returns)?,
             FesDriverEffect::SystemBlock { name, complete: false } if name == block));
         let mut tails = 0;
         let mut completed = false;
         for _ in 0..32 {
-            match driver.advance_system_notification(10, &mut shared, 2, Some(block))? {
+            match driver.advance_system_notification(10, &mut shared, 2, returns)? {
                 FesDriverEffect::Yield => {}
                 FesDriverEffect::Command(command) => {
                     assert!(expected_tail && command.context.block == b"MES_SHOW");
@@ -299,4 +343,47 @@ fn kanmi_message_notifications_preserve_the_main_wait() -> Result<()> {
         assert_eq!(driver.interpreter.call_depth(), 0);
     }
     Ok(())
+}
+
+#[test]
+fn hatsumira_message_notification_enables_each_button_and_restores_wait() -> Result<()> {
+    let section = |header: &[u8], base, lines: &[&[u8]]| cs2_script::FesSection {
+        header: header.to_vec(),
+        lines: lines.iter().enumerate().map(|(index, line)| cs2_script::FesLine {
+            offset: base + index,
+            bytes: line.to_vec(),
+        }).collect(),
+    };
+    let document = FesDocument { sections: vec![
+        section(b"START", 0, &[b"call BODY"]),
+        section(b"BODY", 10, &[b"wait 1"]),
+        section(b"MES_SHOW", 20, &[br"\0 = 0", b"call SETBUTTON", br"\3 = 1"]),
+        section(b"SETBUTTON", 30, &[b"call SETBTNSTATE", br"\0 = 1", b"call SETBTNSTATE"]),
+        section(b"SETBTNSTATE", 40, &[b"call SET_BTN_ENABLE"]),
+        section(b"SET_BTN_ENABLE", 50, &[br"\(1+\0) = 1"]),
+    ] };
+    let mut driver = FesScriptDriver::new(&document)?;
+    let mut shared = ExpressionState::default();
+    while driver.initialization_pending() {
+        driver.advance_initialization(&mut shared)?;
+    }
+    assert!(matches!(driver.advance(10, &mut shared, 32)?, FesDriverEffect::Waiting { .. }));
+    let position = driver.interpreter.position();
+    assert_eq!(driver.interpreter.call_depth(), 1);
+    assert!(driver.dispatch_system_block(b"MES_SHOW")?);
+    let returns = Some(FesSystemReturns::NestedCalls(b"MES_SHOW"));
+    for _ in 0..32 {
+        match driver.advance_system_notification(10, &mut shared, 1, returns)? {
+            FesDriverEffect::Yield | FesDriverEffect::SystemBlock { complete: false, .. } => {}
+            FesDriverEffect::SystemBlock { complete: true, .. } => {
+                assert_eq!(&driver.interpreter.local_values()[1..4], &[1, 1, 1]);
+                assert_eq!(driver.interpreter.position(), position);
+                assert_eq!(driver.interpreter.call_depth(), 1);
+                assert_eq!(driver.waiting(), Some(&FesDriverWait::Frames { until: 11 }));
+                return Ok(());
+            }
+            effect => panic!("unexpected notification effect: {effect:?}"),
+        }
+    }
+    bail!("MES_SHOW did not complete")
 }

@@ -6,10 +6,11 @@
 //! interpolates scalars/vectors/control points. Angle helper2b8f0 uses the
 //! shortest turn. Nonlinear ccc/acc/zcc/scc/occ and cp remain diagnostic.
 
-use super::{EmoteError, PsbValue, Result};
+use super::{EmoteError, PsbValue, Result, cpu::PriorityTimeline};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 ///One parser-created reference holder per physical layer/instance path.
 ///36321 creates its player once;41b83 releases the selected motion on hide.
@@ -21,6 +22,7 @@ pub(super) struct CpuReferenceTimelines {
     seen: BTreeSet<Vec<usize>>,
     updated_tick: Option<f32>,
     updated_variables: Arc<BTreeMap<String, f64>>,
+    visible_layers: Option<Arc<Vec<usize>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,41 @@ pub(super) struct CpuReferenceSample {
 }
 
 impl CpuReferenceTimelines {
+    pub(super) fn estimated_snapshot_bytes(&self) -> usize {
+        // The updated variable map is shared by Arc. Allow headroom for tree
+        // nodes in both the owned path map and the transient seen set.
+        const TREE_ENTRY_OVERHEAD: usize = 8 * size_of::<usize>();
+        let labels = |(owner, motion): &(String, String)| owner.len() + motion.len();
+        self.root.as_ref().map_or(0, labels)
+            + self.owners.iter().map(|(path, state)| {
+                size_of::<(Vec<usize>, ReferenceClock)>() + TREE_ENTRY_OVERHEAD
+                    + path.len() * size_of::<usize>() + state.selected.as_ref().map_or(0, labels)
+            }).sum::<usize>()
+            + self.seen.iter().map(|path| {
+                size_of::<Vec<usize>>() + TREE_ENTRY_OVERHEAD + path.len() * size_of::<usize>()
+            }).sum::<usize>()
+            + self.updated_variables.iter().map(|(name, _)| {
+                size_of::<(String, f64)>() + TREE_ENTRY_OVERHEAD + name.len()
+            }).sum::<usize>()
+            + self.visible_layers.as_ref().map_or(0, |layers| layers.capacity() * size_of::<usize>())
+    }
+
+    pub(super) fn same_selected_owners(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.visible_layers.as_ref().zip(other.visible_layers.as_ref())
+                .is_some_and(|(left, right)| Arc::ptr_eq(left, right) || left == right)
+            && self.owners.iter().filter(|(_, owner)| owner.selected.is_some())
+            .map(|(path, owner)| (path, &owner.selected))
+            .eq(other.owners.iter().filter(|(_, owner)| owner.selected.is_some())
+                .map(|(path, owner)| (path, &owner.selected)))
+    }
+
+    pub(super) fn record_visible_layers(&mut self, layers: Vec<usize>) {
+        if self.visible_layers.as_deref() != Some(&layers) {
+            self.visible_layers = Some(Arc::new(layers));
+        }
+    }
+
     pub(super) fn same_render_state(&self, other: &Self) -> bool {
         self.root == other.root
             && self.updated_tick.map(f32::to_bits) == other.updated_tick.map(f32::to_bits)
@@ -64,6 +101,7 @@ impl CpuReferenceTimelines {
             self.root = Some((object.to_owned(), motion.to_owned()));
             self.updated_tick = None;
             self.updated_variables = Arc::default();
+            self.visible_layers = None;
         }
         self.seen.clear();
     }
@@ -328,6 +366,34 @@ impl KeyHeader {
 pub(super) struct LayerKey<'a> {
     header: KeyHeader,
     frame: &'a PsbValue,
+    pub(super) local_transform: Option<&'a LocalTransformSlot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LocalLayerTransform {
+    pub(super) matrix: [f64; 6],
+    pub(super) opacity: u8,
+    pub(super) depth: f32,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct LocalTransformSlot {
+    value: OnceLock<LocalLayerTransform>,
+    publishing: AtomicBool,
+}
+
+impl LocalTransformSlot {
+    pub(super) fn get(&self) -> Option<LocalLayerTransform> {
+        self.value.get().copied()
+    }
+
+    pub(super) fn publish(&self, transform: LocalLayerTransform) {
+        // An already computed transform may be published once. Readers
+        // continue with their own result if another worker is publishing.
+        if !self.publishing.swap(true, Ordering::Relaxed) {
+            let _ = self.value.set(transform);
+        }
+    }
 }
 
 type LayerKeys<'a> = (Option<LayerKey<'a>>, Option<LayerKey<'a>>);
@@ -348,7 +414,7 @@ fn layer_keyframes(layer: &PsbValue, time: f32) -> Result<LayerKeys<'_>> {
     for (index, frame) in frames.iter().enumerate() {
         let header = KeyHeader::read(frame, last)?;
         last = header.time;
-        let key = LayerKey { header, frame };
+        let key = LayerKey { header, frame, local_transform: None };
         //The last record is the next-boundary sentinel, never the current
         //sample.3bc40/3bc50 clamps random seek to count-2;3c845 and3bf27
         //stop forward object/parameter cursors there. Actual NEKO layers
@@ -368,25 +434,124 @@ fn layer_keyframes(layer: &PsbValue, time: f32) -> Result<LayerKeys<'_>> {
 
 #[derive(Debug, Default)]
 pub(super) struct LayerTimelines {
-    layers: HashMap<usize, IndexedLayer>,
-    stencils: HashMap<usize, OnceLock<Result<Vec<super::CpuStencilBinding>>>>,
+    motions: HashMap<usize, IndexedMotion>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct IndexedMotion {
+    pub(super) layers: Vec<IndexedLayer>,
+    stencils: OnceLock<Result<Vec<super::CpuStencilBinding>>>,
+    pub(super) priority: Option<PriorityTimeline>,
+}
+
+impl IndexedMotion {
+    pub(super) fn stencil_bindings(&self, motion: &PsbValue) -> Result<&[super::CpuStencilBinding]> {
+        self.stencils.get_or_init(|| super::resolve_emote_stencil_bindings(motion))
+            .as_deref().map_err(Clone::clone)
+    }
+
+    fn estimated_storage_bytes(&self) -> usize {
+        self.layers.capacity() * size_of::<IndexedLayer>()
+            + self.layers.iter().map(IndexedLayer::estimated_storage_bytes).sum::<usize>()
+            + self.stencils.get().and_then(|bindings| bindings.as_ref().ok()).map_or(0, |bindings| {
+                bindings.capacity() * size_of::<super::CpuStencilBinding>()
+                    + bindings.iter().map(|binding| {
+                        binding.owner_label.capacity()
+                            + binding.source_indices.capacity() * size_of::<usize>()
+                            + binding.ignored_labels.capacity() * size_of::<String>()
+                            + binding.ignored_labels.iter().map(String::capacity).sum::<usize>()
+                    }).sum::<usize>()
+            })
+            + self.priority.as_ref().map_or(0, PriorityTimeline::estimated_storage_bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum LayerField {
+    Type,
+    ReferenceInherit,
+    Coordinate,
+    InheritMask,
+    MeshSync,
+    MeshTransform,
+    MeshCombine,
+    MeshDivision,
+    StencilType,
+}
+
+impl LayerField {
+    const ALL: [Self; 9] = [
+        Self::Type, Self::ReferenceInherit, Self::Coordinate, Self::InheritMask, Self::MeshSync,
+        Self::MeshTransform, Self::MeshCombine, Self::MeshDivision, Self::StencilType,
+    ];
+
+    pub(super) fn specification(self) -> (&'static str, f64) {
+        match self {
+            Self::Type => ("type", 2.0),
+            Self::ReferenceInherit => ("motionIndependentLayerInherit", 0.0),
+            Self::Coordinate => ("coordinate", 0.0),
+            Self::InheritMask => ("inheritMask", 0x020007fc_u32 as f64),
+            Self::MeshSync => ("meshSyncChildMask", 0.0),
+            Self::MeshTransform => ("meshTransform", 0.0),
+            Self::MeshCombine => ("meshCombine", 0.0),
+            Self::MeshDivision => ("meshDivision", -1.0),
+            Self::StencilType => ("stencilType", 0.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ParameterIndex {
+    None,
+    Number(f64),
+    Invalid,
+}
+
+impl ParameterIndex {
+    pub(super) fn read(node: &PsbValue) -> Self {
+        match node.get("parameterize") {
+            None | Some(PsbValue::Null) => Self::None,
+            Some(value) => value.number().map_or(Self::Invalid, Self::Number),
+        }
+    }
 }
 
 #[derive(Debug)]
-struct IndexedLayer {
+pub(super) struct IndexedLayer {
     headers: Result<Vec<KeyHeader>>,
     transform_order: Result<[u8; 4]>,
+    local_transforms: Vec<LocalTransformSlot>,
+    numbers: [Option<f64>; LayerField::ALL.len()],
+    pub(super) parameter: ParameterIndex,
+}
+
+impl IndexedLayer {
+    pub(super) fn number(&self, field: LayerField) -> Option<f64> {
+        self.numbers[field as usize]
+    }
+
+    pub(super) fn transform_order(&self) -> Result<[u8; 4]> {
+        self.transform_order.clone()
+    }
 }
 
 impl LayerTimelines {
     pub(super) fn prepare(root: &PsbValue) -> Self {
+        const LOCAL_TRANSFORM_SLOTS: usize = 2 * 1024 * 1024 / size_of::<LocalTransformSlot>();
+        const PRIORITY_BYTES: usize = 1024 * 1024;
         let mut timelines = Self::default();
+        let mut transform_slots = LOCAL_TRANSFORM_SLOTS;
+        let mut priority_bytes = PRIORITY_BYTES;
         if let Some(objects) = root.get("object").and_then(PsbValue::object) {
             for object in objects.values() {
                 if let Some(motions) = object.get("motion").and_then(PsbValue::object) {
                     for motion in motions.values() {
-                        timelines.prepare_layers(motion.get("layer"));
-                        timelines.stencils.insert(motion as *const PsbValue as usize, OnceLock::new());
+                        let mut indexed = IndexedMotion {
+                            priority: PriorityTimeline::prepare(motion, &mut priority_bytes),
+                            ..IndexedMotion::default()
+                        };
+                        Self::prepare_layers(motion.get("layer"), &mut transform_slots, &mut indexed.layers);
+                        timelines.motions.insert(std::ptr::from_ref(motion) as usize, indexed);
                     }
                 }
             }
@@ -395,64 +560,69 @@ impl LayerTimelines {
     }
 
     pub(super) fn estimated_storage_bytes(&self) -> usize {
-        let layer_entries = self.layers.capacity() * (std::mem::size_of::<(usize, IndexedLayer)>() + 1);
-        let stencil_entries = self.stencils.capacity()
-            * (std::mem::size_of::<(usize, OnceLock<Result<Vec<super::CpuStencilBinding>>>)>() + 1);
-        let headers = self.layers.values().filter_map(|index| index.headers.as_ref().ok())
-            .map(|headers| headers.capacity() * std::mem::size_of::<KeyHeader>())
-            .sum::<usize>();
-        let bindings = self.stencils.values().filter_map(OnceLock::get).filter_map(|value| value.as_ref().ok())
-            .map(|bindings| bindings.capacity() * std::mem::size_of::<super::CpuStencilBinding>())
-            .sum::<usize>();
-        std::mem::size_of::<Self>() + layer_entries + stencil_entries + headers + bindings
+        size_of::<Self>() + self.motions.capacity() * (size_of::<(usize, IndexedMotion)>() + 1)
+            + self.motions.values().map(IndexedMotion::estimated_storage_bytes).sum::<usize>()
     }
 
-    pub(super) fn stencil_bindings(
-        &self, motion: &PsbValue,
-    ) -> Result<Cow<'_, [super::CpuStencilBinding]>> {
-        let Some(bindings) = self.stencils.get(&(motion as *const PsbValue as usize)) else {
-            return super::resolve_emote_stencil_bindings(motion).map(Cow::Owned);
-        };
-        bindings.get_or_init(|| super::resolve_emote_stencil_bindings(motion))
-            .as_deref().map(Cow::Borrowed).map_err(Clone::clone)
+    pub(super) fn motion(&self, motion: &PsbValue) -> Option<&IndexedMotion> {
+        self.motions.get(&(std::ptr::from_ref(motion) as usize))
     }
 
-    fn prepare_layers(&mut self, layers: Option<&PsbValue>) {
+    fn prepare_layers(layers: Option<&PsbValue>, transform_slots: &mut usize, output: &mut Vec<IndexedLayer>) {
         let Some(layers) = layers.and_then(PsbValue::list) else { return };
         for layer in layers {
-            self.layers.insert(layer as *const PsbValue as usize, IndexedLayer {
-                headers: key_headers(layer),
+            let headers = key_headers(layer);
+            let current_count = headers.as_ref().map_or(0, |keys| keys.len() - usize::from(keys.len() >= 2));
+            let local_transforms = if current_count <= *transform_slots {
+                let mut local_transforms = Vec::with_capacity(current_count);
+                local_transforms.resize_with(current_count, LocalTransformSlot::default);
+                *transform_slots -= current_count;
+                local_transforms
+            } else {
+                Vec::new()
+            };
+            output.push(IndexedLayer {
+                headers,
                 transform_order: transform_order(layer),
+                local_transforms,
+                numbers: LayerField::ALL.map(|field| {
+                    // Defer malformed-field errors to the draw branch which
+                    // actually consumes the field, as in the unindexed path.
+                    let (name, default) = field.specification();
+                    match layer.get(name) {
+                        None | Some(PsbValue::Null) => Some(default),
+                        Some(value) => value.number().filter(|number| number.is_finite()),
+                    }
+                }),
+                parameter: ParameterIndex::read(layer),
             });
-            self.prepare_layers(layer.get("children"));
+            Self::prepare_layers(layer.get("children"), transform_slots, output);
         }
     }
+}
 
-    fn keyframes<'a>(
-        &self, layer: &'a PsbValue, time: f32,
-    ) -> Result<LayerKeys<'a>> {
+impl IndexedLayer {
+    fn estimated_storage_bytes(&self) -> usize {
+        self.headers.as_ref().map_or(0, |headers| headers.capacity() * size_of::<KeyHeader>())
+            + self.local_transforms.capacity() * size_of::<LocalTransformSlot>()
+    }
+
+    fn keyframes<'a>(&'a self, layer: &'a PsbValue, time: f32) -> Result<LayerKeys<'a>> {
         if !time.is_finite() {
             return Err(invalid("non-finite frame time"));
         }
-        let Some(index) = self.layers.get(&(layer as *const PsbValue as usize)) else {
-            return layer_keyframes(layer, time);
-        };
         // Errors discovered during preparation are reported when the layer is sampled.
-        let headers = index.headers.as_ref().map_err(Clone::clone)?;
+        let headers = self.headers.as_ref().map_err(Clone::clone)?;
         let frames = layer_frames(layer)?;
         // The sentinel can end interpolation but cannot become the current frame.
         let current_count = headers.len() - usize::from(headers.len() >= 2);
         let boundary = headers[..current_count].partition_point(|header| header.time <= time);
-        let key = |i: usize| LayerKey { header: headers[i], frame: &frames[i] };
+        let key = |i: usize| LayerKey {
+            header: headers[i], frame: &frames[i], local_transform: self.local_transforms.get(i),
+        };
         Ok((boundary.checked_sub(1).map(key), (boundary < frames.len()).then(|| key(boundary))))
     }
 
-    pub(super) fn transform_order(&self, layer: &PsbValue) -> Result<[u8; 4]> {
-        match self.layers.get(&(layer as *const PsbValue as usize)) {
-            Some(index) => index.transform_order.clone(),
-            None => transform_order(layer),
-        }
-    }
 }
 
 fn key_headers(layer: &PsbValue) -> Result<Vec<KeyHeader>> {
@@ -484,6 +654,26 @@ mod layer_index_tests {
     }
 
     #[test]
+    fn layer_metadata_preserves_null_defaults_and_invalid_fields() {
+        let layer = object([
+            ("type", PsbValue::Null),
+            ("inheritMask", PsbValue::Integer(0)),
+            ("meshDivision", PsbValue::String("bad".into())),
+            ("parameterize", PsbValue::Null),
+            ("frameList", PsbValue::List(Vec::new())),
+        ]);
+        let layers = PsbValue::List(vec![layer]);
+        let mut indexed_layers = Vec::new();
+        let mut transform_slots = 0;
+        LayerTimelines::prepare_layers(Some(&layers), &mut transform_slots, &mut indexed_layers);
+        let indexed = &indexed_layers[0];
+        assert_eq!(indexed.number(LayerField::Type), Some(2.0));
+        assert_eq!(indexed.number(LayerField::InheritMask), Some(0.0));
+        assert_eq!(indexed.number(LayerField::MeshDivision), None);
+        assert!(matches!(indexed.parameter, ParameterIndex::None));
+    }
+
+    #[test]
     fn indexed_layers_match_linear_sampling_after_seeks_and_ends() -> Result<()> {
         let root = object([("object", object([("actor", object([("motion", object([("idle",
             object([("layer", PsbValue::List(vec![
@@ -496,13 +686,15 @@ mod layer_index_tests {
                 object([("frameList", PsbValue::List(vec![frame(2, 2, 3), frame(1, 0, 0)]))]),
                 object([("frameList", PsbValue::List(vec![frame(2, 1, 3)]))]),
             ]))]))]))]))]))]);
-        let layers = root.get("object").unwrap().get("actor").unwrap()
-            .get("motion").unwrap().get("idle").unwrap().get("layer").unwrap().list().unwrap();
+        let motion = root.get("object").unwrap().get("actor").unwrap()
+            .get("motion").unwrap().get("idle").unwrap();
+        let layers = motion.get("layer").unwrap().list().unwrap();
         let prepared = LayerTimelines::prepare(&root);
-        assert_eq!(prepared.layers.len(), layers.len());
-        for layer in &layers[..3] {
+        let indexed = &prepared.motion(motion).unwrap().layers;
+        assert_eq!(indexed.len(), layers.len());
+        for (layer, index) in layers.iter().zip(indexed).take(3) {
             for time in [-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 20.0, 3.5, 1.0, -1.0, 2.0] {
-                let (previous, next) = prepared.keyframes(layer, time)?;
+                let (previous, next) = lookup_layer_keyframes(layer, time, Some(index))?;
                 let indexed = sample_emote_keys(previous, next, time)?;
                 let linear = sample_emote_layer(layer, f64::from(time))?;
                 assert_eq!(indexed.content.map(FrameContent::into_value), linear.content, "time {time}");
@@ -512,13 +704,13 @@ mod layer_index_tests {
             }
         }
         for (time, expected) in [(2.0, 3.0), (6.0, 6.0), (20.0, 6.0)] {
-            let (previous, _) = prepared.keyframes(&layers[0], time)?;
+            let (previous, _) = lookup_layer_keyframes(&layers[0], time, Some(&indexed[0]))?;
             let (content, _) = visible_layer_key(previous)?.expect("layer is visible");
             assert_eq!(content.get("zx").and_then(PsbValue::number), Some(expected));
         }
-        for layer in &layers[3..] {
+        for (layer, index) in layers.iter().zip(indexed).skip(3) {
             assert_eq!(
-                prepared.keyframes(layer, 0.0).unwrap_err(),
+                lookup_layer_keyframes(layer, 0.0, Some(index)).unwrap_err(),
                 layer_keyframes(layer, 0.0).unwrap_err(),
             );
         }
@@ -527,10 +719,10 @@ mod layer_index_tests {
 }
 
 pub(super) fn lookup_layer_keyframes<'a>(
-    layer: &'a PsbValue, time: f32, timelines: Option<&LayerTimelines>,
+    layer: &'a PsbValue, time: f32, index: Option<&'a IndexedLayer>,
 ) -> Result<LayerKeys<'a>> {
-    match timelines {
-        Some(timelines) => timelines.keyframes(layer, time),
+    match index {
+        Some(index) => index.keyframes(layer, time),
         None => layer_keyframes(layer, time),
     }
 }
@@ -572,6 +764,10 @@ pub(super) struct FrameContent<'a> {
 }
 
 impl<'a> FrameContent<'a> {
+    pub(super) fn is_unmodified(&self) -> bool {
+        self.overrides.is_empty() && self.borrowed_base().is_some()
+    }
+
     pub(super) fn borrowed_base(&self) -> Option<&PsbValue> {
         match &self.base { Cow::Borrowed(value) => Some(value), Cow::Owned(_) => None }
     }

@@ -7,6 +7,7 @@ ambiguous. Dynamic operands are retained instead of disappearing from counts.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import struct
@@ -17,7 +18,9 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-from audit_runtime_evidence import blowfish_le_decrypt, operand_count
+from pefile import PEFormatError
+
+from audit_runtime_evidence import blowfish_le_decrypt, operand_count, runtime_fingerprint
 from startup_inventory import ROOT, SKIP, entries_at, normalized
 
 
@@ -91,14 +94,25 @@ def parse_program(data: bytes, resource: str) -> dict:
     }
 
 
-def scan_game(game: dict) -> dict:
+def scan_game(game: dict, *, all_archives: bool = False) -> dict:
     root = Path(game["root"])
     seeds = {normalized(name): int(value.split()[0], 0)
              for name, value in game["archives"]["selected_name_seeds"].items()}
     programs = []
     diagnostics = []
+    excluded = SKIP - {"patch", "patches"} if all_archives else SKIP
     paths = [p for p in sorted(root.rglob("*"))
-             if p.is_file() and not any(part.lower() in SKIP for part in p.relative_to(root).parts)]
+             if p.is_file() and not any(part.lower() in excluded for part in p.relative_to(root).parts)]
+    candidate_seeds = {0, *seeds.values()}
+    if all_archives:
+        for path in paths:
+            if path.suffix.lower() != ".exe":
+                continue
+            try:
+                candidate_seeds.add(int(runtime_fingerprint(path)["archive_name_seed"], 16))
+            except (ValueError, OSError, PEFormatError):
+                continue
+    archives_scanned = 0
     for path in paths:
         relative = path.relative_to(root).as_posix()
         suffix = path.suffix.lower()
@@ -107,13 +121,20 @@ def scan_game(game: dict) -> dict:
                 programs.append(parse_program(path.read_bytes(), relative))
             except (ValueError, zlib.error) as error:
                 diagnostics.append({"resource": relative, "message": str(error)})
-        if suffix != ".int" or not (
+        if suffix != ".int" or not (all_archives or
             path.stem.lower() in {"kcs", "mot", "ptcl", "ptcldat", "config", "system"}
             or path.stem.lower().startswith("update")
         ):
             continue
         try:
-            entries, layout, cipher = entries_at(path, seeds.get(normalized(relative), 0))
+            known_seed = seeds.get(normalized(relative))
+            entries, layout, cipher = entries_at(path, known_seed or 0)
+            if all_archives and cipher and known_seed is None and len(candidate_seeds) > 1:
+                entries, name_seed = recover_archive_names(path, entries, candidate_seeds)
+                if name_seed is None:
+                    diagnostics.append({"resource": relative, "message": "encrypted archive name seed is ambiguous"})
+                    continue
+            archives_scanned += 1
             with path.open("rb") as handle:
                 for entry in entries:
                     name = entry["name"].decode("cp932", "backslashreplace")
@@ -151,14 +172,44 @@ def scan_game(game: dict) -> dict:
         elif tables:
             program["ambiguous_tables"] = tables
     return {
-        "root": str(root), "program_count": len(programs),
+        "root": str(root), "program_count": len(programs), "archives_scanned": archives_scanned,
         "programs": programs, "diagnostics": diagnostics,
     }
 
 
+def recover_archive_names(path: Path, baseline: list, seeds: set[int]):
+    # The payload cipher is independent of the name seed. Use recognizable
+    # member extensions as alignment evidence when no per-file seed is known.
+    known_suffixes = {
+        b"anm", b"cst", b"cstl", b"csv", b"dat", b"fes", b"hg2", b"hg3", b"kcs", b"kx2",
+        b"mot", b"mpg", b"ogg", b"png", b"ppi", b"psz", b"ttf", b"txt", b"wav", b"webm", b"wmv", b"xml",
+    }
+    def score(entries):
+        return sum(entry["name"].lower().rsplit(b".", 1)[-1] in known_suffixes for entry in entries)
+
+    guesses = [(score(baseline), 0, baseline)]
+    for seed in sorted(seeds - {0}):
+        entries, _, _ = entries_at(path, seed)
+        guesses.append((score(entries), seed, entries))
+    guesses.sort(reverse=True, key=lambda guess: guess[0])
+    best, second = guesses[:2]
+    if best[0] <= second[0]:
+        return baseline, None
+    return best[2], best[1]
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--all-games", action="store_true", help="Scan all current games and INT archives.")
+    parser.add_argument("--output", type=Path, default=REPORT, help="Output path without extension.")
+    args = parser.parse_args()
     audit = json.loads((ROOT / "reports/all_sample_content_audit.json").read_text(encoding="utf-8"))
-    games = [scan_game(game) for game in audit["games"]]
+    sources = audit["games"]
+    if args.all_games:
+        known = {Path(game["root"]).name: game["archives"] for game in sources}
+        sources = [{"root": str(path), "archives": known.get(path.name, {"selected_name_seeds": {}})}
+                   for path in sorted((ROOT / "games").iterdir()) if path.is_dir()]
+    games = [scan_game(game, all_archives=args.all_games) for game in sources]
     grouped = {}
     for game in games:
         for program in game["programs"]:
@@ -188,6 +239,7 @@ def main() -> None:
     result = {
         "schema": "cs2-kcs-call-provenance/v1", "status": "static-no-program-execution",
         "game_count": len(games),
+        "archives_scanned": sum(game["archives_scanned"] for game in games),
         "program_count": sum(game["program_count"] for game in games),
         "runtime_program_count": sum(
             program["role"] == "runtime-candidate"
@@ -207,7 +259,7 @@ def main() -> None:
             "Dynamic operands and their raw flags are retained; no native or VM is executed.",
         ],
     }
-    REPORT.with_suffix(".json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.output.with_suffix(".json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     lines = [
         "# KCS 调用身份与宿主表清单", "",
         "静态读取 KCS，不编译、不执行 VM 或原版。宿主表是路径/同名资源线索，"
@@ -222,8 +274,8 @@ def main() -> None:
               f"其中 {result['runtime_program_count']} 个运行时程序候选；"
               "安装目录的 inst/inst.kcs 保留原始记录但排除于运行时统计。"
               "相同数字属于不同表时分别计数；版本内去重不代表跨版本实现相同。", ""]
-    REPORT.with_suffix(".md").write_text("\n".join(lines), encoding="utf-8")
-    print(json.dumps({key: result[key] for key in ("game_count", "program_count", "diagnostic_count")},
+    args.output.with_suffix(".md").write_text("\n".join(lines), encoding="utf-8")
+    print(json.dumps({key: result[key] for key in ("game_count", "archives_scanned", "program_count", "diagnostic_count")},
                      ensure_ascii=True, indent=2))
 
 

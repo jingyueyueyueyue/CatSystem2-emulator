@@ -1,0 +1,22 @@
+{
+  "1": {"frames": 1900, "inputs": ["story-events", "story-trace", "capture-every:0", "400:784,405", "move:665:1155,235", "680:1155,235", "ctrl-hold:720:1650", "inspect-log:1900"]},
+  "2": {"frames": 2400, "inputs": ["story-events", "story-trace", "capture-every:0", "move:695:105,64", "move:730:400,144", "require-hit:745:26", "745:400,144", "require-hit:805:35", "805:400,144", "ctrl-hold:855:2100", "inspect-log:2400"]},
+  "3": {"frames": 2890, "inputs": ["story-events", "story-trace", "capture-every:0", "230:557,324", "465:557,324", "525:557,324", "549:557,324", "573:557,324", "move:2380:138,362", "2450:138,362", "ctrl-hold:2500:2800", "inspect-log:2890"]},
+  "4": {"frames": 2200, "inputs": ["story-events", "story-trace", "capture-every:0", "move:1172:638,446", "require-hit:1174:19", "1174:638,446", "move:1358:165,386", "require-hit:1360:15", "1360:165,386", "ctrl-hold:1410:2000", "inspect-log:2200"]},
+  "5": {"frames": 1600, "inputs": ["story-events", "story-trace", "capture-every:0", "215:13", "260:400,300", "310:32", "380:400,300", "435:13", "510:13", "move:860:235,509", "require-hit:885:15", "885:235,509", "ctrl-hold:935:1450", "inspect-log:1600"]},
+  "6": {"frames": 1550, "inputs": ["story-events", "story-trace", "capture-every:0", "move:500:98,208", "require-hit:530:18", "530:98,208", "move:640:98,104", "require-hit:660:10", "660:98,104", "ctrl-hold:710:1350", "inspect-log:1550"]},
+  "7": {"frames": 2100, "inputs": ["story-events", "story-trace", "capture-every:0", "move:930:176,256", "require-hit:950:20", "950:176,256", "ctrl-hold:1000:1900", "inspect-log:2100"]},
+  "8": {"frames": 2700, "inputs": ["story-events", "story-trace", "capture-every:0", "eye08-title:story", "ctrl-hold:2530:2650", "inspect-log:2700"]},
+  "9": {"frames": 1150, "inputs": ["story-events", "story-trace", "capture-every:0", "move:381:195,357", "require-hit:382:14", "382:195,357", "ctrl-hold:440:950", "inspect-log:1150"]},
+  "10": {"frames": 1900, "inputs": ["story-events", "story-trace", "capture-every:0", "move:708:190,222", "require-hit:710:39", "710:190,222", "ctrl-hold:760:1700", "inspect-log:1900"]},
+  "11": {"frames": 2100, "inputs": ["story-events", "story-trace", "capture-every:0", "215:13", "385:13", "550:13", "move:605:1154,473", "require-hit:612:15", "612:1154,473", "810:640,360", "890:640,360", "970:640,360", "ctrl-hold:1020:1900", "inspect-log:2100"]},
+  "12": {"frames": 2600, "inputs": ["story-events", "story-trace", "capture-every:0", "move:1612:641,443", "require-hit:1613:15", "1613:641,443", "ctrl-hold:1660:2400", "inspect-log:2600"]},
+  "13": {"frames": 1650, "inputs": ["story-events", "story-trace", "capture-every:0", "require-hit:241:20", "241:640,441", "require-hit:361:55", "361:640,549", "ctrl-hold:410:1450", "inspect-log:1650"]},
+  "14": {"frames": 1750, "inputs": ["story-events", "story-trace", "capture-every:0", "move:725:512,354", "require-hit:750:19", "750:512,354", "ctrl-hold:800:1550", "inspect-log:1750"]},
+  "15": {"frames": 1900, "inputs": ["story-events", "story-trace", "capture-every:0", "move:691:512,353", "require-hit:692:20", "692:512,353", "move:820:400,130", "require-hit:821:67", "821:400,130", "ctrl-hold:870:1700", "inspect-log:1900"]},
+  "16": {"frames": 2800, "inputs": ["story-events", "story-trace", "capture-every:0", "require-hit:425:14", "425:640,480", "require-hit:661:15", "661:66,72", "require-hit:1041:62", "1041:640,420", "ctrl-hold:1050:2450", "inspect-log:2800"]},
+  "17": {"frames": 2400, "inputs": ["story-events", "story-trace", "capture-every:0", "1164:13", "1294:13", "1392:13", "ctrl-hold:1440:2200", "inspect-log:2400"]},
+  "18": {"frames": 1650, "inputs": ["story-events", "story-trace", "capture-every:0", "move:770:183,434", "require-hit:790:11", "790:183,434", "ctrl-hold:840:1450", "inspect-log:1650"]},
+  "19": {"frames": 3150, "inputs": ["story-events", "story-trace", "capture-every:0", "require-hit:2270:17", "2270:335,488", "move:2304:40,32", "ctrl-hold:2320:2950", "inspect-log:3150"]},
+  "20": {"frames": 3200, "inputs": ["story-events", "story-trace", "capture-every:0", "move:2032:480,667", "require-hit:2033:16", "2033:480,667", "move:2193:353,308", "require-hit:2194:14", "2194:353,308", "move:2388:723,418", "require-hit:2389:15", "2389:723,418", "ctrl-hold:2430:3000", "inspect-log:3200"]}
+}

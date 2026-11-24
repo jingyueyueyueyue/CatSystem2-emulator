@@ -21,6 +21,9 @@ pub(super) fn apply_effect(
     if let Some(result) = super::fes_settings::apply_effect(host, view, runtime, driver, effect, shared)? {
         return Ok(Some(result));
     }
+    if let Some(result) = super::fes_window::apply_effect(host, view, driver, effect, shared)? {
+        return Ok(Some(result));
+    }
     if matches!(effect, FesDriverEffect::Waiting { .. } | FesDriverEffect::CancelWait { .. }) {
         if let Some(result) = super::fes_motion::apply_effect(host, view, runtime, driver, effect, shared)? {
             return Ok(Some(result));
@@ -41,8 +44,17 @@ pub(super) fn apply_effect(
     if let Some(result) = super::fes_controls::apply_text_viewport_initializer(host, view, runtime, driver, effect, shared)? {
         return Ok(Some(result));
     }
+    if host.apply_fes_external_variable(view.id, driver, effect, shared)? {
+        return Ok(Some(true));
+    }
     if let Some(result) = super::fes_globals::apply_effect(host, view, runtime, driver, effect, shared)? {
         return Ok(Some(result));
+    }
+    if super::fes_gallery::apply_effect(host, driver, effect, shared)? {
+        return Ok(Some(true));
+    }
+    if super::database_native::apply_fes_effect(host, driver, effect, shared)? {
+        return Ok(Some(true));
     }
     if let Some(result) = driver.apply_file_effect(host, effect, shared)? {
         return Ok(Some(result));
@@ -95,5 +107,6 @@ pub(super) fn release(host: &mut LoggingHost<'_>, owner: u32) -> Result<()> {
     super::fes_sound::release_owner(host, owner);
     super::fes_globals::release_owner(host, owner);
     super::fes_settings::release_owner(host, owner);
+    super::fes_window::release_owner(host, owner);
     Ok(())
 }

@@ -7,6 +7,7 @@ use super::{RASTER, Raster, RasterRect, UPLOAD, blend_code, buffer, device_frame
 use anyhow::{Context, Result, bail};
 use cs2_renderer::{BlendMode, Canvas, Rect, RgbaFrame};
 use std::sync::{Arc, atomic::Ordering};
+use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub(in crate) struct SceneVertex {
@@ -29,6 +30,8 @@ pub(in crate) struct SceneRaster {
 
 impl SceneRaster {
     fn new(device: &wgpu::Device) -> Result<Self> {
+        #[cfg(target_os = "android")]
+        let validation = crate::gpu_raster::lock_validation_scope();
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("CS2 ordered scene triangles"),
@@ -41,6 +44,8 @@ impl SceneRaster {
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
             bail!("compile scene triangle shader: {error}");
         }
+        #[cfg(target_os = "android")]
+        drop(validation);
         let layout = pipeline.get_bind_group_layout(0);
         Ok(Self { pipeline, layout,
             parameters: buffer(device, 48, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
@@ -216,6 +221,22 @@ fn prepare(size: [u32; 2], input: &[SceneTriangle], clip: Option<Rect>, half: bo
 }
 
 impl Raster {
+    pub(super) fn prepare_scene_triangles(&mut self, phase: &'static str) -> Result<&mut SceneRaster> {
+        self.scene_triangles.get_or_insert_with(|| {
+            let started = Instant::now();
+            let result = SceneRaster::new(&self.device).map_err(|error| format!("{error:#}"));
+            report(&format!(
+                "scene_triangles_pipeline phase={phase} status={} compile_us={}",
+                if result.is_ok() { "ready" } else { "failed" },
+                started.elapsed().as_micros(),
+            ));
+            if let Err(error) = &result {
+                report(&format!("scene_triangles_pipeline_error reason={error}"));
+            }
+            result
+        }).as_mut().map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_scene_triangles(
         &mut self, canvas: &mut Canvas, triangles: &[SceneTriangle], source: Option<&RgbaFrame>,
@@ -237,7 +258,7 @@ impl Raster {
         if let Some(previous) = device_frame(canvas) && !Arc::ptr_eq(&previous.failed, &self.failed) {
             bail!("foreign_device_generation");
         }
-        if self.scene_triangles.is_none() { self.scene_triangles = Some(SceneRaster::new(&self.device)?); }
+        self.prepare_scene_triangles("demand")?;
         let source_view = self.source_texture(source);
         self.full_target = None;
         self.previous_planes = None;
@@ -249,7 +270,8 @@ impl Raster {
         } else {
             self.queue.write_buffer(&self.target, 0, canvas.pixels());
         }
-        let scene = self.scene_triangles.as_mut().context("scene raster missing after initialization")?;
+        let scene = self.scene_triangles.as_mut().and_then(|result| result.as_mut().ok())
+            .context("scene raster missing after initialization")?;
         for (buffer_slot, bytes) in [(&mut scene.triangles, &prepared.triangles),
             (&mut scene.tiles, &prepared.tiles), (&mut scene.indices, &prepared.indices)] {
             if buffer_slot.size() < bytes.len() as u64 {
@@ -281,7 +303,7 @@ impl Raster {
             pass.set_bind_group(0, &bindings, &[]);
             pass.dispatch_workgroups(prepared.region.size[0].div_ceil(8), prepared.region.size[1].div_ceil(8), 1);
         }
-        self.queue.submit(Some(encoder.finish()));
+        super::submit_gpu_commands(&self.queue, Some(encoder.finish()));
         canvas.set_deferred_device_pixels(self.publish_device_frame(size));
         static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !REPORTED.swap(true, Ordering::Relaxed) {

@@ -498,8 +498,6 @@ impl HeadlessPlayer {
 
     pub(super) fn initialize_configuration_host(&mut self) -> Result<()> {
         self.with_host(|host| host.ensure_configuration_state())?;
-        // Own the mutable definition here; LoggingHost's live scripts borrow
-        // an immutable view of it during dispatch.
         if self.sound_config_enabled != 0 {
             let path = self.save_root.join(&self.data_services.configuration.sound_file);
             match std::fs::read(&path) {

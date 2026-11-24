@@ -56,6 +56,30 @@ enum Operation {
         slot: i32,
         container: u32,
     },
+    SaveAppendString {
+        slot: i32,
+        record: u32,
+        text: Vec<u8>,
+    },
+    SaveGetString {
+        slot: i32,
+        record: u32,
+        destination: u32,
+    },
+    DeleteSave {
+        slot: i32,
+    },
+    CopySave {
+        from: i32,
+        to: i32,
+        exchange: bool,
+    },
+    SortSave {
+        destination: i32,
+        first: i32,
+        last: i32,
+        slots: Vec<(i32, u64)>,
+    },
 }
 
 impl FesScriptDriver {
@@ -72,7 +96,8 @@ impl FesScriptDriver {
         };
         if !matches!(
             command.parameters.first().map(Vec::as_slice),
-            Some(b"newsave" | b"saveexist" | b"datasave")
+            Some(b"newsave" | b"saveexist" | b"datasave" | b"saveapend_str" | b"saveget_str"
+                | b"savedelete" | b"savecopy" | b"saveexchg" | b"sortsave")
         ) {
             return Ok(None);
         }
@@ -172,6 +197,25 @@ impl FileCommand {
                     last, selected: -1, latest: 0,
                 });
             }
+            b"sortsave" => {
+                let mut bounds = [0; 3];
+                for (ordinal, bound) in bounds.iter_mut().enumerate() {
+                    let Some(number) = self.number(ordinal, ordinal + 1, driver, shared)? else {
+                        self.operation = Some(Operation::Skipped);
+                        return Ok(());
+                    };
+                    *bound = number;
+                }
+                let [destination, first, last] = bounds;
+                if i64::from(last) - i64::from(first) + 1 > MAX_QUERY_SLOTS {
+                    bail!("FES sortsave range exceeds {MAX_QUERY_SLOTS} slots");
+                }
+                self.operation = Some(if first < last {
+                    Operation::SortSave { destination, first, last, slots: Vec::new() }
+                } else {
+                    Operation::Skipped
+                });
+            }
             b"saveexist" => {
                 let Some(slot) = self.number(0, 1, driver, shared)? else {
                     self.operation = Some(Operation::Skipped);
@@ -214,6 +258,50 @@ impl FileCommand {
                 };
                 self.operation = Some(Operation::DataSave { slot, container: container as u32 });
             }
+            b"saveapend_str" | b"saveget_str" => {
+                let Some(slot) = self.number(0, 1, driver, shared)? else {
+                    self.operation = Some(Operation::Skipped);
+                    return Ok(());
+                };
+                let Some(record) = self.number(1, 2, driver, shared)? else {
+                    self.operation = Some(Operation::Skipped);
+                    return Ok(());
+                };
+                let record = record as u32;
+                self.operation = Some(if self.command.parameters[0] == b"saveapend_str" {
+                    match self.command.parameters.get(3) {
+                        Some(text) => Operation::SaveAppendString {
+                            slot, record, text: nul(text).to_vec(),
+                        },
+                        None => Operation::Skipped,
+                    }
+                } else {
+                    match self.number(2, 3, driver, shared)? {
+                        Some(destination) => Operation::SaveGetString {
+                            slot, record, destination: destination as u32,
+                        },
+                        None => Operation::Skipped,
+                    }
+                });
+            }
+            b"savedelete" => {
+                self.operation = Some(match self.number(0, 1, driver, shared)? {
+                    Some(slot) => Operation::DeleteSave { slot },
+                    None => Operation::Skipped,
+                });
+            }
+            b"savecopy" | b"saveexchg" => {
+                let Some(from) = self.number(0, 1, driver, shared)? else {
+                    self.operation = Some(Operation::Skipped);
+                    return Ok(());
+                };
+                self.operation = Some(match self.number(1, 2, driver, shared)? {
+                    Some(to) => Operation::CopySave {
+                        from, to, exchange: self.command.parameters[0] == b"saveexchg",
+                    },
+                    None => Operation::Skipped,
+                });
+            }
             _ => bail!("FES file-command kind is invalid"),
         }
         Ok(())
@@ -242,6 +330,19 @@ impl FileCommand {
                     return Ok(false);
                 }
                 write_shared(shared, *destination, *selected);
+                Ok(true)
+            }
+            Operation::SortSave { destination, first, last, slots } => {
+                let count = (i64::from(*last) - i64::from(*first) + 1) as usize;
+                for index in slots.len()..count.min(slots.len() + QUERY_BATCH) {
+                    let slot = *first + index as i32;
+                    slots.push((slot, modified_time(host.save_root, slot)?.unwrap_or(0)));
+                }
+                if slots.len() < count { return Ok(false); }
+                sort_save_slots(slots);
+                for (offset, &(slot, _)) in slots.iter().enumerate() {
+                    write_shared(shared, destination.wrapping_add(offset as i32), slot);
+                }
                 Ok(true)
             }
             Operation::SaveExist { destination, filename, lower, upper } => {
@@ -282,8 +383,164 @@ impl FileCommand {
                 });
                 Ok(true)
             }
+            Operation::SaveAppendString { slot, record, text } => {
+                append_save_string(host.save_root, *slot, *record, text)?;
+                Ok(true)
+            }
+            Operation::SaveGetString { slot, record, destination } => {
+                if let Some(text) = get_save_string(host.save_root, *slot, *record)? {
+                    shared.strings.insert(*destination, text);
+                }
+                Ok(true)
+            }
+            Operation::DeleteSave { slot } => {
+                let path = crate::save_path(host.save_root, &slot_filename(*slot))?;
+                let result = remove_slot(&path);
+                record_file_result(host, "savedelete", format!("slot={slot}"), result);
+                Ok(true)
+            }
+            Operation::CopySave { from, to, exchange } => {
+                let source = crate::save_path(host.save_root, &slot_filename(*from))?;
+                let destination = crate::save_path(host.save_root, &slot_filename(*to))?;
+                let verb = if *exchange { "saveexchg" } else { "savecopy" };
+                let result = copy_slots(&source, &destination, *exchange);
+                record_file_result(host, verb, format!("from={from} to={to}"), result);
+                Ok(true)
+            }
         }
     }
+}
+
+fn record_file_result(host: &mut LoggingHost<'_>, verb: &str, slots: String, result: Result<bool>) {
+    let outcome = match result {
+        Ok(changed) => format!("changed={changed}"),
+        Err(error) => format!("error={error:#}"),
+    };
+    host.events.push(LogicEvent {
+        frame: host.frame,
+        kind: "fes-save-file".into(),
+        detail: format!("command={verb} {slots} {outcome}"),
+    });
+}
+
+fn remove_slot(path: &Path) -> Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(windows))]
+    let _ = metadata;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct SlotContents {
+    bytes: Vec<u8>,
+    modified: std::time::SystemTime,
+}
+
+impl SlotContents {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() { return Ok(None); }
+        if metadata.len() > MAX_SAVE_BYTES { bail!("FES save file exceeds 64 MiB"); }
+        let mut bytes = Vec::new();
+        file.take(MAX_SAVE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_SAVE_BYTES { bail!("FES save file exceeds 64 MiB"); }
+        Ok(Some(Self { bytes, modified: metadata.modified()? }))
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        // Windows cannot replace a read-only file. The original save-copy
+        // helper also permits overwriting read-only slots.
+        #[cfg(windows)]
+        let previous_permissions = match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().readonly() => {
+                let previous = metadata.permissions();
+                let mut writable = previous.clone();
+                writable.set_readonly(false);
+                fs::set_permissions(path, writable)?;
+                Some(previous)
+            }
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let written = cs2_runtime::write_private_file_with_modified_time(path, &self.bytes, self.modified);
+        #[cfg(windows)]
+        if written.is_err() {
+            if let Some(previous) = previous_permissions {
+                fs::set_permissions(path, previous).context("restore save slot permissions")?;
+            }
+        }
+        written?;
+        Ok(())
+    }
+}
+
+fn copy_slots(source: &Path, destination: &Path, exchange: bool) -> Result<bool> {
+    if source == destination { return Ok(false); }
+    let first = SlotContents::read(source)?;
+    if !exchange {
+        let Some(first) = first else { return Ok(false); };
+        first.write(destination)?;
+        return Ok(true);
+    }
+
+    let second = SlotContents::read(destination)?;
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            // Keep both originals until the replacement writes succeed. A
+            // second-write failure can then restore the first slot in place.
+            second.write(source)?;
+            if let Err(error) = first.write(destination) {
+                first.write(source).with_context(|| format!(
+                    "FES save exchange rollback failed after destination write: {error:#}",
+                ))?;
+                return Err(error);
+            }
+        }
+        (Some(_), None) => fs::rename(source, destination)?,
+        (None, Some(_)) => fs::rename(destination, source)?,
+        (None, None) => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn append_save_string(root: &Path, slot: i32, record: u32, text: &[u8]) -> Result<()> {
+    let name = slot_filename(slot);
+    let Some(mut file) = read_css(root, &name)? else { return Ok(()); };
+    let path = crate::save_path(root, &name)?;
+    let modified = fs::metadata(&path)?.modified()?;
+    file.try_remove(record)?;
+    // The original stores four bytes after the text, including the terminator.
+    let mut bytes = Vec::with_capacity(text.len() + 4);
+    bytes.extend_from_slice(text);
+    bytes.extend_from_slice(&[0; 4]);
+    file.append(record, &bytes)?;
+    cs2_runtime::write_private_file_with_modified_time(&path, &file.to_css()?, modified)?;
+    Ok(())
+}
+
+fn get_save_string(root: &Path, slot: i32, record: u32) -> Result<Option<Vec<u8>>> {
+    let Some(file) = read_css(root, &slot_filename(slot))? else { return Ok(None); };
+    Ok(file.try_record(record)?.map(|bytes| nul(bytes).to_vec()))
 }
 
 fn write_shared(state: &mut ExpressionState, destination: i32, value: i32) {
@@ -294,6 +551,41 @@ fn write_shared(state: &mut ExpressionState, destination: i32, value: i32) {
 
 fn slot_filename(slot: i32) -> String {
     format!("save{slot:04}.dat")
+}
+
+fn sort_save_slots(mut slots: &mut [(i32, u64)]) {
+    // The original partitions around the lower midpoint and moves only
+    // strictly newer entries to its left. Equal timestamps keep its swaps.
+    while slots.len() > 1 {
+        slots.swap(0, (slots.len() - 1) / 2);
+        let pivot = slots[0].1;
+        let mut split = 0;
+        let mut all_equal = true;
+        for index in 1..slots.len() {
+            all_equal &= slots[index].1 == pivot;
+            if slots[index].1 > pivot {
+                split += 1;
+                slots.swap(index, split);
+            }
+        }
+        if all_equal {
+            // The remaining partitions only swap their first and middle entries.
+            for first in 1..slots.len() - 1 {
+                slots.swap(first, (first + slots.len() - 1) / 2);
+            }
+            return;
+        }
+        slots.swap(0, split);
+        let (newer, rest) = slots.split_at_mut(split);
+        let older = &mut rest[1..];
+        if newer.len() < older.len() {
+            sort_save_slots(newer);
+            slots = older;
+        } else {
+            sort_save_slots(older);
+            slots = newer;
+        }
+    }
 }
 
 fn modified_time(root: &Path, slot: i32) -> Result<Option<u64>> {
@@ -365,4 +657,118 @@ fn read_css(root: &Path, name: &str) -> Result<Option<CssFile>> {
 
 fn nul(bytes: &[u8]) -> &[u8] {
     bytes.split(|&byte| byte == 0).next().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cs2_script::{FesInterpreter, FesProgram, FesStep};
+
+    #[test]
+    fn fes_save_slot_operations_preserve_bytes_and_timestamps() -> Result<()> {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-fes-save-slot-{}-{unique}", std::process::id()));
+        fs::create_dir(&root)?;
+        let first = root.join(slot_filename(1));
+        let second = root.join(slot_filename(2));
+        let third = root.join(slot_filename(3));
+        let bytes_a = b"CSS\0first\xff";
+        let bytes_b = b"CSS\0second";
+        let time_a = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let time_b = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let result = (|| -> Result<()> {
+            cs2_runtime::write_private_file_with_modified_time(&first, bytes_a, time_a)?;
+            cs2_runtime::write_private_file_with_modified_time(&second, bytes_b, time_b)?;
+            #[cfg(windows)]
+            {
+                let mut permissions = fs::metadata(&second)?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&second, permissions)?;
+            }
+            assert!(copy_slots(&first, &second, false)?);
+            assert_eq!(fs::read(&first)?, bytes_a);
+            assert_eq!(fs::read(&second)?, bytes_a);
+            assert_eq!(fs::metadata(&second)?.modified()?, time_a);
+
+            cs2_runtime::write_private_file_with_modified_time(&second, bytes_b, time_b)?;
+            assert!(copy_slots(&first, &second, true)?);
+            assert_eq!(fs::read(&first)?, bytes_b);
+            assert_eq!(fs::read(&second)?, bytes_a);
+            assert_eq!(fs::metadata(&first)?.modified()?, time_b);
+            assert_eq!(fs::metadata(&second)?.modified()?, time_a);
+            assert!(copy_slots(&third, &second, true)?);
+            assert!(!second.exists());
+            assert_eq!(fs::read(&third)?, bytes_a);
+            assert_eq!(fs::metadata(&third)?.modified()?, time_a);
+
+            assert!(!copy_slots(&second, &first, false)?);
+            assert!(!copy_slots(&first, &first, true)?);
+            assert_eq!(fs::read(&first)?, bytes_b);
+            assert!(remove_slot(&first)?);
+            assert!(!remove_slot(&first)?);
+            Ok(())
+        })();
+        for path in [&first, &second, &third] { remove_slot(path)?; }
+        fs::remove_dir(&root)?;
+        result
+    }
+
+    #[test]
+    fn fes_save_string_roundtrip_keeps_text_and_existing_save_records() -> Result<()> {
+        let program = FesProgram::from_text(
+            b"#MACRO\nVALNO_S_NEW 42\n#START\n\
+              if (1) saveapend_str $VALNO_S_NEW 0x80000000 $str155\n\
+              saveapend_str $VALNO_S_NEW 0x200 $str751\n",
+        )?;
+        let mut interpreter = FesInterpreter::new(program)?;
+        let mut state = ExpressionState::default();
+        let title = b"Chapter \"2 (one $str3";
+        let comment = b"First save\t[story]";
+        state.strings.insert(155, title.to_vec());
+        state.strings.insert(751, comment.to_vec());
+
+        let root = std::env::temp_dir().join(format!(
+            "cs2-fes-save-string-{}-{:?}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos(),
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let path = root.join(slot_filename(0));
+            let mut file = CssFile::new(0x91);
+            file.append(0x10, b"game state")?;
+            file.append(0x80000000, b"old title\0")?;
+            fs::write(&path, file.to_css()?)?;
+            File::options().write(true).open(&path)?.set_times(
+                fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
+            )?;
+            let modified = fs::metadata(&path)?.modified()?;
+
+            for (id, record, text) in [
+                (b"0x80000000".as_slice(), 0x80000000, title.as_slice()),
+                (b"0x200".as_slice(), 0x200, comment.as_slice()),
+            ] {
+                assert!(matches!(interpreter.run(&mut state, 8)?, FesStep::Event));
+                let parameters = interpreter.pending_command_parameters().unwrap();
+                assert_eq!(parameters.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    [b"saveapend_str".as_slice(), b"$42", id, text]);
+                append_save_string(&root, 0, record, &parameters[3])?;
+                interpreter.resume();
+            }
+
+            let file = read_css(&root, &slot_filename(0))?.unwrap();
+            assert_eq!(file.tag(), 0x91);
+            assert_eq!(file.record(0x10), Some(b"game state".as_slice()));
+            assert_eq!(file.record(0x80000000), Some([title.as_slice(), &[0; 4]].concat().as_slice()));
+            assert_eq!(file.records.iter().filter(|record| record.id == 0x80000000).count(), 1);
+            assert_eq!(get_save_string(&root, 0, 0x200)?.as_deref(), Some(comment.as_slice()));
+            assert_eq!(get_save_string(&root, 0, 0x201)?, None);
+            assert_eq!(fs::metadata(&path)?.modified()?, modified);
+            Ok(())
+        })();
+        fs::remove_file(root.join(slot_filename(0)))?;
+        fs::remove_dir(&root)?;
+        result
+    }
 }

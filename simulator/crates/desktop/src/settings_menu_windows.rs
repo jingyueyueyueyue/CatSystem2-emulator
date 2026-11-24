@@ -79,10 +79,17 @@ unsafe fn get_long(window: isize, index: i32) -> isize {
     { unsafe { GetWindowLongW(window, index) } }
 }
 fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(Some(0)).collect() }
-fn hwnd(window: &Window) -> Result<isize> {
+pub(super) fn hwnd(window: &Window) -> Result<isize> {
     let handle = window.window_handle()?;
     let RawWindowHandle::Win32(handle) = handle.as_raw() else { bail!("host UI requires a Win32 window"); };
     Ok(handle.hwnd.get())
+}
+
+pub(super) fn show_fes_menu_info(player: &mut HeadlessPlayer, window: &Window) -> Result<()> {
+    let info = player.host_fes_menu_info()?;
+    let result = unsafe { MessageBoxW(hwnd(window)?, wide(&info.message).as_ptr(), wide(&info.title).as_ptr(), 0x40) };
+    if result == 0 { bail!("menu information dialog failed: {}", std::io::Error::last_os_error()); }
+    player.complete_host_fes_menu_info(info.id)
 }
 struct Context {
     player: *mut HeadlessPlayer, owner: isize, request: HostEffectSettings, values: Vec<HostSettingsEdit>,

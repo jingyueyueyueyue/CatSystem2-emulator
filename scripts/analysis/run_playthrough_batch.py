@@ -48,7 +48,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 SAVE_NAME = re.compile(r"save(?:[0-9]+|gen)\.dat|slot_.*\.cs2save", re.IGNORECASE)
 REUSABLE_ATTEMPT_STATUSES = {
     "checkpoint_reached", "engine_error", "unexpected_branch", "unknown_state",
-    "unrecognized_wait", "input_missed", "checkpoint_mismatch",
+    "unrecognized_wait", "input_missed", "checkpoint_mismatch", "visual_review_required",
 }
 
 
@@ -339,13 +339,20 @@ def load_attempt_history(cache_root, indices):
         try:
             receipt = json.loads(path.read_text(encoding="utf-8"))
             key = receipt.get("attempt_key")
+            if receipt.get("status") == "visual_review_required" and (
+                receipt.get("exit_code") != 0
+                or receipt.get("last_frame") != int(receipt["command"][3])
+                or not all((Path(receipt["output"]) / capture).is_file()
+                           for capture in receipt["captures"])
+            ):
+                continue
             if (receipt.get("index") == index and is_sha256(key)
                     and receipt.get("status") in REUSABLE_ATTEMPT_STATUSES
                     and isinstance(receipt.get("seconds"), (float, int))
                     and not receipt.get("timed_out")
                     and all(Path(receipt[field]).is_file() for field in ("stdout", "stderr"))):
                 receipts.setdefault((index, key), (path, receipt))
-        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError):
             continue
     return receipts
 
@@ -746,7 +753,7 @@ def main():
     parser.add_argument("--fast-text", action="store_true",
                         help="seed the fastest native text speed in each isolated replay profile")
     parser.add_argument("--reuse-attempts", action="store_true",
-                        help="reuse a prior checkpoint or diagnosed stop for identical replay inputs")
+                        help="reuse a completed frame run, checkpoint, or diagnosed stop for identical inputs")
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--button-probe", action="store_true",
                         help="record actual mouse targets at fixed-frame inspect checkpoints")

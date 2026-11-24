@@ -1,7 +1,7 @@
 //! The real confirmation/cancel path's ordered BUTTON control requests.
 //! This is a descendant of fes_driver, sharing its handler and notice queues.
 use super::super::*;
-use crate::{LoggingHost, fes_tasks::FesTaskView};
+use crate::{FesRuntime, LoggingHost, fes_tasks::FesTaskView};
 use anyhow::Context;
 use cs2_runtime::TaskCommand;
 
@@ -13,6 +13,9 @@ pub(crate) enum Request {
     /// The preceding real UNFOCUS handler has completed. Retain this stage
     /// in the existing deferred queue, including across a budget continuation.
     ResetSelection,
+    DeleteBackgroundButton,
+    AutoMove(FesDriverTarget),
+    RestoreMove,
 }
 
 impl FesScriptDriver {
@@ -20,9 +23,40 @@ impl FesScriptDriver {
         -> Result<Option<Option<FesDriverEffect>>> {
         let verb = command.parameters.first().map(Vec::as_slice).unwrap_or_default();
         let request = match verb {
+            b"sendbtn" => {
+                self.send_button = command.parameters.get(1)
+                    .map(|value| self.number(value).map(|value| value as u32)).transpose()?;
+                return Ok(Some(None));
+            }
+            b"force_redraw" => {
+                self.force_redraw_pending = true;
+                return Ok(Some(None));
+            }
             b"basebtnpri" => Request::BaseButtonPriority(command.parameters.get(1)
                 .map(|source| self.number(source)).transpose()?.unwrap_or(-1)),
             b"resetactive" => Request::ResetActive,
+            b"deletebgbutton" => Request::DeleteBackgroundButton,
+            b"automove" => {
+                let Some(target) = command.parameters.get(1).map(Vec::as_slice)
+                    .filter(|target| !target.is_empty()) else { return Ok(Some(None)); };
+                let target = if target == b"@" {
+                    command.object_event.as_ref().map(FesDriverTarget::parameter).unwrap_or_default()
+                } else { target.to_vec() };
+                let Some((name, count)) = self.adapter.objects.iter().map(|object| &object.definition)
+                    .filter(|object| target == object.name || target.strip_prefix(object.name.as_slice())
+                        .is_some_and(|tail| tail.starts_with(b"[") && tail.ends_with(b"]")))
+                    .max_by_key(|object| object.name.len())
+                    .map(|object| (object.name.clone(), object.bank_count))
+                else { return Ok(Some(None)); };
+                let tail = &target[name.len()..];
+                if tail.is_empty() && count != 1 { return Ok(Some(None)); }
+                let bank = if tail.is_empty() { 0 } else { self.number(&tail[1..tail.len() - 1])? };
+                if usize::try_from(bank).ok().is_none_or(|bank| self.adapter.object_bank(&name, bank).is_none()) {
+                    return Ok(Some(None));
+                }
+                Request::AutoMove(FesDriverTarget { name, bank, default_group: None, value: -1 })
+            }
+            b"restoremove" => Request::RestoreMove,
             _ => return Ok(None),
         };
         let effect = FesDriverEffect::ControlFlow(request);
@@ -30,7 +64,7 @@ impl FesScriptDriver {
             self.defer(effect)?;
             // PE 2db320 returns -3; 2dde90 returns zero. The latter must
             // finish its calling handler before consuming the queued reset.
-            if verb == b"basebtnpri" {
+            if matches!(verb, b"basebtnpri" | b"deletebgbutton") {
                 return self.finish_handler(false).map(|effect| Some(Some(effect)));
             }
             return Ok(Some(None));
@@ -81,12 +115,12 @@ fn send_input(host: &mut LoggingHost<'_>, owner: u32, code: u32, data: [u32; 3])
 }
 
 pub(crate) fn apply_effect(host: &mut LoggingHost<'_>, view: &FesTaskView,
-    driver: &mut FesScriptDriver, effect: &FesDriverEffect) -> Result<Option<bool>> {
+    runtime: &FesRuntime, driver: &mut FesScriptDriver, effect: &FesDriverEffect) -> Result<Option<bool>> {
     let FesDriverEffect::ControlFlow(request) = effect else { return Ok(None); };
     match request {
         Request::BaseButtonPriority(value) => {
-            let button = host.data_services.tasks.fes.platform.auxiliary_button(view.id)
-                .context("FES basebtnpri has no original low button")?;
+            let Some(button) = host.data_services.tasks.fes.platform.auxiliary_button(view.id)
+            else { return Ok(Some(true)); };
             if host.scene_nodes.get(&button).is_none_or(|node| node.kind != 6 || node.parent != view.id)
                 || !host.input_task.regions.iter().any(|region| region.id() == button) {
                 bail!("FES basebtnpri low button is absent or unregistered");
@@ -132,6 +166,27 @@ pub(crate) fn apply_effect(host: &mut LoggingHost<'_>, view: &FesTaskView,
             }
         }
         Request::ResetSelection => send_input(host, view.id, 146, [0, 1, 1])?,
+        Request::DeleteBackgroundButton => {
+            crate::fes_task_platform::delete_background_button(host, view.id)?;
+        }
+        Request::AutoMove(target) => {
+            let Some((_, key, _)) = crate::fes_task_platform::navigation_binding(
+                host, view.id, &target.name, target.bank,
+            ) else { return Ok(Some(true)); };
+            if host.fes_auto_pointer_enabled()? {
+                let point = crate::fes_motion::button_image_position(host, view.id, runtime, &key)?;
+                let target = super::button_pointer_point(host, view, runtime, &key, [point.x, point.y])?;
+                let origin = host.query_device_pointer()?;
+                host.move_fes_pointer(view.id, target, 4)?;
+                driver.auto_pointer_origin = Some(origin);
+            }
+        }
+        Request::RestoreMove => {
+            if host.fes_auto_pointer_enabled()? && let Some(origin) = driver.auto_pointer_origin {
+                host.move_fes_pointer(view.id, origin, 4)?;
+                driver.auto_pointer_origin = None;
+            }
+        }
     }
     Ok(Some(true))
 }

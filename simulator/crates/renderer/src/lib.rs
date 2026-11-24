@@ -1196,6 +1196,7 @@ pub trait CanvasReadback: std::any::Any + std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 enum CanvasPixels {
     Cpu(Vec<u8>),
+    SharedCpu(Arc<Vec<u8>>),
     Device(Arc<DevicePixels>),
 }
 
@@ -1248,24 +1249,27 @@ impl DevicePixels {
 impl CanvasPixels {
     #[track_caller]
     fn make_cpu(&mut self) -> &mut Vec<u8> {
-        if matches!(self, Self::Device(_)) {
+        if !matches!(self, Self::Cpu(_)) {
             let current = std::mem::replace(self, Self::Cpu(Vec::new()));
-            let Self::Device(pixels) = current else { unreachable!() };
-            *self = Self::Cpu(match Arc::try_unwrap(pixels) {
-                Ok(pixels) => pixels.into_vec(),
-                Err(pixels) => {
-                    let mut output = pixels.take_recycled();
-                    if let Some(cached) = pixels.pixels.get() {
-                        output.clear();
-                        output.extend_from_slice(cached);
-                    } else {
-                        output.resize(pixels.bytes, 0);
-                        if !pixels.source.read_rgba_at(&mut output, std::panic::Location::caller()) {
-                            panic!("device pixel readback failed; rebuild the frame instead of using stale pixels");
+            *self = Self::Cpu(match current {
+                Self::SharedCpu(pixels) => Arc::unwrap_or_clone(pixels),
+                Self::Device(pixels) => match Arc::try_unwrap(pixels) {
+                    Ok(pixels) => pixels.into_vec(),
+                    Err(pixels) => {
+                        let mut output = pixels.take_recycled();
+                        if let Some(cached) = pixels.pixels.get() {
+                            output.clear();
+                            output.extend_from_slice(cached);
+                        } else {
+                            output.resize(pixels.bytes, 0);
+                            if !pixels.source.read_rgba_at(&mut output, std::panic::Location::caller()) {
+                                panic!("device pixel readback failed; rebuild the frame instead of using stale pixels");
+                            }
                         }
+                        output
                     }
-                    output
-                }
+                },
+                Self::Cpu(_) => unreachable!(),
             });
         }
         let Self::Cpu(pixels) = self else { unreachable!() };
@@ -1273,22 +1277,25 @@ impl CanvasPixels {
     }
 
     fn overwrite(&mut self) -> &mut Vec<u8> {
-        if matches!(self, Self::Device(_)) {
+        if !matches!(self, Self::Cpu(_)) {
             let current = std::mem::replace(self, Self::Cpu(Vec::new()));
-            let Self::Device(pixels) = current else { unreachable!() };
-            *self = Self::Cpu(match Arc::try_unwrap(pixels) {
-                Ok(pixels) => {
-                    let bytes = pixels.bytes;
-                    let recycled = pixels.recycled.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let mut output = pixels.pixels.into_inner().unwrap_or(recycled);
-                    output.resize(bytes, 0);
-                    output
-                }
-                Err(pixels) => {
-                    let mut output = pixels.take_recycled();
-                    output.resize(pixels.bytes, 0);
-                    output
-                }
+            *self = Self::Cpu(match current {
+                Self::SharedCpu(pixels) => Arc::try_unwrap(pixels).unwrap_or_else(|pixels| vec![0; pixels.len()]),
+                Self::Device(pixels) => match Arc::try_unwrap(pixels) {
+                    Ok(pixels) => {
+                        let bytes = pixels.bytes;
+                        let recycled = pixels.recycled.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut output = pixels.pixels.into_inner().unwrap_or(recycled);
+                        output.resize(bytes, 0);
+                        output
+                    }
+                    Err(pixels) => {
+                        let mut output = pixels.take_recycled();
+                        output.resize(pixels.bytes, 0);
+                        output
+                    }
+                },
+                Self::Cpu(_) => unreachable!(),
             });
         }
         let Self::Cpu(pixels) = self else { unreachable!() };
@@ -1299,6 +1306,7 @@ impl CanvasPixels {
         let current = std::mem::replace(self, Self::Cpu(Vec::new()));
         match current {
             Self::Cpu(pixels) => pixels,
+            Self::SharedCpu(pixels) => Arc::try_unwrap(pixels).unwrap_or_default(),
             Self::Device(pixels) => match Arc::try_unwrap(pixels) {
                 Ok(pixels) => {
                     let mut recycled = pixels.recycled.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1316,6 +1324,7 @@ impl CanvasPixels {
     fn into_vec(self) -> Vec<u8> {
         match self {
             Self::Cpu(pixels) => pixels,
+            Self::SharedCpu(pixels) => Arc::unwrap_or_clone(pixels),
             Self::Device(pixels) => match Arc::try_unwrap(pixels) {
                 Ok(pixels) => pixels.into_vec(),
                 Err(pixels) => pixels.pixels().to_vec(),
@@ -1331,6 +1340,7 @@ impl Deref for CanvasPixels {
     fn deref(&self) -> &[u8] {
         match self {
             Self::Cpu(pixels) => pixels,
+            Self::SharedCpu(pixels) => pixels,
             Self::Device(pixels) => pixels.pixels(),
         }
     }
@@ -1395,8 +1405,18 @@ impl Canvas {
     pub fn pixels(&self) -> &[u8] {
         match &self.pixels {
             CanvasPixels::Cpu(pixels) => pixels,
+            CanvasPixels::SharedCpu(pixels) => pixels,
             CanvasPixels::Device(pixels) => pixels.pixels(),
         }
+    }
+
+    /// Retain an immutable frame without copying CPU pixels or reading back a device frame.
+    /// A later CPU write detaches the canvas only if the snapshot still holds its data.
+    pub fn share_snapshot(&mut self) -> Self {
+        if let CanvasPixels::Cpu(pixels) = &mut self.pixels {
+            self.pixels = CanvasPixels::SharedCpu(Arc::new(std::mem::take(pixels)));
+        }
+        self.clone()
     }
 
     #[track_caller]
@@ -1447,7 +1467,7 @@ impl Canvas {
     pub fn device_pixels(&self) -> Option<&dyn CanvasReadback> {
         match &self.pixels {
             CanvasPixels::Device(pixels) => Some(&*pixels.source),
-            CanvasPixels::Cpu(_) => None,
+            CanvasPixels::Cpu(_) | CanvasPixels::SharedCpu(_) => None,
         }
     }
 

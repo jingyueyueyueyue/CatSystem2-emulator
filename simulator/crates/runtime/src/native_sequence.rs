@@ -218,6 +218,42 @@ impl NativeSequence {
         }
     }
 
+    /// Flatten the gallery table in file order, retaining the category IDs
+    /// used by named lookups. The final item in each category has a zero link.
+    pub fn gallery_entries(&self) -> Result<Vec<GalleryEntry>> {
+        let mut entries = Vec::new();
+        let mut category = 0;
+        let mut visited = 0;
+        while category < self.file.len() {
+            let header = range(&self.file, category, 12)?;
+            let next_category = word(header, 0)?;
+            let id = word(header, 4)?;
+            let mut item = category + 12;
+            for _ in 0..(word(header, 8)? as i32).max(0) {
+                let header = range(&self.file, item, 72)?;
+                let next_item = word(header, 0)?;
+                let name = zstring(&header[4..68])?.to_vec();
+                let count = (word(header, 68)? as i32).max(0) as usize;
+                visited += 1 + count;
+                if visited > MAX_ITEMS {
+                    return Err(error("gallery file has too many items and variants"));
+                }
+                let records = range(&self.file, item + 72, count * self.record_span)?;
+                let variants = records.chunks_exact(self.record_span).map(|record| {
+                    let name = zstring(record)?;
+                    Ok(GalleryVariant { name: name.to_vec(), registered: self.contains(name)? })
+                }).collect::<Result<_>>()?;
+                entries.push(GalleryEntry { category: id, name, variants });
+                if next_item == 0 { break; }
+                item = linked_offset(item, next_item, 72)?;
+            }
+            if next_category == 0 { break; }
+            category = linked_offset(category, next_category, 12)?;
+            range(&self.file, category, 12)?;
+        }
+        Ok(entries)
+    }
+
     pub fn save_tree(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         for (name, root) in &self.names {
@@ -254,6 +290,19 @@ impl NativeSequence {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GalleryEntry {
+    pub category: u32,
+    pub name: Vec<u8>,
+    pub variants: Vec<GalleryVariant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GalleryVariant {
+    pub name: Vec<u8>,
+    pub registered: bool,
 }
 
 fn sequence_parts(text: &[u8]) -> Result<Option<(Vec<u8>, Vec<i32>)>> {

@@ -2019,6 +2019,16 @@ impl HeadlessPlayer {
             .then_some((region, receiver))
     }
 
+    pub(super) fn write_cst_runtime_diagnostic(&self, out: &mut String) {
+        use std::fmt::Write;
+
+        for (id, context) in self.cst_contexts.iter().take(8) {
+            let story = &context.story;
+            let _ = writeln!(out, "cst id={id} scene={:?} loaded={} candidate={:?} page={:?}",
+                story.scene.chars().take(120).collect::<String>(), story.loaded, story.candidate, story.page);
+        }
+    }
+
     pub fn host_replay_wait_diagnostics(&self) -> String {
         let (frame, state, scene, group, record) = self.host_story_trace();
         let eyecatch_08 = (self.data_services.story_trace

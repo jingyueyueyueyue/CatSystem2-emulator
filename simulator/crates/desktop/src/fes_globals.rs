@@ -1,14 +1,15 @@
-//! FES sound-configuration queries. Every entry shares the driver's expression
+//! FES global commands. Every entry shares the driver's expression
 //! scope and the player's random stream. Retry cursors retain successful
 //! evaluations so an error cannot replay earlier assignment/random effects.
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
+use cs2_runtime::resource_router::ResourceMode;
 use cs2_script::ExpressionState;
 
 use super::fes_driver::{FesDriverEffect, FesScriptDriver};
 use super::fes_tasks::FesTaskView;
-use super::{DesktopSoundPart, FesRuntime, LoggingHost, trim_nul};
+use super::{DesktopSoundConfig, DesktopSoundPart, FesRuntime, LoggingHost, normalize_sound_name, trim_nul};
 
 #[derive(Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
@@ -53,13 +54,22 @@ pub(super) fn apply_effect(
 ) -> Result<Option<bool>> {
     let FesDriverEffect::Command(command) = effect else { return Ok(None); };
     let Some(verb) = command.parameters.first().map(Vec::as_slice) else { return Ok(None); };
-    if !matches!(verb, b"sysvoiceex" | b"getsndconfex") { return Ok(None); }
+    if !matches!(verb, b"sysvoiceex" | b"getsndconfex" | b"setsndconfex" | b"rand" | b"bitcount" | b"fileexist"
+        | b"steam_isenable" | b"steam_isbroadcast" | b"steam_enablescreenshot" | b"steam_achievement")
+    {
+        return Ok(None);
+    }
     let args = &command.parameters[1..];
     if args.is_empty() { return Ok(Some(true)); }
+    // The FES parser already expands the NAME token. The original wrapper
+    // only passes it on when a Steam service is present.
+    if verb == b"steam_achievement" { return Ok(Some(true)); }
     let query = args.get(1).map(Vec::as_slice);
-    let needs_config = if verb == b"sysvoiceex" {
-        host.sound_config_enabled != 0
-    } else { query.is_some() };
+    let needs_config = match verb {
+        b"sysvoiceex" => host.sound_config_enabled != 0,
+        b"getsndconfex" => query.is_some(),
+        _ => false,
+    };
     if needs_config && !host.sound_config.source_loaded {
         bail!("FES sound query requires a loaded sound configuration");
     }
@@ -76,14 +86,96 @@ pub(super) fn apply_effect(
     let key = (view.id, command.offset);
     let mut progress = host.data_services.fes_globals.pending.remove(&key).unwrap_or_default();
     let result = (|| -> Result<()> {
+        if verb == b"fileexist" {
+            let Some(destination) = args.get(1) else { return Ok(()); };
+            let path = host.text_encoding.decode(trim_nul(&args[0]));
+            let output = match progress.output {
+                Some(output) => output,
+                None => {
+                    let output = driver.evaluate_parameter(destination, command.context.current, shared)?;
+                    progress.output = Some(output);
+                    output
+                }
+            };
+            let present = host.resources.resolve_mode_candidate(&path, ResourceMode::LooseFirst)?.is_some();
+            write(shared, output, i32::from(present));
+            return Ok(());
+        }
+        if verb == b"steam_enablescreenshot" {
+            // The offline wrapper still evaluates the optional enable flag.
+            driver.evaluate_parameter(&args[0], command.context.current, shared)?;
+            return Ok(());
+        }
         let output = match progress.output {
             Some(output) => output,
             None => {
-                let output = driver.evaluate_parameter(&args[0], 0, shared)?;
+                let current = if matches!(verb, b"sysvoiceex" | b"getsndconfex" | b"setsndconfex") {
+                    0
+                } else {
+                    command.context.current
+                };
+                let output = driver.evaluate_parameter(&args[0], current, shared)?;
                 progress.output = Some(output);
                 output
             }
         };
+        if matches!(verb, b"steam_isenable" | b"steam_isbroadcast") {
+            write(shared, output, 0);
+            return Ok(());
+        }
+        if verb == b"setsndconfex" {
+            let Some((setting, selector)) = query.and_then(SoundSetting::parse) else { return Ok(()); };
+            if selector == SoundSelector::Id {
+                for source in args.iter().skip(2 + progress.values.len()) {
+                    progress.values.push(driver.evaluate_parameter(source, 0, shared)?);
+                }
+                if let Some(part) = sound_part_by_id(&mut host.sound_config.parts, &progress.values) {
+                    setting.apply_part(part, output, true);
+                }
+            } else {
+                let Some(raw_name) = args.get(2).map(|name| trim_nul(name)) else { return Ok(()); };
+                let name = normalize_sound_name(raw_name);
+                if selector == SoundSelector::Name {
+                    if raw_name == b"master" && setting.apply_master(host.sound_config, output) {
+                        host.data_services.language.system_settings_dirty = 1;
+                        return Ok(());
+                    }
+                    if let Some(part) = sound_part_by_name(&mut host.sound_config.parts, &name) {
+                        setting.apply_part(part, output, false);
+                        if let Some(overrides) = host.sound_config.user_overrides.get_mut(&name) {
+                            match setting {
+                                SoundSetting::Volume => overrides.volume = None,
+                                SoundSetting::VoiceBgm => overrides.voice_volume = None,
+                                SoundSetting::Mute => overrides.mute = None,
+                                SoundSetting::Reset => *overrides = Default::default(),
+                                SoundSetting::Play | SoundSetting::SystemPlay => {}
+                            }
+                        }
+                    }
+                } else {
+                    setting.apply_type(&mut host.sound_config.parts, &name, output);
+                }
+            }
+            host.data_services.language.system_settings_dirty = 1;
+            return Ok(());
+        }
+        if matches!(verb, b"rand" | b"bitcount") {
+            let count = if verb == b"rand" { 2 } else { 1 };
+            for source in args.iter().take(1 + count).skip(1 + progress.values.len()) {
+                progress.values.push(driver.evaluate_parameter(source, command.context.current, shared)?);
+            }
+            let value = match progress.values.as_slice() {
+                [value] if verb == b"bitcount" => value.count_ones() as i32,
+                [first, last] if verb == b"rand" => {
+                    let width = (*last as u32).wrapping_sub(*first as u32).wrapping_add(1);
+                    if width == 0 { bail!("FES rand range has zero width"); }
+                    first.wrapping_add((host.script_random.next_integer() % width) as i32)
+                }
+                _ => return Ok(()),
+            };
+            write(shared, output, value);
+            return Ok(());
+        }
         if verb == b"sysvoiceex" {
             if host.sound_config_enabled == 0 {
                 write(shared, output, -1);
@@ -141,6 +233,102 @@ pub(super) fn apply_effect(
     })();
     if result.is_err() { host.data_services.fes_globals.pending.insert(key, progress); }
     result.map(|_| Some(true))
+}
+
+#[derive(Clone, Copy)]
+enum SoundSetting { Volume, Play, SystemPlay, Mute, VoiceBgm, Reset }
+
+#[derive(PartialEq, Eq)]
+enum SoundSelector { Name, Type, Id }
+
+impl SoundSetting {
+    fn parse(query: &[u8]) -> Option<(Self, SoundSelector)> {
+        let (field, selector) = if let Some(field) = query.strip_suffix(b"_id") {
+            (field, SoundSelector::Id)
+        } else if let Some(field) = query.strip_suffix(b"_type") {
+            (field, SoundSelector::Type)
+        } else {
+            (query, SoundSelector::Name)
+        };
+        let setting = match field {
+            b"volume" => Self::Volume,
+            b"play" => Self::Play,
+            b"sysplay" => Self::SystemPlay,
+            b"mute" => Self::Mute,
+            b"voicebgm" => Self::VoiceBgm,
+            b"reset" => Self::Reset,
+            _ => return None,
+        };
+        Some((setting, selector))
+    }
+
+    fn apply_master(self, config: &mut DesktopSoundConfig, value: i32) -> bool {
+        let defaults = config.defaults;
+        match self {
+            Self::Volume => config.master_volume = Some(value),
+            Self::Play if defaults.play.is_some_and(|play| play != -1) => config.master_play_enabled = Some(value),
+            Self::Mute if defaults.mute.is_some_and(|mute| mute != -1) => config.master_mute = value,
+            Self::Play | Self::Mute => {}
+            Self::Reset => {
+                config.master_volume = defaults.volume;
+                config.master_play_enabled = defaults.play;
+                config.master_system_voice = defaults.system_voice;
+                config.master_voice_volume = defaults.voice_volume;
+                config.master_mute = defaults.mute.unwrap_or(0);
+            }
+            Self::SystemPlay | Self::VoiceBgm => return false,
+        }
+        true
+    }
+
+    fn apply_part(self, part: &mut DesktopSoundPart, value: i32, reset_minus_one: bool) {
+        let defaults = part.defaults;
+        let (destination, default) = match self {
+            Self::Volume => (&mut part.volume, defaults.volume),
+            Self::Play if defaults.play != Some(-1) => (&mut part.play_enabled, defaults.play),
+            Self::SystemPlay if defaults.system_voice != Some(-1) => (&mut part.system_voice, defaults.system_voice),
+            Self::Mute if defaults.mute != Some(-1) => (&mut part.mute, defaults.mute),
+            Self::VoiceBgm => (&mut part.voice_volume, defaults.voice_volume),
+            Self::Reset => {
+                part.volume = defaults.volume.unwrap_or(part.volume);
+                part.play_enabled = defaults.play.unwrap_or(part.play_enabled);
+                part.system_voice = defaults.system_voice.unwrap_or(part.system_voice);
+                part.voice_volume = defaults.voice_volume.unwrap_or(part.voice_volume);
+                part.mute = defaults.mute.unwrap_or(part.mute);
+                return;
+            }
+            Self::Play | Self::SystemPlay | Self::Mute => return,
+        };
+        *destination = if reset_minus_one && value == -1 { default.unwrap_or(*destination) } else { value };
+    }
+
+    fn apply_type(self, parts: &mut [DesktopSoundPart], type_name: &[u8], value: i32) {
+        for part in parts {
+            if normalize_sound_name(&part.type_name) == type_name {
+                self.apply_part(part, value, true);
+            }
+            self.apply_type(&mut part.children, type_name, value);
+        }
+    }
+}
+
+fn sound_part_by_name<'a>(parts: &'a mut [DesktopSoundPart], name: &[u8]) -> Option<&'a mut DesktopSoundPart> {
+    if name.is_empty() { return None; }
+    for part in parts {
+        if normalize_sound_name(&part.name) == name { return Some(part); }
+        if let Some(child) = sound_part_by_name(&mut part.children, name) { return Some(child); }
+    }
+    None
+}
+
+fn sound_part_by_id<'a>(mut parts: &'a mut [DesktopSoundPart], path: &[i32]) -> Option<&'a mut DesktopSoundPart> {
+    let (last, parents) = path.split_last()?;
+    for id in parents {
+        if let Some(index) = parts.iter().position(|part| part.id == *id) {
+            parts = &mut parts[index].children;
+        }
+    }
+    parts.iter_mut().find(|part| part.id == *last)
 }
 
 pub(super) fn release_owner(host: &mut LoggingHost<'_>, owner: u32) {

@@ -109,7 +109,7 @@ impl VmExecutionSnapshot {
             self.code.clone(), self.initial_data.clone(), self.stack_size, self.header.clone(),
         )?;
         let boundary = |position: usize| {
-            position == program.code.len() || program.boundaries.contains(&position)
+            program.is_instruction_boundary(position)
         };
         if !boundary(self.instruction_pointer)
             || self.control.call_return.is_some_and(|position| !boundary(position))

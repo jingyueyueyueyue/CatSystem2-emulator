@@ -53,6 +53,8 @@ pub(super) struct PreparedDataTables {
 
 #[derive(Default)]
 pub(super) struct DataServices {
+    pub(super) fast_forward_enabled: bool,
+    pub(super) fast_forward: bool,
     pub(super) sound_async: super::sound_async::SoundAsyncStore,
     pub(super) newton_legacy_gbk: bool,
     pub(super) cst_text_origins: super::cst_context_native::CstTextOrigins,
@@ -103,6 +105,7 @@ pub(super) struct DataServices {
     pub(super) particle_external: super::particle_external::ParticleExternalStore,
     pub(super) particle_message_pe_sha256: Option<&'static str>,
     pub(super) native_profile: Option<&'static cs2_runtime::native_profile::FeatureProfile>,
+    pub(super) task_native_profile: Option<cs2_runtime::native_task_profile::TaskNativeProfile>,
     pub(super) kanmi_native925_verified: Option<bool>,
     pub(super) css_task_pe_sha256: Option<&'static str>,
     pub(super) css_models: super::css_model::CssModelStore,
@@ -119,6 +122,12 @@ pub(super) struct DataServices {
 }
 
 impl DataServices {
+    pub(super) fn task_native_profile(&self) -> Option<cs2_runtime::native_task_profile::TaskNativeProfile> {
+        self.task_native_profile.or_else(|| {
+            cs2_runtime::native_task_profile::exact_task_native_profile(self.native_profile?.pe_sha256)
+        })
+    }
+
     pub(crate) fn graph_opaque_data_count(&self) -> usize {
         self.effekseer.manager.task_count() + self.css_models.owners.len()
             + self.fes_particles.graph_object_count()

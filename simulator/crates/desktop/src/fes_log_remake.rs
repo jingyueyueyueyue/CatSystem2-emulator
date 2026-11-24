@@ -3,7 +3,7 @@
 //! This is not the clear/append history-import protocol of ordinary1034.
 use super::*;
 use cs2_formats::{CstFile, CstlTable};
-use crate::cst_context_native::decode_cst_dialogue;
+use crate::cst_context_native::{decode_cst_dialogue, repair_routed_scene_text};
 
 struct Scene {
     document: CstFile,
@@ -123,7 +123,8 @@ fn load_scene(host: &LoggingHost<'_>, source: &[u8]) -> Result<Scene> {
     let (resolved, resource) = host.cst_resource_with_source(b"scene", source)?
         .context("LOGSTRING remake source CST is unavailable; retained history is unchanged")?;
     let encoding = host.cst_scene_encoding_override(&resource).unwrap_or(host.text_encoding);
-    let document = CstFile::parse(&resource.bytes).context("LOGSTRING remake source CST is malformed")?;
+    let mut document = CstFile::parse(&resource.bytes).context("LOGSTRING remake source CST is malformed")?;
+    repair_routed_scene_text(&resource, document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
     let mut adjacent = resolved;
     if let Some(dot) = adjacent.rfind('.').filter(|&dot|
         adjacent[..dot].rfind(['/', '\\']).is_none_or(|slash| slash < dot)) {

@@ -5,7 +5,7 @@ use cs2_runtime::{resource_router::ResourceMode, backlog::{Backlog, Settings}};
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, LogicEvent, cp932_to_utf8,
     expand_kcs_format, native_state_error, read_u32, trim_nul};
-use super::cst_context_native::decode_cst_dialogue;
+use super::cst_context_native::{decode_cst_dialogue, repair_routed_scene_text};
 use super::string_native::expand_shared_strings;
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -155,8 +155,9 @@ impl LoggingHost<'_> {
                     continue;
                 }
             }
-            let document = CstFile::parse(bytes)
+            let mut document = CstFile::parse(bytes)
                 .map_err(|_| native_state_error("backlog CST resource is malformed"))?;
+            repair_routed_scene_text(&resource, document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
             if *count as i32 <= 0 { continue; }
             let count = *count as usize;
             imported = imported.checked_add(count).filter(|&count| count <= MAX_ITEMS)

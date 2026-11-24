@@ -20,6 +20,8 @@ use super::{
 pub(crate) mod checkpoint;
 #[path = "fes_platform_state.rs"]
 mod state;
+#[path = "fes_gallery_tables.rs"]
+mod gallery_tables;
 
 #[derive(Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
@@ -29,6 +31,8 @@ pub(super) struct FesTaskPlatform {
     #[serde(skip)]
     pub(crate) save_panels: super::fes_save_panel::FesSavePanelStore,
     objects: BTreeMap<(u32, Vec<u8>, i32), ObjectBinding>,
+    #[serde(skip)]
+    gallery_tables: gallery_tables::TableCache,
     #[serde(skip)]
     image_masks: BTreeMap<(u32, String), u8>,
     button_records: BTreeMap<(u32, usize, i32), ButtonRecordState>,
@@ -165,6 +169,8 @@ struct ObjectBinding {
     key: String,
     kind: Vec<u8>,
     child: Option<u32>,
+    #[serde(default)]
+    gallery: gallery_tables::BankState,
 }
 
 #[derive(Clone, cs2_runtime::graph_serde::Serialize)]
@@ -300,7 +306,7 @@ pub(crate) fn bind_save_panel_layers(host: &mut LoggingHost<'_>, owner: u32) -> 
                 bail!("SAVEPANEL platform identity is owned by another consumer");
             }
         } else {
-            platform.objects.insert(identity, ObjectBinding { key, kind: b"SAVEPANEL".to_vec(), child: None });
+            platform.objects.insert(identity, ObjectBinding { key, kind: b"SAVEPANEL".to_vec(), child: None, gallery: Default::default() });
         }
     }
     Ok(())
@@ -632,6 +638,19 @@ fn prepare_input(
     Ok(true)
 }
 
+pub(super) fn delete_background_button(host: &mut LoggingHost<'_>, owner: u32) -> Result<()> {
+    let Some(button) = host.data_services.tasks.fes.platform.auxiliary_button(owner) else {
+        return Ok(());
+    };
+    host.receive_input_button_command(
+        cs2_runtime::TaskCommand { target: button as i32, sender: owner as i32, code: 3, data: [0; 3] },
+        &mut Default::default(), &mut 0, 1,
+    )?;
+    host.data_services.tasks.fes.platform.low_buttons.remove(&owner);
+    host.mark_input_geometry_dirty();
+    Ok(())
+}
+
 fn send_message(host: &mut LoggingHost<'_>, target: u32, message: [u32; 4]) -> Result<bool> {
     Ok(host.send_fes_task_message(target, message)?)
 }
@@ -807,7 +826,7 @@ pub(super) fn plan_bank_release(
                     bail!("FES DRAW delete has no live snapshot/transition owner");
                 }
             }
-            b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"CPLANE" | b"PLANE" => {
+            b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"CPLANE" | b"PLANE" | b"BGTABLE2" | b"CHTABLE2" | b"CHTABLE3" => {
                 let platform = &host.data_services.tasks.fes.platform;
                 let binding = platform.objects.get(&identity)
                     .context("FES delete has no live graphics binding")?;
@@ -956,7 +975,7 @@ fn graphics_delete_command(
     let (name, index) = super::fes_media::split_target(&source, host.text_encoding)?;
     let Some(object) = driver.adapter.object(name).filter(|object| matches!(
         object.definition.kind_name.as_slice(),
-        b"PLANE" | b"CPLANE" | b"IMAGE" | b"CIMAGE" | b"BUTTON" | b"SAVEPANEL",
+        b"PLANE" | b"CPLANE" | b"IMAGE" | b"CIMAGE" | b"BUTTON" | b"SAVEPANEL" | b"BGTABLE2" | b"CHTABLE2" | b"CHTABLE3",
     )) else { return Ok(false); };
     let count = object.definition.bank_count as i32;
     let bank = index.map(|source| driver.evaluate_parameter(source, command.context.current, shared)).transpose()?;
@@ -1026,6 +1045,9 @@ fn apply_effect(
     }
     match effect {
         FesDriverEffect::Command(command) => {
+            if gallery_tables::apply_command(host, view, runtime, driver, command, shared)? {
+                return Ok(true);
+            }
             if graphics_delete_command(host, view, runtime, driver, command, shared)? {
                 return Ok(true);
             }
@@ -1357,7 +1379,7 @@ fn fes_preload_routes_literal_names_and_allows_misses() {
     std::fs::create_dir(&root).unwrap();
     let fixture = Fixture(root);
     std::fs::create_dir(fixture.0.join("image")).unwrap();
-    std::fs::write(fixture.0.join("startup.xml"), b"<document><INT><int00><name>image</name><int>image.int</int><ext>hg3</ext><dir>image</dir></int00></INT></document>").unwrap();
+    std::fs::write(fixture.0.join("startup.xml"), b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><document><INT><int00><name>image</name><int>image.int</int><ext>hg3</ext><dir>image</dir></int00></INT></document>").unwrap();
     std::fs::write(fixture.0.join("image/window art.hg3"), b"raw bytes").unwrap();
     std::fs::write(fixture.0.join("image/empty.hg3"), []).unwrap();
     let resources = ResourceIndex::scan(&fixture.0).unwrap();
@@ -1538,7 +1560,7 @@ fn create_objects(
                 }
                 Some(host.create_task_object(2, view.id, definition.name.as_slice(), b"")?)
             }
-            b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" => {
+            b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"BGTABLE2" | b"CHTABLE2" | b"CHTABLE3" => {
                 runtime.media.insert(
                     key.clone(),
                     blank_layer(key.clone(), String::from_utf8_lossy(kind).into_owned()),
@@ -1562,6 +1584,7 @@ fn create_objects(
                 key,
                 kind: kind.to_vec(),
                 child,
+                gallery: Default::default(),
             },
         );
         if kind == b"BUTTON" {
@@ -1631,7 +1654,7 @@ fn initialize_objects(
         let child = binding.child;
         if !matches!(
             kind.as_slice(),
-            b"PLANE" | b"CPLANE" | b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON"
+            b"PLANE" | b"CPLANE" | b"IMAGE" | b"CIMAGE" | b"DIFIMAGE" | b"BUTTON" | b"BGTABLE2" | b"CHTABLE2" | b"CHTABLE3"
         ) {
             bail!(
                 "FES initialization of {} needs its dedicated object platform",
@@ -1700,13 +1723,16 @@ fn initialize_objects(
                     _ => bail!("FES MASK channel {channel} is outside 0..=4"),
                 }
             }
-            b"BTYPE" if matches!(kind.as_slice(), b"IMAGE" | b"BUTTON" | b"CIMAGE") => {
+            b"TABLE" if gallery_tables::is_gallery_kind(&kind) => {
+                gallery_tables::initialize_table(host, &kind, value)?;
+            }
+            b"BTYPE" if matches!(kind.as_slice(), b"IMAGE" | b"BUTTON" | b"CIMAGE") || gallery_tables::is_gallery_kind(&kind) => {
                 let mode = driver.evaluate_parameter(value, 0, shared)?;
                 let layer = runtime.media.get_mut(&key)
                     .context("BTYPE used on an absent image bank")?;
                 layer.source.btype = mode;
             }
-            b"TYPE" if kind == b"IMAGE" => {
+            b"TYPE" if kind == b"IMAGE" || gallery_tables::is_gallery_kind(&kind) => {
                 driver.evaluate_parameter(value, 0, shared)?;
             }
             b"IDN" if matches!(kind.as_slice(), b"IMAGE" | b"BUTTON") => {
@@ -1848,6 +1874,7 @@ fn finish_task_media_inner(
         {
             let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_image_sources");
             super::fes_media::update_image_sources(host, view, runtime)?;
+            gallery_tables::update_characters(host, view, runtime)?;
         }
         let _detail = super::perf_detail::SlowTask::new(view.id, || 34, "fes_image_animation");
         if !runtime.prepare_driver_animations(host, view)? {
@@ -2217,10 +2244,20 @@ mod media_lifecycle_tests {
         test: impl FnOnce(&mut LoggingHost<'_>, &FesTaskView, &mut FesRuntime,
             &mut FesScriptDriver, &mut ExpressionState) -> Result<()>,
     ) -> Result<()> {
+        with_script_sections(&[(b"DEFINE", &[definition]), (b"START", commands)], &[], test)
+    }
+
+    fn with_script_sections(
+        sections: &[(&[u8], &[&[u8]])], files: &[(&str, &[u8])],
+        test: impl FnOnce(&mut LoggingHost<'_>, &FesTaskView, &mut FesRuntime,
+            &mut FesScriptDriver, &mut ExpressionState) -> Result<()>,
+    ) -> Result<()> {
         let directory = std::env::temp_dir().join(format!("cs2-fes-media-{}-{}",
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
         std::fs::create_dir(&directory)?;
-        let result = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile"))
+        let result = (|| -> Result<()> {
+            for (name, bytes) in files { std::fs::write(directory.join(name), bytes)?; }
+            HeadlessPlayer::open_with_save_root(&directory, directory.join("profile"))
             .and_then(|mut player| player.with_host(|host| {
                 let mut offset = 0;
                 let mut section = |header: &[u8], lines: &[&[u8]]| FesSection {
@@ -2231,9 +2268,8 @@ mod media_lifecycle_tests {
                         line
                     }).collect(),
                 };
-                let document = FesDocument { sections: vec![
-                    section(b"DEFINE", &[definition]), section(b"START", commands),
-                ] };
+                let document = FesDocument { sections: sections.iter().map(|(header, lines)|
+                    section(header, lines)).collect() };
                 let mut driver = FesScriptDriver::new(&document)?;
                 let mut runtime = FesRuntime::new(document);
                 let mut shared = ExpressionState::default();
@@ -2246,9 +2282,10 @@ mod media_lifecycle_tests {
                     }
                 }
                 test(host, &view, &mut runtime, &mut driver, &mut shared)
-            }));
-        std::fs::remove_dir(&directory)?;
-        result
+            }))
+        })();
+        let cleanup = std::fs::remove_dir_all(&directory).map_err(Into::into);
+        result.and(cleanup)
     }
 
     fn command(
@@ -2259,6 +2296,226 @@ mod media_lifecycle_tests {
         assert!(matches!(effect, FesDriverEffect::Command(_)), "{effect:?}");
         assert!(apply_effect(host, view, runtime, driver, &effect, shared)?);
         Ok(())
+    }
+
+    #[test]
+    fn fes_bgtable2_queries_enabled_rows_and_exact_variant_cells() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"bg[0] max 880",
+            b"bg[0] exist 0 0 881",
+            b"bg[0] exist 0 1 882",
+            b"bg[0] exist 0 2 883",
+            b"bg[0] exist 1 0 884",
+            b"bg[0] exist 2 0 885",
+            b"bg[0] exist -1 0 886",
+            b"bg[0] exist 0 -2 887",
+            b"bg[0] exist 0 -3 888",
+            b"bg[1] max 889",
+            b"bg[1] exist 0 0 890",
+            b"bg[2] max 891",
+        ];
+        with_script_sections(&[
+            (b"DEFINE", &[b"BGTABLE2 bg[2]"]),
+            (b"OBJECT TABLE POS PRI DISP BTYPE TYPE PL", &[b"bg[0] BGList.csv 30,50 10 1 0 0 p"]),
+            (b"OBJECT TABLE", &[b"bg[0] absent.csv", b"bg[1] absent.csv"]),
+            (b"START", commands),
+        ], &[("BGList.csv", b"flag,key,image\r\n\x81\x9b,a,first,\"\",\"third,alt\"\r\n-,disabled,present\r\n\"\x81\x9b\",b,second")],
+        |host, view, runtime, driver, shared| {
+            let layer = &runtime.media["bg[0]"];
+            assert_eq!(layer.position, Point::new(30, 50));
+            assert_eq!(layer.priority, 10);
+            assert!(layer.visible);
+            shared.shared[880..892].fill(-1);
+            for _ in commands { command(host, view, runtime, driver, shared)?; }
+            assert_eq!(shared.shared[880..892], [2, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, -1]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_gallery_loads_backgrounds_and_tones_from_game_archives() -> Result<()> {
+        let games = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+        let cases = [
+            ("\u{30ab}\u{30df}\u{30ab}\u{30bc}", "config.int/bglist.csv", "config.int/bgtone.tbl",
+                "CHTABLE2", "config.int/charlist.set", 1, "bg001a", [100; 3]),
+            ("\u{3053}\u{3053}\u{304b}\u{3089}", "config.int/bglist.csv", "config.int/bgtone.tbl",
+                "CHTABLE2", "config.int/charlist_m.set", 1, "BGA01a", [100; 3]),
+            ("\u{30c4}\u{30ca}\u{30d0}\u{30f3}", "fes.int/BGList.csv", "scene.int/bgtone.tbl",
+                "CHTABLE2", "fes.int/CharList.set", 2, "bg05b1", [101, 95, 91]),
+            ("\u{795d}\u{798f}\u{306e}", "config.int/BGList.csv", "config.int/bgtone.tbl",
+                "CHTABLE2", "config.int/CharList.set", 1, "bg01b1", [101, 97, 91]),
+            ("Happiness", "config.int/BGList.csv", "config.int/bgtone.tbl",
+                "CHTABLE3", "config.int/CharList.cl", 1, "bg01b_19", [100, 94, 91]),
+        ];
+        let Ok(dirs) = std::fs::read_dir(games) else { return Ok(()); };
+        let dirs: Vec<_> = dirs.collect::<std::io::Result<_>>()?;
+        for (prefix, backgrounds, tone_table, kind, characters, variant, expected_file, expected_tone) in cases {
+            let Some(game) = dirs.iter().find(|game| game.file_name().to_string_lossy().starts_with(prefix)) else { continue; };
+            let profile = std::env::temp_dir().join(format!("cs2-fes-gallery-table-{}-{}",
+                std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+            let result = HeadlessPlayer::open_with_save_root(&game.path(), &profile).and_then(|mut player| player.with_host(|host| {
+                let character_load = if kind == "CHTABLE3" {
+                    "actor load 0 0 0 0"
+                } else {
+                    "actor load 0 0 0 0 0"
+                };
+                let script = format!("#DEFINE\nBGTABLE2 bg\n{kind} actor\n\
+                    #OBJECT TABLE DISP\nbg {backgrounds} 1\nactor {characters} 1\n\
+                    #START\nbg tonetbl {tone_table}\nbg max 880\nbg exist 0 {variant} 881\n\
+                    bg load 0 {variant}\nbg gettonetbl 882 883 884\n\
+                    actor max 885\nactor max 886 0\nactor max 887 0 0 0\n{character_load}\n\
+                    actor tone 50 60 80\nbg load 999 {variant}\nbg gettonetbl 888 889 890\n\
+                    bg tonetbl missing.tbl\nbg gettonetbl 891 892 893\nactor tone 100 100 100\n");
+                let document = crate::fes_tasks::parse_document(script.as_bytes())?;
+                let mut driver = FesScriptDriver::new(&document)?;
+                let mut runtime = FesRuntime::new(document);
+                let mut shared = ExpressionState::default();
+                let id = host.create_task_object(34, 0, b"gallery table test", b"")?;
+                let view = FesTaskView { id, parent: 0, context: Vec::new(), list: None, now: 1, paused: 0 };
+                while let Some(effect) = driver.advance_initialization(&mut shared)? {
+                    if !matches!(effect, FesDriverEffect::Yield) {
+                        super::super::fes_motion::observe(host, &view, &driver, &effect)?;
+                        assert!(apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?);
+                    }
+                }
+                for _ in 0..9 { command(host, &view, &mut runtime, &mut driver, &mut shared)?; }
+                assert!(finish_task_media(host, &view, &mut runtime, &mut driver)?);
+                assert!(shared.shared[880] > 0 && shared.shared[881] == 1, "{prefix} background table query");
+                assert!(shared.shared[885..888].iter().all(|&value| value > 0), "{prefix} character table query");
+                let background = &runtime.media["bg"];
+                assert!(background.image.is_some(), "{prefix} background image");
+                assert_eq!(background.file.as_deref(), Some(expected_file));
+                assert_eq!(shared.shared[882..885], expected_tone);
+                let selected_plan = runtime.media["actor"].file.clone();
+                let image_candidates = selected_plan
+                    .as_deref()
+                    .map(|plan| host.resources.category_names(b"image", plan))
+                    .transpose()?
+                    .unwrap_or_default();
+                let original = runtime.media["actor"].image.clone().with_context(|| format!(
+                    "{prefix} character image: plan={selected_plan:?}, candidates={image_candidates:?}"
+                ))?;
+                for _ in 0..3 { command(host, &view, &mut runtime, &mut driver, &mut shared)?; }
+                assert!(finish_task_media(host, &view, &mut runtime, &mut driver)?);
+                let tinted = runtime.media["actor"].image.as_ref().context("FES character tone dropped image")?;
+                assert_ne!(original.pixels(), tinted.pixels());
+                assert_eq!(original.metadata(), tinted.metadata());
+                assert_eq!(shared.shared[882..885], shared.shared[888..891]);
+                for _ in 0..3 { command(host, &view, &mut runtime, &mut driver, &mut shared)?; }
+                assert!(finish_task_media(host, &view, &mut runtime, &mut driver)?);
+                assert_eq!(shared.shared[891..894], [100; 3]);
+                assert_eq!(runtime.media["actor"].image.as_ref(), Some(&original));
+                Ok(())
+            }));
+            if profile.is_dir() { std::fs::remove_dir_all(&profile)?; }
+            result.with_context(|| format!("gallery resources in {}", game.path().display()))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fes_external_variable_commands_read_task_owned_values() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"setexvar SKIP_FORCE 0x80000001",
+            b"getexvar SKIP_FORCE (10+1)",
+            b"getexvar skip_force 12",
+            b"getexvar AUTO 13",
+            b"setexvar SKIP_FORCE",
+            b"getexvar SKIP_FORCE 14",
+        ];
+        with_script(b"IMAGE dummy", commands, |host, view, runtime, driver, shared| {
+            shared.shared[11..15].fill(-1);
+            for _ in commands { command(host, view, runtime, driver, shared)?; }
+            assert_eq!(shared.shared[11..15], [0x80000001_u32 as i32, 0, 0, 0]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_sortsave_writes_slots_by_time_including_missing_saves() -> Result<()> {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let commands: &[&[u8]] = &[b"sortsave 880 0 3", b"sortsave 884 3 3"];
+        with_script(b"IMAGE dummy", commands, |host, view, runtime, driver, shared| {
+            let older = host.save_root.join("save0001.dat");
+            let newer = host.save_root.join("save0003.dat");
+            std::fs::create_dir_all(host.save_root)?;
+            let result = (|| -> Result<()> {
+                cs2_runtime::write_private_file_with_modified_time(&older, b"older", UNIX_EPOCH + Duration::from_secs(1_700_000_000))?;
+                cs2_runtime::write_private_file_with_modified_time(&newer, b"newer", UNIX_EPOCH + Duration::from_secs(1_700_000_100))?;
+                shared.shared[880..885].fill(-1);
+                for _ in commands { command(host, view, runtime, driver, shared)?; }
+                assert_eq!(shared.shared[880..885], [3, 1, 2, 0, -1]);
+                assert_eq!(std::fs::read(&older)?, b"older");
+                assert_eq!(std::fs::read(&newer)?, b"newer");
+                Ok(())
+            })();
+            std::fs::remove_file(&older)?;
+            std::fs::remove_file(&newer)?;
+            std::fs::remove_dir(host.save_root)?;
+            result
+        })
+    }
+
+    #[test]
+    fn fes_globals_write_script_results_without_sound_configuration() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"rand 10 -7 -7",
+            b"bitcount 11 0x80000001",
+            b"fileexist scene.int/missing.cst 12",
+            b"steam_isenable 13",
+            b"steam_isbroadcast 14",
+            b"steam_enablescreenshot ($15+=1)",
+            b"steam_achievement ACHIEVEMENT_4_1",
+        ];
+        with_script(b"IMAGE dummy", commands, |host, view, runtime, driver, shared| {
+            shared.shared[10..16].fill(-1);
+            for _ in commands { command(host, view, runtime, driver, shared)?; }
+            assert_eq!(shared.shared[10..16], [-7, 2, 0, 0, 0, 0]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_setsndconfex_updates_live_config_and_restores_defaults() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"setsndconfex 65 volume master",
+            b"getsndconfex 10 volume master",
+            b"setsndconfex 41 volume bgm",
+            b"getsndconfex 11 volume bgm",
+            b"setsndconfex 52 voicebgm bgm",
+            b"getsndconfex 12 voicebgm bgm",
+            b"setsndconfex 37 volume_type man",
+            b"getsndconfex 13 volume_id 2 0",
+            b"getsndconfex 14 volume_id 2 1",
+            b"setsndconfex 0 play_id 2 0",
+            b"getsndconfex 15 play_id 2 0",
+            b"setsndconfex 0 sysplay_id 2 0",
+            b"getsndconfex 16 sysplay_id 2 0",
+            b"setsndconfex -1 volume_id 2 0",
+            b"getsndconfex 17 volume_id 2 0",
+            b"setsndconfex 0 reset_id 2 0",
+            b"getsndconfex 18 play_id 2 0",
+            b"getsndconfex 19 sysplay_id 2 0",
+            b"setsndconfex 0 reset bgm",
+            b"getsndconfex 20 voicebgm bgm",
+            b"setsndconfex 0 reset master",
+            b"getsndconfex 21 volume master",
+        ];
+        with_script(b"IMAGE dummy", commands, |host, view, runtime, driver, shared| {
+            *host.sound_config = crate::parse_desktop_sound_config(br#"<?xml version="1.0" encoding="UTF-8"?>
+                <document><MASTER><volume>90</volume></MASTER><PART>
+                <bgm><name>bgm</name><id>1</id><volume>75</volume><voicevol>80</voicevol></bgm>
+                <voice><name>voice</name><id>2</id><part>
+                <first><id>0</id><type>man</type><volume>85</volume><play>1</play><sysplay>1</sysplay></first>
+                <second><id>1</id><type>man</type><volume>95</volume></second>
+                </part></voice></PART></document>
+            "#)?;
+            for _ in commands { command(host, view, runtime, driver, shared)?; }
+            assert_eq!(shared.shared[10..22], [65, 41, 52, 37, 37, 0, 0, 85, 1, 1, 80, 90]);
+            assert_eq!(host.data_services.language.system_settings_dirty, 1);
+            Ok(())
+        })
     }
 
     #[test]
@@ -2318,6 +2575,77 @@ mod media_lifecycle_tests {
             assert_eq!(runtime.media["btn1"].plane.as_deref(), Some("pl[5]"));
             Ok(())
         })
+    }
+
+    #[test]
+    fn fes_transforms_run_the_games_registered_motion_programs() -> Result<()> {
+        let root = std::env::var_os("CS2_FES_TRANSFORM_GAME_ROOT").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../games/cs2_full_v401"));
+        if !root.is_dir() { return Ok(()); }
+        let profile = std::env::temp_dir().join(format!("cs2-fes-transforms-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        let result = HeadlessPlayer::open_with_save_root(&root, &profile).and_then(|mut player| player.with_host(|host| {
+            let document = crate::fes_tasks::parse_document(b"\
+#SUBCOMMAND\n\
+oneshot rot pRot RX[0] RY[0] RZ[0] : [0] [1] [2]\n\
+oneshot mrot motRot p[30] rx[0] ry[0] rz[0] : [0] 0 0 0 [1] [2] [3]\n\
+oneshot mscale motScale p[30] sx[100%] sy[100%] sz[100%] : [0] 0 0 0 [1] [2] [3]\n\
+#DEFINE\n\
+PLANE pl[2]\n\
+IMAGE image\n\
+#START\n\
+pl[0] rot 45 0 0\n\
+wait 1\n\
+pl[0] mrot 4 0 90\n\
+pl mscale 4 50% 75%\n\
+image mscale 4 125% 175%\n\
+wait 30\n")?;
+            let mut driver = FesScriptDriver::new(&document)?;
+            let mut runtime = FesRuntime::new(document);
+            let mut shared = ExpressionState::default();
+            let id = host.create_task_object(34, 0, b"transform test", b"")?;
+            let mut view = FesTaskView { id, parent: 0, context: Vec::new(), list: None, now: 1, paused: 0 };
+            while let Some(effect) = driver.advance_initialization(&mut shared)? {
+                if !matches!(effect, FesDriverEffect::Yield) {
+                    assert!(apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?);
+                }
+            }
+            let close = |actual: u32, expected: f32| {
+                let actual = f32::from_bits(actual);
+                assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
+            };
+            for now in 1..=10 {
+                view.now = now;
+                loop {
+                    let effect = driver.advance(u64::from(now), &mut shared, 64)?;
+                    if matches!(effect, FesDriverEffect::Waiting { .. }) { break; }
+                    assert!(matches!(effect, FesDriverEffect::Command(_)), "{effect:?}");
+                    assert!(apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?);
+                }
+                assert!(super::super::fes_motion::advance_owner(host, &view, &mut runtime, &mut driver, 4096)?);
+                if now == 1 {
+                    let words = runtime.planes["pl[0]"].motion.context("pRot did not write back")?;
+                    close(words[29], std::f32::consts::FRAC_PI_4);
+                    close(words[14], std::f32::consts::FRAC_1_SQRT_2);
+                }
+            }
+            for key in ["pl[0]", "pl[1]"] {
+                let words = super::super::fes_motion::plane_render_properties(host, &view, &runtime, key)?;
+                close(words[25], 0.5);
+                close(words[26], 0.75);
+                close(words[27], 1.);
+                close(words[29], 0.);
+                close(words[30], if key == "pl[0]" { std::f32::consts::FRAC_PI_2 } else { 0. });
+            }
+            let words = runtime.media["image"].motion.context("IMAGE motScale did not write back")?;
+            close(words[25], 1.25);
+            close(words[26], 1.75);
+            Ok(())
+        }));
+        if profile.is_dir() { std::fs::remove_dir_all(profile)?; }
+        result
     }
 
     #[test]
