@@ -1,8 +1,8 @@
 //! Typed backlog natives and ordered CST history import. This module owns no
 //! CST registrations or shared strings; it borrows those existing services.
-use cs2_runtime::{resource_router::ResourceMode, backlog::{Backlog, Settings}};
+use cs2_runtime::{resource_router::ResourceMode, backlog::{Backlog, SegmentEncoding, Settings}};
 use cs2_script::{CstDocument, NativeReturn, Result, Vm};
-use super::{LoggingHost, LogicEvent, cp932_to_utf8,
+use super::{LoggingHost, LogicEvent, ScriptTextEncoding, cp932_to_utf8,
     expand_kcs_format, native_state_error, read_u32, trim_nul};
 use super::cst_context_native::{decode_cst_dialogue, repair_routed_scene_text};
 use super::string_native::expand_shared_strings;
@@ -78,21 +78,53 @@ impl LoggingHost<'_> {
         match index {
             698 | 977 => {
                 let source = formatted(vm, read_u32(args, 4)?, 64)?;
-                let mut name = formatted(vm, read_u32(args, 12)?, 256)?;
-                let text = formatted(vm, read_u32(args, 16)?, 4096)?;
+                let input = read_u32(args, 8)?;
+                let (mut name, name_codec) = self.formatted_history_text(vm, read_u32(args, 12)?, 256)?;
+                let (text, mut body_codec) = self.formatted_history_text(vm, read_u32(args, 16)?, 4096)?;
+                let scene_codec = self.cst_contexts.values().find_map(|context|
+                    context.story.scene_name().as_bytes().eq_ignore_ascii_case(&source).then_some(context.encoding));
+                body_codec = body_codec.or(scene_codec);
                 strip_name_prefix(&mut name, b"\xef\xbc\xa0");
-                self.backlogs.get_mut(&handle).unwrap().append(
-                    &source, read_u32(args, 8)?, &name, &text,
+                self.backlogs.get_mut(&handle).unwrap().append_sourced(
+                    &source, input, &name, &text,
                     read_u32(args, 20)?, read_u32(args, 24)?,
                     if index == 977 { read_u32(args, 28)? } else { u32::MAX },
+                    SegmentEncoding { name: name_codec, body: body_codec },
                 ).map_err(|_| native_state_error("backlog byte layout or storage is invalid"))?;
             }
             700 => {
                 let target = read_u32(args, 4)?;
+                let row = read_u32(args, 8)?;
+                let task = self.current_task_id;
+                let origins = &mut self.data_services.cst_text_origins;
+                origins.invalidate_returned(task, target);
                 vm.write(target, &[0])?;
-                if let Some(name) = self.backlogs[&handle].name_for_row(read_u32(args, 8)?) {
-                    let mut bytes = name.to_vec(); bytes.push(0);
+                let log = &self.backlogs[&handle];
+                if let Some(name) = log.name_for_row(row) {
+                    let source_codec = log.segment_for_row(row).and_then(|(segment, encoding)| {
+                        encoding.name.or_else(|| self.saved_history_name_codec(log, segment, name))
+                    });
+                    let codec = source_codec.unwrap_or(if self.data_services.has_loose_gbk_text() {
+                        ScriptTextEncoding::Gbk
+                    } else { self.text_encoding });
+                    let (display, bad_at) = log.decode_name(name, codec);
+                    let mut bytes = name.to_vec();
+                    bytes.push(0);
                     vm.write(target, &bytes)?;
+                    self.data_services.cst_text_origins.record_display(task, target, name, codec, display);
+                    if let Some(bad_at) = bad_at {
+                        self.data_services.note_text_decode(self.events, self.frame, format!(
+                            "backlog speaker row={row} codec={codec:?} bad_at={bad_at}",
+                        ));
+                    }
+                    if self.data_services.story_trace {
+                        let (source, input) = log.segment_for_row(row).map_or((None, None), |(segment, _)|
+                            (log.sources().get(segment.source as usize), Some(segment.input)));
+                        self.events.push(LogicEvent { frame: self.frame, kind: "backlog-speaker".into(),
+                            detail: format!("row={row} source={:?} input={input:?} codec={codec:?} matched={source_codec:?} bytes={:02x?}",
+                                source.map(|source| String::from_utf8_lossy(source)), name),
+                        });
+                    }
                 }
             }
             785 => self.backlogs.get_mut(&handle).unwrap().set_limit(read_u32(args, 4)?),
@@ -100,6 +132,60 @@ impl LoggingHost<'_> {
             _ => return Err(cs2_script::ScriptError::UnimplementedNativeCall { index }),
         }
         Ok(NativeReturn::Continue)
+    }
+
+    fn formatted_history_text(
+        &self, vm: &Vm, address: u32, capacity: usize,
+    ) -> Result<(Vec<u8>, Option<ScriptTextEncoding>)> {
+        let mut codec = None;
+        let mut mixed = false;
+        let origins = &self.data_services.cst_text_origins;
+        let input = vm.read_string(address)?;
+        let bytes = super::expand_kcs_format_observed(vm, &input, 0, &mut |address, bytes| {
+            if bytes.is_ascii() { return; }
+            match origins.returned(self.current_task_id, address, bytes) {
+                Some(candidate) if codec.is_none_or(|previous| previous == candidate) => codec = Some(candidate),
+                _ => mixed = true,
+            }
+        })?;
+        let bytes = trim_nul(&bytes);
+        if bytes.len() >= capacity {
+            return Err(native_state_error("backlog formatted text exceeds buffer"));
+        }
+        let direct = origins.returned(self.current_task_id, address, bytes);
+        let expanded = if mixed || !input.is_ascii() { None } else { codec };
+        Ok((bytes.to_vec(), direct.or(expanded)))
+    }
+
+    fn saved_history_name_codec(
+        &self, log: &Backlog, segment: &cs2_runtime::backlog::Segment, name: &[u8],
+    ) -> Option<ScriptTextEncoding> {
+        if name.is_ascii() { return None; }
+        let source = log.sources().get(segment.source as usize)?;
+        let (_, resource) = self.cst_resource_with_source(b"scene", source).ok()??;
+        let mut document = CstDocument::parse(&resource.bytes).ok()?;
+        let codec = self.cst_scene_encoding_override_with_document(&resource, Some(&document))
+            .unwrap_or(self.text_encoding);
+        repair_routed_scene_text(self.resources, &resource, &mut document);
+        let mut matches = None;
+        for record in document.input_records(segment.input as usize)?.iter().filter(|row| row.kind == 0x21) {
+            let mut raw = trim_nul(&record.text).to_vec();
+            let delimiter = if codec == ScriptTextEncoding::Utf8 { b"\xef\xbc\xa0".as_slice() } else { b"\x81\x97" };
+            strip_name_prefix(&mut raw, delimiter);
+            if log.matches_name(name, &raw, codec) {
+                if matches.is_some_and(|other| other != codec) { return None; }
+                matches = Some(codec);
+            }
+            if let Ok(decoded) = decode_cst_dialogue(&record.text, codec) {
+                let mut utf8 = decoded.into_owned().into_bytes();
+                strip_name_prefix(&mut utf8, b"\xef\xbc\xa0");
+                if log.matches_name(name, &utf8, ScriptTextEncoding::Utf8) {
+                    if matches.is_some_and(|other| other != ScriptTextEncoding::Utf8) { return None; }
+                    matches = Some(ScriptTextEncoding::Utf8);
+                }
+            }
+        }
+        matches
     }
 
     fn import_backlog(
@@ -172,11 +258,14 @@ impl LoggingHost<'_> {
                         match record.kind {
                             0x20 | 0x21 => {
                                 scratch = if language.is_some() {
-                                    decode_cst_dialogue(&record.text, source_codec).map_err(|cause|
-                                        super::native_state_error_owned(format!(
-                                            "native 1034 history={history_index} input={input} source={:?}: {cause}",
-                                            resource.source,
-                                        )))?.into_owned().into_bytes()
+                                    let (text, bad_at) = source_codec.decode_message(trim_nul(&record.text));
+                                    if let Some(bad_at) = bad_at {
+                                        self.data_services.note_text_decode(self.events, self.frame, format!(
+                                            "native=1034 source={resolved:?} input={input} kind={:#x} codec={source_codec:?} bad_at={bad_at}",
+                                            record.kind,
+                                        ));
+                                    }
+                                    text.into_bytes()
                                 } else { trim_nul(&record.text).to_vec() };
                                 if scratch.len() >= 4096 { return Err(native_state_error("backlog CST text exceeds read buffer")); }
                                 if record.kind == 0x20 {
@@ -218,7 +307,8 @@ impl LoggingHost<'_> {
                 let result = if language.is_some() {
                     backlog.append_utf8(name, input as u32, &speaker, &text, mark, space, history_index as u32)
                 } else {
-                    backlog.append(name, input as u32, &speaker, &text, mark, space, history_index as u32)
+                    backlog.append_sourced(name, input as u32, &speaker, &text, mark, space, history_index as u32,
+                        SegmentEncoding { name: Some(source_codec), body: Some(source_codec) })
                 };
                 result.map_err(|cause| super::native_state_error_owned(format!(
                     "backlog history={history_index} input={input} byte layout: {cause}"
@@ -305,6 +395,49 @@ fn append_bounded(target: &mut Vec<u8>, source: &[u8], capacity: usize) -> Resul
 mod tests {
     use super::*;
     use cs2_script::Host;
+
+    #[test]
+    fn backlog_speaker_codec_survives_native_publication_to_fes() -> anyhow::Result<()> {
+        let serial = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-backlog-speaker-{}-{serial}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let result = (|| {
+            let mut player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"))?;
+            let mut vm = Vm::new();
+            vm.bind_external(vec![0; 4096])?;
+            let args = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            let output = 0x8000_0400;
+            let raw = b"\xe3\x80\x90\xc2\xa9\xe3\x80\x91";
+            player.with_host(|host| {
+                let NativeReturn::Value(handle) = host.call(696, &[], &mut vm)? else {
+                    anyhow::bail!("missing backlog handle");
+                };
+                let mut backlog = Backlog::new(Settings {
+                    name_first: "\u{3010}".as_bytes().to_vec(), name_last: "\u{3011}".as_bytes().to_vec(),
+                    ..Settings::default()
+                })?;
+                backlog.append_sourced(
+                    b"scene", 0, b"\xc2\xa9", b"\xc4\xe3", 0, 0, 0,
+                    SegmentEncoding { name: Some(ScriptTextEncoding::Cp932), body: Some(ScriptTextEncoding::Gbk) },
+                )?;
+                host.backlogs.insert(handle, backlog);
+                host.call(700, &args(&[handle, output, 0]), &mut vm)?;
+                host.call(276, &args(&[60, output]), &mut vm)?;
+                let stored = vm.read_string(output)?;
+                assert_eq!(stored, raw);
+                assert_eq!(host.data_services.cst_text_origins.shared(60, &stored), Some(ScriptTextEncoding::Cp932));
+                assert_eq!(host.data_services.cst_text_origins.shared_display(60, &stored), Some("\u{3010}\u{ff82}\u{ff69}\u{3011}"));
+                host.call(700, &args(&[handle, output, u32::MAX]), &mut vm)?;
+                host.call(276, &args(&[60, output]), &mut vm)?;
+                assert!(vm.read_string(output)?.is_empty());
+                assert_eq!(host.data_services.cst_text_origins.shared(60, raw), None);
+                assert_eq!(host.data_services.cst_text_origins.shared_display(60, raw), None);
+                Ok(())
+            })
+        })();
+        std::fs::remove_dir_all(root)?;
+        result
+    }
 
     #[test]
     #[ignore = "requires the installed Daydream translation and an isolated profile"]

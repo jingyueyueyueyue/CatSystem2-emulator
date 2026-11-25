@@ -4889,6 +4889,21 @@ impl LoggingHost<'_> {
             }
             return Ok(true);
         }
+        let appended = buffer.as_deref().filter(|_| operation == 3).map(|bytes| {
+            let codec = self.data_services.cst_text_origins
+                .returned(self.current_task_id, data_words[1], bytes)
+                .unwrap_or(match encoding {
+                    MessageEncoding::Cp932 => super::ScriptTextEncoding::Cp932,
+                    MessageEncoding::Unicode => super::ScriptTextEncoding::Utf8,
+                });
+            let (text, bad_at) = codec.decode_message(bytes);
+            if let Some(bad_at) = bad_at {
+                self.data_services.note_text_decode(self.events, self.frame, format!(
+                    "message command={command} codec={codec:?} bad_at={bad_at}",
+                ));
+            }
+            text
+        });
         let data = &mut *self.data_services;
         let mut context = MessagePlatformContext {
             device: &mut data.message_device,
@@ -4912,6 +4927,11 @@ impl LoggingHost<'_> {
         let scale = context.message_time_scale();
         let object = data.messages.object_mut(target).unwrap();
         match operation {
+            3 => {
+                if let Some((bytes, text)) = buffer.as_deref().zip(appended.as_deref()) {
+                    object.append_decoded(bytes, text)?;
+                }
+            }
             9 => {
                 if configured {
                     object.set_user_glyph_source(source)?;

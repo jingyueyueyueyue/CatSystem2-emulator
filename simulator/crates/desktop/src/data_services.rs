@@ -5,7 +5,7 @@
 //! including allocators outside this module. Raw allocations advance it by
 //! their entire reserved range; their addresses are never VM addresses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cs2_formats::CssFile;
 use cs2_runtime::{ResourceIndex, RuntimeError};
@@ -53,6 +53,7 @@ pub(super) struct PreparedDataTables {
 
 #[derive(Default)]
 pub(super) struct DataServices {
+    text_decode_warnings: BTreeSet<String>,
     pub(super) fast_forward_enabled: bool,
     pub(super) fast_forward: bool,
     pub(super) sound_async: super::sound_async::SoundAsyncStore,
@@ -125,6 +126,14 @@ pub(super) struct DataServices {
 }
 
 impl DataServices {
+    pub(super) fn note_text_decode(
+        &mut self, events: &mut Vec<super::LogicEvent>, frame: u64, detail: String,
+    ) {
+        if self.text_decode_warnings.len() < 4096 && self.text_decode_warnings.insert(detail.clone()) {
+            events.push(super::LogicEvent { frame, kind: "text-decode-recovered".into(), detail });
+        }
+    }
+
     pub(super) fn has_loose_gbk_text(&self) -> bool {
         self.loose_scene_encoding.as_ref()
             .is_some_and(super::cst_context_native::LooseSceneEncoding::corroborated_gbk)

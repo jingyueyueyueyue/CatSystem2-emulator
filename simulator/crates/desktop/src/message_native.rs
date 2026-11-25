@@ -689,7 +689,8 @@ impl MessageNativeServices {
             614 => {
                 let text = expand_kcs_format(vm, &vm.read_string(word(1))?, 0)?;
                 let text = text.split(|&byte| byte == 0).next().unwrap_or_default();
-                object.append(text)?;
+                let (decoded, _) = super::ScriptTextEncoding::Cp932.decode_message(text);
+                object.append_decoded(text, &decoded)?;
                 object.prepare(scale, context)?;
             }
             615 => {

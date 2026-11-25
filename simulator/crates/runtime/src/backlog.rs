@@ -1,6 +1,7 @@
 //! Byte-oriented backlog tables, independently recovered from the public
 //! format contract and baseline PE instructions. No font/layout dependency.
 use std::collections::VecDeque;
+use crate::message_object::ScriptTextEncoding;
 use cs2_formats::ConfigXml;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -103,12 +104,19 @@ pub struct Line {
     pub text: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentEncoding {
+    pub name: Option<ScriptTextEncoding>,
+    pub body: Option<ScriptTextEncoding>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backlog {
     settings: Settings,
     limit: u32,
     sources: Vec<Vec<u8>>,
     segments: VecDeque<Segment>,
+    encodings: VecDeque<SegmentEncoding>,
     lines: VecDeque<Line>,
     names: Vec<Vec<u8>>,
     segment_start: u32,
@@ -124,12 +132,14 @@ pub struct BacklogSnapshot {
     pub settings: Settings,
     pub limit: u32,
     pub body: Vec<u8>,
+    #[serde(default)]
+    pub encodings: Vec<SegmentEncoding>,
 }
 
 impl Backlog {
     pub fn snapshot(&self) -> Result<BacklogSnapshot> {
         Ok(BacklogSnapshot { version: 1, settings: self.settings.clone(),
-            limit: self.limit, body: self.serialize()? })
+            limit: self.limit, body: self.serialize()?, encodings: self.encodings.iter().copied().collect() })
     }
 
     pub fn from_snapshot(snapshot: &BacklogSnapshot) -> Result<Self> {
@@ -137,12 +147,18 @@ impl Backlog {
         let mut result = Self::new(snapshot.settings.clone())?;
         result.limit = snapshot.limit;
         result.restore(&snapshot.body)?;
+        if !snapshot.encodings.is_empty() {
+            if snapshot.encodings.len() != result.segments.len() {
+                return Err(BacklogError::InvalidTables);
+            }
+            result.encodings = snapshot.encodings.iter().copied().collect();
+        }
         Ok(result)
     }
 
     pub fn new(settings: Settings) -> Result<Self> {
         settings.validate()?;
-        Ok(Self { settings, limit: 100, sources: Vec::new(), segments: VecDeque::new(),
+        Ok(Self { settings, limit: 100, sources: Vec::new(), segments: VecDeque::new(), encodings: VecDeque::new(),
             lines: VecDeque::new(), names: Vec::new(), segment_start: 0, line_start: 0,
             serialized_size: 40 })
     }
@@ -203,10 +219,15 @@ impl Backlog {
         // No clear/restore/trim: absolute line numbers, limits, flags, input,
         // source, voice/path extra and every existing segment stay in place.
         for (line, text) in self.lines.iter_mut().zip(rows) {
-            if let Some(text) = text { line.text = text; }
+            if let Some(text) = text {
+                line.text = text;
+                let offset = line.segment.wrapping_sub(self.segment_start) as usize;
+                self.encodings[offset].body = Some(ScriptTextEncoding::Utf8);
+            }
         }
-        for (segment, name) in self.segments.iter_mut().zip(bindings) {
+        for ((segment, codec), name) in self.segments.iter_mut().zip(&mut self.encodings).zip(bindings) {
             segment.name = name.unwrap_or(u32::MAX);
+            codec.name = name.map(|_| ScriptTextEncoding::Utf8);
         }
         self.names = next_names;
         self.serialized_size = size;
@@ -215,6 +236,7 @@ impl Backlog {
 
     pub fn clear(&mut self) {
         self.sources.clear(); self.segments.clear(); self.lines.clear(); self.names.clear();
+        self.encodings.clear();
         self.serialized_size = 40;
         // 0x68cb40 leaves both cumulative starts and the limit unchanged.
     }
@@ -224,11 +246,50 @@ impl Backlog {
         self.trim();
     }
 
+    pub fn segment_for_row(&self, row: u32) -> Option<(&Segment, SegmentEncoding)> {
+        let absolute = self.lines.get(row as usize)?.segment;
+        if absolute == u32::MAX { return None; }
+        let offset = absolute.wrapping_sub(self.segment_start) as usize;
+        Some((self.segments.get(offset)?, self.encodings[offset]))
+    }
+
     pub fn name_for_row(&self, row: u32) -> Option<&[u8]> {
-        let segment = self.lines.get(row as usize)?.segment;
-        if segment == u32::MAX { return None; }
-        let segment = self.segments.get(segment.wrapping_sub(self.segment_start) as usize)?;
+        let (segment, _) = self.segment_for_row(row)?;
         self.names.get(segment.name as usize).map(Vec::as_slice)
+    }
+
+    pub fn name_prefix_for_row(&self, row: u32) -> Option<&[u8]> {
+        let (segment, _) = self.segment_for_row(row)?;
+        if self.line_start.wrapping_add(row) != segment.first_line
+            || (self.settings.name_line == 0 && self.settings.display_name == 0) {
+            return None;
+        }
+        let name = self.names.get(segment.name as usize)?;
+        self.lines.get(row as usize)?.text.starts_with(name).then_some(name.as_slice())
+    }
+
+    /// Runtime XML has already normalized the name decorations to UTF-8.
+    /// The legacy backlog stores them next to the original speaker bytes.
+    pub fn decode_name(&self, stored: &[u8], codec: ScriptTextEncoding) -> (String, Option<usize>) {
+        let first = nul(&self.settings.name_first);
+        let last = nul(&self.settings.name_last);
+        if let Some(name) = stored.strip_prefix(first).and_then(|text| text.strip_suffix(last)) {
+            let (name, bad_at) = codec.decode_message(name);
+            let mut text = String::from_utf8_lossy(first).into_owned();
+            text.push_str(&name);
+            text.push_str(&String::from_utf8_lossy(last));
+            (text, bad_at.map(|offset| offset + first.len()))
+        } else {
+            codec.decode_message(stored)
+        }
+    }
+
+    /// Match stored, formatted bytes when a native-format save lacks encoding metadata.
+    pub fn matches_name(&self, stored: &[u8], name: &[u8], codec: ScriptTextEncoding) -> bool {
+        preprocess(nul(name), self.settings.escape != 0, TextEncoding::from_codec(Some(codec))).is_ok_and(|name| {
+            [nul(&self.settings.name_first), name.as_slice(), nul(&self.settings.name_last)]
+                .into_iter().flatten().copied().eq(stored.iter().copied())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -236,7 +297,15 @@ impl Backlog {
         &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
         mark: u32, space: u32, extra: u32,
     ) -> Result<bool> {
-        self.append_with_encoding(source, input, name, text, mark, space, extra, TextEncoding::Legacy)
+        self.append_with_encoding(source, input, name, text, mark, space, extra, SegmentEncoding::default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_sourced(
+        &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
+        mark: u32, space: u32, extra: u32, encodings: SegmentEncoding,
+    ) -> Result<bool> {
+        self.append_with_encoding(source, input, name, text, mark, space, extra, encodings)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -244,25 +313,31 @@ impl Backlog {
         &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
         mark: u32, space: u32, extra: u32,
     ) -> Result<bool> {
-        self.append_with_encoding(source, input, name, text, mark, space, extra, TextEncoding::Utf8)
+        if std::str::from_utf8(nul(name)).is_err() || std::str::from_utf8(nul(text)).is_err() {
+            return Err(BacklogError::InvalidUtf8);
+        }
+        self.append_with_encoding(source, input, name, text, mark, space, extra, SegmentEncoding {
+            name: Some(ScriptTextEncoding::Utf8), body: Some(ScriptTextEncoding::Utf8),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn append_with_encoding(
         &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
-        mark: u32, space: u32, extra: u32, encoding: TextEncoding,
+        mark: u32, space: u32, extra: u32, encodings: SegmentEncoding,
     ) -> Result<bool> {
         let source = nul(source);
         if self.segments.back().is_some_and(|last| last.input == input
             && self.sources.get(last.source as usize).is_some_and(|last| last == source)) {
             return Ok(false);
         }
-        let name = preprocess(nul(name), self.settings.escape != 0, encoding)?;
-        let text = preprocess(nul(text), self.settings.escape != 0, encoding)?;
+        let name_layout = TextEncoding::from_codec(encodings.name);
+        let body_layout = TextEncoding::from_codec(encodings.body);
+        let name = preprocess(nul(name), self.settings.escape != 0, name_layout)?;
+        let text = preprocess(nul(text), self.settings.escape != 0, body_layout)?;
         let formatted_name = if name.is_empty() { Vec::new() } else {
             [nul(&self.settings.name_first), &name, nul(&self.settings.name_last)].concat()
         };
-        encoding.columns(&formatted_name)?;
         let mut rows = Vec::new();
         if self.settings.space != 0 && space != 0 && !self.lines.is_empty() {
             rows.push(Line { segment: u32::MAX, text: Vec::new() });
@@ -280,7 +355,11 @@ impl Backlog {
             let prefix = if self.settings.name_line == 0 && self.settings.display_name != 0 {
                 formatted_name.as_slice()
             } else { &[] };
-            let wrapped = layout(&text, prefix, &self.settings, encoding)?;
+            let name_columns = if prefix.is_empty() { 0 } else {
+                TextEncoding::Utf8.columns(nul(&self.settings.name_first)) + name_layout.columns(&name)
+                    + TextEncoding::Utf8.columns(nul(&self.settings.name_last))
+            };
+            let wrapped = layout(&text, prefix, name_columns, &self.settings, body_layout)?;
             if !wrapped.is_empty() {
                 first = self.line_start.wrapping_add((self.lines.len() + rows.len()) as u32);
                 last = first.wrapping_add(wrapped.len() as u32 - 1);
@@ -313,6 +392,7 @@ impl Backlog {
             flags, source: source_id, input, first_line: first, last_line: last,
             name: name_id, extra,
         });
+        self.encodings.push_back(encodings);
         self.lines.extend(rows);
         self.serialized_size += addition;
         self.trim();
@@ -323,6 +403,7 @@ impl Backlog {
         if self.limit == u32::MAX { return; }
         while self.segments.len() > self.limit as usize {
             let Some(segment) = self.segments.pop_front() else { break; };
+            self.encodings.pop_front();
             self.serialized_size -= 28;
             // Empty segment endpoints remain zero. The PE still advances
             // line_start for each nonnegative absolute range, even if the
@@ -423,6 +504,7 @@ impl Backlog {
             restored.serialized_size = restored.serialized_size.saturating_add(5).saturating_add(line.text.len());
         }
         if restored.serialized_size > MAX_BYTES { return Err(BacklogError::TooLarge); }
+        restored.encodings.resize(restored.segments.len(), SegmentEncoding::default());
         restored.trim();
         *self = restored;
         Ok(())
@@ -480,42 +562,68 @@ fn unit(data: &[u8], offset: usize) -> Result<usize> {
 #[derive(Clone, Copy)]
 enum TextEncoding {
     Legacy,
+    Cp932,
+    Gbk,
     Utf8,
 }
 
 impl TextEncoding {
-    fn unit(self, data: &[u8], offset: usize) -> Result<(usize, usize)> {
-        match self {
-            Self::Utf8 => match data.get(offset) {
-                Some(0xc2..=0xdf) => Ok((2, 2)),
-                Some(0xe0..=0xef) => Ok((3, 2)),
-                Some(0xf0..=0xf4) => Ok((4, 2)),
-                _ => unit(data, offset).map(|length| (length, length)),
-            },
-            Self::Legacy => unit(data, offset).map(|length| (length, length)),
+    fn from_codec(codec: Option<ScriptTextEncoding>) -> Self {
+        match codec {
+            Some(ScriptTextEncoding::Cp932) => Self::Cp932,
+            Some(ScriptTextEncoding::Gbk) => Self::Gbk,
+            Some(ScriptTextEncoding::Utf8) => Self::Utf8,
+            _ => Self::Legacy,
         }
     }
 
-    fn columns(self, data: &[u8]) -> Result<usize> {
+    fn unit(self, data: &[u8], offset: usize) -> Result<(usize, usize)> {
         match self {
-            Self::Legacy => Ok(data.len()),
-            Self::Utf8 => std::str::from_utf8(data)
-                .map(|text| text.chars().map(|character| if character.is_ascii() { 1 } else { 2 }).sum())
-                .map_err(|_| BacklogError::InvalidUtf8),
+            Self::Utf8 => {
+                let tail = data.get(offset..).ok_or(BacklogError::TruncatedCharacter)?;
+                let length = match tail.first() {
+                    Some(0xc2..=0xdf) => 2,
+                    Some(0xe0..=0xef) => 3,
+                    Some(0xf0..=0xf4) => 4,
+                    _ => return Ok((unit(data, offset)?.min(if tail[0].is_ascii() { 2 } else { 1 }), 1)),
+                };
+                Ok(if tail.get(..length).is_some_and(|bytes| std::str::from_utf8(bytes).is_ok()) {
+                    (length, 2)
+                } else { (1, 1) })
+            }
+            Self::Cp932 if matches!(data.get(offset), Some(0xf0..=0xfc))
+                && matches!(data.get(offset + 1), Some(0x40..=0x7e | 0x80..=0xfc)) => Ok((2, 2)),
+            Self::Cp932 if data.get(offset..offset + 2) == Some(b"\x81\x01") => Ok((2, 2)),
+            Self::Gbk if matches!(data.get(offset), Some(0x81..=0xfe)) => Ok(
+                if matches!(data.get(offset + 1), Some(0x40..=0x7e | 0x80..=0xfe)) { (2, 2) } else { (1, 1) }
+            ),
+            Self::Gbk => unit(data, offset).map(|length| (length, length)),
+            Self::Legacy | Self::Cp932 => unit(data, offset).map(|length| (length, length)),
+        }
+    }
+
+    fn columns(self, data: &[u8]) -> usize {
+        match self {
+            Self::Legacy | Self::Cp932 | Self::Gbk => data.len(),
+            Self::Utf8 => String::from_utf8_lossy(data).chars()
+                .map(|character| if character.is_ascii() { 1 } else { 2 }).sum(),
         }
     }
 
     fn wide_space(self) -> &'static [u8] {
         match self {
-            Self::Legacy => b"\x81\x40",
+            Self::Legacy | Self::Cp932 => b"\x81\x40",
+            Self::Gbk => b"\xa1\xa1",
             Self::Utf8 => "\u{3000}".as_bytes(),
         }
     }
 
     fn opening_indent(self, text: &[u8]) -> usize {
         let opening = match self {
-            Self::Legacy => matches!(text.get(..2),
+            Self::Legacy | Self::Cp932 => matches!(text.get(..2),
                 Some(b"\x81\x69" | b"\x81\x6d" | b"\x81\x6f" | b"\x81\x75" | b"\x81\x77")),
+            Self::Gbk => matches!(text.get(..2),
+                Some(b"\xa3\xa8" | b"\xa3\xdb" | b"\xa3\xfb" | b"\xa1\xb8" | b"\xa1\xba")),
             Self::Utf8 => ["\u{ff08}", "\u{ff3b}", "\u{ff5b}", "\u{300c}", "\u{300e}"]
                 .iter().any(|opening| text.starts_with(opening.as_bytes())),
         };
@@ -537,7 +645,6 @@ fn numeric_span(data: &[u8]) -> usize {
 
 fn preprocess(data: &[u8], escape: bool, encoding: TextEncoding) -> Result<Vec<u8>> {
     if data.len() > MAX_BYTES { return Err(BacklogError::TooLarge); }
-    encoding.columns(data)?;
     let mut output = Vec::with_capacity(data.len());
     let mut offset = 0;
     while offset < data.len() {
@@ -599,6 +706,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_codec_survives_trim_and_graph_restore() -> Result<()> {
+        let mut log = Backlog::new(Settings::default())?;
+        log.set_limit(1);
+        log.append_utf8(b"other", 0, "切换".as_bytes(), b"first", 0, 0, 0)?;
+        let encoding = SegmentEncoding { name: Some(ScriptTextEncoding::Cp932), body: Some(ScriptTextEncoding::Gbk) };
+        let name = b"\x81\x75";
+        log.append_sourced(b"scene", 1, name, b"\xc4\xe3", 1, 0, 17, encoding)?;
+        assert_eq!(log.segment_for_row(0).map(|(_, encoding)| encoding), Some(encoding));
+        assert_eq!(log.name_for_row(0), Some(name.as_slice()));
+        let snapshot = log.snapshot()?;
+        assert_eq!(Backlog::from_snapshot(&snapshot)?, log);
+
+        #[derive(Serialize)]
+        struct LegacySnapshot {
+            version: u32,
+            settings: Settings,
+            limit: u32,
+            body: Vec<u8>,
+        }
+        let legacy = crate::object_graph::encode_component(&LegacySnapshot {
+            version: snapshot.version, settings: snapshot.settings, limit: snapshot.limit, body: snapshot.body.clone(),
+        }).unwrap();
+        let legacy: BacklogSnapshot = crate::object_graph::decode_component(&legacy).unwrap();
+        let old = Backlog::from_snapshot(&legacy)?;
+        assert_eq!(old.name_for_row(0), Some(name.as_slice()));
+        assert_eq!(old.serialize()?, snapshot.body);
+        assert_eq!(old.segment_for_row(0).map(|(_, encoding)| encoding), Some(SegmentEncoding::default()));
+        Ok(())
+    }
+
+    #[test]
     fn backlog_keeps_unpaired_bytes_and_still_consumes_valid_pairs() -> Result<()> {
         assert_eq!(unit(b"\xe3", 0)?, 1);
         assert_eq!(unit(b"\x81\x7f", 0)?, 1);
@@ -639,9 +777,8 @@ mod tests {
     }
 }
 
-fn layout(text: &[u8], prefix: &[u8], settings: &Settings, encoding: TextEncoding) -> Result<Vec<Vec<u8>>> {
+fn layout(text: &[u8], prefix: &[u8], prefix_columns: usize, settings: &Settings, encoding: TextEncoding) -> Result<Vec<Vec<u8>>> {
     let opening_indent = encoding.opening_indent(text);
-    let prefix_columns = encoding.columns(prefix)?;
     let mut output = Vec::new();
     let mut offset = 0usize;
     while offset < text.len() {
@@ -663,7 +800,7 @@ fn layout(text: &[u8], prefix: &[u8], settings: &Settings, encoding: TextEncodin
                     end += encoding.unit(text, end)?.0;
                 }
                 let body = body_end.unwrap_or_else(|| end - usize::from(text.get(end.wrapping_sub(1)) == Some(&b']')));
-                let visible = encoding.columns(&text[offset + 1..body])?;
+                let visible = encoding.columns(&text[offset + 1..body]);
                 if width.saturating_add(visible) > (settings.columns + settings.extra_columns) as usize { break; }
                 width += visible;
                 offset = end;

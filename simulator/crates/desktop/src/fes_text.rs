@@ -600,8 +600,20 @@ impl FesTextStore {
             } else if matches!(column, b"STR" | b"TEXT") {
                 for key in &keys {
                     let bank = self.banks.get_mut(key).unwrap();
-                    let text = normalize_text(raw, bank.message.encoding(), false, encoding)?;
-                    bank.replace_with_codec(&text, host.data_services.has_loose_gbk_text())?;
+                    let unicode = bank.message.encoding() == MessageEncoding::Unicode;
+                    let codec = if !unicode && host.data_services.has_loose_gbk_text() {
+                        ScriptTextEncoding::Gbk
+                    } else if unicode && encoding == ScriptTextEncoding::Cp932 && std::str::from_utf8(raw).is_ok() {
+                        ScriptTextEncoding::Utf8
+                    } else { encoding };
+                    let (text, bad_at) = codec.decode_message(raw);
+                    if let Some(bad_at) = bad_at {
+                        host.data_services.note_text_decode(host.events, host.frame, format!(
+                            "FES initializer offset={:#x} bank={:?} codec={codec:?} bad_at={bad_at}",
+                            initializer.offset, String::from_utf8_lossy(name),
+                        ));
+                    }
+                    bank.replace_text(if unicode { text.as_bytes() } else { raw }, false, Some(&text))?;
                     bank.observe_story_source(key, host);
                 }
             } else if matches!(column, b"POS2" | b"SIZE2") {
@@ -878,12 +890,25 @@ impl FesTextStore {
                         continue;
                     }
                     let explicit_cp932 = verb == b"strsj";
-                    let text = normalize_text(raw, record.message.encoding(),
-                        explicit_cp932, resource_encoding)?;
+                    let unicode = record.message.encoding() == MessageEncoding::Unicode;
+                    let codec = if explicit_cp932 { ScriptTextEncoding::Cp932 }
+                        else if legacy_gbk { ScriptTextEncoding::Gbk }
+                        else if unicode && resource_encoding == ScriptTextEncoding::Cp932
+                            && std::str::from_utf8(raw).is_ok() { ScriptTextEncoding::Utf8 }
+                        else { resource_encoding };
+                    let (text, bad_at) = codec.decode_message(raw);
+                    if let Some(bad_at) = bad_at {
+                        host.data_services.note_text_decode(host.events, host.frame, format!(
+                            "FES block={:?} offset={:#x} bank={:?} codec={codec:?} bad_at={bad_at}",
+                            String::from_utf8_lossy(&command.context.block), command.offset,
+                            String::from_utf8_lossy(&key.1),
+                        ));
+                    }
+                    let bytes = if unicode { text.as_bytes() } else { raw };
                     if verb == b"apend" {
-                        record.append_body(&text, legacy_gbk)?;
+                        record.append_body_text(bytes, legacy_gbk, Some(&text))?;
                     } else {
-                        record.replace_with_codec(&text, legacy_gbk && !explicit_cp932)?;
+                        record.replace_text(bytes, false, Some(&text))?;
                     }
                     record.observe_story_text(key, host, keep_prefix, provenance.as_deref());
                 }
@@ -1606,11 +1631,11 @@ impl TextBank {
             if newline { text.push('\n'); }
             if !speaker_raw.is_empty() {
                 if let Some(speaker) = speaker_decoded { text.push_str(speaker); }
-                else { text.push_str(&decode_text(speaker_raw, codec)?); }
+                else { text.push_str(&codec.decode_message(speaker_raw).0); }
                 text.push('\n');
             }
             if let Some(body) = decoded { text.push_str(body); }
-            else { text.push_str(&decode_text(bytes, codec)?); }
+            else { text.push_str(&codec.decode_message(bytes).0); }
             Some(text)
         } else { None };
         self.append_text(&paragraph, legacy_gbk, text.as_deref())?;
@@ -1977,13 +2002,14 @@ pub(super) fn update_owner(
     let data = &mut *host.data_services;
     let loose_gbk = data.has_loose_gbk_text();
     let next_surface = &mut data.fes_text.next_surface;
+    let mut warnings = Vec::new();
     for ((owner, name, index), bank) in &mut data.fes_text.banks {
         if *owner != view.id { continue; }
         if bank.log.is_some() {
             let _stage = TextHostTimer::new(TextStage::History);
             let _detail = SlowTask::new(view.id, || 34, "fes_text_log").named(name, None).code(*index);
             log::update(bank, next_surface, &mut data.message_device, view, runtime, name, *index,
-                host.backlogs, host.resources, loose_gbk)?;
+                host.backlogs, host.resources, loose_gbk, |detail| warnings.push(detail))?;
         } else {
             let observed = bank.story_body.source.is_some();
             let forced = observed && bank.skip && !bank.story_body.eden_layout_skip_pending;
@@ -1998,6 +2024,9 @@ pub(super) fn update_owner(
                 bank.observe_story_reveal(host.frame, naturally_updated, start_requested, &data.message_device);
             }
         }
+    }
+    for detail in warnings {
+        data.note_text_decode(host.events, host.frame, detail);
     }
     if view.list.is_some() {
         let scene_text: Vec<_> = host.data_services.fes_text.banks.iter()
@@ -2127,8 +2156,17 @@ fn render_bank_with_surface(
                 bank.message.prepare(scale, device)?;
                 bank.message.advance_display(0, MessageCopy::Full, device)?;
             }
-            TextRequest::Append(bytes) => bank.message.append(&bytes)?,
-            TextRequest::AppendLegacyGbk(bytes) => bank.message.append_legacy_gbk(&bytes)?,
+            TextRequest::Append(bytes) => {
+                let codec = match bank.message.encoding() {
+                    MessageEncoding::Cp932 => ScriptTextEncoding::Cp932,
+                    MessageEncoding::Unicode => ScriptTextEncoding::Utf8,
+                };
+                bank.message.append_decoded(&bytes, &codec.decode_message(&bytes).0)?;
+            }
+            TextRequest::AppendLegacyGbk(bytes) => {
+                let codec = ScriptTextEncoding::Gbk;
+                bank.message.append_decoded(&bytes, &codec.decode_message(&bytes).0)?;
+            }
             TextRequest::AppendDecoded { bytes, text } => bank.message.append_decoded(&bytes, &text)?,
             TextRequest::Separator => bank.message.append_separator()?,
         }
@@ -2631,7 +2669,7 @@ fn sourced_text(
     let origins = &host.data_services.cst_text_origins;
     let trace = host.data_services.story_trace;
     let mut variables = Vec::new();
-    let mut failure = None;
+    let mut failures = Vec::new();
     let decoded = decode_sourced_text_with_failure(
         template, raw, literal, host.text_encoding, driver.is_island_gbk_fes_source(),
         |id| {
@@ -2640,11 +2678,18 @@ fn sourced_text(
             if trace && let Some(codec) = codec && !variables.contains(&codec) {
                 variables.push(codec);
             }
-            (bytes, codec)
+            (bytes, codec, origins.shared_display(id, bytes))
         },
-        |part| failure = Some(part),
+        |part| failures.push(part.diagnostic_detail()),
+        true,
     );
-    if let Some(part) = failure && eden_diagnostic_fes(host, driver) == Some(true) {
+    for part in &failures {
+        host.data_services.note_text_decode(host.events, host.frame, format!(
+            "FES block={:?} offset={:#x} {part}",
+            String::from_utf8_lossy(block), command.offset,
+        ));
+    }
+    if let Some(part) = failures.first() && eden_diagnostic_fes(host, driver) == Some(true) {
         let resolved_cst = match host.cst_resource_with_source(b"scene", b"BLAOP1_END.cst") {
             Ok(Some((_, resource))) if resource.bytes.len() == 26298
                 && super::particle_plugin_digest::sha256(&resource.bytes)
@@ -2656,8 +2701,8 @@ fn sourced_text(
         host.events.push(LogicEvent {
             frame: host.frame,
             kind: "fes-text-eden-decode-error".into(),
-            detail: format!("task={owner} resource=meswnd.fes block={} offset={:#x} resolved_cst={resolved_cst} {}",
-                String::from_utf8_lossy(block), command.offset, part.diagnostic_detail()),
+            detail: format!("task={owner} resource=meswnd.fes block={} offset={:#x} resolved_cst={resolved_cst} {part}",
+                String::from_utf8_lossy(block), command.offset),
         });
     }
     Ok(decoded?.map(|text| SourcedText { text, literal, variables }))
@@ -2685,6 +2730,7 @@ struct SourcedPart<'a> {
     bytes: &'a [u8],
     codec: ScriptTextEncoding,
     variable: Option<(u32, bool)>,
+    display: Option<&'a str>,
 }
 
 impl SourcedPart<'_> {
@@ -2734,16 +2780,20 @@ pub(super) fn decode_sourced_text<'a>(
     default_variable_codec: ScriptTextEncoding, sourced: bool,
     variable: impl FnMut(u32) -> (&'a [u8], Option<ScriptTextEncoding>),
 ) -> Result<Option<String>> {
-    decode_sourced_text_with_failure(template, expected, literal, default_variable_codec, sourced, variable, |_| {})
+    let mut variable = variable;
+    decode_sourced_text_with_failure(template, expected, literal, default_variable_codec, sourced, |id| {
+        let (bytes, codec) = variable(id);
+        (bytes, codec, None)
+    }, |_| {}, false)
 }
 
 fn decode_sourced_text_with_failure<'a>(
     mut template: &'a [u8], expected: &[u8], literal: ScriptTextEncoding,
     default_variable_codec: ScriptTextEncoding, mut sourced: bool,
-    mut variable: impl FnMut(u32) -> (&'a [u8], Option<ScriptTextEncoding>),
-    mut on_failure: impl FnMut(SourcedPart<'a>),
+    mut variable: impl FnMut(u32) -> (&'a [u8], Option<ScriptTextEncoding>, Option<&'a str>),
+    mut on_failure: impl FnMut(SourcedPart<'a>), recover: bool,
 ) -> Result<Option<String>> {
-    let literal_part = |bytes: &'a [u8]| SourcedPart { bytes, codec: literal, variable: None };
+    let literal_part = |bytes: &'a [u8]| SourcedPart { bytes, codec: literal, variable: None, display: None };
     let mut parts = Vec::new();
     while let Some(start) = template.windows(4).position(|part| part == b"$str") {
         let digits = &template[start + 4..];
@@ -2757,10 +2807,10 @@ fn decode_sourced_text_with_failure<'a>(
         let id = digits[..count].iter().fold(0u32, |id, byte| {
             id.wrapping_mul(10).wrapping_add(u32::from(*byte - b'0'))
         });
-        let (bytes, codec) = variable(id);
-        sourced |= codec.is_some();
+        let (bytes, codec, display) = variable(id);
+        sourced |= codec.is_some() || display.is_some();
         parts.push(SourcedPart {
-            bytes, codec: codec.unwrap_or(default_variable_codec), variable: Some((id, codec.is_some())),
+            bytes, codec: codec.unwrap_or(default_variable_codec), variable: Some((id, codec.is_some())), display,
         });
         template = &digits[count + usize::from(digits.get(count) == Some(&b';'))..];
     }
@@ -2770,11 +2820,19 @@ fn decode_sourced_text_with_failure<'a>(
     }
     let mut text = String::new();
     for part in parts {
+        if let Some(display) = part.display {
+            text.push_str(display);
+            continue;
+        }
         match decode_text(part.bytes, part.codec) {
             Ok(decoded) => text.push_str(&decoded),
             Err(error) => {
+                if !recover {
+                    on_failure(part);
+                    return Err(error);
+                }
+                text.push_str(&part.codec.decode_message(part.bytes).0);
                 on_failure(part);
-                return Err(error);
             }
         }
     }
@@ -2789,11 +2847,11 @@ fn fes_sourced_failure_reports_only_the_rejected_segment() {
         b"\x81\x79$str1000;$str1001;\x81\x7a", b"\x81\x79A\xff\xec\xcdB\x81\x7a",
         cp932, cp932, false,
         |id| match id {
-            1000 => (b"A\xff\xec\xcd", None),
-            1001 => (b"B", Some(cp932)),
+            1000 => (b"A\xff\xec\xcd", None, None),
+            1001 => (b"B", Some(cp932), None),
             _ => unreachable!(),
         },
-        |part| details.push(part.diagnostic_detail()),
+        |part| details.push(part.diagnostic_detail()), false,
     );
     assert_eq!(result.unwrap_err().to_string(), "invalid Cp932 FES text from declared source");
     assert_eq!(details, ["source=shared-default variable=1000 codec=Cp932 bytes=4 bad_at=2"]);

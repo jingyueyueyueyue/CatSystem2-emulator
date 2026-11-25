@@ -392,6 +392,7 @@ pub(super) fn body_control_only(mut bytes: &[u8]) -> bool {
 struct CstByteOrigin {
     bytes: Vec<u8>,
     codec: ScriptTextEncoding,
+    display: Option<String>,
     body: Vec<CstBodySource>,
     speaker: Option<CstSpeakerOrigin>,
 }
@@ -611,7 +612,16 @@ impl CstTextOrigins {
         let body = origin.filter(|origin| self.body_is_current(&origin.body))
             .map_or_else(Vec::new, |origin| origin.body.clone());
         let speaker = origin.and_then(|origin| origin.speaker).map(|_| CstSpeakerOrigin::Record);
+        let display = origin.and_then(|origin| origin.display.clone());
         self.record_origin(task, address, bytes, codec, body, speaker);
+        self.returned.back_mut().unwrap().1.display = display;
+    }
+
+    pub(super) fn record_display(
+        &mut self, task: u32, address: u32, bytes: &[u8], codec: ScriptTextEncoding, display: String,
+    ) {
+        self.record_origin(task, address, bytes, codec, Vec::new(), None);
+        self.returned.back_mut().unwrap().1.display = Some(display);
     }
 
     fn record_with_body(&mut self, task: u32, address: u32, bytes: &[u8], codec: ScriptTextEncoding,
@@ -628,7 +638,7 @@ impl CstTextOrigins {
         if self.returned.len() == 64 {
             self.returned.pop_front();
         }
-        self.returned.push_back((key, CstByteOrigin { bytes: bytes.to_vec(), codec, body, speaker }));
+        self.returned.push_back((key, CstByteOrigin { bytes: bytes.to_vec(), codec, display: None, body, speaker }));
     }
 
     pub(super) fn invalidate_returned(&mut self, task: u32, address: u32) {
@@ -663,7 +673,8 @@ impl CstTextOrigins {
         if let Some(origin) = self.returned_origin(task, address, bytes)
             .filter(|origin| !bytes.is_ascii() || !origin.body.is_empty())
         {
-            let origin = CstByteOrigin { bytes: bytes.to_vec(), codec: origin.codec, body: origin.body.clone(), speaker: None };
+            let mut origin = origin.clone();
+            origin.speaker = None;
             self.shared.insert(id, origin);
         } else {
             self.shared.remove(&id);
@@ -672,6 +683,11 @@ impl CstTextOrigins {
 
     pub(super) fn shared(&self, id: u32, bytes: &[u8]) -> Option<ScriptTextEncoding> {
         self.shared.get(&id).and_then(|origin| (origin.bytes == bytes && !bytes.is_ascii()).then_some(origin.codec))
+    }
+
+    pub(super) fn shared_display(&self, id: u32, bytes: &[u8]) -> Option<&str> {
+        let origin = self.shared.get(&id)?;
+        (origin.bytes == bytes).then_some(origin.display.as_deref()).flatten()
     }
 
     pub(super) fn shared_body(&self, id: u32, bytes: &[u8]) -> Option<&[CstBodySource]> {
@@ -688,7 +704,7 @@ impl CstTextOrigins {
         if bytes.is_ascii() {
             self.shared.remove(&id);
         } else {
-            self.shared.insert(id, CstByteOrigin { bytes: bytes.to_vec(), codec, body: Vec::new(), speaker: None });
+            self.shared.insert(id, CstByteOrigin { bytes: bytes.to_vec(), codec, display: None, body: Vec::new(), speaker: None });
         }
     }
 
@@ -1597,7 +1613,7 @@ impl LoggingHost<'_> {
         Ok(NativeReturn::Continue)
     }
 
-    pub(super) fn cst_option_native1064(&self, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
+    pub(super) fn cst_option_native1064(&mut self, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
         let handle = read_u32(args, 0)?;
         if handle == 0 { return Ok(NativeReturn::Value(0)); }
         let context = self.cst_contexts.get(&handle)
@@ -1610,6 +1626,7 @@ impl LoggingHost<'_> {
         let ordinal = read_u32(args, 8)?;
         let language = formatted(vm, read_u32(args, 12)?, 64)?;
         vm.write(target, &[0])?;
+        self.data_services.cst_text_origins.invalidate_returned(self.current_task_id, target);
         let Some(table) = context.localization.as_ref().filter(|_|
             context.languages.binary_search_by(|name| name.as_slice().cmp(language.as_slice())).is_ok())
         else { return Ok(NativeReturn::Value(0)); };
@@ -1629,6 +1646,10 @@ impl LoggingHost<'_> {
             }
         }
         write_kcs_terminated(vm, target, &text, 1)?;
+        self.data_services.cst_text_origins.invalidate_returned(self.current_task_id, target);
+        if !text.is_empty() {
+            self.data_services.cst_text_origins.record(self.current_task_id, target, &text, ScriptTextEncoding::Utf8);
+        }
         Ok(NativeReturn::Value(text.len() as u32))
     }
 
@@ -2063,9 +2084,14 @@ impl LoggingHost<'_> {
             }
         } else if matches!(index, 1037 | 1038) {
             if matches!(record.kind, 0x20 | 0x21) {
-                decode_cst_dialogue(&record.text, context.encoding).map_err(|error|
-                    native_state_error_owned(format!("native {index} input={input} record={ordinal}: {error}")))?
-                    .into_owned().into_bytes()
+                let (text, bad_at) = context.encoding.decode_message(trim_nul(&record.text));
+                if let Some(bad_at) = bad_at {
+                    self.data_services.note_text_decode(self.events, self.frame, format!(
+                        "CST scene={:?} native={index} input={input} record={ordinal} codec={:?} bad_at={bad_at}",
+                        context.story.scene_name(), context.encoding,
+                    ));
+                }
+                text.into_bytes()
             } else {
                 context.encoding.decode(&record.text).into_bytes()
             }
@@ -2299,7 +2325,7 @@ impl LoggingHost<'_> {
         self.cst_scene_encoding_override_with_document(resource, None)
     }
 
-    fn cst_scene_encoding_override_with_document(
+    pub(super) fn cst_scene_encoding_override_with_document(
         &self,
         resource: &SourcedResource,
         document: Option<&CstDocument>,

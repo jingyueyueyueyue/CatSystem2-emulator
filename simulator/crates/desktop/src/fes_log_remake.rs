@@ -4,7 +4,7 @@
 use super::*;
 use cs2_formats::CstlTable;
 use cs2_script::CstDocument;
-use crate::cst_context_native::{decode_cst_dialogue, repair_routed_scene_text};
+use crate::cst_context_native::repair_routed_scene_text;
 
 struct Scene {
     document: CstDocument,
@@ -102,7 +102,12 @@ fn remake_backlog(host: &mut LoggingHost<'_>, handle: u32, language: Option<&str
                         .context("LOGSTRING remake segment has no retained source")?;
                     scenes.insert(source, load_scene(host, source_name)?);
                 }
-                read_input(&scenes[&source], input as usize, language)?
+                read_input_with_recovery(&scenes[&source], input as usize, language, |record, codec, bad_at| {
+                    host.data_services.note_text_decode(host.events, host.frame, format!(
+                        "LOGSTRING remake source={:?} input={input} record={record} codec={codec:?} bad_at={bad_at}",
+                        sources.get(source as usize).map(|name| String::from_utf8_lossy(name)),
+                    ));
+                })?
             } else {
                 // Null main clears the existing main row. No scene-language
                 // index or current global language is substituted for it.
@@ -138,7 +143,10 @@ fn load_scene(host: &LoggingHost<'_>, source: &[u8]) -> Result<Scene> {
     Ok(Scene { document, localization, encoding })
 }
 
-fn read_input(scene: &Scene, input: usize, language: &str) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+fn read_input_with_recovery(
+    scene: &Scene, input: usize, language: &str,
+    mut warn: impl FnMut(usize, ScriptTextEncoding, usize),
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let Some(range) = scene.document.inputs.get(input) else { return Ok((Vec::new(), None)) };
     // A missing binding uses base CST; an existing binding with empty/missing
     // name, message or fragment stays empty. Do not use choice-menu fallback.
@@ -147,19 +155,24 @@ fn read_input(scene: &Scene, input: usize, language: &str) -> Result<(Vec<u8>, O
     let mut text = Vec::new();
     let mut name = None;
     let mut fragment = 0;
-    for record in &scene.document.records[range.clone()] {
+    for (ordinal, record) in scene.document.records[range.clone()].iter().enumerate() {
+        let mut base_utf8 = || {
+            let (text, bad_at) = scene.encoding.decode_message(crate::trim_nul(&record.text));
+            if let Some(bad_at) = bad_at { warn(ordinal, scene.encoding, bad_at); }
+            text.into_bytes()
+        };
         let bytes = match record.kind {
             0x20 => {
                 let bytes = if let Some(table) = bound {
                     table.segment(language, input, fragment).unwrap_or("").as_bytes().to_vec()
-                } else { base_utf8(&record.text, scene.encoding)? };
+                } else { base_utf8() };
                 fragment += 1;
                 bytes
             }
             0x21 => {
                 let bytes = if let Some(table) = bound {
                     table.message(language, input).map_or("", |message| &message.name).as_bytes().to_vec()
-                } else { base_utf8(&record.text, scene.encoding)? };
+                } else { base_utf8() };
                 check_record(&bytes)?;
                 name = Some(bytes);
                 continue;
@@ -186,8 +199,9 @@ fn check_record(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn base_utf8(bytes: &[u8], codec: ScriptTextEncoding) -> Result<Vec<u8>> {
-    Ok(decode_cst_dialogue(bytes, codec).context("LOGSTRING remake base CST")?.into_owned().into_bytes())
+#[cfg(test)]
+fn read_input(scene: &Scene, input: usize, language: &str) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    read_input_with_recovery(scene, input, language, |_, _, _| {})
 }
 
 #[test]
@@ -222,7 +236,7 @@ fn log_remake_keeps_declared_base_codec_and_bound_utf8_overrides() {
             ("\u{65e5}".as_bytes().to_vec(), Some(Vec::new())));
     }
     scene.document.records[1].text = b"\x81".to_vec();
-    assert!(read_input(&scene, 0, "unbound").is_err());
+    assert_eq!(read_input(&scene, 0, "unbound").unwrap().0, "\u{fffd}!".as_bytes());
 }
 
 #[test]

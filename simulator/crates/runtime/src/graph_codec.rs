@@ -221,7 +221,11 @@ impl<'de> de::Deserializer<'de> for &mut Reader<'de> {
         let len = fields.len();
         // Six trailing FES driver fields were appended to the original graph
         // layout. Their serde defaults decode checkpoints written before them.
-        let minimum = if name == "FesScriptDriver" { len.saturating_sub(6) } else { len };
+        let minimum = match name {
+            "FesScriptDriver" => len.saturating_sub(6),
+            "BacklogSnapshot" => len.saturating_sub(1),
+            _ => len,
+        };
         self.sequence(visitor, Some(minimum..=len), false)
     }
     fn deserialize_enum<V: de::Visitor<'de>>(self, _: &'static str, _: &'static [&'static str], visitor: V) -> Result<V::Value> {

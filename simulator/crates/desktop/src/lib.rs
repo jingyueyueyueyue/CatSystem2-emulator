@@ -199,23 +199,7 @@ mod particle_canvas;
 mod particle_canvas_native;
 mod particle_render;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScriptTextEncoding {
-    #[default]
-    Cp932,
-    Gbk,
-    Utf8,
-}
-
-impl ScriptTextEncoding {
-    pub fn decode(self, bytes: &[u8]) -> String {
-        match self {
-            Self::Cp932 => encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned(),
-            Self::Gbk => encoding_rs::GBK.decode(bytes).0.into_owned(),
-            Self::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
-        }
-    }
-}
+pub use cs2_runtime::message_object::ScriptTextEncoding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicEvent {
@@ -11153,6 +11137,12 @@ fn kcs_format_preserves_literal_percent_and_checks_explicit_fields() {
 }
 
 fn expand_kcs_format(vm: &Vm, input: &[u8], depth: usize) -> cs2_script::Result<Vec<u8>> {
+    expand_kcs_format_observed(vm, input, depth, &mut |_, _| {})
+}
+
+fn expand_kcs_format_observed(
+    vm: &Vm, input: &[u8], depth: usize, observe: &mut impl FnMut(u32, &[u8]),
+) -> cs2_script::Result<Vec<u8>> {
     if depth >= 32 {
         return Err(cs2_script::ScriptError::InvalidStructuredText {
             offset: 0,
@@ -11238,7 +11228,8 @@ fn expand_kcs_format(vm: &Vm, input: &[u8], depth: usize) -> cs2_script::Result<
         let rendered = match kind {
             b's' => {
                 let source = vm.read_string(address)?;
-                let mut text = expand_kcs_format(vm, &source, depth + 1)?;
+                let mut text = expand_kcs_format_observed(vm, &source, depth + 1, observe)?;
+                observe(address, &source);
                 if let Some(limit) = precision {
                     text.truncate(limit);
                 }

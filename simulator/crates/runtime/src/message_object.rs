@@ -52,6 +52,88 @@ pub fn decode_cp932_display(bytes: &[u8]) -> Option<Cow<'_, str>> {
         .map(|text| Cow::Owned(text.into_owned()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScriptTextEncoding {
+    #[default]
+    Cp932,
+    Gbk,
+    Utf8,
+}
+
+impl ScriptTextEncoding {
+    fn encoding(self) -> &'static encoding_rs::Encoding {
+        match self {
+            Self::Cp932 => encoding_rs::SHIFT_JIS,
+            Self::Gbk => encoding_rs::GBK,
+            Self::Utf8 => encoding_rs::UTF_8,
+        }
+    }
+
+    pub fn decode(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+            _ => self.encoding().decode(bytes).0.into_owned(),
+        }
+    }
+
+    pub fn decode_strict(self, bytes: &[u8]) -> Option<Cow<'_, str>> {
+        if self == Self::Cp932 {
+            decode_cp932_display(bytes)
+        } else {
+            self.encoding().decode_without_bom_handling_and_without_replacement(bytes)
+        }
+    }
+
+    /// Legacy message buffers use FF for a segment break, independently of the code page.
+    pub fn decode_message(self, bytes: &[u8]) -> (String, Option<usize>) {
+        let mut text = String::new();
+        let mut bad_at = None;
+        let mut offset = 0;
+        let parts = bytes.split(|&byte| self != Self::Utf8 && byte == 0xff);
+        for (index, part) in parts.enumerate() {
+            if index != 0 { text.push('\u{ffff}'); }
+            if let Some(decoded) = self.decode_strict(part) {
+                text.push_str(&decoded);
+            } else {
+                let encoding = self.encoding();
+                if bad_at.is_none() {
+                    let mut decoder = encoding.new_decoder_without_bom_handling();
+                    let mut consumed = 0;
+                    let mut scratch = [0; 256];
+                    loop {
+                        let (result, read, _) = decoder.decode_to_utf8_without_replacement(
+                            &part[consumed..], &mut scratch, true,
+                        );
+                        consumed += read;
+                        match result {
+                            encoding_rs::DecoderResult::OutputFull => continue,
+                            encoding_rs::DecoderResult::Malformed(length, after) => {
+                                bad_at = Some(offset + consumed.saturating_sub(
+                                    usize::from(length) + usize::from(after),
+                                ));
+                            }
+                            encoding_rs::DecoderResult::InputEmpty => {}
+                        }
+                        break;
+                    }
+                }
+                text.push_str(&encoding.decode_without_bom_handling(part).0);
+            }
+            offset += part.len() + 1;
+        }
+        (text, bad_at)
+    }
+}
+
+#[test]
+fn display_encoding_preserves_ambiguous_bytes_and_recovers_only_invalid_characters() {
+    let ambiguous = b"\xc2\xa9";
+    assert_eq!(ScriptTextEncoding::Cp932.decode_message(ambiguous), ("\u{ff82}\u{ff69}".into(), None));
+    assert_eq!(ScriptTextEncoding::Gbk.decode_message(ambiguous), ("\u{6f0f}".into(), None));
+    assert_eq!(ScriptTextEncoding::Utf8.decode_message(ambiguous), ("\u{a9}".into(), None));
+    assert_eq!(ScriptTextEncoding::Gbk.decode_message(b"A\xffB\x81"), ("A\u{ffff}B\u{fffd}".into(), Some(3)));
+}
+
 #[test]
 fn cp932_display_preserves_character_boundaries_and_rejects_other_errors() {
     assert_eq!(decode_cp932_display(b"\x81\x75\x81\x01\x81\x01\x81\x76").as_deref(),

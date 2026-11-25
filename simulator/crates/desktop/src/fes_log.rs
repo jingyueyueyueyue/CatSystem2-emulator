@@ -243,6 +243,7 @@ pub(super) fn update(
     bank: &mut TextBank, next_surface: &mut i32, device: &mut DesktopMessageDevice,
     view: &FesTaskView, runtime: &FesRuntime, name: &[u8], index: i32,
     backlogs: &BTreeMap<u32, Backlog>, resources: &cs2_runtime::ResourceIndex, legacy_gbk: bool,
+    mut warn: impl FnMut(String),
 ) -> Result<()> {
     let mut state = bank.log.take().unwrap();
     let result = (|| -> Result<()> {
@@ -317,7 +318,34 @@ pub(super) fn update(
                         };
                     }
                 }
-                row.replace_with_codec(text, row_gbk)?;
+                let encoding = log.and_then(|log| log.segment_for_row(line_index))
+                    .map(|(_, encoding)| encoding).unwrap_or_default();
+                let fallback = match row.message.encoding() {
+                        MessageEncoding::Unicode => ScriptTextEncoding::Utf8,
+                        MessageEncoding::Cp932 if row_gbk => ScriptTextEncoding::Gbk,
+                        MessageEncoding::Cp932 => ScriptTextEncoding::Cp932,
+                };
+                let prefix = log.and_then(|log| log.name_prefix_for_row(line_index)).unwrap_or_default();
+                let mut report_decode = |codec: ScriptTextEncoding, bad_at: Option<usize>, offset: usize| {
+                    if let Some(bad_at) = bad_at {
+                        let source = info.and_then(|(_, segment)| log?.sources().get(segment.source as usize));
+                        warn(format!("LOGSTRING source={:?} input={:?} row={line_index} codec={codec:?} bad_at={}",
+                            source.map(|name| String::from_utf8_lossy(name)), info.map(|(_, segment)| segment.input), offset + bad_at));
+                    }
+                };
+                let mut decoded = String::new();
+                if !prefix.is_empty() {
+                    let codec = encoding.name.unwrap_or(fallback);
+                    let (name, bad_at) = log.unwrap().decode_name(prefix, codec);
+                    report_decode(codec, bad_at, 0);
+                    decoded = name;
+                }
+                let codec = encoding.body.unwrap_or(fallback);
+                let (body, bad_at) = codec.decode_message(&text[prefix.len()..]);
+                report_decode(codec, bad_at, prefix.len());
+                decoded.push_str(&body);
+                let bytes = if row.message.encoding() == MessageEncoding::Unicode { decoded.as_bytes() } else { text };
+                row.replace_text(bytes, false, Some(&decoded))?;
                 row.draw = Some(u32::MAX);
             }
         }
