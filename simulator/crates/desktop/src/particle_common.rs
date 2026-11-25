@@ -6,8 +6,6 @@ use super::super::{native_state_error,ResourceIndex};
 use cs2_runtime::resource_router::ResourceMode;
 use cs2_script::Result;
 
-pub(super) const COMMON_SHA:&str="afe0138dfde4b7c558b87e00e2518c34e55cb0866cb27ef0ba9623bdd73d1c05";
-pub(super) const COMMON_LEGACY_SHA:&str="137c565ce19826c1d34b3d4e8e04f80fe17a89747b840e083a7c66fe852b5fbc";
 const KEYS:[&str;50]=[
     "angle","angleVariance","blendFuncDestination","blendFuncSource","duration","emitterType",
     "finishColorAlpha","finishColorBlue","finishColorGreen","finishColorRed",
@@ -55,9 +53,13 @@ impl CommonParticles {
         //2b86/2a86 SDK80 receives this formatted name and reads actual
         //plist bytes. The task's texture is independent of plist texture keys.
         let name=format!("ptcl{}{:03}.plist",int(word(p,0)),int(word(p,1)));
-        let bytes=resources.read_mode(&name,ResourceMode::LooseFirst)
-            .map_err(|_|native_state_error("particle plist resource read failed"))?
-            .ok_or_else(||native_state_error("particle plist resource is unavailable"))?;
+        let Some(bytes) = resources.read_mode(&name, ResourceMode::LooseFirst)
+            .map_err(|_| native_state_error("particle plist resource read failed"))?
+        else {
+            // The original SDK start returns immediately when its size probe
+            // finds no preset. Keep any existing emitter state on a restart.
+            return Ok(());
+        };
         self.config=parse_config(&bytes,viewport)?;
         self.viewport_half=viewport.map(|v|v as f32*0.5);
         self.burst=int(word(p,2))!=0;self.live=0;self.finished=0;self.accumulator=0.;self.time=0.;

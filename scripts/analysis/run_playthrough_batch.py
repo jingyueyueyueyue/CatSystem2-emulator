@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 import ctypes
 from datetime import datetime
 import hashlib
@@ -19,6 +20,8 @@ import subprocess
 import tempfile
 import time
 from xml.etree import ElementTree as ET
+
+from batch_progress import BatchProgress
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -126,6 +129,30 @@ def load_ordinary_saves(path):
             or not isinstance(manifest.get("approved"), dict)):
         raise ValueError("invalid ordinary save manifest")
     return manifest["approved"]
+
+
+def load_checkpoint_files(files):
+    if not isinstance(files, dict) or not files:
+        raise ValueError("checkpoint_files must map profile filenames to archived files")
+    staged = {}
+    for name, source in files.items():
+        if not (re.fullmatch(r"save(?:[0-9]{4}|gen)\.dat", name) or name in {"dic.dat", "setup.xml"}):
+            raise ValueError(f"invalid checkpoint profile filename: {name}")
+        relative = manifest_path(source)
+        if len(relative.parts) < 3 or relative.parts[0] != "archive":
+            raise ValueError("checkpoint sources must be in the workspace archive")
+        path = ROOT / relative
+        info = checked_path(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"checkpoint source is not a regular file: {path}")
+        if SAVE_NAME.fullmatch(name):
+            with path.open("rb") as stream:
+                header = stream.read(16)
+            if (len(header) != 16 or header[:4] != b"CSS\0"
+                    or int.from_bytes(header[4:8], "little") > info.st_size - 16):
+                raise ValueError(f"checkpoint source is not a complete CSS file: {path}")
+        staged[name] = path
+    return staged
 
 
 def stage_ordinary_save(save, game_path, player, profile):
@@ -273,11 +300,19 @@ class ReplayProgress:
         return self.replay_status or ("missing_replay_status" if self.expects_checkpoint else "visual_review_required")
 
 
-def wait_for_replay(process, events, progress, deadline, poll_interval):
+def wait_for_replay(process, events, progress, deadline, poll_interval, *, watchdog_seconds=None):
+    started = time.monotonic()
     try:
         while process.poll() is None:
             progress.sample(events)
             remaining = deadline - time.monotonic()
+            if watchdog_seconds is not None:
+                last_tick = progress.last_advance if progress.last_advance is not None else started
+                watchdog_remaining = watchdog_seconds - (time.monotonic() - last_tick)
+                if watchdog_remaining <= 0 and process.poll() is None:
+                    progress.watchdog_stalled = True
+                    return True
+                remaining = min(remaining, watchdog_remaining)
             if remaining <= 0:
                 return process.poll() is None
             try:
@@ -382,7 +417,8 @@ def attempt_key(player_sha256, game_path, command_args, timeout, stall_seconds, 
 
 def run_case(index, game, frames, inputs, player, output, timeout, env, *,
              route=None, diagnostics=(), stall_seconds=30, ordinary_save=None, neko_language=None,
-             fast_text=False, reuse_attempts=None, game_root_override=None):
+             fast_text=False, reuse_attempts=None, game_root_override=None, checkpoint_files=None,
+             watchdog=False):
     game_root = game_root_override if game_root_override is not None else ROOT / game["root"]
     game_path = game_root
     if ordinary_save is None:
@@ -407,6 +443,10 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
 
     started = time.monotonic()
     profile = prefix.with_suffix(".profile")
+    if checkpoint_files:
+        profile.mkdir()
+        for name, source in checkpoint_files.items():
+            shutil.copyfile(source, profile / name)
     if neko_language is not None:
         from stage_neko_cold_language import seed_language_profile
 
@@ -433,7 +473,7 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
     if not save_rejected:
         if fast_text:
             text_setup = seed_fast_text_profile(profile)
-        if reuse_attempts is not None:
+        if reuse_attempts is not None and not checkpoint_files:
             player_sha256, history = reuse_attempts
             try:
                 key = attempt_key(player_sha256, game_path, [frames, route, inputs, diagnostics],
@@ -458,14 +498,16 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
         with events_path.open("xb") as events, host_path.open("xb") as host, \
                 events_path.open("rb") as reader:
             try:
-                process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=events, stderr=host)
+                process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=events, stderr=host,
+                                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             except OSError as error:
                 host.write(f"{error}\n".encode("utf-8", errors="backslashreplace"))
             else:
                 with process:
                     pid = process.pid
                     timed_out = wait_for_replay(process, reader, progress, deadline,
-                                                min(1, stall_window / 4))
+                                                min(1, stall_window / 4),
+                                                watchdog_seconds=stall_seconds if watchdog else None)
                     if not timed_out:
                         exit_code = process.returncode
 
@@ -474,6 +516,8 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
     status = progress.status(save_rejected=save_rejected, timed_out=timed_out,
                              exit_code=exit_code, frame_idle_seconds=frame_idle_seconds,
                              stall_window=stall_window)
+    if getattr(progress, "watchdog_stalled", False) and status != "engine_error":
+        status = "watchdog_stalled"
 
     record = {
         "index": index,
@@ -500,6 +544,8 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
     }
     if save_receipt is not None:
         record["ordinary_save"] = save_receipt
+    if checkpoint_files:
+        record["checkpoint_files"] = {name: str(path) for name, path in checkpoint_files.items()}
     if neko_language is not None:
         record["neko_language"] = neko_language
     if text_setup is not None:
@@ -545,7 +591,7 @@ def available_ram_bytes():
 
 
 def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_text=False,
-              reuse_attempts=None, game_root_override=None):
+              reuse_attempts=None, game_root_override=None, ledger=None):
     pending = deque(cases)
     active = {}
     case_failed = False
@@ -555,8 +601,9 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
             while pending and len(active) < args.jobs:
                 free_ram = available_ram_bytes()
                 free_disk = shutil.disk_usage(output).free
-                required_ram = int((args.reserve_ram_gib + (len(active) + 1) * args.ram_per_job_gib) * GIB)
-                required_disk = int((args.reserve_disk_gib + (len(active) + 1) * args.disk_per_job_gib) * GIB)
+                # Available resources already exclude resident processes and written files.
+                required_ram = int((args.reserve_ram_gib + args.ram_per_job_gib) * GIB)
+                required_disk = int((args.reserve_disk_gib + args.disk_per_job_gib) * GIB)
                 if free_ram < required_ram or free_disk < required_disk:
                     if active:
                         break
@@ -585,15 +632,26 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
                     print("Playback resources available; resuming batch", flush=True)
                     admission_deadline = None
                 index, game, settings = pending.popleft()
+                receipt = output / f"{index:02}.json"
+                if settings.get("defer"):
+                    result = {"index": index, "game": game["root"], "status": "scenario_deferred",
+                              "reason": settings["defer"], "exit_code": None, "seconds": 0, "captures": []}
+                    write_json(receipt, result)
+                    if ledger:
+                        ledger.finish(game["root"], result, receipt)
+                    continue
                 save_id = settings.get("ordinary_save")
                 ordinary_save = None if save_id is None else (save_id, ordinary_saves[save_id])
+                if ledger:
+                    ledger.start(game["root"], receipt)
                 task = pool.submit(run_case, index, game, settings.get("frames", args.frames),
                                    settings.get("inputs", []), player, output, args.timeout, env,
                                    route=settings.get("route"), diagnostics=settings.get("diagnostics", ()),
                                    stall_seconds=args.stall_seconds,
                                    ordinary_save=ordinary_save, neko_language=settings.get("neko_language"),
                                    fast_text=fast_text, reuse_attempts=reuse_attempts,
-                                   game_root_override=game_root_override)
+                                   game_root_override=game_root_override,
+                                   checkpoint_files=settings.get("checkpoint_files"), watchdog=ledger is not None)
                 active[task] = (index, game, settings)
             if active:
                 recheck_resources = pending and len(active) < args.jobs
@@ -612,6 +670,8 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
                         }
                         write_json(output / f"{index:02}.json", result)
                     case_failed |= result["status"] in {"ordinary_save_rejected", "case_setup_failed"}
+                    if ledger:
+                        ledger.finish(game["root"], result, output / f"{index:02}.json")
                     print(f'{result["index"]:02}: {result["status"]}, {result["seconds"]}s', flush=True)
     return int(case_failed)
 
@@ -654,6 +714,18 @@ def new_output_directory(cache_root, now):
                                  suffix="_playthrough", dir=month))
 
 
+def postrun_ending_evidence(case_dir, index, ending):
+    """Identify the artifacts reviewed after a fixed-frame ending run."""
+    name = f"{index:02}"
+    return {path.as_posix(): file_sha256(case_dir / path) for path in (
+        Path(f"{name}.events.log"), Path(f"{name}.host.log"),
+        Path(f"{name}.{ending['card_frame']:04}.png"),
+        Path(f"{name}.{ending['clear_verified_frame']:04}.png"),
+        Path(f"{name}.profile/savegen.dat"), Path(f"{name}.cold.events.log"),
+        Path(f"{name}.cold.host.log"),
+    )}
+
+
 def find_cleared_cases(games, indices, cache_root):
     """Reuse completed first-ending receipts across candidates in the same test campaign."""
     pending = {index: (ROOT / games[index]["root"]).resolve() for index in indices}
@@ -666,9 +738,10 @@ def find_cleared_cases(games, indices, cache_root):
             receipt_path = batch / f"{index:02}.json"
             try:
                 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                replay_status = receipt.get("replay_status")
                 if (receipt.get("status") != "ending_verified" or receipt.get("index") != index
                         or Path(receipt["game"]) != game_path or receipt.get("exit_code") != 0
-                        or receipt.get("replay_status") != "completed" or receipt.get("timed_out")
+                        or replay_status not in ("completed", "frame_limit") or receipt.get("timed_out")
                         or receipt.get("first_engine_error")):
                     continue
                 ending = receipt["ending"]
@@ -689,9 +762,17 @@ def find_cleared_cases(games, indices, cache_root):
                 progress = ReplayProgress(state_mode=True)
                 with (case_dir / f"{index:02}.events.log").open("rb") as events:
                     progress.sample(events)
-                if (progress.first_engine_error or progress.replay_status != "completed"
-                        or not progress.verified_ending
-                        or any(ending.get(key) != value for key, value in progress.verified_ending.items())):
+                if progress.first_engine_error or progress.replay_status != replay_status:
+                    continue
+                if replay_status == "completed":
+                    if not progress.verified_ending or any(
+                        ending.get(key) != value for key, value in progress.verified_ending.items()
+                    ):
+                        continue
+                elif (progress.frame != receipt.get("last_frame")
+                      or progress.frame != ending["clear_verified_frame"]
+                      or "postrun_evidence" not in ending
+                      or ending["postrun_evidence"] != postrun_ending_evidence(case_dir, index, ending)):
                     continue
             except (OSError, ValueError, TypeError, AttributeError, KeyError):
                 # A partial, outdated or removed receipt cannot exclude a game.
@@ -749,7 +830,7 @@ def main():
     parser.add_argument("--ordinary-saves", type=Path,
                         help="reviewed manifest; only scenarios with an approved ordinary_save ID preload a slot")
     parser.add_argument("--skip-cleared", action="store_true",
-                        help="first-ending campaign: skip games with an archived verified ending")
+                        help="without a progress ledger, skip games with an archived verified ending")
     parser.add_argument("--fast-text", action="store_true",
                         help="seed the fastest native text speed in each isolated replay profile")
     parser.add_argument("--reuse-attempts", action="store_true",
@@ -757,7 +838,9 @@ def main():
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--button-probe", action="store_true",
                         help="record actual mouse targets at fixed-frame inspect checkpoints")
-    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--jobs", type=int, default=2, help="worker cap, or 0 to derive it from available CPU cores")
+    parser.add_argument("--progress", type=Path,
+                        help="persist this campaign's checkpoints, blockers and verified clear results")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--stall-seconds", type=float, default=30,
                         help="timeout stall window in seconds (capped at half the timeout)")
@@ -781,8 +864,11 @@ def main():
     indices = list(dict.fromkeys(args.indices)) if args.indices else default_indices
     if any(index < 0 or index >= len(games) for index in indices):
         parser.error("sample index outside the inventory")
-    if min(args.jobs, args.frames, args.timeout) < 1:
-        parser.error("jobs, frames and timeout must be positive")
+    if min(args.frames, args.timeout) < 1 or args.jobs < 0:
+        parser.error("frames and timeout must be positive and jobs nonnegative")
+    if args.jobs == 0:
+        cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
+        args.jobs = max(1, (cpu_count() or 1) // 2)
     if args.admission_wait_seconds < 0:
         parser.error("admission wait must be nonnegative")
     budgets = (args.stall_seconds, args.ram_per_job_gib, args.disk_per_job_gib,
@@ -793,14 +879,34 @@ def main():
     if args.game_root is not None or os.name != "nt":
         default_root = ROOT / "archive"
     else:
-        default_root = Path("F:/CS2-build-cache/playthrough")
+        preferred = Path("F:/")
+        default_root = (preferred / "CS2-build-cache/playthrough" if preferred.is_dir()
+                        else Path(os.environ.get("SystemDrive", "C:") + "/cs2-playthrough-cache/playthrough"))
     cache_override = os.environ.get("CS2_BUILD_CACHE_ROOT")
     cache_root = Path(cache_override) / "playthrough" if cache_override else default_root
     if not cache_root.is_absolute():
         parser.error("CS2_BUILD_CACHE_ROOT must be an absolute path")
     try:
-        cleared = find_cleared_cases(games, indices, cache_root) if args.skip_cleared else {}
+        with BatchProgress(args.progress) if args.progress else nullcontext() as ledger:
+            if ledger:
+                ledger.sync_inventory(games, default_indices)
+            return run_selection(args, parser, games, indices, cache_root, now, ledger)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+
+
+def run_selection(args, parser, games, indices, cache_root, now, ledger):
+    try:
+        cleared = {}
+        if ledger:
+            for index in indices:
+                if row := ledger.cleared(games[index]["root"]):
+                    cleared[index] = {"index": index, "game": games[index]["root"], "status": "skipped_cleared",
+                                      "ending": row["ending"], "ending_receipt": row["clear_evidence"]}
         pending = [index for index in indices if index not in cleared]
+        if args.skip_cleared and ledger is None:
+            cleared.update(find_cleared_cases(games, pending, cache_root))
+            pending = [index for index in pending if index not in cleared]
         scenarios = load_scenarios(args.scenarios, pending)
         ordinary_saves = load_ordinary_saves(args.ordinary_saves) if args.ordinary_saves else {}
     except (OSError, ValueError) as error:
@@ -828,6 +934,12 @@ def main():
             save_id = settings["ordinary_save"]
             if not isinstance(save_id, str) or not save_id or save_id not in ordinary_saves:
                 parser.error(f"scenario {index} ordinary_save must name an approved --ordinary-saves entry")
+        if "checkpoint_files" in settings:
+            if "ordinary_save" in settings or "neko_language" in settings:
+                parser.error(f"scenario {index} checkpoint_files require an isolated profile")
+            settings = {**settings, "checkpoint_files": load_checkpoint_files(settings["checkpoint_files"])}
+        if "defer" in settings and (not isinstance(settings["defer"], str) or not settings["defer"].strip()):
+            parser.error(f"scenario {index} defer must give a reason")
         if "neko_language" in settings and (
             index != 1 or settings["neko_language"] not in ("jp", "cn")
             or "route" not in settings or "ordinary_save" in settings
@@ -857,14 +969,19 @@ def main():
     for index in indices:
         if index in cleared:
             write_json(output / f"{index:02}.json", cleared[index])
+            if ledger and not ledger.cleared(games[index]["root"]):
+                ledger.finish(games[index]["root"], cleared[index], output / f"{index:02}.json")
             print(f"{index:02}: skipped_cleared ({cleared[index]['ending']['id']})", flush=True)
     env = os.environ.copy()
-    env.setdefault("CS2_MEDIA_CACHE", str(output / "movie-input"))
+    env.setdefault("CS2_MEDIA_CACHE", str(cache_root / "movie-input"))
+    env.setdefault("RUST_BACKTRACE", "full")
     if os.name == "nt":
         env["PATH"] = os.pathsep.join(("C:/msys64/mingw64/bin", env.get("PATH", "")))
     reuse_attempts = (source["sha256"], load_attempt_history(cache_root, pending)) if args.reuse_attempts else None
+    if ledger:
+        cases = ledger.prioritize_blockers(cases)
     return run_batch(cases, player, output, args, env, ordinary_saves, fast_text=args.fast_text,
-                     reuse_attempts=reuse_attempts, game_root_override=args.game_root)
+                     reuse_attempts=reuse_attempts, game_root_override=args.game_root, ledger=ledger)
 
 
 if __name__ == "__main__":

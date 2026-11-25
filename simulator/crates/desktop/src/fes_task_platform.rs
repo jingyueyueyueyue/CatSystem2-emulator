@@ -22,6 +22,7 @@ pub(crate) mod checkpoint;
 mod state;
 #[path = "fes_gallery_tables.rs"]
 mod gallery_tables;
+pub(super) use gallery_tables::apply_tone;
 
 #[derive(Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
@@ -2514,6 +2515,27 @@ mod media_lifecycle_tests {
             for _ in commands { command(host, view, runtime, driver, shared)?; }
             assert_eq!(shared.shared[10..22], [65, 41, 52, 37, 37, 0, 0, 85, 1, 1, 80, 90]);
             assert_eq!(host.data_services.language.system_settings_dirty, 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_button_getid_reads_the_selected_frame_bank() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"ch_n[0] setid 2",
+            b"ch_n[1] setid 7",
+            b"ch_n[0] getid 850",
+            b"ch_n[$851] getid 852",
+            b"ch_n[1] getid -1",
+        ];
+        with_script(b"BUTTON ch_n[2]", commands, |host, view, runtime, driver, shared| {
+            shared.shared[850..853].copy_from_slice(&[-1, 1, -1]);
+            for _ in commands {
+                command(host, view, runtime, driver, shared)?;
+            }
+            assert_eq!(shared.shared[850..853], [2, 1, 7]);
+            assert!(host.events.iter().any(|event| event.kind == "fes-media"
+                && event.detail == "object=\"ch_n\" bank=1 command=getid destination=852 value=7"));
             Ok(())
         })
     }

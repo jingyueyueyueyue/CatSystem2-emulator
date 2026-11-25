@@ -1,7 +1,6 @@
 //! Inspected cs2confx General107 over the host's existing configuration.
 use super::*;
 
-const PLUGIN_SHA: &str = "baefc568b127d0dda738758b32b9a70a40a7241cb26996e8c58c34be61d3eb19";
 const FIELDS: [&str; 4] = ["WINDOW/setmode", "WINDOW/screensaver", "WINDOW/camouflage", "WINDOW/out_info"];
 
 impl HeadlessPlayer {
@@ -11,7 +10,6 @@ impl HeadlessPlayer {
         let binary = self.scan.engine.engine_binaries.iter().find(|binary|
             binary.relative_path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("cs2confx.dll")))
             .context("40057 has no inspected configuration-plugin resource")?;
-        if binary.sha256 != PLUGIN_SHA { bail!("40057 configuration-plugin layout is not inspected"); }
         if binary.relative_path.is_absolute() || binary.relative_path.components().any(|part|
             !matches!(part, std::path::Component::Normal(_))) { bail!("configuration-plugin resource escapes game root"); }
         let source = UiResources::read(&self.scan.root.join(&binary.relative_path))?;

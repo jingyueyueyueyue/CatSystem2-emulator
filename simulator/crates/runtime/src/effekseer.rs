@@ -1,6 +1,6 @@
 //! Concrete type61 manager and deterministic SKFE node simulation.
 //!
-//! PE contract: YukikoiMelt SHA256 below; ctor18b9f0, receiver18c1f0,
+//! PE contract: YukikoiMelt ctor18b9f0, receiver18c1f0,
 //! update18bed0, draw18be10. Resource parsing follows pinned MIT format
 //! documentation/source behavior, independently implemented. No engine FFI.
 
@@ -22,7 +22,6 @@ mod tree;
 #[path = "effekseer_trig.rs"]
 mod trig;
 
-pub const PE_SHA256: &str = "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976";
 pub const NATIVE_COMMANDS: [(u32, u32, usize); 3] =
     [(1014, 578, 8), (1015, 579, 4), (1016, 580, 8)];
 

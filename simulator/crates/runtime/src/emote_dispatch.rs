@@ -305,7 +305,7 @@ use EmoteOperation::{
 };
 
 /// Sorted, exact-PE descriptors. All RVAs are relative to the SHA-bound image
-/// from emote::NEKOPARA_PE_SHA256. Evidence: recovery_A_20261116_emote.json.
+/// from the registered M2 task and its command layouts.
 #[rustfmt::skip]
 pub static EMOTE_NATIVE_DESCRIPTORS: &[EmoteNativeDescriptor] = &[
     single!(906, 0x24d2b0, 12, Continue, Fixed(524), LoadSpec, LoadResource),

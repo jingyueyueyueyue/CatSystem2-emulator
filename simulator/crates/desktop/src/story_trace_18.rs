@@ -13,6 +13,38 @@ pub(crate) const LOCALIZED_CST: &str = "a46748a49c7970fc13a19f0b3522b59523a3be78
 const ROOT_WAIT: u32 = 0x59f;
 const TITLE_REGION: u32 = 11;
 
+impl HeadlessPlayer {
+    pub fn host_campanella_first_choice(&mut self) -> anyhow::Result<Option<(u32, [i32; 2])>> {
+        if self.scan.engine.primary_executable.as_ref().is_none_or(|binary| binary.sha256 != PE)
+            || !self.cst_contexts.values().any(|context| context.story.is_scene("0001_03")
+                && context.document.as_ref().and_then(|document| document.input_records(99))
+                    .is_some_and(|rows| rows.len() == 4 && rows[0].text == b"select"
+                        && rows[1].text.starts_with(b"1 0001_03_2 ")))
+        {
+            return Ok(None);
+        }
+        let mut owners = self.scene_nodes.values().filter(|node| node.kind == 12 && node.name == "select"
+            && self.task_vms.get(&node.id).and_then(|vm| vm.program_code_sha256())
+                == Some("e1ce1d324414ef854314c9b2ee12ea70b462454f2c05262ac104a2384dd96b93"));
+        let Some(owner) = owners.next().filter(|_| owners.next().is_none()).map(|node| node.id)
+        else { return Ok(None); };
+        let mut buttons = self.scene_nodes.values().filter(|node| node.name == "button 0"
+            && live_child(self, node.id, owner, 6));
+        let Some(region) = buttons.next().filter(|_| buttons.next().is_none()).map(|node| node.id)
+        else { return Ok(None); };
+        if !self.input_button_state(region).is_some_and(|button| button.receiver == Some(owner)) {
+            return Ok(None);
+        }
+        let Some(hit) = self.host_replay_input_regions().find(|hit| hit[0] == region && hit[8] != 0)
+        else { return Ok(None); };
+        let [left, top, right, bottom] = [hit[3], hit[4], hit[5], hit[6]].map(|value| value as i32);
+        if left >= right || top >= bottom { return Ok(None); }
+        let point = [i32::midpoint(left, right), i32::midpoint(top, bottom)];
+        Ok((self.masked_input_region_at(point)?.is_some_and(|hit| hit[0] == region)
+            && self.mouse_press_candidate_regions(point)?.contains(&region)).then_some((region, point)))
+    }
+}
+
 pub(crate) fn page_records(localized: bool, group: i32) -> Option<(i32, &'static [usize])> {
     const ORIGINAL: [(i32, &[usize]); 10] = [
         (90, &[88, 89]), (95, &[92]), (98, &[96, 97]), (100, &[99]), (112, &[102]),

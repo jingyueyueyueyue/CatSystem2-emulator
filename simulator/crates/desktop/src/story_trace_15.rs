@@ -138,6 +138,18 @@ fn observe_state(player: &HeadlessPlayer, frame: u64) -> Option<Observation> {
 }
 
 pub(super) fn observe(player: &HeadlessPlayer, frame: u64) -> Option<String> {
+    if player.cst_contexts.is_empty() {
+        let tasks = &player.data_services.tasks;
+        let (owner, _, _, _) = tasks.fes.story_runtimes()
+            .find(|(_, name, _, _)| matches!(*name, b"title" | b"title.fes"))?;
+        let clock = tasks.task_clock(owner);
+        let audio: Vec<_> = player.sound_channels.iter().filter_map(|(channel, state)| {
+            let pending = state.pending_start.as_ref()?;
+            Some((*channel, pending.owner, pending.index))
+        }).collect();
+        let drive = tasks.fes.story_drive_diagnostic(owner)?;
+        return Some(format!("title owner={owner} clock={clock:?} pending_audio={audio:?} {drive}"));
+    }
     let Observation { owner, handle, loaded, wait, local100, generation, source, layout_complete,
         committed, composited, enter } = observe_state(player, frame)?;
     let sources = source.map(|source| [source]);

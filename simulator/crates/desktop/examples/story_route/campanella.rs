@@ -1,6 +1,5 @@
 use super::{
-    Action, Decision, HeadlessPlayer, InputKey, LogicEvent, MousePress, NovelWindowLifetime,
-    consuming_mouse_resume,
+    Action, Decision, HeadlessPlayer, InputKey, LogicEvent, NovelWindowLifetime,
 };
 use cs2_desktop::CampanellaWait;
 use cs2_runtime::message_object::{ButtonSource, RoutedPhysicalButton};
@@ -14,6 +13,7 @@ pub(super) enum Replay {
     TitlePress {
         frame: u64,
         owner: u32,
+        routed_at: Option<u64>,
     },
     First {
         title_owner: u32,
@@ -57,24 +57,41 @@ impl Replay {
 
     pub(super) fn observe_frame(&mut self, player: &HeadlessPlayer) {
         match self {
-            Self::TitlePress { frame, owner } => {
-                let frame = *frame + 1;
-                let press = MousePress {
-                    candidates: vec![],
-                    region: 11,
-                    key: 0,
-                    group: 0,
-                    response: 0,
-                };
-                if consuming_mouse_resume(player, &press, frame, *owner, TITLE, None) {
-                    eprintln!("frame {frame}: 18 verified title click region=11 receiver={owner}");
+            Self::TitlePress { frame, owner, routed_at } => {
+                let now = player.state().clock.frame;
+                let mut presses = player.host_input_route_receipts().iter().filter(|receipt| {
+                    receipt.frame == now && now > *frame && receipt.pressed != 0
+                });
+                if let Some(receipt) = presses.next() {
+                    if routed_at.is_some() || presses.next().is_some()
+                        || (receipt.region, receipt.receiver, receipt.key, receipt.group, receipt.response)
+                            != (11, *owner, 0, 0, 0)
+                        || receipt.pressed != 1 || receipt.repeated
+                        || receipt.raw_mask != ButtonSource::Mouse.mask()
+                        || receipt.physical != [RoutedPhysicalButton { source: ButtonSource::Mouse, code: 1 }]
+                    {
+                        *self = Self::Failed("18 title click receipt differed");
+                        return;
+                    }
+                    *routed_at = Some(now);
+                }
+                let mut resumes = player.events().iter().filter(|event| {
+                    event.frame == now && now > *frame && event.kind == "message-resume"
+                });
+                if let Some(resume) = resumes.next() {
+                    let [x, y] = TITLE;
+                    if routed_at.is_none() || resumes.next().is_some()
+                        || resume.detail != format!("message=[2, {x}, {y}, 0]")
+                    {
+                        *self = Self::Failed("18 title root VM resume differed");
+                        return;
+                    }
+                    eprintln!("frame {now}: 18 verified title click region=11 receiver={owner} routed_frame={}", routed_at.unwrap());
                     *self = Self::First {
                         title_owner: *owner,
-                        since: frame,
+                        since: now,
                         previous: None,
                     };
-                } else {
-                    *self = Self::Failed("18 title receipt or VM resume differed");
                 }
             }
             Self::Successor {
@@ -165,7 +182,7 @@ impl Replay {
                     && player.mouse_press_candidate_regions(TITLE)? == [11, 29, 6]
                 {
                     let [x, y] = TITLE;
-                    *self = Self::TitlePress { frame, owner };
+                    *self = Self::TitlePress { frame, owner, routed_at: None };
                     return Ok(Decision::Input(Action::Pointer {
                         x,
                         y,
@@ -260,6 +277,14 @@ impl Replay {
             }
             Self::Failed(reason) => {
                 return Ok(Decision::Stop("checkpoint_mismatch", (*reason).into()));
+            }
+            Self::TitlePress { frame: pressed, routed_at, .. } if frame - *pressed >= idle => {
+                let reason = if routed_at.is_some() {
+                    "18 title root VM did not resume after the click receipt"
+                } else {
+                    "18 title click did not complete its input callback"
+                };
+                return Ok(Decision::Stop("unrecognized_wait", reason.into()));
             }
             Self::TitlePress { .. } => {}
         }

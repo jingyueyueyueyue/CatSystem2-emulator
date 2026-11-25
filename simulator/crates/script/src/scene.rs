@@ -158,6 +158,65 @@ pub struct FesProgram {
     macros: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FesBranch {
+    If,
+    Else,
+    End,
+    Statement,
+}
+
+// Some compiled FES blocks have an extra ENDIF immediately before ELSE.
+// Only recover an otherwise orphaned ELSE with its own closing ENDIF.
+fn remove_premature_fes_endings(lines: &mut Vec<FesLine>, branches: &mut Vec<FesBranch>) {
+    use FesBranch::{Else, End, If};
+    let mut depth = 0;
+    let mut root_has_else = false;
+    let mut removed = Vec::new();
+    for (index, branch) in branches.iter().enumerate() {
+        match branch {
+            If => {
+                if depth == 0 { root_has_else = false; }
+                depth += 1;
+            }
+            Else if depth == 1 => root_has_else = true,
+            End if depth == 1 && !root_has_else && branches.get(index + 1) == Some(&Else)
+                && fes_alternative_has_end(&branches[index + 2..]) => removed.push(index),
+            End if depth != 0 => depth -= 1,
+            _ => {}
+        }
+    }
+    if !removed.is_empty() {
+        let mut index = 0;
+        let mut keep = || {
+            let keep = removed.binary_search(&index).is_err();
+            index += 1;
+            keep
+        };
+        lines.retain(|_| keep());
+        let mut index = 0;
+        branches.retain(|_| {
+            let keep = removed.binary_search(&index).is_err();
+            index += 1;
+            keep
+        });
+    }
+}
+
+fn fes_alternative_has_end(branches: &[FesBranch]) -> bool {
+    let mut nested = 0;
+    for branch in branches {
+        match branch {
+            FesBranch::If => nested += 1,
+            FesBranch::End if nested == 0 => return true,
+            FesBranch::Else if nested == 0 => return false,
+            FesBranch::End => nested -= 1,
+            _ => {}
+        }
+    }
+    false
+}
+
 impl FesProgram {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.get(..4) != Some(b"FES\0") {
@@ -332,31 +391,40 @@ impl FesProgram {
         }
         let (blocks, diagnostics) = (&mut program.blocks, &mut program.diagnostics);
         for block in blocks {
+            let mut branches = block.lines.iter().map(|line| {
+                let structural = expand_fes_macros(&line.bytes, &macros)?;
+                Ok(match structural.as_slice() {
+                    b"else" => FesBranch::Else,
+                    b"endif" => FesBranch::End,
+                    _ if split_fes_condition(&structural)?.is_some_and(|(_, tail)| tail.is_empty()) => FesBranch::If,
+                    _ => FesBranch::Statement,
+                })
+            }).collect::<Result<Vec<_>>>()?;
+            remove_premature_fes_endings(&mut block.lines, &mut branches);
             block.false_jump = vec![None; block.lines.len()];
             block.end_jump = vec![None; block.lines.len()];
             let mut stack = Vec::<(usize, Option<usize>)>::new();
-            for index in 0..block.lines.len() {
-                let line = &block.lines[index];
-                let structural = expand_fes_macros(&line.bytes, &macros)?;
-                if let Some((_, tail)) = split_fes_condition(&structural)? {
-                    if tail.is_empty() {
-                        stack.push((index, None));
-                    }
-                } else if structural == b"else" {
-                    if let Some((start, alternative @ None)) = stack.last_mut() {
-                        block.false_jump[*start] = Some(index + 1);
-                        *alternative = Some(index);
-                    } else {
-                        diagnostics.push(scene_error(line.offset, "isolated or repeated else"));
-                    }
-                } else if structural == b"endif" {
-                    if let Some((start, alternative)) = stack.pop() {
-                        if let Some(alternative) = alternative {
-                            block.end_jump[alternative] = Some(index + 1);
+            for (index, branch) in branches.into_iter().enumerate() {
+                match branch {
+                    FesBranch::If => stack.push((index, None)),
+                    FesBranch::Else => {
+                        if let Some((start, alternative @ None)) = stack.last_mut() {
+                            block.false_jump[*start] = Some(index + 1);
+                            *alternative = Some(index);
                         } else {
-                            block.false_jump[start] = Some(index + 1);
+                            diagnostics.push(scene_error(block.lines[index].offset, "isolated or repeated else"));
                         }
                     }
+                    FesBranch::End => {
+                        if let Some((start, alternative)) = stack.pop() {
+                            if let Some(alternative) = alternative {
+                                block.end_jump[alternative] = Some(index + 1);
+                            } else {
+                                block.false_jump[start] = Some(index + 1);
+                            }
+                        }
+                    }
+                    FesBranch::Statement => {}
                 }
             }
             for (start, _) in stack {
@@ -3225,6 +3293,28 @@ mod tests {
         FesInterpreter, FesProgram, parse_cst_text,
     };
     use crate::{CstRecord, CstlLocalization, CstlMessage, CstlTable, expression::ExpressionState};
+
+    #[test]
+    fn fes_recovers_premature_endif_only_for_an_orphaned_else() {
+        let extra_end = b"#START\nif ($1==0)\n$2=31\nendif\nelse\n$2=42\nendif\nexit $2\n";
+        let nested = b"#START\nif ($1==0)\nif (1)\n$2=31\nendif\nelse\n$2=42\nendif\nexit $2\n";
+        for script in [extra_end.as_slice(), nested] {
+            let program = FesProgram::from_text(script).unwrap();
+            assert!(program.diagnostics.is_empty());
+            for (selector, expected) in [(0, 31), (1, 42)] {
+                let mut state = ExpressionState::default();
+                state.shared[1] = selector;
+                let mut interpreter = FesInterpreter::new(program.clone()).unwrap();
+                interpreter.run(&mut state, 16).unwrap();
+                assert_eq!(interpreter.pending(), Some(&FesEvent::Exit(expected)));
+            }
+        }
+        let unterminated = b"#START\nif ($1==0)\n$2=31\nendif\nelse\n$2=42\n";
+        let program = FesProgram::from_text(unterminated).unwrap();
+        assert!(matches!(program.diagnostics.as_slice(), [crate::ScriptError::InvalidSceneControl {
+            message: "isolated or repeated else", ..
+        }]));
+    }
 
     #[test]
     fn fes_integer_formatting_keeps_width_precision_and_argument_widths() {

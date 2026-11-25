@@ -1,12 +1,13 @@
-//! Native549 returns the unchanged VM input/return parameter in proven PEs.
+//! Native549 returns the unchanged VM input/return parameter in verified layouts.
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, native_state_error};
 
 impl LoggingHost<'_> {
     pub(super) fn vm_context_native(&mut self, vm: &mut Vm) -> Result<NativeReturn> {
-        let digest = self.data_services.native_profile.map_or("", |profile| profile.pe_sha256);
-        if !cs2_runtime::native_context_profile::returns_vm_identity(digest) {
-            return Err(native_state_error("native 549 needs its exact VM return-slot alias profile"));
+        if !self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.native549_returns_vm_identity())
+        {
+            return Err(native_state_error("native 549 needs a registered VM return-slot alias"));
         }
         let identity = if let Some(identity) = vm.native_context_identity() {
             // A restored context still reserves its original object identity.

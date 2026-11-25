@@ -4,9 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use cs2_renderer::{Canvas, Color, ImageDrawOptions, Point, RgbaFrame};
-use cs2_runtime::ResourceLocation;
 use cs2_runtime::fes_motion::{FesMotionArguments, FesMotionContext, x86_integer};
-use cs2_script::{ExpressionState, FesEvent, FesSubcommand, KcsProgram, NativeReturn};
+use cs2_script::{ExpressionState, FesEvent, FesSubcommand, KcsProgram, NativeReturn, Operand};
 
 use super::fes_driver::{FesDriverCommand, FesDriverEffect, FesScriptDriver};
 use super::fes_tasks::FesTaskView;
@@ -588,16 +587,14 @@ pub(super) fn apply_effect(
     if matches!(verb.as_slice(), b"getpos" | b"getpos2") {
         return query_position(host, view, runtime, driver, command, shared, verb == b"getpos2");
     }
-    let legacy_mcpend = verb == b"mcpend"
-        && host.data_services.css_task_pe_sha256 == Some(super::css_model::SHA);
     let built_in = matches!(
         verb.as_slice(),
         b"pos" | b"blend" | b"color" | b"arc" | b"mcarc" | b"delay" | b"ismot" | b"stop"
-    ) || legacy_mcpend;
+    );
     let binding = (!built_in)
         .then(|| driver.adapter.subcommand(verb).cloned())
         .flatten();
-    if !built_in && binding.is_none() {
+    if !built_in && binding.is_none() && verb != b"mcpend" {
         return Ok(None);
     }
     let (raw_name, _) = split(
@@ -608,9 +605,11 @@ pub(super) fn apply_effect(
         return Ok(None);
     };
     let kind_name = &definition.definition.kind_name;
-    if legacy_mcpend && !kind_name.eq_ignore_ascii_case(b"IMAGE") {
+    let image_mcpend = verb == b"mcpend" && kind_name.eq_ignore_ascii_case(b"IMAGE");
+    if !built_in && !image_mcpend && binding.is_none() {
         return Ok(None);
     }
+    let binding = if image_mcpend { None } else { binding };
     let node_kind = kind(kind_name);
     if node_kind == Kind::Other {
         let window_fade = verb == b"fade" && binding.as_ref()
@@ -1646,51 +1645,29 @@ fn create_fes_motion_runner(
     }, layout)
 }
 
-fn uses_short_fes_motion_layout(pe_sha: Option<&str>) -> bool {
-    const UTATE_MEGURI_SHA: &str =
-        "a9f8b08713aac278671853b2293a13b2623a122ede9341cb921901b09601cb52";
-    matches!(
-        pe_sha,
-        Some(super::particle_external::CAMPANELLA_SHA | super::css_model::SHA | UTATE_MEGURI_SHA)
-    )
-}
-
-fn fes_motion_external_layout(
-    pe_sha: Option<&str>, archive_name: Option<&str>, member: &str, code: &[u8],
-) -> ExternalLayout {
-    if !uses_short_fes_motion_layout(pe_sha)
-        || !archive_name.is_some_and(|name| name.eq_ignore_ascii_case("mot.int"))
-    {
-        return ExternalLayout::Default;
-    }
-    let digest = match member.rsplit(['/', '\\']).next().unwrap_or(member) {
-        "motfade.kcs" => "ac0c5bd4bde966f0749bdefcae54164d1bde8a86225977ffb0e2c2d063b2755c",
-        "motfade2.kcs" => "5e68e41efb92c31ea3b592b91b9c03dc6ca16e15d6123f906aac6d01db1afdf3",
-        "motmove.kcs" => "f0c7cc2432f9fd07da58233610c9a4128fce3c228fca126826bdcdd4a1d4b039",
-        "motrot.kcs" => "f6a23ac5449351fe0abfe6be05c1a20e9f492f06c4a86b2fffebc3e8759ea75e",
-        "motscale.kcs" => "d461e36f2f52481330c66cb517fb62dc7c909bcf0a65733509330f035b53f886",
-        "mcfade.kcs" => "8eebe432198f723e930205237fa80a4d016a1d39cbbe506f148cc1465f395a17",
-        "mcmove.kcs" => "eb626eae7b4de39214dcc13391d7b39547859684f4604dc7f49b3f12702fd63b",
-        "mcpend.kcs" if pe_sha == Some(super::css_model::SHA) => {
-            "5d29c4b32edc46fb15fbcbbe088a430a953a0b0e737c3532ec26f2d45a997b7d"
+fn fes_motion_external_layout(program: &KcsProgram) -> ExternalLayout {
+    let mut layout = ExternalLayout::Default;
+    for pair in program.instructions.windows(2) {
+        let index = &pair[0];
+        let address = &pair[1];
+        // The compiler multiplies the index by sizeof(DWORD), then adds the
+        // result to the static start of the external parameter array.
+        let [scale, subscript] = index.operands.as_slice() else { continue };
+        if index.opcode != 0x03 || *scale != Operand::immediate(4)
+            || !matches!(subscript.flags.bits(), 0x03 | 0x43) || address.opcode != 0x3e
+        {
+            continue;
         }
-        "mcrot.kcs" => "2550e754e0fac92fcd380c22503e04084f990433303f49d163ffee1dbce2645b",
-        "mcscalecos.kcs" => "d8cd5f1df6cd30dd281710d94103b8bfb16709adff1729359529fe71816683d7",
-        "mcscalesin.kcs" => "ad5fcc72b72d7a85a9c4395143c4071d5148a51757f8daa2800d647f0a733cba",
-        "pbase.kcs" => "171e58f8afd181083a48f3e5ed12982b7568fa7d4b111161d84ab900751c0c7b",
-        "pcolor.kcs" => "0559f4afdf8dbf0b89cc8c292ed75dd64f691ecfed40a62711b7fe092a0aba9a",
-        "pdepth.kcs" => "dafa40f545276cf893411f40f9a893a3048452d0372e55e88adf46f29c2ccb06",
-        "ppos.kcs" => "73a23866f2f5c2d3129a174da3113d3d43f9e0acab68f150c4cebdbd972866e2",
-        "prot.kcs" => "c163f9c82795d91ec177a9703016d3b735ce5c4efbd6025439d5a673767c8efd",
-        "pscale.kcs" => "8eb68956e3ce9a9d7a307ba4e43009a418149c7f28f4486f3e0b8ff10fbbd749",
-        "pvram.kcs" => "6b9531f7ced26052a7b2d73c57e422a5bec7087144e28b0543b51467ec629778",
-        _ => return ExternalLayout::Default,
-    };
-    if super::particle_plugin_digest::sha256(code) == digest {
-        ExternalLayout::Campanella
-    } else {
-        ExternalLayout::Default
+        let [base, offset] = address.operands.as_slice() else { continue };
+        if base.flags.bits() == 0xa4 && offset.flags.bits() == 0x43 {
+            match base.payload {
+                0x8000_0098 => layout = ExternalLayout::Campanella,
+                0x8000_009c => return ExternalLayout::Default,
+                _ => {}
+            }
+        }
     }
+    layout
 }
 
 fn load_program(
@@ -1705,32 +1682,17 @@ fn load_program(
                 .category_names(b"mot", &decode(raw_name, host.text_encoding)?)?,
         );
     }
-    let pe_sha = host.data_services.css_task_pe_sha256;
     for name in &owner.resources[raw_name] {
         let key = name.to_lowercase();
-        let layout = |program: &KcsProgram, location: &ResourceLocation| {
-            let archive = match location {
-                ResourceLocation::Archive { path, .. } => path.file_name().and_then(|name| name.to_str()),
-                ResourceLocation::File { .. } => None,
-            };
-            fes_motion_external_layout(pe_sha, archive, &key, &program.code)
-        };
         if let Some(program) = owner.programs.get(&key) {
-            let external = if uses_short_fes_motion_layout(pe_sha) {
-                host.resources.resolve(name)?.map_or(ExternalLayout::Default, |resource| {
-                    layout(program, &resource.location)
-                })
-            } else {
-                ExternalLayout::Default
-            };
-            return Ok(Some((program.clone(), external)));
+            return Ok(Some((program.clone(), fes_motion_external_layout(program))));
         }
         if let Some(resource) = host.resources.resolve(name)? {
             if resource.size > MAX_BYTES {
                 bail!("FES motion resource exceeds 64 MiB");
             }
             let program = KcsProgram::parse(&host.resources.read_candidate(resource)?)?;
-            let external = layout(&program, &resource.location);
+            let external = fes_motion_external_layout(&program);
             owner.programs.insert(key, program.clone());
             return Ok(Some((program, external)));
         }
@@ -2314,11 +2276,172 @@ pub(super) fn button_unlocked_coordinates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion_vm::{MotionHost, MotionProgress};
     use crate::{HeadlessPlayer, fes_services};
+    use cs2_runtime::ResourceLocation;
     use cs2_script::{FesDocument, FesLine, FesSection};
 
     #[test]
-    fn tsunaban_mcpend_maps_all_four_motion_words() {
+    fn motion_layout_requires_indexed_short_parameters_without_a_default_base() -> Result<()> {
+        const SHORT: [u8; 11] = [0x3e, 0xa4, 0x98, 0, 0, 0x80, 0x43, 2, 0, 0, 0];
+        const DEFAULT: [u8; 11] = [0x3e, 0xa4, 0x9c, 0, 0, 0x80, 0x43, 2, 0, 0, 0];
+        const INDEX: [u8; 11] = [0x03, 0x03, 4, 0, 0, 0, 0x03, 2, 0, 0, 0];
+        const WRONG_SCALE: [u8; 11] = [0x03, 0x03, 8, 0, 0, 0, 0x03, 2, 0, 0, 0];
+        const UNRELATED_FINISH: [u8; 6] = [0x25, 0x13, 0x98, 0, 0, 0x80];
+        for (code, expected) in [
+            ([INDEX, SHORT].concat(), ExternalLayout::Campanella),
+            ([INDEX, DEFAULT].concat(), ExternalLayout::Default),
+            ([INDEX, SHORT, INDEX, DEFAULT].concat(), ExternalLayout::Default),
+            ([INDEX, DEFAULT, INDEX, SHORT].concat(), ExternalLayout::Default),
+            ([WRONG_SCALE, SHORT].concat(), ExternalLayout::Default),
+            (SHORT.to_vec(), ExternalLayout::Default),
+            (UNRELATED_FINISH.to_vec(), ExternalLayout::Default),
+        ] {
+            assert_eq!(
+                fes_motion_external_layout(&KcsProgram::from_code(&code, vec![], 32)?),
+                expected,
+                "{code:02x?}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an installed Campanella sample and isolated profile"]
+    fn campanella_arc_moves_chapter_button() -> Result<()> {
+        let game = std::env::var_os("CS2_CAMPANELLA_TEST_GAME").context("installed game required")?;
+        let profile = std::path::PathBuf::from(
+            std::env::var_os("CS2_CAMPANELLA_TEST_PROFILE").context("isolated profile required")?,
+        );
+        let mut player = HeadlessPlayer::open_with_save_root(game, &profile)?;
+        player.with_host(|host| {
+            let mut owner = Owner::default();
+            let (program, layout) =
+                load_program(host, &mut owner, b"motArc")?.context("motArc program missing")?;
+            assert_eq!(layout, ExternalLayout::Campanella);
+            let (cached_program, cached_layout) =
+                load_program(host, &mut owner, b"motArc")?.context("cached motArc program missing")?;
+            assert_eq!(cached_program, program);
+            assert_eq!(cached_layout, layout);
+            let mut parameters = [0; 256];
+            parameters[..6].copy_from_slice(
+                &[16.0, std::f32::consts::FRAC_PI_2, 0.0, 80.0, 0.0, 0.0].map(f32::to_bits),
+            );
+            let mut properties = [0; 36];
+            properties[6] = (-80.0_f32).to_bits();
+            let mut runner =
+                create_fes_motion_runner(cached_program, cached_layout, b"motArc", parameters, properties)?;
+            let mut services = MotionHost::default();
+            assert!(matches!(runner.update(0, &mut services, 4096)?, MotionProgress::Complete(_)));
+            assert!(matches!(runner.update(17, &mut services, 4096)?, MotionProgress::Complete(_)));
+            let words = runner.properties()?;
+            let position = [words[6], words[7], words[8]].map(f32::from_bits);
+            assert!(position.iter().all(|axis| axis.abs() < 0.001), "{position:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "requires installed motion archives and an isolated profile"]
+    fn installed_motion_layout_follows_archive_and_loose_override() -> Result<()> {
+        let games = std::path::PathBuf::from(
+            std::env::var_os("CS2_MOTION_TEST_GAMES").context("installed games required")?,
+        );
+        let profile = std::path::PathBuf::from(
+            std::env::var_os("CS2_CAMPANELLA_TEST_PROFILE").context("isolated profile required")?,
+        );
+        let mut fades = Vec::new();
+        for (game, layout) in [
+            ("\u{795d}\u{798f}\u{306e}\u{30ab}\u{30f3}\u{30d1}\u{30cd}\u{30e9}", ExternalLayout::Campanella),
+            ("\u{3046}\u{305f}\u{3066}\u{3081}\u{3050}\u{308a}", ExternalLayout::Campanella),
+            ("\u{30c4}\u{30ca}\u{30d0}\u{30f3} \u{3089}\u{3076}\u{307f}\u{304f}\u{3059}", ExternalLayout::Campanella),
+            ("ISLAND", ExternalLayout::Default),
+        ] {
+            let saves = profile.join(game);
+            let mut player = HeadlessPlayer::open_with_save_root(games.join(game), saves)?;
+            fades.push(player.with_host(|host| {
+                let mut owner = Owner::default();
+                for name in ["motFade", "motFade2", "motMove", "motRot", "motScale", "motArc",
+                    "mcFade", "mcMove", "mcPend", "mcRot", "mcScaleCos", "mcScaleSin", "mcArc",
+                    "pBase", "pColor", "pDepth", "pPos", "pRot", "pScale", "pVRAM"]
+                {
+                    for _ in 0..2 {
+                        let (_, actual) =
+                            load_program(host, &mut owner, name.as_bytes())?.with_context(|| name.to_owned())?;
+                        assert_eq!(actual, layout, "{game} {name}");
+                    }
+                }
+                let names = host.resources.category_names(b"mot", "motFade")?;
+                let candidate = host.resources.resolve(&names[0])?.context("installed motFade missing")?;
+                assert!(matches!(&candidate.location, ResourceLocation::Archive { path, .. }
+                    if path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("mot.int"))));
+                let (program, actual) = load_program(host, &mut owner, b"motFade")?.context("motFade missing")?;
+                let mut parameters = [0; 256];
+                parameters[..3].copy_from_slice(&[60.0, 0.0, 255.0].map(f32::to_bits));
+                let mut properties = [0; 36];
+                properties[28] = 0xff12_3456;
+                let mut runner = create_fes_motion_runner(program, actual, b"motFade", parameters, properties)?;
+                let mut services = MotionHost::default();
+                runner.update(0, &mut services, 4096)?;
+                assert_eq!(runner.properties()?[28], 0x0012_3456, "{game}");
+                runner.update(30, &mut services, 4096)?;
+                assert!((120..=135).contains(&(runner.properties()?[28] >> 24)), "{game}");
+                runner.update(61, &mut services, 4096)?;
+                assert_eq!(runner.properties()?[28], 0xff12_3456, "{game}");
+                assert_eq!(runner.state()?.running, 0, "{game}");
+                Ok(host.resources.read_candidate(candidate)?)
+            })?);
+        }
+
+        for (index, archived, loose, archive_layout, loose_layout) in [
+            ("short", &fades[0], &fades[3], ExternalLayout::Campanella, ExternalLayout::Default),
+            ("default", &fades[3], &fades[0], ExternalLayout::Default, ExternalLayout::Campanella),
+        ] {
+            let root = profile.join(index);
+            std::fs::create_dir_all(root.join("loose"))?;
+            std::fs::write(root.join("startup.xml"), concat!(
+                "<?xml version='1.0' encoding='UTF-8'?>",
+                "<document><INT><int00><name>mot</name><int>mot.int</int>",
+                "<dir>loose</dir><ext>kcs</ext></int00></INT></document>"
+            ))?;
+            let mut archive = vec![0; 80];
+            archive[..8].copy_from_slice(b"KIF\0\x01\0\0\0");
+            archive[8..19].copy_from_slice(b"motFade.kcs");
+            archive[72..76].copy_from_slice(&80_u32.to_le_bytes());
+            archive[76..80].copy_from_slice(&u32::try_from(archived.len())?.to_le_bytes());
+            archive.extend_from_slice(archived);
+            std::fs::write(root.join("mot.int"), archive)?;
+
+            let loose_path = root.join("loose/motFade.kcs");
+            if loose_path.exists() {
+                std::fs::remove_file(&loose_path)?;
+            }
+            for (is_loose, layout, data) in [(false, archive_layout, archived), (true, loose_layout, loose)] {
+                if is_loose {
+                    std::fs::write(&loose_path, data)?;
+                }
+                let mut player = HeadlessPlayer::open_with_save_root(&root, root.join("profile"))?;
+                player.with_host(|host| {
+                    let names = host.resources.category_names(b"mot", "motFade")?;
+                    let resource = host.resources.resolve(&names[0])?.context("motion fixture missing")?;
+                    assert_eq!(matches!(resource.location, ResourceLocation::File { .. }), is_loose);
+                    let expected = KcsProgram::parse(data)?;
+                    let mut owner = Owner::default();
+                    for _ in 0..2 {
+                        let (program, actual) =
+                            load_program(host, &mut owner, b"motFade")?.context("motFade missing")?;
+                        assert_eq!(program, expected);
+                        assert_eq!(actual, layout);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcpend_maps_all_four_motion_words() {
         assert_eq!(
             mcpend_parameters([150, 0, 0, 2]),
             [150.0_f32.to_bits(), 0, 0, 2.0_f32.to_radians().to_bits()],
@@ -2327,6 +2450,60 @@ mod tests {
             mcpend_parameters([-1, 90, -180, 45]),
             [0, std::f32::consts::FRAC_PI_2.to_bits(), (-std::f32::consts::PI).to_bits(), std::f32::consts::FRAC_PI_4.to_bits()],
         );
+    }
+
+    #[test]
+    #[ignore = "requires installed motion archives and an isolated profile"]
+    fn image_mcpend_dispatches_without_engine_identity() -> Result<()> {
+        let games = std::path::PathBuf::from(
+            std::env::var_os("CS2_MOTION_TEST_GAMES").context("installed games required")?,
+        );
+        let profile = std::path::PathBuf::from(
+            std::env::var_os("CS2_CAMPANELLA_TEST_PROFILE").context("isolated profile required")?,
+        );
+        for (game, expected_layout) in [
+            ("\u{30c4}\u{30ca}\u{30d0}\u{30f3} \u{3089}\u{3076}\u{307f}\u{304f}\u{3059}", ExternalLayout::Campanella),
+            ("ISLAND", ExternalLayout::Default),
+        ] {
+            let mut player = HeadlessPlayer::open_with_save_root(games.join(game), profile.join(game))?;
+            player.with_host(|host| {
+                host.data_services.css_task_pe_sha256 = None;
+                let document = FesDocument { sections: vec![
+                    FesSection { header: b"DEFINE".to_vec(), lines: vec![
+                        FesLine { offset: 0, bytes: b"IMAGE ship".to_vec() },
+                        FesLine { offset: 11, bytes: b"PLANE plane".to_vec() },
+                    ] },
+                    FesSection { header: b"START".to_vec(), lines: vec![
+                        FesLine { offset: 23, bytes: b"ship mcpend 150 0 0 2".to_vec() },
+                        FesLine { offset: 44, bytes: b"plane mcpend 150 0 0 2".to_vec() },
+                    ] },
+                ] };
+                let mut driver = FesScriptDriver::new(&document)?;
+                let mut runtime = FesRuntime::new(document);
+                let mut shared = ExpressionState::default();
+                let id = host.create_task_object(34, 0, b"image mcpend test", b"")?;
+                let view = FesTaskView { id, parent: 0, context: Vec::new(), list: None, now: 50, paused: 0 };
+                while let Some(effect) = driver.advance_initialization(&mut shared)? {
+                    if matches!(&effect, FesDriverEffect::Initialize { event: FesEvent::CreateObject(_), .. }) {
+                        fes_services::apply_effect(host, &view, &mut runtime, &mut driver, &effect, &mut shared)?;
+                    }
+                }
+                let image = driver.advance(u64::from(view.now), &mut shared, 64)?;
+                assert_eq!(apply_effect(host, &view, &mut runtime, &mut driver, &image, &mut shared)?, Some(true));
+                let plane = driver.advance(u64::from(view.now), &mut shared, 64)?;
+                assert_eq!(apply_effect(host, &view, &mut runtime, &mut driver, &plane, &mut shared)?, None);
+
+                let owner = &host.data_services.fes_motion.owners[&id];
+                let task = &owner.nodes[&(b"ship".to_vec(), 0)].controller.tasks[&1];
+                assert_eq!(task.name, b"mcPend");
+                assert_eq!(task.group, 1);
+                assert_eq!(task.parameters[..4], mcpend_parameters([150, 0, 0, 2]));
+                assert!(owner.nodes[&(b"plane".to_vec(), 0)].controller.tasks.is_empty());
+                assert!(owner.programs.values().any(|program| fes_motion_external_layout(program) == expected_layout));
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]

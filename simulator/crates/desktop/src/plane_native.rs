@@ -1019,7 +1019,14 @@ impl LoggingHost<'_> {
         let kind = self.scene_nodes.get(&id).map(|node| node.kind);
         let legacy_display = abi.slot == 92 && matches!(kind, Some(6 | 47))
             && self.bind_utate_plane_input_profile()?;
-        if (id != 0 && !legacy_display && kind.is_some_and(|kind| kind != 2))
+        let legacy_string_command = kind == Some(45) && self.data_services.ordinary_native_table
+            .as_ref().is_some_and(|table| match abi.slot {
+                84 => table.string_plane_has_position_wrapper(),
+                85 | 88 => table.string_plane_has_base_wrappers(),
+                94 => table.string_plane_has_alpha_wrapper(),
+                _ => false,
+            });
+        if (id != 0 && !legacy_display && !legacy_string_command && kind.is_some_and(|kind| kind != 2))
             || self
                 .movie_host
                 .as_ref()
@@ -1340,6 +1347,14 @@ impl LoggingHost<'_> {
             .get(&id)
             .filter(|node| node.kind == 2 || (legacy_utate_display && node.kind == 47)
                 || (legacy_string2_display && node.kind == 45)
+                // These StringPlane2 messages forward to the PLANE receiver.
+                || (node.kind == 45 && self.data_services.ordinary_native_table
+                    .as_ref().is_some_and(|table| match command.code {
+                        49 | 61 => table.string_plane_has_base_wrappers(),
+                        51 => table.string_plane_has_position_wrapper(),
+                        63 => table.string_plane_has_alpha_wrapper(),
+                        _ => false,
+                    }))
                 || self.legacy_utate_string_binding(node.kind, command.code))
             .cloned()
         else {
@@ -1706,6 +1721,7 @@ impl LoggingHost<'_> {
         if let Some(code) = propagate {
             let legacy_button_display = code == 48
                 && (legacy_utate_display || legacy_string2_profile.is_some());
+            let rebind_button = matches!(code, 50 | 52);
             let mut data = command.data;
             if code == 48 && (legacy_utate_display || (legacy_string2_display && node.kind == 45)) {
                 data[1] = self.data_services.planes.planes[&id].display;
@@ -1722,7 +1738,7 @@ impl LoggingHost<'_> {
                     .min_by_key(|&child| child as i32);
                 let Some(child) = child else { break };
                 cursor = Some(child as i32);
-                if legacy_button_display && self.data_services.tasks.message_task_state(child)
+                if (legacy_button_display || rebind_button) && self.data_services.tasks.message_task_state(child)
                     .is_some_and(|(_, deletion, _)| deletion != 0)
                 {
                     continue;
@@ -1733,7 +1749,7 @@ impl LoggingHost<'_> {
                     code,
                     data,
                 };
-                if legacy_button_display
+                if (legacy_button_display || rebind_button)
                     && self.scene_nodes.get(&child).is_some_and(|node| node.kind == 6)
                     && self.receive_input_button_command(forwarded, &mut Default::default(), output, 4096)?.is_some()
                 {

@@ -307,18 +307,21 @@ impl LegacyModelState {
     }
 }
 
-fn matrix(values: &[u32; 11]) -> RuntimeResult<Matrix> {
-    let f = values[..10].iter().map(|&bits| f32::from_bits(bits)).collect::<Vec<_>>();
-    if f.iter().any(|value| !value.is_finite()) { return Err(invalid("model override contains non-finite render geometry")); }
-    let [x, y, z, w] = [f[6], f[7], f[8], f[9]];
-    // 92cc0: quaternion rotation, then right-multiplied scale and translation.
-    // The original does not normalize this quaternion.
-    let mut m = [
+/// Construct the row-major D3DX rotation matrix without normalizing the quaternion.
+pub fn model_rotation_matrix([x, y, z, w]: [f32; 4]) -> Matrix {
+    [
         [1. - 2.*(y*y+z*z), 2.*(x*y+z*w), 2.*(x*z-y*w), 0.],
         [2.*(x*y-z*w), 1. - 2.*(x*x+z*z), 2.*(y*z+x*w), 0.],
         [2.*(x*z+y*w), 2.*(y*z-x*w), 1. - 2.*(x*x+y*y), 0.],
         [0., 0., 0., 1.],
-    ];
+    ]
+}
+
+fn matrix(values: &[u32; 11]) -> RuntimeResult<Matrix> {
+    let f = values[..10].iter().map(|&bits| f32::from_bits(bits)).collect::<Vec<_>>();
+    if f.iter().any(|value| !value.is_finite()) { return Err(invalid("model override contains non-finite render geometry")); }
+    // 92cc0: quaternion rotation, then right-multiplied scale and translation.
+    let mut m = model_rotation_matrix([f[6], f[7], f[8], f[9]]);
     for row in &mut m { for axis in 0..3 { row[axis] *= f[3 + axis]; } }
     m[3][..3].copy_from_slice(&f[..3]);
     if m.iter().flatten().any(|value| !value.is_finite()) { return Err(invalid("model override matrix overflows render geometry")); }

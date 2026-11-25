@@ -1,147 +1,164 @@
-use cs2_runtime::ResourceIndex;
 use cs2_script::NativeReturn;
-
-use super::particle_plugin_digest::sha256;
-
-const HAPPINESS2_COMPANION_PE_SHA256: &str =
-    "5869b7d03a636c200f5042f0c3fc37878a362615bf724f58d47aec5eb8b2d44c";
-const REBELLIONS_PE_SIZE: usize = 4_350_976;
-const REBELLIONS_PE_SHA256: &str =
-    "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3";
-const REBELLIONS_SSCRIPT_SHA256: &str =
-    "533ecc0aec6ae5c0b6b2e21f56ee1d3e4637f5eb655ac0b746a133c06f323407";
-
-/// Resolves only the zero-argument call after the host's companion verification.
-pub(super) fn happiness2_companion_native(
-    index: u32,
-    arguments: &[u8],
-    verified_companion: Option<&str>,
-) -> Option<NativeReturn> {
-    verified_zero_argument_native925(index, arguments, || {
-        verified_companion == Some(HAPPINESS2_COMPANION_PE_SHA256)
-    })
-}
-
-pub(super) fn rebellions_native(
-    index: u32,
-    arguments: &[u8],
-    resources: &ResourceIndex,
-) -> Option<NativeReturn> {
-    rebellions_native_with_fingerprints(
-        index,
-        arguments,
-        || {
-            let runtime = resources.resolve_plain_file("REBELLIONS.exe").ok()??;
-            if runtime.size != REBELLIONS_PE_SIZE as u64 {
-                return None;
-            }
-            let bytes = resources
-                .read_candidate_bounded(runtime, REBELLIONS_PE_SIZE)
-                .ok()??;
-            Some(sha256(&bytes))
-        },
-        || {
-            let names = resources.category_names(b"kcs", "sscript").ok()?;
-            let script = names.iter().find_map(|name| resources.find(name))?;
-            Some(sha256(&resources.read_candidate(script).ok()?))
-        },
-    )
-}
-
-fn rebellions_native_with_fingerprints(
-    index: u32,
-    arguments: &[u8],
-    runtime_sha256: impl FnOnce() -> Option<String>,
-    script_sha256: impl FnOnce() -> Option<String>,
-) -> Option<NativeReturn> {
-    match (index, arguments) {
-        // REBELLIONS.exe RVA 0xaad40 returns status 2 without reading
-        // arguments or writing the result slot.
-        (439, _) => {
-            (runtime_sha256().as_deref() == Some(REBELLIONS_PE_SHA256))
-                .then_some(NativeReturn::Continue)
-        }
-        (925, []) => {
-            (runtime_sha256().as_deref() == Some(REBELLIONS_PE_SHA256)
-                && script_sha256().as_deref() == Some(REBELLIONS_SSCRIPT_SHA256))
-            .then_some(NativeReturn::Value(0))
-        }
-        _ => None,
-    }
-}
-
-fn verified_zero_argument_native925(
-    index: u32,
-    arguments: &[u8],
-    verified: impl FnOnce() -> bool,
-) -> Option<NativeReturn> {
-    (index == 925 && arguments.is_empty() && verified()).then_some(NativeReturn::Value(0))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn happiness2_native925_requires_verified_companion_and_zero_arguments() {
-        let companion = Some(HAPPINESS2_COMPANION_PE_SHA256);
-        let packed = Some("21dfeb88edafc4bf19226d158e040687738f592282c578740e9d972127938df7");
-        assert!(matches!(
-            happiness2_companion_native(925, &[], companion),
-            Some(NativeReturn::Value(0))
-        ));
-        assert!(happiness2_companion_native(925, &[], None).is_none());
-        assert!(happiness2_companion_native(925, &[], packed).is_none());
-        assert!(happiness2_companion_native(925, &[0; 4], companion).is_none());
-        assert!(happiness2_companion_native(924, &[], companion).is_none());
+    #[ignore = "requires the installed Rebellions game and an isolated save root"]
+    fn rebellions_registered_ordinary_constants_use_installed_game() -> anyhow::Result<()> {
+        use std::path::Path;
+        use cs2_runtime::native_profile::ConstantNativeReturn;
+        use cs2_script::{Host, Vm};
+
+        let game = std::env::var_os("CS2_REBELLIONS_TEST_GAME").expect("installed game root required");
+        let profile = std::env::var_os("CS2_SIDECAR9_PROFILE").expect("isolated profile required");
+        let mut player = crate::HeadlessPlayer::open_with_save_root(
+            game, Path::new(&profile).join("rebellions-native-constants"),
+        )?;
+        let primary = player.scan.engine.primary_executable.as_ref().unwrap();
+        assert!(primary.relative_path.as_os_str().eq_ignore_ascii_case("REBELLIONS.exe"));
+        assert_eq!(player.default_entry.as_deref(), Some("kcs.int/main.kcs"));
+        let table = player.data_services.ordinary_native_table.as_ref()
+            .expect("startup resolves the registered ordinary table");
+        assert_eq!(table.constant(439), Some(ConstantNativeReturn::Continue));
+        assert_eq!(table.feature_constant(925), Some(ConstantNativeReturn::Value(0)));
+        player.load_startup()?;
+        player.with_host(|host| {
+            let mut vm = Vm::new();
+            let mut resume_args = [0u8; 8];
+            resume_args[..4].copy_from_slice(&1u32.to_le_bytes());
+            assert_eq!(host.call(439, &resume_args, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(925, &[], &mut vm)?, NativeReturn::Value(0));
+            Ok(())
+        })
     }
 
     #[test]
-    fn rebellions_native925_requires_verified_runtime_and_zero_arguments() {
-        let runtime = || Some(REBELLIONS_PE_SHA256.to_owned());
-        let script = || Some(REBELLIONS_SSCRIPT_SHA256.to_owned());
-        assert_eq!(
-            rebellions_native_with_fingerprints(925, &[], runtime, script),
-            Some(NativeReturn::Value(0))
+    #[ignore = "requires the installed Happiness!2 game and an isolated save root"]
+    fn happiness2_native439_and_925_use_registered_archive_companion() -> anyhow::Result<()> {
+        use std::path::Path;
+        use cs2_script::{Host, ScriptError, Vm};
+
+        let game = std::path::PathBuf::from(
+            std::env::var_os("CS2_HAPPINESS2_TEST_GAME").expect("installed game root required"),
         );
-        let companion = || Some(HAPPINESS2_COMPANION_PE_SHA256.to_owned());
-        let unexpected_read = || -> Option<String> { panic!("fingerprint should not be read") };
-        assert!(
-            rebellions_native_with_fingerprints(925, &[], companion, unexpected_read).is_none()
-        );
-        assert!(rebellions_native_with_fingerprints(925, &[], || None, unexpected_read).is_none());
-        assert!(rebellions_native_with_fingerprints(925, &[], runtime, || None).is_none());
-        let startup =
-            || Some("a25b9e9c8d4c7d8091b30d457fec070211fb86013e5d58dc6fdbec7ac0236ec1".to_owned());
-        assert!(rebellions_native_with_fingerprints(925, &[], runtime, startup).is_none());
-        for (index, arguments) in [(924, &[][..]), (926, &[][..]), (925, &[0; 4][..])] {
-            assert!(
-                rebellions_native_with_fingerprints(
-                    index,
-                    arguments,
-                    unexpected_read,
-                    unexpected_read
-                )
-                .is_none()
-            );
+        let profile = std::env::var_os("CS2_SIDECAR9_PROFILE").expect("isolated profile required");
+        let mut player = crate::HeadlessPlayer::open_with_save_root(
+            &game, Path::new(&profile).join("happiness2-native925"),
+        )?;
+        assert!(player.data_services.ordinary_native_table.is_none());
+        let companion = player.data_services.startup_companion_natives.as_ref().unwrap();
+        assert!(companion.native439_continue && companion.native925_zero);
+        assert_eq!(companion.message_list_base, Some(448));
+        let raster_messages = companion.raster_messages.expect("registered Raster18 commands");
+        assert_eq!((raster_messages.start, raster_messages.configure), (263, 269));
+        assert!(companion.raster_finalize_passthrough);
+        const TABLE_OFFSET: usize = 0x5e26e8;
+        let mut companion = std::fs::read(game.join("cs2_crack.exe"))?;
+        let mut primary = companion.clone();
+        let slot_925 = TABLE_OFFSET + 925 * 4;
+        primary.copy_within(slot_925..slot_925 + 4, TABLE_OFFSET + 439 * 4);
+        let primary = cs2_runtime::native_table::OrdinaryNativeTable::from_pe(&primary).unwrap();
+        player.load_startup()?;
+        player.with_host(|host| {
+            // The producer's registered return does not depend on the particle profile.
+            host.data_services.particle_message_pe_sha256 = None;
+            let mut vm = Vm::new();
+            assert_eq!(host.call(925, &[], &mut vm)?, NativeReturn::Value(0));
+            let inspector = host.create_task_object(47, 0, b"message list", b"")?;
+            let binding = [inspector, 0].map(u32::to_le_bytes).concat();
+            assert_eq!(host.call(571, &binding, &mut vm)?, NativeReturn::Continue);
+            let raster = host.create_task_object(18, 0, b"Raster", b"")?;
+            let mut raster_vm = Vm::from_program(cs2_script::KcsProgram::from_code(
+                &[0x3b], vec![0; 64], 0,
+            )?)?;
+            let record = [0u32, 0, 0, 15f32.to_bits(), 20f32.to_bits()]
+                .map(u32::to_le_bytes).concat();
+            raster_vm.write(4, &record)?;
+            let configure = [raster, 4].map(u32::to_le_bytes).concat();
+            let receiver = raster.to_le_bytes();
+            assert_eq!(host.call(196, &configure, &mut raster_vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(197, &receiver, &mut raster_vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(200, &receiver, &mut raster_vm)?, NativeReturn::Value(1));
+            assert_eq!(host.call(203, &receiver, &mut raster_vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(198, &receiver, &mut raster_vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(200, &receiver, &mut raster_vm)?, NativeReturn::Value(0));
+            for flag in [0u32, 1] {
+                let arguments = [17u32, flag].map(u32::to_le_bytes).concat();
+                assert_eq!(host.call(439, &arguments, &mut vm)?, NativeReturn::Continue);
+            }
+            let bad_flag = [17u32, 2].map(u32::to_le_bytes).concat();
+            for (index, arguments) in [
+                (925, &[0; 4][..]), (924, &[][..]), (439, &[0; 4][..]), (439, bad_flag.as_slice()),
+            ] {
+                assert!(matches!(host.call(index, arguments, &mut vm),
+                    Err(ScriptError::UnimplementedNativeCall { index: reported }) if reported == index));
+            }
+            host.data_services.ordinary_native_table = Some(primary);
+            assert_eq!(host.call(439, &[0; 8], &mut vm)?, NativeReturn::Value(0));
+            host.data_services.ordinary_native_table = None;
+            host.data_services.startup_companion_natives = None;
+            assert!(matches!(host.call(439, &[0; 8], &mut vm),
+                Err(ScriptError::UnimplementedNativeCall { index: 439 })));
+            Ok(())
+        })?;
+
+        let fixture = Path::new(&profile).join(format!("companion-925-{}", std::process::id()));
+        std::fs::create_dir_all(fixture.join("config"))?;
+        for name in ["cs2.exe", "kcs.int"] {
+            std::fs::copy(game.join(name), fixture.join(name))?;
         }
+        std::fs::write(fixture.join("config/startup.xml"), br#"<?xml version="1.0" encoding="UTF-8"?>
+<document><SCRIPT><start>kcs.int/main.kcs</start></SCRIPT><INT>
+  <int01><name>kcs</name><int>kcs.int</int><ext>kcs</ext><dir>kcs</dir></int01>
+</INT></document>
+"#)?;
+        companion.extend_from_slice(b"unrelated PE overlay");
+        std::fs::write(fixture.join("companion.exe"), &companion)?;
+
+        let scan_fixture = || cs2_runtime::GameRoot::open(&fixture)?.scan();
+        let scan = scan_fixture()?;
+        let recover = cs2_runtime::native_table::OrdinaryNativeTable::startup_companion_natives;
+        use cs2_runtime::native_table::RenderArgumentOrder::DurationFirst;
+        assert_eq!(scan.engine.primary_executable.as_ref().unwrap().relative_path, Path::new("cs2.exe"));
+        let contracts = recover(&scan, "kcs.int/main.kcs").unwrap();
+        assert!(contracts.native439_continue && contracts.native925_zero);
+        assert_eq!((contracts.draw_order, contracts.wipe_order), (Some(DurationFirst), Some(DurationFirst)));
+        assert_eq!(contracts.message_list_base, Some(448));
+        assert_eq!(contracts.raster_messages, Some(raster_messages));
+        assert!(contracts.raster_finalize_passthrough);
+        assert!(recover(&scan, "config/startup.xml").is_none());
+
+        let scene_script = scan.resources.read_category(b"kcs", "sscript")?;
+        let scene_candidate = scan.resources.resolve("kcs.int/sscript.kcs")?.unwrap();
+        let cs2_runtime::ResourceLocation::Archive { path, offset, size, .. } = &scene_candidate.location else {
+            panic!("expected a scene script in the copied archive");
+        };
+        let mut archive = std::fs::read(path)?;
+        let last_byte = usize::try_from(offset + size - 1)?;
+        archive[last_byte] ^= 1;
+        std::fs::write(path, archive)?;
+        let changed_script = scan_fixture()?;
+        assert_ne!(changed_script.resources.read_category(b"kcs", "sscript")?, scene_script);
+        assert_eq!(recover(&changed_script, "kcs.int/main.kcs").unwrap().message_list_base, Some(448));
+
+        // Redirect 439 to the adjacent side-effecting wrapper while preserving the table and seed.
+        let slot_438 = TABLE_OFFSET + 438 * 4;
+        companion.copy_within(slot_438..slot_438 + 4, slot_438 + 4);
+        std::fs::write(fixture.join("companion.exe"), &companion)?;
+        let changed = recover(&scan_fixture()?, "kcs.int/main.kcs").unwrap();
+        assert!(!changed.native439_continue && changed.native925_zero);
+
+        std::fs::copy(game.join("cs2_crack.exe"), fixture.join("another.exe"))?;
+        assert!(recover(&scan_fixture()?, "kcs.int/main.kcs").is_none());
+
+        std::fs::rename(fixture.join("another.exe"), fixture.join("another.exe.disabled"))?;
+        std::fs::create_dir_all(fixture.join("kcs"))?;
+        std::fs::write(fixture.join("kcs/sscript.kcs"), scene_script)?;
+        let overridden = scan_fixture()?;
+        assert!(recover(&overridden, "kcs.int/main.kcs").is_none());
+        Ok(())
     }
 
-    #[test]
-    fn rebellions_native439_leaves_the_result_slot_untouched() {
-        let unknown_script = || -> Option<String> { panic!("callback does not read script") };
-        assert_eq!(
-            rebellions_native_with_fingerprints(
-                439,
-                &[0; 8],
-                || Some(REBELLIONS_PE_SHA256.to_owned()),
-                unknown_script,
-            ),
-            Some(NativeReturn::Continue),
-        );
-        assert_eq!(
-            rebellions_native_with_fingerprints(439, &[0; 8], || None, unknown_script),
-            None,
-        );
-    }
 }

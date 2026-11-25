@@ -1,8 +1,7 @@
-//! SHA-identified bang2 SDK2.1 state machine. Original PE is read-only evidence,
+//! Independent bang2 SDK2.1 state machine. Original PE is read-only evidence,
 //! never loaded. Start1070/1360, update1110, finish1350,28-byte private record.
 use cs2_script::Result;
 use super::particle_vm::{ParticleCanvas,ParticleQuad,ParticleRandomSource,ParticleRenderSnapshot,ParticleVertex};
-pub(super) const SHA: &str = "9bbce135f74477cc287127ad41031922be36c64dae7622941e0d47e76a4731b8";
 
 #[derive(Debug,Clone,Default)]
 struct Drop {

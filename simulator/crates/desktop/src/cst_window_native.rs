@@ -238,8 +238,7 @@ fn load_slot(host: &LoggingHost<'_>, window: &mut HistoryWindow, slot: usize) ->
         return Ok(false);
     }
     let mut document = CstDocument::parse(bytes)?;
-    super::cst_context_native::repair_routed_scene_text(&resource,
-        document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
+    super::cst_context_native::repair_routed_scene_text(host.resources, &resource, &mut document);
     let size = document_storage(&document)?;
     let retained = window.slots.iter().enumerate().filter(|(index, _)| *index != slot)
         .filter_map(|(_, slot)| slot.document.as_ref()).try_fold(0usize, |total, document| {

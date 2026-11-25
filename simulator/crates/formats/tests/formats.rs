@@ -893,6 +893,51 @@ fn decodes_hg3_jpeg_with_separate_alpha_mask() {
 }
 
 #[test]
+fn decodes_hg3_blank_jpeg_placeholder_with_invalid_alpha() {
+    let tiny_jpeg = |rgb: [u8; 3]| {
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode(&rgb.repeat(4), 2, 2, ColorType::Rgb8.into()).unwrap();
+        assert_eq!(&jpeg[2..4], &[0xff, 0xe0]);
+        // Replace the generated JFIF segment with a comment to make the test
+        // JPEG the same size as the original empty overlay.
+        let end = 4 + usize::from(u16::from_be_bytes([jpeg[4], jpeg[5]]));
+        let comment_len = 631 - (jpeg.len() - end) - 4;
+        let mut comment = vec![0xff, 0xfe];
+        comment.extend_from_slice(&(comment_len as u16).to_be_bytes());
+        comment.resize(comment_len + 2, 0);
+        jpeg.splice(2..end, comment);
+        assert_eq!(jpeg.len(), 631);
+        jpeg
+    };
+    let mut stdinfo = synthetic_stdinfo(2, 2);
+    stdinfo[20..24].copy_from_slice(&916u32.to_le_bytes());
+    stdinfo[24..28].copy_from_slice(&1272u32.to_le_bytes());
+    let mut invalid_alpha = [12u32, 4].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    invalid_alpha.extend_from_slice(&[0x78, 0xda, 0x61, 0x06, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut tags = [
+        (*b"stdinfo\0", stdinfo),
+        (*b"img_jpg\0", tiny_jpeg([0, 0, 0])),
+        (*b"img_al\0\0", invalid_alpha.clone()),
+    ];
+    let decode = |tags: &[([u8; 8], Vec<u8>)]| {
+        let bytes = synthetic_hg3_with_tags(tags);
+        HgFile::parse(&bytes).unwrap().decode_frame_rgba8(&bytes, 0)
+    };
+    assert_eq!(decode(&tags).unwrap(), [0; 16]);
+    tags[2].1 = synthetic_alpha_tag(&[1, 2, 3, 4]);
+    let pixels = decode(&tags).unwrap();
+    assert_eq!(pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>(), [1, 2, 3, 4]);
+
+    tags[2].1 = invalid_alpha;
+    tags[1].1 = tiny_jpeg([127, 127, 127]);
+    assert!(matches!(decode(&tags), Err(HgError::InvalidCompression)));
+    tags[1].1 = tiny_jpeg([0, 0, 0]);
+    tags[0].1[12..16].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(decode(&tags), Err(HgError::InvalidCompression)));
+}
+
+#[test]
 fn decodes_hg3_webp_and_standalone_alpha_tags() {
     let rgba_source = [14, 80, 190, 255];
     let mut webp = Vec::new();

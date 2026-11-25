@@ -91,10 +91,8 @@ impl LoggingHost<'_> {
             if !matches!(args.len(), 8 | 12) {
                 return Err(native_state_error("native 600 requires the legacy two- or package three-DWORD ABI"));
             }
-            if args.len() == 8 && self.data_services.native_profile.is_some_and(|profile| matches!(
-                profile.pe_sha256,
-                "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f"
-                | "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976"))
+            if args.len() == 8 && self.data_services.ordinary_native_table.as_ref()
+                .is_some_and(cs2_runtime::native_table::OrdinaryNativeTable::has_wallpaper_package_wrapper)
             {
                 return Err(native_state_error("identified native 600 wrapper requires the package ABI"));
             }

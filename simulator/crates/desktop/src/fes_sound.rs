@@ -959,8 +959,7 @@ fn query_group_key(host: &mut LoggingHost<'_>, name: &[u8]) -> Result<u32> {
 fn query_load_field(
     host: &mut LoggingHost<'_>, code: u32, channel: u32, data1: Option<&mut [u8]>,
 ) -> Result<u32> {
-    let task = host.default_sound_task()?
-        .context("FES SOUND load query requires a kind 13 sound task")?;
+    let task = host.required_sound_task()?;
     let mut output = 0;
     if !host.dispatch_sound_task_command(
         task,

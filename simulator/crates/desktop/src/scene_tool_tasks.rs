@@ -235,21 +235,21 @@ impl LoggingHost<'_> {
         &mut self, index: u32, args: &[u8], vm: &Vm,
     ) -> Result<NativeReturn> {
         let target = read_u32(args, 0)?;
-        let profile = task_profile(self)?;
+        let commands = self.data_services.scene_tool_commands();
         let (code, second) = match index {
-            279 => (profile.scene_debug.ok_or_else(no_profile)?[0], None),
-            280 => (profile.scene_debug.ok_or_else(no_profile)?[1], None),
-            281 => (profile.scene_debug.ok_or_else(no_profile)?[2],
+            279 => (commands.debug.ok_or_else(no_commands)?[0], None),
+            280 => (commands.debug.ok_or_else(no_commands)?[1], None),
+            281 => (commands.debug.ok_or_else(no_commands)?[2],
                 Some(vm.read(read_u32(args, 4)?, 0x160)?)),
             282 => {
                 let bytes = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
                 if bytes.len() >= 128 { return Err(native_state_error("debug log exceeds127 encoded bytes")); }
                 let mut bytes = bytes; bytes.push(0);
-                (profile.scene_debug.ok_or_else(no_profile)?[3], Some(bytes))
+                (commands.debug.ok_or_else(no_commands)?[3], Some(bytes))
             }
-            283 => (profile.scene_debug.ok_or_else(no_profile)?[4], None),
-            287 => (profile.scene_list.ok_or_else(no_profile)?[0], None),
-            288 => (profile.scene_list.ok_or_else(no_profile)?[1], None),
+            283 => (commands.debug.ok_or_else(no_commands)?[4], None),
+            287 => (commands.list.ok_or_else(no_commands)?[0], None),
+            288 => (commands.list.ok_or_else(no_commands)?[1], None),
             _ => return Err(cs2_script::ScriptError::UnimplementedNativeCall { index }),
         };
         let value = if matches!(index, 280 | 288) { read_u32(args, 4)? } else { 0 };
@@ -265,7 +265,7 @@ impl LoggingHost<'_> {
             let offset = vm.program().map(|program|
                 (vm.stack_pointer() as u32).wrapping_sub(program.data.len() as u32))
                 .ok_or(cs2_script::ScriptError::NoProgram)?;
-            let code = profile.scene_debug_refresh.ok_or_else(no_profile)?;
+            let code = commands.debug.ok_or_else(no_commands)?[5];
             self.receive_task_command(
                 TaskCommand { target: target as i32, sender: self.current_task_id as i32,
                     code, data: [0, offset, 0] },
@@ -278,17 +278,9 @@ impl LoggingHost<'_> {
     pub(crate) fn receive_scene_tool_command(
         &mut self, command: TaskCommand, buffers: &mut TaskCommandBuffers<'_>, budget: usize,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let profile = task_profile(self)?;
         let id = command.target as u32;
-        let kind = self.data_services.tasks.message_task_state(id).map(|state| state.0);
-        let operation = match kind {
-            Some(32) => profile.scene_debug.and_then(|codes| codes.iter()
-                .position(|&code| code == command.code).map(|index| index as u8))
-                .or_else(|| (profile.scene_debug_refresh == Some(command.code)).then_some(5)),
-            Some(33) => profile.scene_list.and_then(|codes| codes.iter()
-                .position(|&code| code == command.code).map(|index| index as u8)),
-            _ => return Ok(None),
-        };
+        let Some((kind, _, _)) = self.data_services.tasks.message_task_state(id) else { return Ok(None); };
+        let operation = self.data_services.scene_tool_commands().operation(kind, command.code);
         let Some(operation) = operation else { return Ok(None); };
         let mut tool = self.data_services.tasks.scene_tools.tasks.remove(&id)
             .ok_or_else(|| native_state_error("scene-tool receiver was not registered"))?;
@@ -362,16 +354,8 @@ impl LoggingHost<'_> {
         &mut self, target: u32, packet: TaskMessage, queued: bool,
         output: &mut u32, vm: Option<&mut Vm>,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let profile = task_profile(self)?;
-        let kind = self.data_services.tasks.message_task_state(target).map(|state| state.0);
-        let operation = match kind {
-            Some(32) => profile.scene_debug.and_then(|codes| codes.iter()
-                .position(|&code| code == packet[1]).map(|index| index as u8))
-                .or_else(|| (profile.scene_debug_refresh == Some(packet[1])).then_some(5)),
-            Some(33) => profile.scene_list.and_then(|codes| codes.iter()
-                .position(|&code| code == packet[1]).map(|index| index as u8)),
-            _ => return Ok(None),
-        };
+        let Some((kind, _, _)) = self.data_services.tasks.message_task_state(target) else { return Ok(None); };
+        let operation = self.data_services.scene_tool_commands().operation(kind, packet[1]);
         let Some(operation) = operation else { return Ok(None); };
         let command = TaskCommand { target: target as i32, sender: packet[0] as i32,
             code: packet[1], data: [packet[2], packet[3], 0] };
@@ -381,10 +365,10 @@ impl LoggingHost<'_> {
                 let open = self.data_services.tasks.scene_tools.tasks.get(&target)
                     .is_some_and(|tool| tool.open);
                 let second = match (kind, operation, open) {
-                    (Some(32), 2, true) => Some(vm.as_deref()
+                    (32, 2, true) => Some(vm.as_deref()
                         .ok_or_else(|| native_state_error("scene-debug record needs sender VM or owned bytes"))?
                         .read(packet[3], 0x160)?),
-                    (Some(32), 3, true) => {
+                    (32, 3, true) => {
                         let mut bytes = vm.as_deref()
                             .ok_or_else(|| native_state_error("scene-debug log needs sender VM or owned bytes"))?
                             .read_string(packet[3])?;
@@ -406,10 +390,9 @@ impl LoggingHost<'_> {
         &mut self, command: TaskCommand, buffers: &mut TaskCommandBuffers<'_>,
         output: &mut u32, budget: usize,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let profile = match self.data_services.task_native_profile()
-        { Some(profile) => profile, None => return Ok(None) };
-        let Some(codes) = profile.scene_list else { return Ok(None); };
-        if command.code != codes[0]+2 { return Ok(None); }
+        if self.data_services.scene_tool_commands().list.map(|codes| codes[2]) != Some(command.code) {
+            return Ok(None);
+        }
         let target = command.target as u32;
         let has_program = self.task_vms.contains_key(&target)
             || self.data_services.tasks.records.get(&target).is_some_and(|record| record.had_vm
@@ -433,9 +416,9 @@ impl LoggingHost<'_> {
         &mut self, target: u32, packet: TaskMessage, queued: bool,
         output: &mut u32, vm: Option<&mut Vm>,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let profile = match self.data_services.task_native_profile()
-        { Some(profile) => profile, None => return Ok(None) };
-        if profile.scene_list.is_none_or(|codes| packet[1] != codes[0]+2) { return Ok(None); }
+        if self.data_services.scene_tool_commands().list.map(|codes| codes[2]) != Some(packet[1]) {
+            return Ok(None);
+        }
         let command = TaskCommand { target: target as i32, sender: packet[0] as i32,
             code: packet[1], data: [packet[2], packet[3], 0] };
         let mut buffers = match self.pending_owned_task_buffers(command) {
@@ -646,11 +629,56 @@ impl LoggingHost<'_> {
     }
 }
 
-fn task_profile(host: &LoggingHost<'_>) -> Result<cs2_runtime::native_task_profile::TaskNativeProfile> {
-    host.data_services.task_native_profile().ok_or_else(no_profile)
+fn no_commands() -> cs2_script::ScriptError {
+    native_state_error("scene-tool protocol needs a verified registered command layout")
 }
-fn no_profile() -> cs2_script::ScriptError {
-    native_state_error("scene-tool protocol needs its exact registered PE descriptor")
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn scene_tool_registered_commands_route_from_the_game_executable() -> anyhow::Result<()> {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/ISLAND");
+        if !game.join("ISLAND.exe").is_file() {
+            return Ok(());
+        }
+        let temporary = crate::tests::TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&game, temporary.0.join("profile"))?;
+        player.with_host(|host| {
+            let task = host.create_task_object(33, 0, b"scene list", b"")?;
+            let export = host.create_task_object(45, 0, b"export", b"")?;
+            let args = [task, 1].map(u32::to_le_bytes).concat();
+            assert_eq!(host.scene_tool_native(288, &args, &Vm::new())?, NativeReturn::Continue);
+            assert!(host.data_services.tasks.scene_tools.tasks[&task].visible);
+            let mut output = 0;
+            let command = TaskCommand { target: export as i32, sender: 0, code: 477, data: [0; 3] };
+            let outcome = host.receive_task_command(command, &mut TaskCommandBuffers::default(), &mut output, 1)?;
+            assert!(outcome.is_some_and(|outcome| outcome.done));
+            assert_eq!(output, 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn scene_tool_registered_commands_follow_the_resolved_companion_entry() -> anyhow::Result<()> {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../games/\u{7a81}\u{7136}\u{4e4b}\u{95f4}\u{53d1}\u{73b0}\u{6211}\u{5df2}\u{604b}\u{4e0a}\u{4f60}",
+        );
+        if !game.join("cs2_cn.exe").is_file() {
+            return Ok(());
+        }
+        let temporary = crate::tests::TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&game, temporary.0.join("profile"))?;
+        player.default_entry = Some("missing.kcs".to_owned());
+        player.load_entry("diagnostic/main.kcs")?;
+        assert!(player.data_services.active_scene_tool_commands.is_some());
+        let commands = player.data_services.scene_tool_commands();
+        assert_eq!(commands.debug, Some([295, 296, 297, 298, 299, 300]));
+        assert_eq!(commands.list, Some([301, 302, 303]));
+        assert_eq!(commands.export_base, Some(448));
+        Ok(())
+    }
 }
 
 fn tool_rows(tool: &Tool) -> Vec<MessageListRow> {

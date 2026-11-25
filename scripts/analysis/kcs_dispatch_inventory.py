@@ -113,7 +113,7 @@ def source_coverage(root: Path):
         if index in VERSION_CHANGED:
             return {"status": "conditional-version", "source": DESKTOP,
                     "line": ordinary.line(ordinary.call_brace + version_guard.start()),
-                    "condition": "Exact PE result, E-mote backend, or verified legacy bridge. Otherwise rejected before the numeric match."}
+                    "condition": "Complete registered callback body, E-mote backend, or verified legacy bridge. Otherwise rejected before the numeric match."}
         overlay = next((item for item in overlays if index in item["supported"]), None)
         module = overlay["module"] if overlay else ordinary
         routes = possible_routes(module.arms, index, length)
@@ -126,7 +126,7 @@ def source_coverage(root: Path):
             return result
         if "reserved_native::call" in rust_mask(arm.body):
             result["status"] = "conditional-version"
-            result["condition"] = "Exact PE constant or preceding concrete receiver required"
+            result["condition"] = "Complete registered callback body or preceding concrete receiver required"
             return result
         if result["status"] != "source-behavior":
             return result

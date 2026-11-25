@@ -1162,7 +1162,17 @@ impl DesktopMessageDevice {
             let name = String::from_utf16(&units)
                 .map_err(|_| invalid("message font filename has an isolated UTF-16 surrogate"))?;
             let key = name.replace('\\', "/").to_ascii_lowercase();
-            let file = self.resource_font_files.get(&key).ok_or_else(|| ScriptError::HostCallFailed {
+            let file = self.resource_font_files.get(&key).or_else(|| {
+                if std::path::Path::new(&key).extension().is_some() {
+                    return None;
+                }
+                // A bare font name may refer to a uniquely named game font file.
+                let mut matches = ["ttf", "ttc", "otf"].into_iter().filter_map(|extension| {
+                    self.resource_font_files.get(&format!("{key}.{extension}"))
+                });
+                let file = matches.next()?;
+                matches.next().is_none().then_some(file)
+            }).ok_or_else(|| ScriptError::HostCallFailed {
                 message: format!("message font resource font/{name} not found for U+{:04X}; actual_font=none", character as u32),
             })?;
             let face = file.face().map_err(|error| {
@@ -1338,13 +1348,20 @@ impl DesktopMessageDevice {
         &self,
         configuration: &MessageConfiguration,
         character: char,
-        size: u32,
+        height: i32,
     ) -> Result<i32> {
+        let size = message_font_size(height)?;
         if size == 0 {
             return Ok(0);
         }
-        if size > i32::MAX as u32 {
-            return Err(invalid("message font size exceeds i32"));
+        if ansi_record_separator(configuration, character) {
+            // GetTextExtentPoint32A gives 0 for byte 0x1e. In fixed-width
+            // mode the original single-byte branch applies a half-cell minimum.
+            return Ok(if configuration.measure_parameter() == 0 {
+                0
+            } else {
+                height / 2 + i32::from(height % 2 > 0)
+            });
         }
         let bold = configuration.font_weight() == 700;
         let selected = self.font(configuration, character, bold, false, None)?;
@@ -1361,19 +1378,17 @@ impl DesktopMessageDevice {
         let mut buffer = [0; 4];
         let (bytes, _, errors) = encoding_rs::SHIFT_JIS.encode(character.encode_utf8(&mut buffer));
         let fixed = if !errors && bytes.len() == 2 {
-            size
+            height
         } else {
-            size.div_ceil(2)
+            height / 2 + i32::from(height % 2 > 0)
         };
-        Ok(measured.max(fixed as i32))
+        Ok(measured.max(fixed))
     }
 
-    fn measure_inline_image(&self, configuration: &MessageConfiguration, size: u32) -> Result<i32> {
+    fn measure_inline_image(&self, configuration: &MessageConfiguration, height: i32) -> Result<i32> {
+        let size = message_font_size(height)?;
         if size == 0 {
             return Ok(0);
-        }
-        if size > i32::MAX as u32 {
-            return Err(invalid("inline image nominal text size exceeds i32"));
         }
         let bold = configuration.font_weight() == 700;
         // Original ui measures code ten through the ordinary selected font,
@@ -1406,7 +1421,7 @@ impl DesktopMessageDevice {
         Ok(if configuration.measure_parameter() == 0 {
             measured
         } else {
-            measured.max(size.div_ceil(2) as i32)
+            measured.max(height / 2 + i32::from(height % 2 > 0))
         })
     }
 
@@ -1452,19 +1467,21 @@ impl DesktopMessageDevice {
             return GlyphMask::from_alpha_with_metrics(0, 0, Vec::new(), GlyphMetrics::default())
                 .map_err(|_| invalid("empty message glyph construction failed"));
         }
-        let selected = self.font(configuration, character, bold, italic, override_name)?;
+        let record_separator = ansi_record_separator(configuration, character);
+        let font_character = if record_separator { ' ' } else { character };
+        let selected = self.font(configuration, font_character, bold, italic, override_name)?;
         let _raster = TextTimer::new(TextStage::GlyphRaster);
-        selected.font
-            .rasterize_styled(
-                character,
-                size,
-                bold && !selected.bold,
-                italic && !selected.italic,
-            )
-            .map_err(|error| message_glyph_error(
-                &format!("rasterization failed: {error}"),
-                &requested_font_name(configuration, override_name), Some(selected.name), character,
-            ))
+        let bold = bold && !selected.bold;
+        let italic = italic && !selected.italic;
+        let glyph = if record_separator {
+            selected.font.rasterize_missing_glyph(size, bold, italic)
+        } else {
+            selected.font.rasterize_styled(character, size, bold, italic)
+        };
+        glyph.map_err(|error| message_glyph_error(
+            &format!("rasterization failed: {error}"),
+            &requested_font_name(configuration, override_name), Some(selected.name), character,
+        ))
     }
 
     fn paint_entry(
@@ -1520,11 +1537,12 @@ impl DesktopMessageDevice {
         {
             return Ok([0; 4]);
         }
-        let size = if *ruby {
+        let height = if *ruby {
             style.ruby_size
         } else {
             style.text_size
-        };
+        } as i32;
+        let size = message_font_size(height)?;
         let tail = if request.configuration.encoding() == MessageEncoding::Cp932 {
             0xc4
         } else {
@@ -1857,6 +1875,21 @@ fn paint_failure(error: ScriptError) -> MessagePaintFailure {
     }
 }
 
+fn ansi_record_separator(configuration: &MessageConfiguration, character: char) -> bool {
+    // GetGlyphOutlineA renders the default glyph for this single-byte value.
+    configuration.encoding() == MessageEncoding::Cp932
+        && configuration.font_backend() == 0
+        && character == '\u{001e}'
+}
+
+fn message_font_size(height: i32) -> Result<u32> {
+    // GDI uses a negative character height for either sign of the record height.
+    height
+        .checked_abs()
+        .map(|size| size as u32)
+        .ok_or_else(|| invalid("message font size exceeds i32"))
+}
+
 fn layout_atoms(
     device: &DesktopMessageDevice,
     configuration: &MessageConfiguration,
@@ -1897,21 +1930,17 @@ fn layout_atoms(
                 ruby,
                 ..
             } => {
-                let size = if *ruby {
+                let height = if *ruby {
                     style.ruby_size
                 } else {
                     style.text_size
-                };
+                } as i32;
                 let width = if atom.inline_image.is_some() {
-                    device.measure_inline_image(configuration, size)?
+                    device.measure_inline_image(configuration, height)?
                 } else {
-                    device.measure(configuration, *character, size)?
+                    device.measure(configuration, *character, height)?
                 };
-                [
-                    width,
-                    i32::try_from(size)
-                        .map_err(|_| invalid("message layout glyph size exceeds i32"))?,
-                ]
+                [width, height]
             }
             _ => [0; 2],
         });
@@ -2746,6 +2775,84 @@ mod game_font_tests {
     }
 
     #[test]
+    fn relative_font_size_crosses_zero_in_layout_and_paint() {
+        use cs2_runtime::message_object::MessagePlaneDisplay;
+
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let font = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        let mut device = DesktopMessageDevice::default();
+        device.bind_font("Arial", &font, 0).unwrap();
+        let configuration = configuration("Arial", 0);
+        let mut message = MessageObject::new(-1, MessageEncoding::Unicode);
+        let scale = Some(5);
+        message.recreate(configuration.bytes(), scale, &mut device).unwrap();
+        message.append(br"A\n\f-40\w0A\f+8A\f+8A\fnA").unwrap();
+        message.prepare(scale, &mut device).unwrap();
+
+        let sizes: Vec<_> = message.layout().unwrap().entries.iter().filter_map(|entry| {
+            let atom = &message.atoms()[entry.atom?];
+            let MessageAtomKind::Glyph { style, .. } = atom.kind else { return None };
+            assert_eq!(style.text_size as i32, entry.size[1]);
+            Some(entry.size)
+        }).collect();
+        assert_eq!(sizes.iter().map(|size| size[1]).collect::<Vec<_>>(), [24, -16, -8, 0, 24]);
+        for &[width, height] in &sizes {
+            assert_eq!(width, device.measure(&configuration, 'A', height.abs()).unwrap());
+        }
+
+        let display = MessagePlaneDisplay::Visible;
+        message.start(0, display, 100, scale, &mut device).unwrap();
+        message.force_complete(display, scale, &mut device).unwrap();
+        assert_eq!(message.remaining_all().unwrap(), 0);
+    }
+
+    #[test]
+    fn ansi_record_separator_preserves_source_and_paints_missing_glyph() {
+        use cs2_runtime::message_object::MessagePlaneDisplay;
+
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let font = fs::read(windows.join("Fonts/msgothic.ttc")).unwrap();
+        let mut device = DesktopMessageDevice::default();
+        device.bind_font("MS Gothic", &font, 0).unwrap();
+        let encoding = MessageEncoding::Cp932;
+        let defaults = MessageDefaults {
+            font_name: "MS Gothic".encode_utf16().collect(),
+            bold: false,
+            shadow: 0,
+            outline: 0,
+            glyph_parameter: Some(128),
+            gradual: false,
+        };
+        let proportional = defaults.configuration(encoding).unwrap();
+        assert_eq!(device.measure(&proportional, '\u{001e}', 24).unwrap(), 0);
+        let mut fixed_bytes = proportional.bytes().to_vec();
+        fixed_bytes[0x80..0x84].copy_from_slice(&1u32.to_le_bytes());
+        let fixed = MessageConfiguration::from_bytes(&fixed_bytes, encoding).unwrap();
+        assert_eq!(device.measure(&fixed, '\u{001e}', 25).unwrap(), 13);
+        let glyph = device.rasterize_mask(&proportional, '\u{001e}', 24, false, false, None).unwrap();
+        assert!(glyph.alpha().iter().any(|&value| value > 0));
+
+        let mut message = MessageObject::new(-1, encoding);
+        let scale = Some(5);
+        message.recreate(proportional.bytes(), scale, &mut device).unwrap();
+        let source = b"\xc4\xd8\x1e\xa1\xad\xa1\xad\xa1\xa3";
+        let text = "\u{5462}\u{001e}\u{2026}\u{2026}\u{3002}";
+        message.append_decoded(source, text).unwrap();
+        assert_eq!(message.source(), text);
+        message.prepare(scale, &mut device).unwrap();
+        let layout = message.layout().unwrap();
+        assert_eq!(layout.entries[1].size[0], 0);
+        assert_eq!(layout.entries[1].position[0], layout.entries[2].position[0]);
+        let display = MessagePlaneDisplay::Visible;
+        message.start(0, display, 100, scale, &mut device).unwrap();
+        message.force_complete(display, scale, &mut device).unwrap();
+        assert_eq!(message.remaining_all().unwrap(), 0);
+        let unicode = configuration("MS Gothic", 0);
+        assert!(device.measure(&unicode, '\u{001e}', 24).is_err());
+        assert!(device.measure(&proportional, '\u{001d}', 24).is_err());
+    }
+
+    #[test]
     fn message_reveal_submits_new_pixels_only_when_enabled() {
         use cs2_runtime::message_object::MessagePlaneDisplay;
 
@@ -2848,6 +2955,8 @@ mod game_font_tests {
         let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
         let font = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
         fs::write(fixture.0.join("inner/font/face.ttf"), &font).unwrap();
+        fs::write(fixture.0.join("inner/font/ambiguous.ttf"), &font).unwrap();
+        fs::write(fixture.0.join("inner/font/ambiguous.otf"), &font).unwrap();
         fs::write(fixture.0.join("inner/font/broken.ttf"), b"bad font").unwrap();
         fs::write(fixture.0.join("inner/other/outside.ttf"), &font).unwrap();
         fs::write(fixture.0.join("font/face.ttf"), b"outer decoy").unwrap();
@@ -2878,13 +2987,19 @@ mod game_font_tests {
         let by_file = device.mask(&configuration("FACE.TTF", 1), 'A', 24, false, false).unwrap();
         let by_family = device.mask(&configuration("TEST FAMILY", 0), 'A', 24, false, false).unwrap();
         let by_archive = device.mask(&configuration("ARCHIVED.TTF", 1), 'A', 24, false, false).unwrap();
+        let by_archive_stem = device.mask(&configuration("Archived", 1), 'A', 24, false, false).unwrap();
+        let by_loose_stem = device.mask(&configuration("Face", 1), 'A', 24, false, false).unwrap();
         assert!(by_file.alpha().iter().any(|&alpha| alpha != 0));
         assert_eq!(by_file.alpha(), by_family.alpha());
         assert_eq!(by_archive.alpha(), by_family.alpha());
+        assert_eq!(by_archive_stem.alpha(), by_archive.alpha());
+        assert_eq!(by_loose_stem.alpha(), by_file.alpha());
         let error = |name, character| {
             device.mask(&configuration(name, 1), character, 24, false, false).unwrap_err().to_string()
         };
         assert!(error("outside.ttf", 'A').contains("not found"));
+        assert!(error("archived.otf", 'A').contains("not found"));
+        assert!(error("ambiguous", 'A').contains("not found"));
         assert!(error("Test family", 'A').contains("not found"));
         assert!(error("broken.ttf", 'A').contains("could not be decoded"));
         let missing = error("face.ttf", '\u{10ffff}');

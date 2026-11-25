@@ -225,7 +225,7 @@ impl Replay {
 
     pub(super) fn observe_receipts(&mut self, player: &HeadlessPlayer) {
         if let Some((_, click)) = &mut self.save_click {
-            click.observe(player.host_input_route_receipts());
+            click.observe(player);
             return;
         }
         let Some(press) = &mut self.pressed else { return; };
@@ -281,6 +281,9 @@ impl Replay {
         }
         if let Some(anchor) = self.save_entry {
             if let Some((panel, click)) = &self.save_click {
+                if !click.rejected && click.received.is_none() && frame - click.started < idle {
+                    return Ok(Decision::Wait);
+                }
                 let Some(received) = click.received.filter(|_| !click.rejected) else {
                     return Ok(Decision::Stop("input_missed", "Daydream empty-slot click lacked a unique physical receipt".into()));
                 };

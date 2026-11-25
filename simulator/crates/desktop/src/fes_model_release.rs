@@ -33,22 +33,9 @@ fn backend(host: &LoggingHost<'_>, id: u32) -> Result<Option<Backend>> {
     if kind != 42 || host.scene_nodes.get(&id).is_none_or(|node| node.kind != kind) {
         bail!("model release consumer differs from its actual task kind");
     }
-    if utate {
-        if host.css_task_sha() != Some(super::UTATE_SHA) {
-            bail!("binary KXS release requires the identified Utate owner");
-        }
-        Ok(Some(Backend::Utate))
-    } else if mdl {
-        if !host.data_services.particle_external.legacy_kc_view() {
-            bail!("MDL release requires the identified kcTask3DView owner");
-        }
-        Ok(Some(Backend::Mdl))
-    } else {
-        if host.css_task_sha() != Some(super::SHA) {
-            bail!("DAE release requires the identified legacy model owner");
-        }
-        Ok(Some(Backend::Dae))
-    }
+    // Ordinary Release already removes these concrete stores by task ID.
+    // The factory's wrapper profile is unnecessary once ownership is known.
+    Ok(Some(if utate { Backend::Utate } else if mdl { Backend::Mdl } else { Backend::Dae }))
 }
 
 /// Capture only models actually below this bank's already-resolved task ids.
@@ -126,4 +113,55 @@ pub(crate) fn request_model_descendants(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HeadlessPlayer, tests::TempDir};
+
+    #[test]
+    fn model_bank_release_uses_live_kind42_owners_without_an_executable_profile() -> Result<()> {
+        let root = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&root.0, root.0.join("profile"))?;
+        player.with_host(|host| {
+            assert!(host.css_task_sha().is_none());
+            assert!(!host.data_services.particle_external.legacy_kc_view());
+            let bank = host.create_task_object(0, 0, b"bank", &[])?;
+            let mdl = host.create_task_object(42, bank, b"model", &[])?;
+            let dae = host.create_task_object(42, mdl, b"model", &[])?;
+            let kxs = host.create_task_object(42, bank, b"model", &[])?;
+            let sibling = host.create_task_object(42, 0, b"unrelated model", &[])?;
+            host.data_services.particle_external.canvases.entry(mdl).or_default();
+            host.data_services.css_models.register(dae);
+            host.data_services.css_models.register_utate(kxs);
+            host.data_services.css_models.register(sibling);
+
+            let plan = plan_model_descendants(host, &[bank])?;
+            assert_eq!(plan.iter().map(|item| item.path.as_slice()).collect::<Vec<_>>(),
+                [&[bank, mdl, dae][..], &[bank, mdl][..], &[bank, kxs][..]]);
+
+            host.data_services.css_models.register(kxs);
+            assert!(request_model_descendants(host, &plan).unwrap_err().to_string().contains("conflicting"));
+            for id in [mdl, dae, kxs] {
+                assert_eq!(host.data_services.tasks.message_task_state(id).unwrap().1, 0);
+            }
+            host.data_services.css_models.owners.remove(&kxs);
+
+            request_model_descendants(host, &plan)?;
+            for id in [mdl, dae, kxs] {
+                assert_eq!(host.data_services.tasks.message_task_state(id).unwrap().1, 1);
+                assert!(!host.scene_nodes[&id].visible);
+                assert!(backend(host, id)?.is_some());
+            }
+            assert!(host.update_ordinary_children(0, 1, 1, 4096)?);
+            for id in [mdl, dae, kxs] {
+                assert!(!host.scene_nodes.contains_key(&id));
+                assert!(backend(host, id)?.is_none());
+            }
+            assert!(host.scene_nodes.contains_key(&bank));
+            assert!(matches!(backend(host, sibling)?, Some(Backend::Dae)));
+            Ok(())
+        })
+    }
 }

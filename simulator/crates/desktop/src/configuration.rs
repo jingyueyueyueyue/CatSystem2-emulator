@@ -6,44 +6,10 @@ use anyhow::{Context, Result, bail};
 use cs2_formats::ConfigXml;
 use cs2_runtime::configuration::ConfigurationDocument;
 use cs2_script::{NativeReturn, Vm};
-use super::particle_external::CAMPANELLA_SHA;
 use super::{DesktopSoundConfig, DesktopSoundPart, HeadlessPlayer, LoggingHost, LogicEvent, native_state_error, xml_integer};
 
-pub(super) const CAMPANELLA_BOOT_PATH: &[&[u8]] = &[b"document", b"sysstr", b"boot"];
-const CAMPANELLA_ADV_SHA256: &str = "5e55b26f8c9637054486a3fe303e25f863a29ae5deda96554e2dc9517e320b22";
-const CAMPANELLA_CONFIG_LENGTHS: [usize; 4] = [0xb28, 0x20, 0x1c, 0x0c];
-const TUNABAN_CONFIG_LENGTHS: [usize; 4] = [0xb28, 0x20, 0x18, 0x0c];
-
-// Copy lengths from the registered 359/360 wrappers of each original PE.
-fn configuration_lengths(sha: Option<&str>) -> [usize; 4] {
-    match sha {
-        Some(super::css_model::SHA | "985096b6064e35c7f48c080aa9008d67442fc0df7e33fec7210fe13fefc1dc4f") =>
-            TUNABAN_CONFIG_LENGTHS,
-        Some(CAMPANELLA_SHA) => CAMPANELLA_CONFIG_LENGTHS,
-        Some(super::css_model::UTATE_SHA) => [0xb28, 0x34, 0x1c, 0x0c],
-        Some(
-            "f6af7437475b8c066be973245aa79688bea510ca1192264add4f1914ebee4c0e"
-            | "012c71635932c241cde4df986377516279a50b907166757e89ea7b86ff3f813f"
-            | "9f3a5ad0ed22074420685f1e2a3bc92436d68289c7bac854d5f7d7331dc3ef67"
-            | "ac226c8455eff72114d6b1b9929fae01ac49ba90b8ba579f049f179c4c6dd8d5"
-            | "b70a802a74c49a5d6f429114f81d878f83e25a4acbcb2778c6f4d5f68528de7b",
-        ) => [0xb28, 0x38, 0x1c, 0x0c],
-        Some(
-            "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c"
-            | "f36f63798eb27b1eb6742c2fe7c3a13f172a249ee6623a12fc79fd8c3dee3cfe",
-        ) => [0x15fc, 0x38, 0x1c, 0x0c],
-        Some(
-            "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f"
-            | "c47c9d883126f641ce07d92eb57b6ac9833fe7495996001c12c68c55b99974d3"
-            | "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1"
-            | "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78"
-            | "7bd9f6dcc7d62868d4ad9cc68d5580452e71bd907540ec4f993d960d051d2c45"
-            | "a540b1dec1185a63cc68c4d283b6bc99bcce8de219e1bead3b8d113577de4027"
-            | "a099ac1cee7af60c8f32869485c9df4aab344b5eb91c1018ae8bb7df2c1f39f3",
-        ) => [0x15fc, 0x3c, 0x1c, 0x0c],
-        _ => [0x15fc, 0x48, 0x20, 0x0c],
-    }
-}
+pub(super) const ADV_BOOT_PATH: &[&[u8]] = &[b"document", b"sysstr", b"boot"];
+const DEFAULT_CONFIGURATION_LENGTHS: [usize; 4] = [0x15fc, 0x48, 0x20, 0x0c];
 
 fn legacy_sound_block(modern: &[u8]) -> cs2_script::Result<[u8; 0xb28]> {
     let raw_volumes = modern.get(0x15d4..0x15e8)
@@ -123,7 +89,7 @@ fn campanella_native359_preserves_motion_slots_and_copy_order() {
     vm.write(0x8000_1168, &0x15f_u32.to_le_bytes()).unwrap();
     let untouched = vm.read(0x8000_0bc8, 0x16a0 - 0xbc8).unwrap();
 
-    write_system_configuration(&blocks, [0x8000_0098, 0x8000_0b80, 0x8000_0ba0, 0x8000_0bbc], configuration_lengths(Some(CAMPANELLA_SHA)), &mut vm).unwrap();
+    write_system_configuration(&blocks, [0x8000_0098, 0x8000_0b80, 0x8000_0ba0, 0x8000_0bbc], [0xb28, 0x20, 0x1c, 0x0c], &mut vm).unwrap();
 
     assert_eq!(vm.read(0x8000_0097, 2).unwrap(), [0xa5, 0x11]);
     assert_eq!(vm.read(0x8000_0b80, 0x20).unwrap(), [0x22; 0x20]);
@@ -165,7 +131,7 @@ fn tunaban_configuration_preserves_scene_planes_and_modern_only_fields() {
     let addresses = [0x8001_1d88, 0x8001_2870, 0x8001_2890, 0x8001_28a8];
     let planes = 0x8001_2ae8;
     let plane_data = vm.read(planes, 0x20 * 56).unwrap();
-    let lengths = configuration_lengths(Some(super::css_model::SHA));
+    let lengths = [0xb28, 0x20, 0x18, 0x0c];
     write_system_configuration(&blocks, addresses, lengths, &mut vm).unwrap();
     assert_eq!(vm.read(planes, plane_data.len()).unwrap(), plane_data);
     assert_eq!(vm.read(addresses[1], 0x20).unwrap(), [0x22; 0x20]);
@@ -191,35 +157,67 @@ fn tunaban_configuration_preserves_scene_planes_and_modern_only_fields() {
     assert_eq!(&blocks[2][0x18..], &[0x33; 8]);
 }
 
-pub(super) fn campanella_boot_first_path(
-    pe_sha: Option<&str>,
-    name: &str,
-    member_sha256: impl FnOnce() -> String,
-) -> Option<&'static [&'static [u8]]> {
-    (pe_sha == Some(CAMPANELLA_SHA)
-        && name.eq_ignore_ascii_case("config.int/adv.xml")
-        && member_sha256() == CAMPANELLA_ADV_SHA256)
-        .then_some(CAMPANELLA_BOOT_PATH)
+pub(super) fn adv_boot_first_path(name: &str) -> Option<&'static [&'static [u8]]> {
+    // The legacy XML query returns the first matching child. In ADV config
+    // a later boot node can name the movie using the same path.
+    name.eq_ignore_ascii_case("config.int/adv.xml").then_some(ADV_BOOT_PATH)
 }
 
 #[cfg(test)]
 #[test]
-fn campanella_boot_first_path_checks_game_and_member_identity() {
-    let adv = "config.int/adv.xml";
-    let verified = || CAMPANELLA_ADV_SHA256.to_owned();
-    assert_eq!(
-        campanella_boot_first_path(Some(CAMPANELLA_SHA), adv, verified),
-        Some(CAMPANELLA_BOOT_PATH)
+fn adv_boot_uses_first_node_for_revised_members() {
+    let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+        <document><sysstr><boot>210</boot><boot>510</boot></sysstr>
+        <save><count>2</count><count>3</count></save></document>"#;
+    let adv = ConfigXml::parse_runtime_with_first_path(xml, adv_boot_first_path("config.int/ADV.xml")).unwrap();
+    assert_eq!(adv.integer(ADV_BOOT_PATH, 0), 210);
+    assert_eq!(adv.integer(&[b"document", b"save", b"count"], 0), 3);
+    let other = ConfigXml::parse_runtime_with_first_path(xml, adv_boot_first_path("config.int/other.xml")).unwrap();
+    assert_eq!(other.integer(ADV_BOOT_PATH, 0), 510);
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires installed games and an isolated profile directory"]
+fn native_configuration_and_adv_queries_use_original_samples() -> Result<()> {
+    use cs2_script::Host;
+
+    let games = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+    let saves = PathBuf::from(
+        std::env::var_os("CS2_CONFIGURATION_TEST_SAVES").context("isolated save root required")?,
     );
-    assert_eq!(campanella_boot_first_path(None, adv, || panic!("unexpected hash")), None);
-    assert_eq!(
-        campanella_boot_first_path(Some(CAMPANELLA_SHA), "adv.xml", || panic!("unexpected hash")),
-        None
-    );
-    assert_eq!(
-        campanella_boot_first_path(Some(CAMPANELLA_SHA), adv, || "changed".to_owned()),
-        None
-    );
+    for (game, lengths) in [
+        ("\u{795d}\u{798f}\u{306e}\u{30ab}\u{30f3}\u{30d1}\u{30cd}\u{30e9}", [0xb28, 0x20, 0x1c, 0x0c]),
+        ("ISLAND", [0x15fc, 0x3c, 0x1c, 0x0c]),
+    ] {
+        let mut player = HeadlessPlayer::open_with_save_root(games.join(game), saves.join(game))?;
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0xa5; 0x2000])?;
+        player.with_host(|host| {
+            assert_eq!(host.configuration_lengths(), lengths, "{game}");
+            let addresses: [u32; 4] = [0x8000_0100, 0x8000_1700, 0x8000_1800, 0x8000_1900];
+            let export: Vec<_> = addresses.into_iter().flat_map(u32::to_le_bytes).collect();
+            assert_eq!(host.call(359, &export, &mut vm)?, NativeReturn::Continue);
+            for (address, length) in addresses.into_iter().zip(lengths) {
+                assert_eq!(vm.read(address + length as u32, 1)?, [0xa5], "{game} {address:#x}");
+            }
+            vm.write(addresses[1], &vec![0x31; lengths[1]])?;
+            assert_eq!(host.call(360, &export[..12], &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.system_config_blocks[1][..lengths[1]], vec![0x31; lengths[1]]);
+
+            let xml = 0x8000_0010_u32;
+            let path = 0x8000_0040_u32;
+            vm.write(xml, b"config.int/adv.xml\0")?;
+            vm.write(path, b"sysstr/boot\0")?;
+            let NativeReturn::Value(handle @ 1..) = host.call(590, &xml.to_le_bytes(), &mut vm)? else {
+                bail!("cannot load {game} ADV configuration");
+            };
+            let query: Vec<_> = [handle, 0, path].into_iter().flat_map(u32::to_le_bytes).collect();
+            assert_eq!(host.call(592, &query, &mut vm)?, NativeReturn::Value(200), "{game}");
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 // Public serialized field identities and initial values, not renderer feature
@@ -304,6 +302,12 @@ impl ConfigurationState {
 }
 
 impl LoggingHost<'_> {
+    fn configuration_lengths(&self) -> [usize; 4] {
+        self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.configuration_lengths())
+            .unwrap_or(DEFAULT_CONFIGURATION_LENGTHS)
+    }
+
     pub(super) fn configuration_export(
         &mut self, arguments: &[u8], vm: &mut Vm,
     ) -> cs2_script::Result<NativeReturn> {
@@ -312,17 +316,12 @@ impl LoggingHost<'_> {
         for (index, address) in addresses.iter_mut().enumerate() {
             *address = super::read_u32(arguments, index * 4)?;
         }
-        let sha = self.css_task_sha().or(self.data_services.particle_message_pe_sha256);
-        let lengths = configuration_lengths(sha);
+        let lengths = self.configuration_lengths();
         write_system_configuration(self.system_config_blocks, addresses, lengths, vm)?;
-        if lengths != configuration_lengths(None) {
+        if lengths != DEFAULT_CONFIGURATION_LENGTHS {
             self.events.push(LogicEvent {
                 frame: self.frame,
-                kind: match sha {
-                    Some(CAMPANELLA_SHA) => "campanella-config-export",
-                    Some(super::css_model::SHA) => "tunaban-config-export",
-                    _ => "game-config-export",
-                }.into(),
+                kind: "game-config-export".into(),
                 detail: format!("native=359 addresses={addresses:#x?} lengths={lengths:#x?}"),
             });
         }
@@ -338,8 +337,7 @@ impl LoggingHost<'_> {
             super::read_u32(arguments, 4)?,
             super::read_u32(arguments, 8)?,
         ];
-        let sha = self.css_task_sha().or(self.data_services.particle_message_pe_sha256);
-        let lengths = configuration_lengths(sha);
+        let lengths = self.configuration_lengths();
         read_system_configuration(self.system_config_blocks, addresses, lengths, vm)?;
         Ok(NativeReturn::Continue)
     }

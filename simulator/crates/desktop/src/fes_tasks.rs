@@ -22,7 +22,6 @@ pub(crate) mod state;
 
 const MAX_FES_BYTES: usize = 64 * 1024 * 1024;
 const SYNC_BUDGET: usize = 4096;
-const LEGACY_SHARED_SLOTS: usize = 1024;
 const REBELLIONS_MESSAGE_FES_SIZE: usize = 3943;
 const REBELLIONS_MESSAGE_FES_SHA256: &str =
     "4ff3b5efdad654cb1d581f1cde55cd46fdfa4a6918471377e69779d1f5535022";
@@ -49,36 +48,6 @@ pub(super) const NEWTON_MESSAGE_FES: (u64, &str) =
     (3333, "61db832ffb40ef1c91f84c78d204fa6fbc9abda55e6116d0b48f19d9cf8cef37");
 const NEWTON_CINEMA_FES: (u64, &str) =
     (3030, "707cf6541aff274d25f7bfc1647ab9518013dd279fce50a9bc0f7bcc8deddd09");
-
-pub(super) fn startup_shared_slots(scan: &cs2_runtime::GameScan, verified_legacy_slots: bool) -> usize {
-    super::discover_shared_slots(&scan.resources)
-        .or_else(|| verified_legacy_slots.then_some(LEGACY_SHARED_SLOTS))
-        .unwrap_or(512)
-}
-
-pub(super) fn verified_totsuzen_companion(
-    scan: &cs2_runtime::GameScan, entry: Option<&str>,
-) -> Option<&'static str> {
-    const PACKED: &str = "35ec21bcfcee0f324206e945eef1c082e35fd8af594ea0e738a46cd941f5b3f3";
-    const COMPANION: &str = "d158c8915d4982c82badc631b4f92e1f140b246df5929ff2d9924d242c66765c";
-    const PRODUCER: &str = "3294c9b35ec41e6ce157444a637d9529a0cd9876bdfbc126733e8ddc397b76cf";
-
-    let sha256 = super::particle_plugin_digest::sha256;
-    if !scan.engine.engine_binaries.iter().any(|binary| {
-        binary.relative_path == std::path::Path::new("cs2.exe") && binary.sha256 == PACKED
-    }) {
-        return None;
-    }
-    let companion = scan.resources.files().iter().find(|file| {
-        file.relative_path == std::path::Path::new("cs2_cn.exe") && file.size == 3_842_048
-    })?;
-    let companion = std::fs::read(scan.resources.root().join(&companion.relative_path)).ok()?;
-    if sha256(&companion) != COMPANION {
-        return None;
-    }
-    let producer = super::read_entry_with_fallback(&scan.resources, entry?).ok()?;
-    (sha256(&producer) == PRODUCER).then_some(COMPANION)
-}
 
 #[cfg(test)]
 mod shared_variable_tests {
@@ -177,7 +146,7 @@ mod shared_variable_tests {
 
         player.with_host(|host| {
             let caller = host.current_task_id;
-            host.task_values_native(209, &(LEGACY_SHARED_SLOTS as u32).to_le_bytes())?;
+            host.task_values_native(209, &1024u32.to_le_bytes())?;
             let parent = host.create_task_object(0, caller, b"parent", b"")?;
             host.current_task_id = parent;
             host.task_values_native(209, &512u32.to_le_bytes())?;
@@ -829,6 +798,23 @@ impl FesTaskStore {
         })
     }
 
+    pub(super) fn story_drive_diagnostic(&self, id: u32) -> Option<String> {
+        let slot = self.slots.get(&id)?;
+        let task = slot.object.as_ref()?;
+        let driver = task.runtime.as_ref()?.driver.as_ref()?;
+        let system = task.system.as_ref().map(|system| {
+            (system.key, String::from_utf8_lossy(&system.block), system.now)
+        });
+        Some(format!(
+            "sync_caller={:?} sync_operation={:?} queued_input={} invocation_now={:?} media_frame={:?} \
+             boundary={:?} boundary_notice={} pending_effect={:?} system={system:?} \
+             button_refresh={} lower_notification={} media_statement={} media_result={}",
+            slot.sync_caller, slot.sync_operation, slot.inputs.len(), task.invocation_now, task.media_frame,
+            task.boundary, task.boundary_notice, task.pending_effect, task.button_refresh.is_some(),
+            task.lower_notification.is_some(), driver.media_statement_pending(), driver.media_statement_result_ready(),
+        ))
+    }
+
     pub(super) fn external_binding(&self, id: u32) -> Option<SharedExternalStorage> {
         self.slots
             .get(&id)?
@@ -919,9 +905,11 @@ impl LoggingHost<'_> {
             666 => 1,
             _ => return Err(cs2_script::ScriptError::UnimplementedNativeCall { index }),
         };
-        self.data_services.task_native_profile()
-            .and_then(|profile| profile.fes_control[command])
-            .ok_or_else(|| native_state_error("FES control wrapper needs its fixed PE descriptor"))?;
+        self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.fes_control_wrappers()[command])
+            .or_else(|| self.data_services.startup_companion_natives.as_ref()
+                .and_then(|companion| companion.fes_control_wrappers[command]))
+            .ok_or_else(|| native_state_error("unrecognized FES control wrapper"))?;
         if index == 450 {
             let name = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
             return self.select_fes_entry(target, nul(&name))
@@ -2130,15 +2118,11 @@ impl FesTask {
         let system = self.system.as_ref().unwrap();
         let now = system.now;
         let context_free = system.object.is_none() && system.input.is_none();
-        let daydream_mes_push = key == 343 && value == 0 && context_free && block == b"MES_PUSH"
-            && host.css_task_sha() == Some(super::story_trace::DAYDREAM_PE)
-            && self.verified_bounded_message_driver(host, &mut driver, block);
-        if daydream_mes_push {
-            guard_daydream_mes_push(&mut driver.interpreter.program);
-        }
+        let message_push = key == 343 && value == 0 && context_free && block == b"MES_PUSH"
+            && guard_message_push(&mut driver.interpreter.program);
         let returns = if self.hatsumira_message_returns(host, &mut driver, key, value, block, context_free) {
             Some(FesSystemReturns::NestedCalls(block))
-        } else if daydream_mes_push
+        } else if message_push
             || (message_button_notification(key, value, block, context_free)
             && (self.verified_bounded_message_driver(host, &mut driver, block)
                 || self.verified_newton_message_driver(host, &mut driver)))
@@ -2333,7 +2317,8 @@ impl FesTask {
         Ok(())
     }
 
-    fn new_runtime(&self, document: FesDocument) -> Result<FesRuntime> {
+    fn new_runtime(&self, mut document: FesDocument) -> Result<FesRuntime> {
+        recover_position_anchors(&mut document);
         let mut driver = FesScriptDriver::new(&document)
             .map_err(|error| native_state_error_owned(format!("FES program initialization failed: {error:#}")))?;
         driver.set_task_id(self.id);
@@ -2502,34 +2487,7 @@ impl FesTask {
         candidate: &cs2_runtime::ResourceCandidate,
         bytes: &[u8],
     ) -> Result<FesRuntime> {
-        let mut document = parse_document(bytes)?;
-        if candidate.name.eq_ignore_ascii_case("saveload.fes")
-            && bytes.len() == 3583
-            && super::particle_plugin_digest::sha256(bytes)
-                == "4554ea15abb1c4d41525f5a017359d95b502ab88db0909c1d20313ee1bee36a8"
-        {
-            // The original no-data block closes its save/load condition
-            // twice. Keep the else branch attached so Load disables empty slots.
-            for section in document.sections.iter_mut().filter(|section| section.header == b"SETDATA_NODATA") {
-                section.lines.retain(|line| line.offset != 0x270d || line.bytes != b"endif");
-            }
-        }
-        if candidate.name.eq_ignore_ascii_case("title.fes")
-            && bytes.len() == 3041
-            && super::particle_plugin_digest::sha256(bytes)
-                == "d905d8308cbb70adfa06f9de47a7c13fc2bfe6bd0018e76a0f6e08ea2620099b"
-            && is_rebellions_fes_game(host.resources)
-        {
-            // The two-button layout contains an extra '1' after the y anchor.
-            for section in document.sections.iter_mut().filter(|section| section.header == b"SETBTN00") {
-                if let Some(line) = section.lines.iter_mut()
-                    .find(|line| line.offset == 0x1e4a && line.bytes == b"btn_1i[0] pos @+90 @1")
-                {
-                    line.bytes.pop();
-                }
-            }
-        }
-        let mut runtime = self.new_runtime(document)?;
+        let mut runtime = self.new_runtime(parse_document(bytes)?)?;
         let driver = runtime.driver.as_mut().unwrap();
         driver.set_island_gbk_fes_source(is_island_gbk_fes_source(host.resources, candidate));
         driver.set_rebellions_message_fes_source(is_rebellions_message_fes_source(host.resources, bytes));
@@ -2576,11 +2534,7 @@ impl FesTask {
                 if program == driver.interpreter.program {
                     return true;
                 }
-                if host.css_task_sha() == Some(super::story_trace::DAYDREAM_PE) {
-                    guard_daydream_mes_push(&mut program);
-                    return program == driver.interpreter.program;
-                }
-                false
+                guard_message_push(&mut program) && program == driver.interpreter.program
             });
         driver.bounded_message_fes_source = Some(verified);
         verified
@@ -3123,8 +3077,10 @@ impl FesTask {
         let returns = if self.hatsumira_message_returns(host, driver, 343, call.bank, &call.name, context_free) {
             Some(FesSystemReturns::NestedCalls(&call.name))
         } else {
-            (neko_message_notification(343, call.bank, &call.name, context_free)
-                && self.verified_neko_message_driver(host, driver))
+            ((call.bank == 0 && context_free && call.name == b"MES_PUSH"
+                && guard_message_push(&mut driver.interpreter.program))
+                || (neko_message_notification(343, call.bank, &call.name, context_free)
+                    && self.verified_neko_message_driver(host, driver)))
                 .then_some(FesSystemReturns::ButtonBlocks(&call.name))
         };
         for iteration in 0..budget {
@@ -3505,16 +3461,100 @@ fn message_button_notification(key: u32, bank: u32, block: &[u8], context_free: 
     key == 343 && bank == 0 && context_free && matches!(block, b"MES_SHOW" | b"MES_SETSTATE")
 }
 
-fn guard_daydream_mes_push(program: &mut FesProgram) {
-    let Some(line) = program.blocks.iter_mut()
-        .find(|block| block.name == b"MES_PUSH")
-        .and_then(|block| block.lines.first_mut())
-    else { return; };
-    if line.offset == 0x2dcd && line.bytes == br"\(250+\0) = \1" {
-        // SETBUTTON refreshes banks 0 through 13 after this assignment.
-        // An invalid bank can still request the refresh without changing a slot.
-        line.bytes = br"if (\0>=0&&\0<=13) \(250+\0) = \1".to_vec();
+fn position_statement(line: &FesLine) -> Option<(&[u8], &[u8], &[u8])> {
+    let mut words = line.bytes.split(u8::is_ascii_whitespace).filter(|word| !word.is_empty());
+    let target = words.next()?;
+    if words.next()? != b"pos" { return None; }
+    let x = words.next()?;
+    let y = words.next()?;
+    words.next().is_none().then_some((target, x, y))
+}
+
+fn recover_position_anchors(document: &mut FesDocument) {
+    for section in &mut document.sections {
+        let corrections: Vec<_> = section.lines.windows(3).enumerate().filter_map(|(index, group)| {
+            let (first, x, b"@") = position_statement(&group[0])? else { return None; };
+            let (middle, middle_x, b"@1") = position_statement(&group[1])? else { return None; };
+            let (last, last_x, b"@") = position_statement(&group[2])? else { return None; };
+            if middle_x != x || last_x != x || first == middle || middle == last || first == last
+                || !matches!(x, [b'@', b'+' | b'-', digits @ ..]
+                    if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+            {
+                return None;
+            }
+            // Another layout of the same three objects establishes the intended Y.
+            section.lines.windows(3).any(|alternate| {
+                let Some((target, alternate_x, y)) = position_statement(&alternate[0]) else {
+                    return false;
+                };
+                target == first && alternate_x != x && y == b"@"
+                    && position_statement(&alternate[1]) == Some((middle, alternate_x, b"@"))
+                    && position_statement(&alternate[2]) == Some((last, alternate_x, b"@"))
+            }).then_some(index + 1)
+        }).collect();
+        for index in corrections {
+            let bytes = &mut section.lines[index].bytes;
+            if let Some(end) = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace()) {
+                bytes.remove(end);
+            }
+        }
     }
+}
+
+#[test]
+fn position_anchor_recovery_requires_a_matching_alternate_layout() -> anyhow::Result<()> {
+    let mut document = parse_document(
+        b"#LAYOUT\nbutton[0] pos @+180 @\nicon[0] pos @+180 @\nhelp[0] pos @+180 @\n\
+        button[0] pos @+90 @\nicon[0] pos @+90 @1\nhelp[0] pos @+90 @\n\
+        other pos @+90 @1\n",
+    )?;
+    recover_position_anchors(&mut document);
+    let lines = &document.sections[0].lines;
+    assert_eq!(lines[4].bytes, b"icon[0] pos @+90 @");
+    assert_eq!(lines[6].bytes, b"other pos @+90 @1");
+    Ok(())
+}
+
+fn guard_message_push(program: &mut FesProgram) -> bool {
+    let Some(set_button) = program.blocks.iter().find(|block| block.name == b"SETBUTTON") else {
+        return false;
+    };
+    // Mode and help updates can sit between the numbered refresh calls.
+    let mut banks = 0;
+    for (index, line) in set_button.lines.iter().enumerate() {
+        if line.bytes != b"call _SETBUTTON" {
+            continue;
+        }
+        if banks == 262 || index == 0
+            || set_button.lines[index - 1].bytes != format!(r"\0 = {banks}").as_bytes()
+        {
+            return false;
+        }
+        banks += 1;
+    }
+    if banks == 0
+        || !program.blocks.iter().any(|block| {
+            block.name == b"_SETBUTTON" && block.lines.iter().any(|line| matches!(line.bytes.as_slice(),
+                br"if (\(250+\0))" | br"if (((\(250+\0)==0)&&($538<0))||(\0==1))"))
+        })
+    {
+        return false;
+    }
+    let Some(push) = program.blocks.iter_mut().find(|block| block.name == b"MES_PUSH") else {
+        return false;
+    };
+    let [write, call] = push.lines.as_mut_slice() else { return false; };
+    if call.bytes != b"call SETBUTTON" {
+        return false;
+    }
+    // A bank outside the refresh table still calls the helpers.
+    let last_bank = banks - 1;
+    let guarded = format!(r"if (\0>=0&&\0<={last_bank}) \(250+\0) = \1").into_bytes();
+    if write.bytes == br"\(250+\0) = \1" {
+        write.bytes = guarded;
+        return true;
+    }
+    write.bytes == guarded
 }
 
 fn bounded_message_fes_identity(host: &LoggingHost<'_>) -> Option<(u64, &'static str)> {
@@ -3587,26 +3627,102 @@ fn neko_message_notification_rejects_other_shapes() {
 }
 
 #[test]
-fn daydream_mes_push_keeps_refreshing_with_an_invalid_bank() -> anyhow::Result<()> {
+fn message_push_keeps_refreshing_with_an_invalid_bank() -> anyhow::Result<()> {
     use cs2_script::{FesInterpreter, FesStep};
 
-    let mut program = FesProgram::from_text(
-        b"#MES_PUSH\n\\(250+\\0) = \\1\ncall SETBUTTON\n#SETBUTTON\n$0 = 1\n",
-    )?;
-    program.blocks[0].lines[0].offset = 0x2dcd;
-    guard_daydream_mes_push(&mut program);
-
-    for (bank, expected) in [(0, 7), (13, 7), (-1, 0), (999, 0)] {
-        let mut interpreter = FesInterpreter::new(program.clone())?;
-        let mut state = ExpressionState::new(1);
-        assert!(interpreter.enter_block(b"MES_PUSH"));
-        interpreter.local_values_mut()[..2].copy_from_slice(&[bank, 7]);
-        assert_eq!(interpreter.run(&mut state, 24)?, FesStep::Event);
-        assert!(matches!(interpreter.pending(), Some(FesEvent::Frame)));
-        assert_eq!(state.shared[0], 1);
-        assert_eq!(interpreter.local_values()[250..264].iter().sum::<i32>(), expected);
+    for banks in [12, 14] {
+        let mut source = "#MES_PUSH\n\\(250+\\0) = \\1\ncall SETBUTTON\n#SETBUTTON\n".to_string();
+        for bank in 0..banks {
+            source.push_str(&format!("\\0 = {bank}\ncall _SETBUTTON\n"));
+        }
+        source.push_str("#_SETBUTTON\nif (\\(250+\\0)) $1 += 1\n$0 += 1\n");
+        let mut program = FesProgram::from_text(source.as_bytes())?;
+        assert!(!guard_message_push(&mut program));
+        source = source.replace("if (\\(250+\\0)) $1 += 1", "if (\\(250+\\0))\n$1 += 1\nendif");
+        let mut program = FesProgram::from_text(source.as_bytes())?;
+        assert!(guard_message_push(&mut program));
+        assert!(guard_message_push(&mut program));
+        for (bank, expected) in [(0, 7), (banks - 1, 7), (banks, 0), (-1, 0), (999, 0)] {
+            let mut interpreter = FesInterpreter::new(program.clone())?;
+            let mut state = ExpressionState::new(2);
+            assert!(interpreter.enter_block(b"MES_PUSH"));
+            interpreter.local_values_mut()[..2].copy_from_slice(&[bank, 7]);
+            assert_eq!(interpreter.run(&mut state, 256)?, FesStep::Event);
+            assert!(matches!(interpreter.pending(), Some(FesEvent::Frame)));
+            assert_eq!(state.shared, [banks, i32::from(expected != 0)]);
+            assert_eq!(interpreter.local_values()[250..265].iter().sum::<i32>(), expected);
+        }
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires the installed Rebellions FES archive and an isolated profile"]
+fn message_push_reads_rebellions_button_banks() -> anyhow::Result<()> {
+    use cs2_script::{FesInterpreter, FesStep};
+
+    let game = std::env::var_os("CS2_REBELLIONS_TEST_GAME").expect("installed game root required");
+    let profile = std::env::var_os("CS2_SIDECAR9_PROFILE").expect("isolated profile required");
+    let save_root = std::path::Path::new(&profile).join("rebellions-message-push");
+    let mut player = HeadlessPlayer::open_with_save_root(game, save_root)?;
+    player.with_host(|host| {
+        for (name, offset) in [
+            (b"meswnd01.fes".as_slice(), 0x1d10),
+            (b"novelwnd01.fes", 0x1d26),
+            (b"novelwnd01m.fes", 0x1d26),
+        ] {
+            let candidate = host.fes_resource_names(name)?.iter()
+                .find_map(|name| host.resources.find(name)).expect("installed FES resource");
+            let bytes = host.resources.read_candidate(candidate)?;
+            let mut document = parse_document(&bytes)?;
+            document.sections.retain(|section| matches!(section.header.as_slice(),
+                b"MES_PUSH" | b"SETBUTTON" | b"_SETBUTTON"));
+            let mut program = FesProgram::from_document(&document)?;
+            let push = program.blocks.iter().find(|block| block.name == b"MES_PUSH").unwrap();
+            assert_eq!(push.lines[0].offset, offset);
+            assert_eq!(push.lines[0].bytes, br"\(250+\0) = \1");
+
+            let mut original = FesInterpreter::new(program.clone())?;
+            assert!(original.enter_block(b"MES_PUSH"));
+            original.local_values_mut()[..2].copy_from_slice(&[999, 7]);
+            let error = original.run(&mut ExpressionState::default(), 256).unwrap_err();
+            assert!(error.to_string().contains("domain=local access=write index=1249 capacity=512"));
+
+            assert!(guard_message_push(&mut program));
+            assert!(guard_message_push(&mut program));
+
+            for bank in [0, 12, 13, 999] {
+                let mut interpreter = FesInterpreter::new(program.clone())?;
+                assert!(interpreter.enter_block(b"MES_PUSH"));
+                assert_eq!(interpreter.local_values().len(), 512);
+                interpreter.local_values_mut()[..2].copy_from_slice(&[bank, 7]);
+                let mut state = ExpressionState::default();
+                state.shared[538] = -1;
+                let mut refreshed = Vec::new();
+                let mut finished = false;
+                for _ in 0..96 {
+                    assert_eq!(interpreter.run(&mut state, 256)?, FesStep::Event);
+                    match interpreter.pending().unwrap() {
+                        FesEvent::Command(line) if line.bytes == br"btn[\0] setid 1" => {
+                            refreshed.push(interpreter.local_values()[0]);
+                        }
+                        FesEvent::Command(_) => {}
+                        FesEvent::Frame => {
+                            finished = true;
+                            break;
+                        }
+                        event => panic!("unexpected MES_PUSH interpreter event: {event:?}"),
+                    }
+                    interpreter.resume();
+                }
+                assert!(finished);
+                assert_eq!(refreshed, (0..=12).collect::<Vec<_>>());
+                assert_eq!(interpreter.local_values()[250..264],
+                    std::array::from_fn::<_, 14, _>(|index| if index as i32 == bank && bank <= 12 { 7 } else { 0 }));
+            }
+        }
+        Ok(())
+    })
 }
 
 #[test]

@@ -73,7 +73,9 @@ pub(super) fn primitives(bytes: &[u8], container: usize, end: usize) -> anyhow::
     let mut total_vertices = 0usize;
     for at in children(bytes, container, end)? {
         let raw = record(bytes, at, end)?;
-        if raw.len() != 0x54 || word(raw, 0)? != 0 { anyhow::bail!("MDL unsupported mesh primitive record"); }
+        // 99730 reads the material at +4 and geometry at +0x44 onward.
+        // The first DWORD is unused here and varies in the original assets.
+        if raw.len() != 0x54 { anyhow::bail!("MDL unsupported mesh primitive record"); }
         let vertex_count = word(raw, 0x44)? as usize;
         let index_count = word(raw, 0x48)? as usize;
         let fvf = word(raw, 0x4c)?;
@@ -119,4 +121,63 @@ pub(super) fn primitives(bytes: &[u8], container: usize, end: usize) -> anyhow::
             indices: indices.ok_or_else(|| anyhow::anyhow!("MDL primitive lacks index buffer"))? });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh_with_triangle(first_word: u32) -> Vec<u8> {
+        const CONTAINER: usize = 0;
+        const PRIMITIVE: usize = 16;
+        const INDEX_BUFFER: usize = PRIMITIVE + 12 + 0x54;
+        const VERTEX_BUFFER: usize = INDEX_BUFFER + 12 + 4 + 6;
+        const STRIDE: usize = 36;
+        let mut bytes = vec![0; VERTEX_BUFFER + 12 + 4 + 3 * STRIDE];
+        for (offset, value) in [
+            (CONTAINER + 4, PRIMITIVE as u32),
+            (CONTAINER + 8, 4),
+            (CONTAINER + 12, 1),
+            (PRIMITIVE + 4, (INDEX_BUFFER - PRIMITIVE) as u32),
+            (PRIMITIVE + 8, 0x54),
+            (PRIMITIVE + 12, first_word),
+            (PRIMITIVE + 12 + 0x44, 3),
+            (PRIMITIVE + 12 + 0x48, 3),
+            (PRIMITIVE + 12 + 0x4c, 0x152),
+            (PRIMITIVE + 12 + 0x50, STRIDE as u32),
+            (INDEX_BUFFER, (VERTEX_BUFFER - INDEX_BUFFER) as u32),
+            (INDEX_BUFFER + 8, 10),
+            (INDEX_BUFFER + 12, 1),
+            (VERTEX_BUFFER + 8, (4 + 3 * STRIDE) as u32),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[PRIMITIVE + 16..PRIMITIVE + 24].copy_from_slice(b"material");
+        bytes[INDEX_BUFFER + 16..INDEX_BUFFER + 22].copy_from_slice(&[0, 0, 1, 0, 2, 0]);
+        bytes
+    }
+
+    #[test]
+    fn primitive_accepts_nonzero_first_word() {
+        for first_word in [0, 1, 7] {
+            let bytes = mesh_with_triangle(first_word);
+            let meshes = primitives(&bytes, 0, bytes.len()).unwrap();
+            assert_eq!(meshes.len(), 1);
+            let mesh = &meshes[0];
+            assert_eq!(mesh.material, b"material");
+            assert_eq!(mesh.fvf, 0x152);
+            assert_eq!(mesh.vertices.len(), 3);
+            assert_eq!(mesh.indices, [0, 1, 2]);
+        }
+    }
+
+    #[test]
+    fn primitive_rejects_invalid_record_length() {
+        let mut bytes = mesh_with_triangle(1);
+        bytes[24..28].copy_from_slice(&0x50_u32.to_le_bytes());
+        assert_eq!(
+            primitives(&bytes, 0, bytes.len()).unwrap_err().to_string(),
+            "MDL unsupported mesh primitive record"
+        );
+    }
 }

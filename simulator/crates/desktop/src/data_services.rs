@@ -56,7 +56,7 @@ pub(super) struct DataServices {
     pub(super) fast_forward_enabled: bool,
     pub(super) fast_forward: bool,
     pub(super) sound_async: super::sound_async::SoundAsyncStore,
-    pub(super) newton_legacy_gbk: bool,
+    pub(super) loose_scene_encoding: Option<super::cst_context_native::LooseSceneEncoding>,
     pub(super) cst_text_origins: super::cst_context_native::CstTextOrigins,
     pub(super) story_trace: bool,
     pub(super) achievements: super::achievement_native::AchievementState,
@@ -105,7 +105,10 @@ pub(super) struct DataServices {
     pub(super) particle_external: super::particle_external::ParticleExternalStore,
     pub(super) particle_message_pe_sha256: Option<&'static str>,
     pub(super) native_profile: Option<&'static cs2_runtime::native_profile::FeatureProfile>,
-    pub(super) task_native_profile: Option<cs2_runtime::native_task_profile::TaskNativeProfile>,
+    pub(super) ordinary_native_table: Option<cs2_runtime::native_table::OrdinaryNativeTable>,
+    pub(super) ordinary_native_table_from_executable: bool,
+    pub(super) startup_companion_natives: Option<cs2_runtime::native_table::StartupCompanionNatives>,
+    pub(super) active_scene_tool_commands: Option<cs2_runtime::native_table::SceneToolCommands>,
     pub(super) kanmi_native925_verified: Option<bool>,
     pub(super) css_task_pe_sha256: Option<&'static str>,
     pub(super) css_models: super::css_model::CssModelStore,
@@ -122,10 +125,16 @@ pub(super) struct DataServices {
 }
 
 impl DataServices {
-    pub(super) fn task_native_profile(&self) -> Option<cs2_runtime::native_task_profile::TaskNativeProfile> {
-        self.task_native_profile.or_else(|| {
-            cs2_runtime::native_task_profile::exact_task_native_profile(self.native_profile?.pe_sha256)
-        })
+    pub(super) fn has_loose_gbk_text(&self) -> bool {
+        self.loose_scene_encoding.as_ref()
+            .is_some_and(super::cst_context_native::LooseSceneEncoding::corroborated_gbk)
+    }
+
+    pub(super) fn scene_tool_commands(&self) -> cs2_runtime::native_table::SceneToolCommands {
+        self.active_scene_tool_commands
+            .or_else(|| self.ordinary_native_table.as_ref().map(|table| table.scene_tool_commands()))
+            .or_else(|| self.startup_companion_natives.as_ref().map(|table| table.scene_tool_commands))
+            .unwrap_or_default()
     }
 
     pub(crate) fn graph_opaque_data_count(&self) -> usize {

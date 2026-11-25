@@ -149,6 +149,15 @@ pub fn eval_kcs_expression_parameter(source: &[u8], state: &mut ExpressionState)
         // Native 213 returns zero on a bracket mismatch, including fragments
         // such as `[2` and `3]` from an earlier comma-delimited split.
         Err(ScriptError::InvalidExpression { message, .. }) if message == UNMATCHED_BRACKET => Ok(0),
+        // The original scalar evaluator returns zero for an incomplete
+        // leading division or comma, as with CST command fragments.
+        Err(ScriptError::InvalidExpression { offset, message })
+            if message == "expression operand is missing"
+                && matches!(source.get(offset), Some(b'/' | b','))
+                && source[..offset].trim_ascii().is_empty() =>
+        {
+            Ok(0)
+        }
         result => result,
     }
 }
@@ -489,6 +498,11 @@ impl Parser<'_> {
                     ));
                 }
                 node
+            } else if prefix == b'\\'
+                && self.source.get(self.position)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            {
+                self.primary()?
             } else {
                 Node::Number(self.number(false)?)
             };
@@ -812,6 +826,18 @@ mod tests {
     }
 
     #[test]
+    fn fes_local_access_accepts_a_named_index_like_the_original_evaluator() {
+        let mut state = ExpressionState::new(1);
+        state.local[0] = 77;
+        assert_eq!(eval_expression(br"\b_pos", &mut state).unwrap(), 77);
+        assert_eq!(eval_expression_fallback(br"\b_pos = 17", &mut state).unwrap(), 17);
+        assert_eq!(eval_expression(br"2+\b_pos", &mut state).unwrap(), 19);
+        state.named.entry("slot".into()).or_default().insert(0, 4);
+        state.local[4] = 23;
+        assert_eq!(eval_expression(br"\slot*2", &mut state).unwrap(), 46);
+    }
+
+    #[test]
     fn expression_reports_invalid_indices_and_division() {
         let mut state = ExpressionState::new(1);
         assert!(matches!(
@@ -868,6 +894,27 @@ mod tests {
         assert_eq!(state.shared[0], 0);
         assert_eq!(eval_kcs_expression_parameter(b"(2+3)", &mut state).unwrap(), 5);
         assert!(eval_kcs_expression_parameter(b"$1", &mut state).is_err());
+    }
+
+    #[test]
+    fn kcs_expression_parameters_tolerate_division_without_a_left_operand() {
+        let mut state = ExpressionState::new(1);
+        for parameter in [b"/s".as_slice(), b"/1", b" /s"] {
+            assert_eq!(eval_kcs_expression_parameter(parameter, &mut state).unwrap(), 0);
+            assert!(eval_expression_parameter(parameter, &mut state).is_err());
+        }
+        assert_eq!(state.shared[0], 0);
+        assert_eq!(eval_kcs_expression_parameter(b"4/2", &mut state).unwrap(), 2);
+    }
+
+    #[test]
+    fn kcs_expression_parameters_accept_a_leading_comma_fragment() {
+        let mut state = ExpressionState::new(1);
+        for parameter in [b",1".as_slice(), b",", b" ,1+2", b",($0=7)"] {
+            assert_eq!(eval_kcs_expression_parameter(parameter, &mut state).unwrap(), 0);
+            assert!(eval_expression_parameter(parameter, &mut state).is_err());
+        }
+        assert_eq!(state.shared[0], 0);
     }
 
     #[test]

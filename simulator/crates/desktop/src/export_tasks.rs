@@ -307,12 +307,12 @@ impl LoggingHost<'_> {
         if !self.data_services.tasks.exports.tasks.contains_key(&id) {
             return Ok(None);
         }
-        let Some(begin) = export_message_base(self.data_services.task_native_profile()) else {
+        let Some(begin) = self.data_services.scene_tool_commands().export_base else {
             if command.code < 450 {
                 return Ok(None);
             }
             return Err(native_state_error(
-                "export receiver needs its identified PE message table",
+                "export receiver needs a verified registered command layout",
             ));
         };
         if command.code == begin {
@@ -339,7 +339,7 @@ impl LoggingHost<'_> {
         output: &mut u32,
         vm: Option<&mut Vm>,
     ) -> cs2_script::Result<Option<TaskCommandOutcome>> {
-        let Some(begin) = export_message_base(self.data_services.task_native_profile()) else {
+        let Some(begin) = self.data_services.scene_tool_commands().export_base else {
             return Ok(None);
         };
         if !matches!(packet[1], code if code == begin || code == begin + 1) {
@@ -418,13 +418,6 @@ fn sound_mode(
     }
 }
 
-fn export_message_base(
-    profile: Option<cs2_runtime::native_task_profile::TaskNativeProfile>,
-) -> Option<u32> {
-    let messages = profile?.export?;
-    let [begin, query, begin_sound] = messages;
-    (query == begin + 1 && begin_sound == begin).then_some(begin)
-}
 fn export_path(root: &Path, name: &str) -> Result<PathBuf> {
     let name = name.replace('\\', "/");
     let path = Path::new(&name);

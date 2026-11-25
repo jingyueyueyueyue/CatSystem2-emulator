@@ -6,6 +6,11 @@ use cs2_script::ExpressionState;
 
 use crate::{LoggingHost, ScriptTextEncoding, fes_driver::{FesDriverCommand, FesScriptDriver}};
 
+// The ordinary save script can write its CP932 "[choice]" literal in place of
+// dialogue. A localized CST does not change the compiled script literal.
+const KCS_CHOICE_PREVIEW: &[u8] = b"[\x91I\x91\xf0\x8e\x88]";
+const STANDARD_TEXT_RECORD: u32 = 0x200;
+
 #[path = "fes_save_panel_time.rs"]
 mod file_date;
 #[path = "fes_save_panel_bank.rs"]
@@ -123,15 +128,24 @@ impl SavePanelData {
             return Ok(ScriptTextEncoding::Utf8);
         }
         let encoding = host.text_encoding;
-        if record != 0x200 || self.record(record)?.map(crate::trim_nul) != Some(text) {
+        // Script-defined CSS preview records can copy the same raw scene text
+        // as the standard snapshot. Keep their valid host-encoded strings.
+        if record == u32::MAX || (record != STANDARD_TEXT_RECORD && (encoding != ScriptTextEncoding::Cp932
+            || encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(text).is_some()))
+            || self.record(record)?.map(crate::trim_nul) != Some(text)
+        {
             return Ok(encoding);
         }
+        if record == STANDARD_TEXT_RECORD && text == KCS_CHOICE_PREVIEW {
+            return Ok(ScriptTextEncoding::Cp932);
+        }
         // The legacy CST snapshot puts the scene name after its first DWORD
-        // and copies the dialogue into 0x200 in that scene's original codec.
+        // and can copy preview text in that scene's original codec.
         let Some(scene) = self.record(5)?.and_then(|header| header.get(4..))
             .map(crate::trim_nul).filter(|scene| !scene.is_empty()) else { return Ok(encoding) };
-        if crate::fes_text::is_island_gbk_scene(host.resources, scene)?
-            && encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(text).is_some()
+        if encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(text).is_some()
+            && host.cst_resource_with_source(b"scene", scene)?.is_some_and(|(_, source)|
+                host.cst_scene_encoding_override(&source) == Some(ScriptTextEncoding::Gbk))
         {
             return Ok(ScriptTextEncoding::Gbk);
         }
@@ -179,5 +193,49 @@ impl SavePanelData {
                 Ok(PanelDataOutcome::ApplyCellSources)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the installed ISLAND Chinese patch and an isolated copy of com05_selB save0000.dat"]
+    fn island_save_panel_preserves_kcs_choice_and_gbk_dialogue() -> Result<()> {
+        let game = std::env::var_os("CS2_ISLAND_TEST_GAME").context("installed game root required")?;
+        let saves = std::env::var_os("CS2_ISLAND_TEST_SAVES").context("isolated save root required")?;
+        let mut player = crate::HeadlessPlayer::open_with_save_root(game, saves)?;
+        player.with_host(|host| {
+            let mut panel = SavePanelData::default();
+            let mut request = PanelDataRequest::SetSave { slot: 0, record: 0x400, start: 0 };
+            assert_eq!(panel.apply(&mut request, host, &mut ExpressionState::default())?,
+                PanelDataOutcome::ApplyCellSources);
+            let scene = panel.record(5)?.and_then(|header| header.get(4..)).map(crate::trim_nul);
+            assert_eq!(scene, Some(b"com05_selB".as_slice()));
+            let (_, source) = host.cst_resource_with_source(b"scene", b"com05_selB")?
+                .context("localized com05_selB scene required")?;
+            assert_eq!(host.cst_scene_encoding_override(&source), Some(ScriptTextEncoding::Gbk));
+
+            let choice = crate::trim_nul(panel.record(STANDARD_TEXT_RECORD)?.context("missing choice preview")?);
+            let encoding = panel.text_encoding(host, STANDARD_TEXT_RECORD, choice)?;
+            assert_eq!(encoding, ScriptTextEncoding::Cp932);
+            assert_eq!(encoding.decode(choice), "[\u{9078}\u{629e}\u{80a2}]");
+
+            let dialogue = crate::trim_nul(panel.record(0x80000000)?.context("missing snapshot dialogue")?)
+                .to_vec();
+            let encoding = panel.text_encoding(host, 0x80000000, &dialogue)?;
+            assert_eq!(encoding, ScriptTextEncoding::Gbk);
+            assert_eq!(encoding.decode(&dialogue),
+                "\u{5582}\u{ff0c}\u{4e5f}\u{5e26}\u{6211}\u{53bb}\u{561b}\u{ff01}\u{53bb}\u{6d77}\u{8fb9}\u{ff01}");
+
+            let css = panel.data.as_mut().context("missing CSS container")?;
+            assert!(css.remove(STANDARD_TEXT_RECORD));
+            let mut preview = dialogue.clone();
+            preview.push(0);
+            css.append(STANDARD_TEXT_RECORD, &preview)?;
+            assert_eq!(panel.text_encoding(host, STANDARD_TEXT_RECORD, &dialogue)?, ScriptTextEncoding::Gbk);
+            Ok(())
+        })
     }
 }

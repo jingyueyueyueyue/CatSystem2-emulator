@@ -196,6 +196,27 @@ impl FesRuntime {
             driver.fallback_command(command, expression)?;
             return Ok(true);
         }
+        if subcommand == "getid" && driver.adapter.object(name_bytes)
+            .is_some_and(|object| object.definition.kind_name == b"BUTTON")
+        {
+            let [target] = targets.as_slice() else { return Ok(true); };
+            let destination = number(
+                &command.parameters[2..], 0, Some(0), 0, driver, expression,
+            )?;
+            let value = self.driver_current_id(target);
+            if let Some(slot) = expression.shared.get_mut(destination as usize) {
+                *slot = value;
+            }
+            events.push(LogicEvent {
+                frame,
+                kind: "fes-media".into(),
+                detail: format!(
+                    "object={name:?} bank={} command=getid destination={destination} value={value}",
+                    bank.unwrap_or(0),
+                ),
+            });
+            return Ok(true);
+        }
         if subcommand == "draw"
             && targets.iter().all(|target| {
                 matches!(target, Target::Image(key) if self.media[key].kind == "BUTTON")
@@ -223,12 +244,26 @@ impl FesRuntime {
                 | "fade"
                 | "enable"
                 | "coordmode"
+                | "tone"
         ) {
             bail!("unsupported FES media subcommand {subcommand:?} for {name:?}");
         }
         let args = &command.parameters[2..];
 
-        if subcommand == "coordmode" {
+        if subcommand == "tone" {
+            if !targets.iter().all(|target| matches!(target, Target::Image(key) if self.media[key].kind == "IMAGE")) {
+                bail!("unsupported FES media subcommand {subcommand:?} for {name:?}");
+            }
+            let mut tone = [100; 3];
+            for (index, percent) in tone.iter_mut().enumerate() {
+                *percent = number(args, index, Some(100), command.context.current, driver, expression)?;
+            }
+            for target in &targets {
+                if let Target::Image(key) = target {
+                    self.media.get_mut(key).context("FES tone target disappeared")?.source.set_tone(tone);
+                }
+            }
+        } else if subcommand == "coordmode" {
             if !targets.iter().all(|target| matches!(target, Target::Image(key) if self.media[key].kind == "IMAGE")) {
                 bail!("unsupported FES media subcommand {subcommand:?} for {name:?}");
             }

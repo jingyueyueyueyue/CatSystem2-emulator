@@ -15,6 +15,7 @@ from unittest.mock import patch
 import zlib
 
 import run_playthrough_batch as batch
+from batch_progress import BatchProgress
 
 
 class PlaythroughBatchSelfTest(unittest.TestCase):
@@ -273,7 +274,7 @@ class PlaythroughBatchSelfTest(unittest.TestCase):
                 first.set_result({"index": 1, "status": "checkpoint_reached", "seconds": 2})
             return set(active), set()
 
-        with patch.object(batch, "available_ram_bytes", side_effect=[4 * batch.GIB, 2 * batch.GIB, 4 * batch.GIB]), \
+        with patch.object(batch, "available_ram_bytes", side_effect=[4 * batch.GIB, batch.GIB, 2 * batch.GIB]), \
                 patch.object(batch, "ThreadPoolExecutor") as pool, \
                 patch.object(batch.shutil, "disk_usage", return_value=SimpleNamespace(free=8 * batch.GIB)), \
                 patch.object(batch, "wait", side_effect=wait_for_cases) as wait_cases, \
@@ -475,6 +476,34 @@ class PlaythroughBatchSelfTest(unittest.TestCase):
         self.assertEqual(progress.verified_ending, {"id": "BAD_02", "card_frame": 20,
                                                     "clear_verified_frame": 40, "log_line": 4})
 
+    def test_campaign_prioritizes_shared_blockers(self):
+        games = {index: {"root": f"games/{index}"} for index in range(5)}
+        cases = [(index, game, {}) for index, game in games.items()]
+        with BatchProgress(self.output / "progress.json") as ledger:
+            ledger.sync_inventory(games, games)
+            for index, signature in ((1, "single"), (2, "shared"), (4, "shared")):
+                row = ledger.rows[games[index]["root"]]
+                row.update(status="blocked", blocker_signature=signature)
+            ordered = ledger.prioritize_blockers(cases)
+        self.assertEqual([index for index, _, _ in ordered], [2, 4, 1, 0, 3])
+
+    def test_campaign_keeps_resumable_checkpoint_after_engine_error(self):
+        game_id = self.game_entry["root"]
+        checkpoint = {"scene": "saved_scene", "record": 100, "resume_save": str(self.source)}
+        receipt = self.output / "20.json"
+        observed = {"scene": "earlier_scene", "record": 30}
+        ledger_path = self.output / "progress.json"
+        with BatchProgress(ledger_path) as ledger:
+            ledger.sync_inventory({20: self.game_entry}, [20])
+            ledger.rows[game_id]["last_checkpoint"] = checkpoint
+            ledger.start(game_id, receipt)
+            ledger.finish(game_id, {"status": "engine_error", "last_story_position": observed}, receipt)
+        with BatchProgress(ledger_path) as ledger:
+            row = ledger.rows[game_id]
+            self.assertEqual(row["status"], "blocked")
+            self.assertEqual(row["last_checkpoint"], checkpoint)
+            self.assertEqual(row["last_observed_position"]["scene"], "earlier_scene")
+
     def test_campaign_skips_a_verified_game_with_archived_evidence(self):
         cache = self.root / "playthrough"
         run = cache / "2026-11" / "verified_playthrough"
@@ -502,6 +531,32 @@ class PlaythroughBatchSelfTest(unittest.TestCase):
         events.write_bytes(ending_log)
         card.unlink()
         self.assertEqual(batch.find_cleared_cases(same_inventory, [1], cache), {})
+
+    def test_campaign_skips_a_reviewed_frame_run_with_intact_evidence(self):
+        cache = self.root / "playthrough"
+        run = cache / "2026-11" / "reviewed_playthrough"
+        case = run / "01"
+        (case / "01.profile").mkdir(parents=True)
+        for name in ("01.host.log", "01.0020.png", "01.0040.png", "01.profile/savegen.dat",
+                     "01.cold.events.log", "01.cold.host.log"):
+            (case / name).write_text(name, encoding="ascii")
+        (case / "01.events.log").write_bytes(b"frame=40 logic-frame headless tick\nreplay_status=frame_limit\n")
+        batch.write_json(run / "build_identity.json", self.save["consumer"])
+        ending = {"id": "first_ending", "card_frame": 20, "clear_verified_frame": 40, "card": "01.0020.png"}
+        receipt = {"index": 1, "game": str(self.game), "status": "ending_verified", "ending": ending,
+                   "exit_code": 0, "replay_status": "frame_limit", "last_frame": 40}
+        receipt_path = run / "01.json"
+        batch.write_json(receipt_path, receipt)
+        inventory = [{}, self.game_entry]
+        self.assertEqual(batch.find_cleared_cases(inventory, [1], cache), {})
+
+        ending["postrun_evidence"] = batch.postrun_ending_evidence(case, 1, ending)
+        receipt_path.unlink()
+        batch.write_json(receipt_path, receipt)
+        self.assertEqual(batch.find_cleared_cases(inventory, [1], cache)[1]["status"], "skipped_cleared")
+
+        (case / "01.profile/savegen.dat").write_bytes(b"changed")
+        self.assertEqual(batch.find_cleared_cases(inventory, [1], cache), {})
 
 
 if __name__ == "__main__":

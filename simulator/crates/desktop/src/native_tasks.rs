@@ -58,8 +58,8 @@ mod state_tree_native;
 #[derive(Default)]
 pub(super) struct NativeTaskStore {
     audio_deletion_waiters: BTreeMap<u32, BTreeSet<u32>>,
+    pub(super) new_visible_list_sources: BTreeSet<u32>,
     graph: object_graph::GraphRequests,
-    hg_window_abi: Option<hg_window_native::HgWindowAbi>,
     original_state_tree_abi: Option<state_tree_native::OriginalStateTreeAbi>,
     model_state_trees: BTreeMap<u32, (u32, cs2_formats::StateTree)>,
     pub(super) fes: super::fes_tasks::FesTaskStore,
@@ -393,6 +393,32 @@ impl NativeTaskStore {
     }
 }
 
+impl super::HeadlessPlayer {
+    /// State of synchronous initializers and the ordinary child currently
+    /// suspended by the frame's instruction budget.
+    pub fn host_pending_ordinary_execution(&self) -> impl Iterator<Item = (u32, usize, u64)> {
+        use std::hash::{DefaultHasher, Hasher};
+
+        let tasks = &self.data_services.tasks;
+        let active_body = tasks.traversal.as_ref().and_then(|traversal| {
+            let &(id, phase) = traversal.stack.last()?;
+            if !matches!(phase, Phase::Body) { return None; }
+            let task = tasks.records.get(&id)?.ordinary.as_ref()?;
+            task.has_pending_update().then_some(id)
+        });
+        tasks.records.iter().filter_map(move |(&id, record)| {
+            let initializing = record.loading.as_ref().is_some_and(|loading| !loading.initialized);
+            if !initializing && active_body != Some(id) { return None; }
+            let vm = self.task_vms.get(&id)?;
+            let stack = vm.stack_bytes();
+            let mut state = DefaultHasher::new();
+            state.write_usize(stack.len());
+            state.write(&stack[stack.len().saturating_sub(256)..]);
+            Some((id, vm.instruction_pointer, state.finish()))
+        })
+    }
+}
+
 pub(super) struct Record {
     pub(super) kind: u32,
     clock: TaskClock,
@@ -674,11 +700,13 @@ impl LoggingHost<'_> {
         if !self.task_is_reachable(parent) {
             return Err(native_state_error("native 66 parent task is unavailable"));
         }
-        if let Some(value) = self.data_services.native_profile.map(|profile| profile.pe_sha256)
-            .or(self.data_services.css_task_pe_sha256)
-            .and_then(|sha| cs2_runtime::native_factory::exact_factory_result(sha, kind))
+        if self.data_services.ordinary_native_table.as_ref()
+            .map(|table| table.null_task_factory())
+            .or_else(|| self.data_services.startup_companion_natives.as_ref()
+                .map(|companion| companion.null_task_factory))
+            .is_some_and(|factory| factory.returns_null(kind))
         {
-            return Ok(NativeReturn::Value(value));
+            return Ok(NativeReturn::Value(0));
         }
         let context = self
             .data_services
@@ -780,7 +808,7 @@ impl LoggingHost<'_> {
                 .and_then(|parent| parent.shared_area);
         }
         if kind == 13 {
-            self.register_sound_task(id, context)?;
+            self.register_sound_task(id)?;
         }
         if kind == 54 {
             self.emote_register_task_hook(id, kind)?;
@@ -2177,6 +2205,48 @@ impl LoggingHost<'_> {
             detail: format!("task={id}: {error}"),
         });
         native_state_error("ordinary task operation failed; see task-error event")
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+    use crate::tests::TempDir;
+    use cs2_script::{Host, KcsProgram};
+    use std::path::Path;
+
+    #[test]
+    #[ignore = "requires the installed V401 engine"]
+    fn native_factory_dispatches_only_registered_null_leaves() -> anyhow::Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/cs2_full_v401/system");
+        let profile = TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&root, &profile.0)?;
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?)?;
+        vm.write(4, b"Factory probe\0")?;
+        let args = |kind: u32| [kind, 0, 4].map(u32::to_le_bytes).concat();
+
+        player.with_host(|host| {
+            host.data_services.native_profile = None;
+            host.data_services.css_task_pe_sha256 = None;
+            let before = host.data_services.tasks.records.len();
+            for kind in [14, 43] {
+                assert_eq!(host.call(66, &args(kind), &mut vm)?, NativeReturn::Value(0));
+            }
+            assert_eq!(host.data_services.tasks.records.len(), before);
+
+            let NativeReturn::Value(child) = host.call(66, &args(0), &mut vm)? else {
+                panic!("base task was not constructed");
+            };
+            assert_ne!(child, 0);
+            assert_eq!(host.data_services.tasks.records[&child].kind, 0);
+            assert_eq!(host.task_parents.get(&child), Some(&0));
+
+            host.data_services.ordinary_native_table = None;
+            let returned = host.call(66, &args(43), &mut vm)?;
+            assert_ne!(returned, NativeReturn::Value(0));
+            Ok(())
+        })?;
+        Ok(())
     }
 }
 

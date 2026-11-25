@@ -12,9 +12,6 @@ use cs2_runtime::RuntimeError;
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{HeadlessPlayer, LoggingHost, LogicEvent, expand_kcs_format, native_state_error, read_u32};
 
-#[path = "achievement_profile.rs"]
-mod profile;
-
 const MAGIC: &[u8; 8] = b"CS2ACH01";
 const FILE: &str = "simulator-achievements.dat";
 const MAX_FILE: usize = 8 * 1024 * 1024;
@@ -93,8 +90,11 @@ impl HeadlessPlayer {
     }
 
     pub(super) fn initialize_local_achievements(&mut self) -> anyhow::Result<()> {
-        let sha = self.scan.engine.primary_executable.as_ref().map_or("", |binary| binary.sha256.as_str());
-        if !profile::recognized(sha) { return Ok(()); }
+        if !self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_achievement_family())
+        {
+            return Ok(());
+        }
         let document = read_declarations(&self.scan.resources)?;
         self.data_services.achievements.initialize(document, &self.save_root)?;
         self.log.push(format!("local achievement profile: {} entries; Steam account synchronization unavailable",
@@ -105,9 +105,10 @@ impl HeadlessPlayer {
 
 impl LoggingHost<'_> {
     pub(super) fn achievement_native(&mut self, index: u32, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
-        let sha = self.data_services.native_profile.map_or("", |profile| profile.pe_sha256);
-        if !profile::recognized(sha) {
-            return Err(native_state_error("achievement native requires its identified PE receiver family"));
+        if !self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_achievement_family())
+        {
+            return Err(native_state_error("achievement native requires a registered Steam receiver family"));
         }
         let expected = if matches!(index, 1042 | 1043) { 4 } else { 0 };
         if args.len() != expected {
@@ -237,4 +238,59 @@ fn replace(source: &Path, destination: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::TempDir;
+    use cs2_script::{Host, KcsProgram};
+
+    #[test]
+    #[ignore = "requires the installed NEKOPARA Vol.3 game"]
+    fn achievement_family_dispatches_local_save_through_opened_game() -> anyhow::Result<()> {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join(concat!(
+            "../../../games/[170526][NEKO WORKs] \u{30cd}\u{30b3}\u{3071}\u{3089} vol.3 ",
+            "steam\u{7248} (files)/nekopara_vol3",
+        ));
+        let profile = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&game, &profile.0)?;
+        let id = b"ACHIEVEMENT_2_15";
+        assert!(player.local_achievements().any(|entry| entry.id == id && !entry.unlocked));
+        player.data_services.native_profile = None;
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?)?;
+        vm.write(4, b"ACHIEVEMENT_2_15\0")?;
+        let args = 4u32.to_le_bytes();
+        player.with_host(|host| {
+            assert_eq!(host.call(1041, &[], &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(1043, &args, &mut vm)?, NativeReturn::Value(0));
+            assert_eq!(host.call(1042, &args, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(1043, &args, &mut vm)?, NativeReturn::Value(1));
+            Ok(())
+        })?;
+        assert_eq!(load(&profile.0)?, BTreeSet::from([id.to_vec()]));
+        drop(player);
+
+        let mut reopened = HeadlessPlayer::open_with_save_root(&game, &profile.0)?;
+        assert!(reopened.local_achievements().any(|entry| entry.id == id && entry.unlocked));
+        reopened.with_host(|host| {
+            assert_eq!(host.call(1043, &args, &mut vm)?, NativeReturn::Value(1));
+            let identity = host.call(549, &[], &mut vm)?;
+            assert!(matches!(identity, NativeReturn::Value(value) if value != 0));
+            assert_ne!(host.call(549, &[], &mut Vm::new())?, identity);
+            assert_eq!(host.call(1044, &[], &mut vm)?, identity);
+            assert_eq!(host.call(1043, &args, &mut vm)?, NativeReturn::Value(0));
+            Ok(())
+        })?;
+        assert!(load(&profile.0)?.is_empty());
+
+        reopened.data_services.ordinary_native_table = None;
+        reopened.with_host(|host| {
+            let error = host.call(1042, &args, &mut vm).unwrap_err();
+            assert!(error.to_string().contains("registered Steam receiver family"));
+            let error = host.call(549, &[], &mut vm).unwrap_err();
+            assert!(error.to_string().contains("registered VM return-slot alias"));
+            Ok(())
+        })
+    }
 }

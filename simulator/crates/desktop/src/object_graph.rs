@@ -3,6 +3,7 @@
 //! the portable receiver; no task is fabricated and no original null factory
 //! profile changes. Preparation constructs an independent replacement graph.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use anyhow::Context;
 use cs2_runtime::graph_serde::{Deserialize, Serialize};
 use cs2_renderer::{Canvas, RgbaFrame};
 use cs2_runtime::object_graph::{self as wire, ExternalBindingSnapshot as Binding,
@@ -203,7 +204,8 @@ impl HeadlessPlayer {
         };
         let saved = ObjectGraphSnapshot {
             version: 4, pe_sha256: self.graph_pe_sha().to_owned(), root: self.current_task_id,
-            next_task_id: self.next_task_id, host_continuation: self.encode_fes_graph_host(wire::encode_component(&host)?)?,
+            next_task_id: self.next_task_id, host_continuation: self.encode_fes_graph_host(wire::encode_component(&host)?)
+                .context("encode host graph continuation")?,
             external_size: self.external_size, configured_shared_slots: self.configured_shared_slots,
             records, reserved: tasks.reserved.clone(), external_tasks: tasks.external_tasks.clone(),
             // History proxies are drawable object identities, not task-tree
@@ -244,11 +246,13 @@ impl HeadlessPlayer {
         };
         // Capture validates the same full replacement which restore accepts,
         // including pointer-domain collisions and saved scheduler cursors.
-        let _validated = self.prepare_object_graph(saved.clone())?;
+        self.prepare_object_graph(saved.clone()).context("validate captured host graph")?;
         Ok(saved)
     }
 
-    fn graph_pe_sha(&self) -> &str { self.data_services.native_profile.map_or("", |profile| profile.pe_sha256) }
+    fn graph_pe_sha(&self) -> &str {
+        self.scan.engine.primary_executable.as_ref().map_or("", |binary| binary.sha256.as_str())
+    }
 
     /// Real final CSS consumer: encode fully before touching the container.
     pub fn save_object_graph_to_container(&mut self, handle: u32, record: u32) -> anyhow::Result<()> {
@@ -287,8 +291,10 @@ impl HeadlessPlayer {
         if saved.external_size > 64 * 1024 * 1024 || saved.configured_shared_slots > 1_000_000
             || saved.system_config.iter().map(Vec::len).collect::<Vec<_>>() != [5628, 72, 32, 12]
         { anyhow::bail!("host graph has invalid external/configuration sizes"); }
-        let (host_bytes, fes_bytes) = Self::decode_fes_graph_host(&saved.host_continuation)?;
-        let host: HostContinuation = wire::decode_component(&host_bytes)?;
+        let (host_bytes, fes_bytes) = Self::decode_fes_graph_host(&saved.host_continuation)
+            .context("decode host graph envelope")?;
+        let host: HostContinuation = wire::decode_component(&host_bytes)
+            .context("decode host graph continuation")?;
         validate_host(&host, &saved)?;
         if saved.state.movie.current.is_some() {
             anyhow::bail!("saved graph contains an unsupported active movie object");
@@ -313,7 +319,6 @@ impl HeadlessPlayer {
         let queue_lengths = saved.records.iter().map(|(&id, r)| (id, r.queued.len())).collect();
         let scene = NativeTaskStore::prepare_scene_message_memory_restore(&saved.scene_memory, &programs, &owners, &queue_lengths)?;
         let mut tasks = NativeTaskStore::default();
-        tasks.hg_window_abi = self.data_services.tasks.hg_window_abi;
         tasks.original_state_tree_abi = self.data_services.tasks.original_state_tree_abi;
         tasks.preserve_graph_buffer_adapters(&self.data_services.tasks);
         for (&id, r) in &saved.records {
@@ -391,7 +396,8 @@ impl HeadlessPlayer {
         // Physical SOUND preparation holds its PCM registry transaction.
         // Prepare it last, validate the paired consumers, then commit/drop
         // synchronously without calling another audio/capture service.
-        let fes_tasks = self.prepare_fes_task_state(&fes_bytes, &saved, &tasks, &images)?;
+        let fes_tasks = self.prepare_fes_task_state(&fes_bytes, &saved, &tasks, &images)
+            .context("prepare host graph FES tasks")?;
         fes_tasks.validate_projection_links(image_lists.checkpoint_lists(), &tasks.checkpoint_task_kinds())?;
         fes_tasks.validate_image_source_links(&image_lists)?;
         Ok(PreparedGraph { saved, host, tasks, root_vm, attached_vms: programs, values, nodes,
@@ -450,7 +456,8 @@ impl HeadlessPlayer {
         let Some(request) = self.data_services.tasks.graph.pending.clone() else { return Ok(()); };
         match request.index {
             688 => {
-                let bytes = self.capture_object_graph_inner(Some(request.clone()))?.encode()?;
+                let bytes = self.capture_object_graph_inner(Some(request.clone()))?.encode()
+                    .context("encode portable host graph")?;
                 self.append_graph_record(request.container, request.record, &bytes)?;
                 self.data_services.tasks.graph.pending = None;
                 self.data_services.tasks.graph.receipt = Some(request);
@@ -470,11 +477,10 @@ impl LoggingHost<'_> {
             .is_some_and(|target| self.data_services.tasks.graph.receivers.contains(&target));
         if !portable { return self.original_state_tree_native(index, args); }
         if args.len() != 12 { return Err(native_state_error("688/689 require CSS, record, task DWORDs")); }
-        // Verified Yukikoi wrappers: CSS=[args], record=[args+4], target=[args+8].
-        // Other originals need their own complete wrapper descriptor.
-        if self.data_services.native_profile.map(|p| p.pe_sha256) != Some(
-            "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976") {
-            return Err(native_state_error("688/689 wrapper needs an exact PE descriptor"));
+        // The registered wrappers prove the same three argument positions.
+        // The explicitly installed adapter owns the portable graph format.
+        if self.registered_state_tree_commands().is_none() {
+            return Err(native_state_error("portable 688/689 need a registered state-tree wrapper"));
         }
         let container = read_u32(args, 0)?;
         if container == 0 { return Ok(NativeReturn::Value(0)); }
@@ -538,6 +544,75 @@ fn restore_phase(phase: u32) -> PlayerFramePhase {
         2 => PlayerFramePhase::Children, 3 => PlayerFramePhase::Root, 4 => PlayerFramePhase::Fes,
         5 => PlayerFramePhase::Particles, 6 => PlayerFramePhase::Messages,
         7 => PlayerFramePhase::Configuration, _ => PlayerFramePhase::Render }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::TempDir;
+    use cs2_formats::CssFile;
+    use cs2_script::KcsProgram;
+    use std::path::Path;
+
+    #[test]
+    #[ignore = "requires the installed V401 engine"]
+    fn native_state_tree_portable_adapter_uses_registered_wrapper() -> anyhow::Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let scratch = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(workspace.join("games/cs2_full_v401"), &scratch.0)?;
+        player.data_services.native_profile = None;
+        player.data_services.css_task_pe_sha256 = None;
+        player.vm = Some(Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 8], 0)?)?);
+        player.with_host(|host| Ok(host.ensure_task_record(0)?))?;
+        player.install_portable_object_graph_receiver(0)?;
+        let arguments = [1, 42, 0].map(u32::to_le_bytes).concat();
+        player.with_host(|host| {
+            host.css_handles.insert(1, CssFile::new(1000));
+            let error = host.portable_object_graph_native(688, &arguments).unwrap_err();
+            assert!(error.to_string().contains("external root body"));
+            host.data_services.tasks.executing_external = Some(0);
+            let result = host.portable_object_graph_native(688, &arguments);
+            host.data_services.tasks.executing_external = None;
+            assert_eq!(result?, NativeReturn::Retry);
+            Ok(())
+        })?;
+        player.service_object_graph_request().context("servicing registered portable capture")?;
+        let saved = ObjectGraphSnapshot::decode(player.css_handles[&1].try_record(42)?.unwrap())
+            .context("decoding the newly captured portable graph")?;
+        assert_eq!(saved.pe_sha256, player.scan.engine.primary_executable.as_ref().unwrap().sha256);
+
+        player.with_host(|host| {
+            host.data_services.tasks.executing_external = Some(0);
+            let result = host.portable_object_graph_native(688, &arguments);
+            host.data_services.tasks.executing_external = None;
+            assert_eq!(result?, NativeReturn::Value(1));
+            Ok(())
+        })?;
+        let mut foreign = saved;
+        foreign.pe_sha256 = "0".repeat(64);
+        let error = player.restore_object_graph_bytes(&foreign.encode()?).unwrap_err();
+        assert!(error.to_string().contains("another or an unidentified PE profile"));
+
+        player.current_parameter = 112;
+        player.with_host(|host| {
+            host.data_services.tasks.executing_external = Some(0);
+            let result = host.portable_object_graph_native(689, &arguments);
+            host.data_services.tasks.executing_external = None;
+            assert_eq!(result?, NativeReturn::Retry);
+            Ok(())
+        })?;
+        player.service_object_graph_request().context("servicing registered portable restore")?;
+        assert_ne!(player.current_parameter, 112);
+        assert!(!player.data_services.tasks.object_graph_request_pending());
+
+        player.data_services.ordinary_native_table = None;
+        player.with_host(|host| {
+            let error = host.portable_object_graph_native(689, &arguments).unwrap_err();
+            assert!(error.to_string().contains("need a registered state-tree wrapper"));
+            assert!(!host.data_services.tasks.object_graph_request_pending());
+            Ok(())
+        })
+    }
 }
 fn capture_node(n: &SceneNode) -> SceneNodeSnapshot {
     SceneNodeSnapshot { id: n.id, kind: n.kind, parent: n.parent, name: n.name.clone(),

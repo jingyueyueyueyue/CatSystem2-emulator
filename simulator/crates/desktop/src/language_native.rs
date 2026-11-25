@@ -12,8 +12,6 @@ use cs2_runtime::language::{
 };
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 
-const NEKO_STEAM_PE: &str = "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc";
-
 #[derive(Debug, Clone, Default)]
 pub(super) struct LanguageNativeServices {
     pub(super) languages: LanguageState,
@@ -66,8 +64,8 @@ impl LanguageNativeServices {
         matches!(index, 533 | 1036 | 1053 | 1062)
     }
 
-    pub(super) fn configure_prefix_query(&mut self, pe_sha256: Option<&str>) {
-        self.query_story_prefixes = pe_sha256 == Some(NEKO_STEAM_PE);
+    pub(super) fn configure_prefix_query(&mut self, story_prefixes: bool) {
+        self.query_story_prefixes = story_prefixes;
     }
 
     /// task_id is the sender's raw DWORD, including any signed-id bit pattern.
@@ -310,7 +308,7 @@ mod tests {
     use cs2_script::KcsProgram;
 
     #[test]
-    fn query_1036_uses_neko_main_and_subtitle_without_changing_legacy_abi() -> Result<()> {
+    fn query_1036_uses_the_configured_two_prefix_outputs() -> Result<()> {
         let program = KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?;
         let mut vm = Vm::from_program(program)?;
         let mut service = LanguageNativeServices::new(LanguageState {
@@ -324,7 +322,7 @@ mod tests {
         arguments[..4].copy_from_slice(&4_u32.to_le_bytes());
         arguments[4..].copy_from_slice(&16_u32.to_le_bytes());
 
-        service.configure_prefix_query(Some(NEKO_STEAM_PE));
+        service.configure_prefix_query(true);
         service.call(1036, &arguments, &mut vm, 0)?;
         assert_eq!(vm.read(4, 3)?, b"cn\0");
         assert_eq!(vm.read(16, 3)?, b"jp\0");
@@ -335,7 +333,7 @@ mod tests {
         assert_eq!(vm.read(4, 3)?, b"jp\0");
         assert_eq!(vm.read(16, 3)?, b"en\0");
 
-        service.configure_prefix_query(Some("unrecognized"));
+        service.configure_prefix_query(false);
         service.call(1036, &arguments, &mut vm, 0)?;
         assert_eq!(vm.read(4, 3)?, b"en\0");
         assert_eq!(vm.read(16, 3)?, b"jp\0");

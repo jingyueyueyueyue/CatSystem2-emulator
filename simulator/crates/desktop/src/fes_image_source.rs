@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use cs2_renderer::RgbaFrame;
 use cs2_script::ExpressionState;
+use std::cell::RefCell;
 
 use super::{FesDriverCommand, FesScriptDriver, decode, split_target};
 use crate::{FesMediaLayer, FesRuntime, LoggingHost, ScriptTextEncoding};
@@ -13,6 +14,12 @@ use crate::perf_detail::{ImageSourceStage, ImageSourceStep, ImageSourceTrace, Sl
 struct NameExpansion {
     prefixes: [Option<Vec<u8>>; 2],
     encoding: ScriptTextEncoding,
+}
+
+#[derive(Clone, Debug)]
+struct TonedFrame {
+    source: RgbaFrame,
+    frame: RgbaFrame,
 }
 
 #[derive(Clone, Debug, Default, cs2_runtime::graph_serde::Serialize)]
@@ -35,6 +42,9 @@ pub(crate) struct ImageSourceState {
     difimage_resource: Option<u32>,
     pub(crate) coordmode: i32,
     pub(crate) btype: i32,
+    pub(super) tone: Option<[i32; 3]>,
+    #[serde(skip)]
+    toned_frame: RefCell<Option<TonedFrame>>,
 }
 
 impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ImageSourceState {
@@ -48,7 +58,7 @@ impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ImageSourceState {
             type Value = ImageSourceState;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an IMAGE source record with optional coordmode and BTYPE")
+                formatter.write_str("an IMAGE source record with optional coordmode, BTYPE, and tone")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
@@ -66,6 +76,8 @@ impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ImageSourceState {
                     difimage_resource: None,
                     coordmode: seq.next_element()?.unwrap_or_default(),
                     btype: seq.next_element()?.unwrap_or_default(),
+                    tone: seq.next_element()?.unwrap_or_default(),
+                    toned_frame: RefCell::default(),
                 })
             }
         }
@@ -102,6 +114,14 @@ impl ImageSourceState {
     /// The legacy media updater must leave raw frame selection to the
     /// retained directory instead of reopening FILE on every ANM frame.
     pub(crate) fn has_raw_source(&self) -> bool { self.raw_bytes.is_some() }
+
+    pub(super) fn set_tone(&mut self, tone: [i32; 3]) {
+        let tone = (tone != [100; 3]).then_some(tone);
+        if self.tone != tone {
+            self.tone = tone;
+            *self.toned_frame.get_mut() = None;
+        }
+    }
 }
 
 pub(crate) fn apply_difimage_reference(
@@ -527,6 +547,20 @@ fn rebuild_raw_source(
 /// frame directory; failed IDs preserve its current unsigned-minimum selection.
 pub(crate) fn source_image(host: &LoggingHost<'_>, layer: &FesMediaLayer)
     -> Result<Option<cs2_renderer::RgbaFrame>> {
+    let image = original_source_image(host, layer)?;
+    let (Some(tone), Some(image)) = (layer.source.tone, image.as_ref()) else {
+        return Ok(image);
+    };
+    let mut cache = layer.source.toned_frame.borrow_mut();
+    if let Some(cached) = cache.as_ref().filter(|cached| cached.source.pixel_identity().matches(image)) {
+        return Ok(Some(cached.frame.clone().with_raw_metadata(image.metadata())));
+    }
+    let frame = crate::fes_task_platform::apply_tone(image.clone(), tone)?;
+    *cache = Some(TonedFrame { source: image.clone(), frame: frame.clone() });
+    Ok(Some(frame))
+}
+
+fn original_source_image(host: &LoggingHost<'_>, layer: &FesMediaLayer) -> Result<Option<RgbaFrame>> {
     if let Some(handle) = layer.source.difimage_resource {
         return host.image_resources.get(&handle).map(|resource| Some(resource.image.clone()))
             .with_context(|| format!("DIFIMAGE lost its retained image resource {handle}"));

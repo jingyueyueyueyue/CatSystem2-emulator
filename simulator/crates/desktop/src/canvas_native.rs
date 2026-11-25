@@ -8,7 +8,6 @@ use cs2_script::{NativeReturn, Vm};
 use std::collections::BTreeMap;
 
 const MAX_BYTES: u64 = 128 * 1024 * 1024;
-const HATSUMIRA: &str = "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78";
 
 #[path = "canvas_snapshot.rs"]
 mod graph;
@@ -291,6 +290,7 @@ pub(super) struct CanvasNativeState {
     split_row: u32,
     tiles: Vec<Option<Tile>>,
     view: Option<(MoviePlaneProjection, BTreeMap<u32, PlaneCamera>)>,
+    // Retained for checkpoints written before native 568 used the auxiliary pool.
     offscreen: Option<Canvas>,
 }
 
@@ -734,25 +734,32 @@ impl LoggingHost<'_> {
                         )?;
                     }
                 }
-                859 => {
-                    let index = auxiliary.unwrap();
-                    let Some(target) = self.data_services.tasks.render.auxiliary_target(index)
+                568 | 859 => {
+                    let slot = if index == 568 {
+                        // 568 allocates one target and captures into slot zero
+                        // through the same depth-range draw as explicit 859.
+                        let size = self.back_buffer.as_ref().map_or(surface_size, |buffer| {
+                            [buffer.width(), buffer.height()]
+                        });
+                        let policy = self.frame_effect_capture_policy()?;
+                        if !self.data_services.tasks.render.prepare_effect_auxiliary(1, size, policy)? {
+                            return Ok(());
+                        }
+                        0
+                    } else {
+                        auxiliary.unwrap()
+                    };
+                    let Some(target) = self.data_services.tasks.render.auxiliary_target(slot)
                     else {
                         return Ok(());
                     };
                     let mut output = Canvas::new(target.width(), target.height())?;
-                    output.clear(Color::TRANSPARENT);
                     let [lower, upper] = depth.unwrap();
                     self.draw_scene_depth_range(&mut output, lower, upper)?;
-                    let output = RgbaFrame::from_rgba8(
-                        output.width(),
-                        output.height(),
-                        output.pixels().to_vec(),
-                    )?;
                     self.data_services
                         .tasks
                         .render
-                        .replace_auxiliary_target(index, output)?;
+                        .replace_auxiliary_target(slot, output.into_frame())?;
                 }
                 541 => {
                     let [x, y, w, h] =
@@ -847,29 +854,6 @@ impl LoggingHost<'_> {
                                 }
                             }
                         }
-                    }
-                }
-                568 => {
-                    let size = self
-                        .back_buffer
-                        .as_ref()
-                        .map_or(surface_size, |buffer| [buffer.width(), buffer.height()]);
-                    let shared_capture = self.css_task_sha() == Some(HATSUMIRA);
-                    if shared_capture {
-                        // Hatsumira 0x524a50 allocates one auxiliary target and
-                        // calls 0x52dc30 with slot 0 before the script changes the scene.
-                        let policy = self.frame_effect_capture_policy()?;
-                        if !self.data_services.tasks.render.prepare_effect_auxiliary(1, size, policy)? {
-                            return Ok(());
-                        }
-                    }
-                    let mut output = Canvas::new(size[0], size[1])?;
-                    let [lower, upper] = depth.unwrap();
-                    self.draw_scene_depth_range(&mut output, lower, upper)?;
-                    if shared_capture {
-                        self.data_services.tasks.render.replace_auxiliary_target(0, output.into_frame())?;
-                    } else {
-                        self.data_services.canvas_native.offscreen = Some(output);
                     }
                 }
                 _ => bail!("canvas native {index} has no contract"),

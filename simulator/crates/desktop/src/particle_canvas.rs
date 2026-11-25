@@ -68,6 +68,9 @@ pub(super) struct ParticleCanvas {
     pub scene_name: Vec<u8>,
     pub loaded: bool,
     pub selected_camera: Option<usize>,
+    // Camera-relative model messages use the basis last refreshed by selection
+    // or message 359, even while the camera's transforms continue changing.
+    camera_basis: [[f32; 3]; 2],
     pub root_overrides: cs2_runtime::model_state::ModelTransformOverrides,
     pub root_local_transforms: ModelLocalTransforms,
     pub root_visible: u32,
@@ -116,6 +119,7 @@ fn local_matrix(position: [f32; 3], scale: [f32; 3], angles: [f32; 3]) -> Matrix
 impl ParticleCanvas {
     pub(super) fn clear_graph(&mut self) {
         self.nodes.clear(); self.selected_camera = None; self.loaded = false; self.scene_name.clear();
+        self.camera_basis = Default::default();
         self.root_overrides = Default::default();
         self.root_local_transforms = Default::default();
         self.root_visible = 1;
@@ -285,6 +289,7 @@ impl ParticleCanvas {
         self.root_local_transforms = Default::default();
         self.root_visible = 1;
         self.selected_camera = Some(default);
+        self.refresh_camera_basis()?;
         self.scene_name = name;
         self.loaded = true;
         Ok(())
@@ -378,6 +383,56 @@ impl ParticleCanvas {
             result = node.overrides.world_matrix(source, result, &node.local_transforms)?;
         }
         Ok(result)
+    }
+
+    pub(super) fn camera_direction_vectors(&self) -> anyhow::Result<Option<[[f32; 3]; 2]>> {
+        let Some(camera) = self.selected_camera.filter(|&index| {
+            self.nodes.get(index).is_some_and(|node| node.alive && node.is_camera())
+        }) else {
+            return Ok(None);
+        };
+        let [x, y, z, _] = transform([0.0, 0.0, -1.0, 0.0], self.world(camera)?);
+        let (sin, cos) = std::f32::consts::FRAC_PI_2.sin_cos();
+        let lateral = [x * cos - z * sin, 0.0, -x * sin - z * cos];
+        Ok(Some([[x, y, z], lateral]))
+    }
+
+    pub(super) fn refresh_camera_basis(&mut self) -> anyhow::Result<()> {
+        if let Some(vectors) = self.camera_direction_vectors()? {
+            self.camera_basis = vectors;
+        }
+        Ok(())
+    }
+
+    pub(super) fn camera_relative_position(&self, [x, y, z]: [f32; 3]) -> [f32; 3] {
+        let [forward, lateral] = self.camera_basis;
+        [forward[0] * z + lateral[0] * x, y, forward[2] * z + lateral[2] * x]
+    }
+
+    pub(super) fn model_position(&self, index: Option<usize>) -> anyhow::Result<[f32; 3]> {
+        let (base, local, overrides) = match index {
+            Some(index) => {
+                let node = &self.nodes[index];
+                let base = match node.overrides.primary {
+                    Some(values) => values,
+                    None => self.source_transform(index)?,
+                };
+                (base, &node.local_transforms, &node.overrides)
+            }
+            None => (
+                self.root_overrides.primary.unwrap_or(IDENTITY_MODEL_TRANSFORM),
+                &self.root_local_transforms,
+                &self.root_overrides,
+            ),
+        };
+        let secondary = overrides.secondary.unwrap_or(IDENTITY_MODEL_TRANSFORM);
+        // 41eb30 and 41ec10 add the live and saved translation channels.
+        // Message 357 does not compose the parent's world matrix.
+        Ok(std::array::from_fn(|axis| {
+            let primary = f32::from_bits(base[axis]) + f32::from_bits(local.primary[axis]);
+            let secondary = f32::from_bits(secondary[axis]) + f32::from_bits(local.secondary[axis]);
+            primary + secondary
+        }))
     }
 
     pub(super) fn bind_motion(&mut self, index: usize, name: Option<&[u8]>) {

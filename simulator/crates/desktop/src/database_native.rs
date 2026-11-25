@@ -82,6 +82,7 @@ pub(super) fn apply_fes_effect(
     if operands.len() < count { return Ok(true); }
     let mut number = |index: usize| driver.evaluate_parameter(&operands[index], command.context.current, shared);
     let handle = number(0)? as u32;
+    let loose_gbk = host.data_services.has_loose_gbk_text();
     let Some(object) = host.data_services.databases.objects.get_mut(&handle) else {
         return Ok(true);
     };
@@ -94,7 +95,7 @@ pub(super) fn apply_fes_effect(
         let bound = |bytes: &[u8]| {
             // The localized Newton tips script retains EUC-JP kana boundaries.
             // Convert those two-byte constants to the database's CP932 order.
-            if host.data_services.newton_legacy_gbk
+            if loose_gbk
                 && let [0xa4, trail @ 0xa1..=0xf3] = bytes
             {
                 return 0x829f + u16::from(trail - 0xa1);

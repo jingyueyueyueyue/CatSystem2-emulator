@@ -1,4 +1,5 @@
 //! Direct resource wrappers, independently recovered from fixed PE helpers.
+use cs2_runtime::native_table::{ImageProducer703, ImageRecordLayers, ImageRecordLayout};
 use cs2_runtime::resource_router::ResourceMode;
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{HeadlessPlayer, LoggingHost, expand_kcs_format, native_state_error, read_u32, trim_nul};
@@ -33,14 +34,7 @@ struct ImageRecordPlan {
 
 impl LoggingHost<'_> {
     pub(super) fn image_records_native(&mut self, index: u32, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
-        // This actual Select.kcs call predates the image-record ABI. Its
-        // ordinary table is installed inline at 430768, not by the later VM
-        // table setter detected by native_profile. Never interpret XY as a
-        // filename pointer or clear the following coordinate arguments.
-        if index == 703 && self.data_services.css_task_pe_sha256 ==
-            Some("a9f8b08713aac278671853b2293a13b2623a122ede9341cb921901b09601cb52") {
-            return self.move_selection_pointer_native703(args);
-        }
+        let table = self.data_services.ordinary_native_table.as_ref();
         if index == 704 {
             if args.len() != 8 { return Err(native_state_error("native 704 requires exactly 8 argument bytes")); }
             let base = read_u32(args, 0)?;
@@ -50,7 +44,9 @@ impl LoggingHost<'_> {
             }
             let count = read_u32(args, 4)? as usize;
             if count == 0 { return Ok(NativeReturn::Continue); }
-            let stride = image_record_stride(self)?;
+            let stride = table.and_then(|table| table.image_release_704())
+                .ok_or_else(|| native_state_error("native 704 image record release wrapper was not recognized"))?
+                .stride();
             if count > (64 * 1024 * 1024) / stride { return Err(native_state_error("native 704 image record count exceeds capacity")); }
             for i in 0..count {
                 let address = record_address(base, i, stride)?;
@@ -71,6 +67,11 @@ impl LoggingHost<'_> {
             }
             return Ok(NativeReturn::Continue);
         }
+        let (layout, layers) = match table.and_then(|table| table.image_producer_703()) {
+            Some(ImageProducer703::SelectionPointer) => return self.move_selection_pointer_native703(args),
+            Some(ImageProducer703::Records { layout, layers }) => (layout, layers),
+            None => return Err(native_state_error("native 703 image record or selection pointer wrapper was not recognized")),
+        };
         if !matches!(args.len(), 12 | 16) { return Err(native_state_error("native 703 requires three DWORD arguments; an unused trailing DWORD is accepted")); }
         let expanded = expand_kcs_format(vm, &vm.read_string(read_u32(args, 0)?)?, 0)?;
         let raw = trim_nul(&expanded);
@@ -87,7 +88,7 @@ impl LoggingHost<'_> {
         let count = read_u32(args, 8)? as i32;
         if count <= 0 { return Ok(NativeReturn::Value(0)); }
         let count = count as usize;
-        let stride = image_record_stride(self)?;
+        let stride = layout.stride();
         if count > (64 * 1024 * 1024) / stride { return Err(native_state_error("native 703 image record count exceeds capacity")); }
         record_address(base, count - 1, stride)?;
         // Validate the complete records, including narrow/wide name tails,
@@ -99,7 +100,7 @@ impl LoggingHost<'_> {
         let policy = self.data_services.image_record_policy;
         let mut created = Vec::<(u32, u32)>::new();
         let result = (|| {
-            self.visit_image_records(name, stride, policy, count, |host, plan| {
+            self.visit_image_records(name, layout, layers, policy, count, |host, plan| {
                 let tag = if plan.animated { 2u32 } else { 1u32 };
                 let handle = if plan.animated {
                     // The ANM test chooses the object kind, but attach reads
@@ -140,7 +141,8 @@ impl LoggingHost<'_> {
         result
     }
 
-    fn visit_image_records(&mut self, name: &str, stride: usize, policy: ImageRecordPolicy, capacity: usize,
+    fn visit_image_records(&mut self, name: &str, layout: ImageRecordLayout,
+        layers: Option<ImageRecordLayers>, policy: ImageRecordPolicy, capacity: usize,
         mut visit: impl FnMut(&mut Self, ImageRecordPlan) -> Result<()>) -> Result<()> {
         let dot = name.rfind('.').filter(|&dot| name[..dot].rfind(['/', '\\']).is_none_or(|slash| dot > slash));
         let (stem, extension) = dot.map_or((name, ""), |dot| (&name[..dot], &name[dot + 1..]));
@@ -158,30 +160,16 @@ impl LoggingHost<'_> {
             return Err(native_state_error("native 703 image plan exceeds 64 layer selectors"));
         }
         if policy == ImageRecordPolicy::PeCompatibility {
-            return match self.data_services.native_profile.map(|profile| profile.pe_sha256) {
-                // Per-SHA helper bodies AND narrow selector writes verified in
-                // format_B_layer_profiles.json. The first six share the full
-                // normalized459-instruction body; Grisaia2/3 were checked at
-                // their actual double-extension/flush/reset/return branches.
-                Some("0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f"
-                    | "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1"
-                    | "c47c9d883126f641ce07d92eb57b6ac9833fe7495996001c12c68c55b99974d3"
-                    | "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78"
-                    | "3b359fc2d737d5ceed454d6b65e6e5b5e6dfb4a24cf88ee361df86e454203f18"
-                    | "6f75ae3877e018de1982a68f1089c127870d895d748c6290dd2ee85cd8daa4de"
-                    | "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c"
-                    | "ac226c8455eff72114d6b1b9929fae01ac49ba90b8ba579f049f179c4c6dd8d5") => {
-                    self.visit_narrow_compatible_records(prefix, extension, &parts[1..], stride, &mut visit)
+            return match layers {
+                Some(ImageRecordLayers::NarrowStaticRuns) => {
+                    self.visit_narrow_compatible_records(prefix, extension, &parts[1..], layout, &mut visit)
                 }
-                Some(sha @ ("63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976"
-                    | "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc"
-                    | "4ccb48ad4bb6bfb5a15a45b8e1f2c2e62072cfad9f1487f869561a473770ed94"
-                    | "1f3288d5fd5408bee4d395faab708aca78c9eeaa6c172dc06dcce09c844ba9d5")) => {
+                Some(ImageRecordLayers::NarrowPrefixReadAsUtf16) => {
                     self.events.push(super::LogicEvent { frame: self.frame, kind: "image-record-compatibility".into(),
-                        detail: format!("policy=pe-compatibility sha256={sha} fault=narrow-buffer-passed-to-wsprintfW name={name}") });
+                        detail: format!("policy=pe-compatibility fault=narrow-buffer-passed-to-wsprintfW name={name}") });
                     Err(native_state_error("native 703 verified wide layer consumer reads a narrow selector prefix without an initialized UTF16 terminator; deterministic compatibility is undefined"))
                 }
-                _ => Err(native_state_error("native 703 layered PE behavior has not been verified for this exact profile")),
+                None => Err(native_state_error("native 703 layered behavior was not recognized in the registered producer")),
             };
         }
         // Portable, explicit repair of the original split-record branch:
@@ -203,16 +191,16 @@ impl LoggingHost<'_> {
             let physical = format!("{prefix}_{}{selector}.{extension}", "0".repeat(i), selector = char::from(first));
             check_record_resource_name(&physical)?;
             if self.image_is_animation_resource(&physical)? {
-                append_static_record(&mut plans, prefix, extension, &selectors, static_end.take(), stride)?;
+                append_static_record(&mut plans, prefix, extension, &selectors, static_end.take(), layout)?;
                 selectors.fill('0');
-                let tail = image_record_name_tail(&physical, stride)?;
+                let tail = image_record_name_tail(&physical, layout)?;
                 plans.push(ImageRecordPlan { name: physical, animated: true, name_tail: Some(tail) });
             } else {
                 selectors[i] = char::from(first);
                 static_end = Some(i + 1);
             }
         }
-        append_static_record(&mut plans, prefix, extension, &selectors, static_end, stride)?;
+        append_static_record(&mut plans, prefix, extension, &selectors, static_end, layout)?;
         if plans.len() > capacity {
             return Err(native_state_error("native 703 output record capacity is smaller than its layer plan"));
         }
@@ -226,7 +214,7 @@ impl LoggingHost<'_> {
     }
 
     fn visit_narrow_compatible_records(&mut self, prefix: &str, extension: &str,
-        parts: &[&str], stride: usize,
+        parts: &[&str], layout: ImageRecordLayout,
         visit: &mut impl FnMut(&mut Self, ImageRecordPlan) -> Result<()>) -> Result<()> {
         let mut candidates = 0;
         let mut pending = prefix.to_owned();
@@ -246,7 +234,7 @@ impl LoggingHost<'_> {
                 // still resets pending and leaves the animation flag set.
                 let actual = format!("{physical}.{extension}");
                 check_record_resource_name(&actual)?;
-                let tail = image_record_name_tail(&actual, stride)?;
+                let tail = image_record_name_tail(&actual, layout)?;
                 visit(self, ImageRecordPlan { name: actual, animated: true, name_tail: Some(tail) })?;
                 candidates += 1;
                 pending = format!("{prefix}{}", ",0".repeat(index));
@@ -257,7 +245,7 @@ impl LoggingHost<'_> {
                 // They intentionally differ. No current-selector append here.
                 let actual = format!("{pending}.{extension}");
                 check_record_resource_name(&actual)?;
-                let tail = image_record_name_tail(&physical, stride)?;
+                let tail = image_record_name_tail(&physical, layout)?;
                 visit(self, ImageRecordPlan { name: actual, animated: false, name_tail: Some(tail) })?;
                 candidates += 1;
                 pending = format!("{prefix}{}", ",0".repeat(index));
@@ -269,8 +257,7 @@ impl LoggingHost<'_> {
         }
         // 54c6b5 returns immediately: no final static flush.
         self.events.push(super::LogicEvent { frame: self.frame, kind: "image-record-layer-plan".into(),
-            detail: format!("policy=pe-compatibility sha256={} candidates={} no-final-flush=true",
-                self.data_services.native_profile.map_or("unknown", |p| p.pe_sha256), candidates) });
+            detail: format!("policy=pe-compatibility candidates={candidates} no-final-flush=true") });
         Ok(())
     }
 
@@ -346,13 +333,13 @@ fn check_record_capacity(written: usize, count: usize) -> Result<()> {
 
 fn append_static_record(
     output: &mut Vec<ImageRecordPlan>, prefix: &str, extension: &str,
-    selectors: &[char], end: Option<usize>, stride: usize,
+    selectors: &[char], end: Option<usize>, layout: ImageRecordLayout,
 ) -> Result<()> {
     let Some(end) = end else { return Ok(()); };
     let selectors = selectors[..end].iter().map(char::to_string).collect::<Vec<_>>().join(",");
     let name = format!("{prefix},{selectors}.{extension}");
     check_record_resource_name(&name)?;
-    let tail = image_record_name_tail(&name, stride)?;
+    let tail = image_record_name_tail(&name, layout)?;
     output.push(ImageRecordPlan { name, animated: false, name_tail: Some(tail) });
     Ok(())
 }
@@ -365,8 +352,8 @@ fn check_record_resource_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn image_record_name_tail(name: &str, stride: usize) -> Result<Vec<u8>> {
-    let mut bytes = if stride == 0x48 {
+fn image_record_name_tail(name: &str, layout: ImageRecordLayout) -> Result<Vec<u8>> {
+    let mut bytes = if layout == ImageRecordLayout::Cp932 {
         let (bytes, _, invalid) = encoding_rs::SHIFT_JIS.encode(name);
         if invalid { return Err(native_state_error("native 703 record name is not CP932 encodable")); }
         let mut bytes = bytes.into_owned();
@@ -375,30 +362,102 @@ fn image_record_name_tail(name: &str, stride: usize) -> Result<Vec<u8>> {
     } else {
         name.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
     };
-    if bytes.len() > stride - 8 {
+    let tail_size = layout.stride() - 8;
+    if bytes.len() > tail_size {
         return Err(native_state_error("native 703 name exceeds its fixed 64-character record tail"));
     }
-    bytes.resize(stride - 8, 0);
+    bytes.resize(tail_size, 0);
     Ok(bytes)
 }
 
-fn image_record_stride(host: &LoggingHost<'_>) -> Result<usize> {
-    // Fixed 704 loop increments in image_records_abi.json. Version text and
-    // VM buffer length cannot distinguish these ABIs safely.
-    match host.data_services.native_profile.map(|profile| profile.pe_sha256) {
-        Some("0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f"
-            | "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1"
-            | "c47c9d883126f641ce07d92eb57b6ac9833fe7495996001c12c68c55b99974d3"
-            | "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78"
-            | "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c"
-            | "ac226c8455eff72114d6b1b9929fae01ac49ba90b8ba579f049f179c4c6dd8d5"
-            | "3b359fc2d737d5ceed454d6b65e6e5b5e6dfb4a24cf88ee361df86e454203f18"
-            | "6f75ae3877e018de1982a68f1089c127870d895d748c6290dd2ee85cd8daa4de") => Ok(0x48),
-        Some("c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc"
-            | "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976"
-            | "4ccb48ad4bb6bfb5a15a45b8e1f2c2e62072cfad9f1487f869561a473770ed94"
-            | "1f3288d5fd5408bee4d395faab708aca78c9eeaa6c172dc06dcce09c844ba9d5") => Ok(0x88),
-        _ => Err(native_state_error("native 703/704 record ABI requires a verified PE profile")),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cs2_runtime::native_table::OrdinaryNativeTable;
+    use cs2_script::{Host, KcsProgram};
+    use std::path::Path;
+
+    fn game(path: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games").join(path)
+    }
+
+    #[test]
+    fn native_image_records_uses_registered_layout_for_adjacent_records() -> anyhow::Result<()> {
+        for (path, stride) in [
+            ("cs2_full_v401/system/cs2_open.exe", 0x48usize),
+            ("Yukikoi Melt/YukikoiMelt.exe", 0x88),
+        ] {
+            let sample = game(path);
+            if !sample.is_file() {
+                continue;
+            }
+            let temp = crate::tests::TempDir::new();
+            std::fs::write(temp.0.join("startup.xml"), concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><document><INT><int00>",
+                "<name>image</name><int>image.int</int><ext>hg3</ext><dir>image</dir>",
+                "</int00></INT></document>",
+            ))?;
+            let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+            let table = OrdinaryNativeTable::from_pe(&std::fs::read(sample)?).expect(path);
+            player.with_host(|host| {
+                assert!(host.data_services.native_profile.is_none());
+                host.data_services.ordinary_native_table = Some(table);
+                let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?)?;
+                let marker = vec![0x7d; 2 * stride + 16];
+                let base = vm.allocate_region(&marker)?;
+                let missing = vm.allocate_region(b"image/missing.hg3\0")?;
+                let args = [missing, base, 2].map(u32::to_le_bytes).concat();
+                assert_eq!(host.call(703, &args, &mut vm)?, NativeReturn::Value(0));
+                let mut cleared = marker;
+                cleared[..8].fill(0);
+                cleared[stride..stride + 8].fill(0);
+                assert_eq!(vm.read(base, cleared.len())?, cleared);
+
+                let mut handles = Vec::new();
+                for record in [base, base + stride as u32] {
+                    let frame = cs2_renderer::RgbaFrame::from_rgba8(1, 1, vec![0; 4])?;
+                    let handle = host.register_image_wrapper(frame, false)?;
+                    handles.push(handle);
+                    let header = [1, handle].map(u32::to_le_bytes).concat();
+                    vm.write(record, &header)?;
+                }
+                let args = [base, 2].map(u32::to_le_bytes).concat();
+                assert_eq!(host.call(704, &args, &mut vm)?, NativeReturn::Continue);
+                assert!(handles.into_iter().all(|handle| !host.image_handles.contains_key(&handle)));
+                assert_eq!(vm.read(base, cleared.len())?, cleared);
+
+                let layered = vm.allocate_region(b"image/missing,1.hg3\0")?;
+                let args = [layered, base, 2].map(u32::to_le_bytes).concat();
+                let result = host.call(703, &args, &mut vm);
+                if stride == 0x88 {
+                    assert!(result.unwrap_err().to_string().contains("narrow selector prefix"));
+                } else {
+                    assert_eq!(result?, NativeReturn::Value(0));
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_image_records_routes_legacy_selection_pointer_without_product_digest() -> anyhow::Result<()> {
+        let sample = game("\u{3046}\u{305f}\u{3066}\u{3081}\u{3050}\u{308a}/UTATEMEGURI.exe");
+        if !sample.is_file() {
+            return Ok(());
+        }
+        let temp = crate::tests::TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+        let table = OrdinaryNativeTable::from_pe(&std::fs::read(sample)?).expect("legacy native table");
+        player.with_host(|host| {
+            assert!(host.data_services.css_task_pe_sha256.is_none());
+            host.data_services.ordinary_native_table = Some(table);
+            let mut vm = Vm::new();
+            for force in [0, 1] {
+                let args = [16_000u32, 13_000, 10, force].map(u32::to_le_bytes).concat();
+                assert_eq!(host.call(703, &args, &mut vm)?, NativeReturn::Continue);
+            }
+            Ok(())
+        })
     }
 }
-

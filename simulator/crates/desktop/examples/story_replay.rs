@@ -22,6 +22,60 @@ enum Action {
     Menu(u32),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LiveInput {
+    Key(u32),
+    Click { region: u32, point: [i32; 2] },
+    Inspect,
+    Ctrl(bool),
+}
+
+impl LiveInput {
+    fn parse(line: &str) -> Result<Self> {
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        match fields.as_slice() {
+            ["key", code] => Ok(Self::Key(code.parse()?)),
+            ["click", region, x, y] => Ok(Self::Click {
+                region: region.parse()?,
+                point: [x.parse()?, y.parse()?],
+            }),
+            ["inspect"] => Ok(Self::Inspect),
+            ["ctrl", "up"] => Ok(Self::Ctrl(false)),
+            ["ctrl", "down"] => Ok(Self::Ctrl(true)),
+            _ => anyhow::bail!("invalid live input {line:?}"),
+        }
+    }
+}
+
+const FRAME_RETRY_LIMIT: u64 = 128;
+const ADVANCING_VM_RETRY_LIMIT: u64 = 4096;
+const FRAME_RETRY_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Default)]
+struct OrdinaryExecutionProgress {
+    previous: Vec<(u32, usize, u64)>,
+    last_change: u64,
+}
+
+impl OrdinaryExecutionProgress {
+    fn stalled(
+        &mut self,
+        retries: u64,
+        elapsed: std::time::Duration,
+        states: impl Iterator<Item = (u32, usize, u64)>,
+    ) -> bool {
+        let current: Vec<_> = states.collect();
+        if current != self.previous {
+            self.previous = current;
+            self.last_change = retries;
+        }
+        retries >= ADVANCING_VM_RETRY_LIMIT
+            || (retries >= FRAME_RETRY_LIMIT
+                && (self.previous.is_empty() || retries - self.last_change >= FRAME_RETRY_LIMIT
+                    || elapsed >= FRAME_RETRY_TIME))
+    }
+}
+
 fn main() -> Result<()> {
     let mut error_status = "scenario_error";
     let result = replay_command(&mut error_status);
@@ -108,8 +162,53 @@ fn replay(
     let mut button_probe = button_probe::Probe::default();
     let mut eye08_title = None;
     let mut eden_entry = None;
+    let mut ready_entry = button_probe::ReadyEntry::default();
+    let mut ctrl_after_ready = false;
+    let mut auto_first_choice = false;
+    let mut auto_choice_banks = std::collections::VecDeque::new();
+    let mut live_input = false;
+    let mut campanella_choice = false;
+    let mut fes_choices = std::collections::VecDeque::new();
     for arg in args {
         let values = arg.to_string_lossy();
+        if values == "live-input" {
+            live_input = true;
+            continue;
+        }
+        if values == "auto-first-choice" {
+            auto_first_choice = true;
+            continue;
+        }
+        if let Some(banks) = values.strip_prefix("auto-choice-banks:") {
+            ensure!(auto_choice_banks.is_empty(), "duplicate auto-choice-banks");
+            auto_choice_banks = banks.split(',').map(str::parse::<u32>)
+                .collect::<std::result::Result<_, _>>().context("expected comma-separated choice banks")?;
+            auto_first_choice = true;
+            continue;
+        }
+        if values == "campanella-first-choice" {
+            ensure!(!campanella_choice, "duplicate 18 choice entry");
+            campanella_choice = true;
+            continue;
+        }
+        if let Some(click) = values.strip_prefix("ready-click:") {
+            ready_entry.add(click)?;
+            continue;
+        }
+        if values == "ctrl-after-ready" {
+            ensure!(!ctrl_after_ready, "duplicate ctrl-after-ready");
+            ctrl_after_ready = true;
+            continue;
+        }
+        if let Some(choice) = values.strip_prefix("fes-choice:") {
+            let mut fields = choice.split(':');
+            let scene = fields.next().filter(|value| !value.is_empty()).context("expected fes-choice:scene:group:target")?;
+            let group = fields.next().context("expected choice group")?.parse::<usize>()?;
+            let target = fields.next().filter(|value| !value.is_empty()).context("expected choice target")?;
+            ensure!(fields.next().is_none(), "expected fes-choice:scene:group:target");
+            fes_choices.push_back((scene.to_owned(), group, target.to_owned()));
+            continue;
+        }
         if values == "eden-live-entry" {
             ensure!(eden_entry.is_none(), "duplicate 13 live entry");
             eden_entry = Some(button_probe::EdenEntry::default());
@@ -387,6 +486,37 @@ fn replay(
         ensure!(guarded_body.is_some_and(|(_, address)| address == 0xad0) && !state_mode
             && inputs.is_empty() && eye08_title.is_none(), "13 live entry requires a guarded Eden route");
     }
+    let has_ready_entry = !ready_entry.done();
+    let has_fes_choices = !fes_choices.is_empty();
+    ensure!(!live_input || (!state_mode && guarded_body.is_none() && !has_fes_choices
+        && !campanella_choice && eden_entry.is_none() && eye08_title.is_none()),
+        "live input requires an unguarded frame replay");
+    if ctrl_after_ready {
+        ensure!(has_ready_entry && ctrl_windows.is_empty() && !state_mode && guarded_body.is_none(),
+            "ctrl-after-ready requires ready-click and no other Ctrl or guarded body timeline");
+    }
+    if auto_first_choice {
+        ensure!((ctrl_after_ready || !ctrl_windows.is_empty()) && !state_mode && !has_fes_choices
+            && !campanella_choice && eden_entry.is_none() && eye08_title.is_none(),
+            "auto-first-choice requires Ctrl holds and a compatible story entry");
+    }
+    if has_fes_choices {
+        ensure!(!state_mode && !campanella_choice && guarded_body.is_none() && inputs.is_empty()
+            && eden_entry.is_none() && eye08_title.is_none() && story_trace,
+            "fes-choice requires tracing and compatible frame inputs");
+    }
+    if campanella_choice {
+        ensure!(has_ready_entry && ready_entry.regions().eq([11]) && guarded_body.is_none()
+            && !state_mode && story_trace, "18 first choice requires the live title entry and story tracing");
+    }
+    if has_ready_entry {
+        ensure!(inputs.is_empty() && !state_mode && eden_entry.is_none() && eye08_title.is_none(),
+            "ready-click cannot be mixed with other entry inputs");
+        if guarded_body.is_some() {
+            ensure!(guarded_body.is_some_and(|(_, address)| address == 0xa04)
+                && ready_entry.regions().eq([20, 67]), "invalid 15 live entry regions");
+        }
+    }
 
     if happiness_produce_save {
         let (waits, address) = guarded_body.context("Happiness Save needs the 02 opening route")?;
@@ -412,7 +542,7 @@ fn replay(
         let enter = Action::Key(InputKey::Keyboard(13));
         let click = |x, y| Action::Pointer { x, y, button: Some(0) };
         let (expected, hits) =
-            if happiness_resume_sha.is_some() || eden_entry.is_some() {
+            if happiness_resume_sha.is_some() || eden_entry.is_some() || has_ready_entry {
                 (Vec::new(), Vec::new())
             } else if guarded_body.is_some_and(|(_, address)| address == 0xea8)
                 && inputs.contains_key(&1174)
@@ -480,7 +610,7 @@ fn replay(
     } else {
         HeadlessPlayer::open_with_save_root(game, profile)?
     };
-    if !ctrl_windows.is_empty() {
+    if ctrl_after_ready || !ctrl_windows.is_empty() {
         player.enable_host_fast_forward(0);
     }
     let mut happiness_load = happiness_resume_sha.map(|digest| happiness::Load::new(&player, digest)).transpose()?;
@@ -505,6 +635,9 @@ fn replay(
     let mut windowed = 1;
     let mut release = None;
     let mut release_ctrl_at = None;
+    let mut auto_choice_started = None;
+    let mut last_auto_choice = None;
+    const AUTO_CHOICE_TIMEOUT: u64 = 120;
     let mut release_pending = None;
     let mut last_story = None;
     let mut logged_fonts = BTreeSet::new();
@@ -517,15 +650,26 @@ fn replay(
     let mut legacy_chapter_bottom_button = None;
     let mut happiness_save: Option<happiness::Save> = None;
     let mut ordinary_save: Option<yukikoi_save::Save> = None;
+    let live_path = output.with_extension("inputs.txt");
+    let mut live_commands = Vec::new();
+    let mut live_next = 0;
     for completed in 0..frames {
         let tick_started = std::time::Instant::now();
         if release_ctrl_at == Some(completed) {
-            player.apply_host_input(InputEvent::KeyUp(ctrl))?;
+            if auto_choice_started.is_none() {
+                player.apply_host_input(InputEvent::KeyUp(ctrl))?;
+            }
             release_ctrl_at = None;
         }
         if let Some(&end) = ctrl_windows.get(&completed) {
             player.apply_host_input(InputEvent::KeyDown(ctrl))?;
             release_ctrl_at = Some(end);
+        }
+        if ctrl_after_ready && ready_entry.done() && release.is_none() {
+            player.apply_host_input(InputEvent::KeyDown(ctrl))?;
+            release_ctrl_at = Some(frames);
+            ctrl_after_ready = false;
+            eprintln!("frame {completed}: Ctrl held after confirmed entry");
         }
         let releasing = release.is_some_and(|(frame, _)| completed == frame);
         if releasing {
@@ -534,6 +678,106 @@ fn replay(
             if state_mode || guarded_body.is_some_and(|(waits, address)| waits.len() > 2 || matches!(address, 0xa04 | 0x9f6)) {
                 release_pending = Some(completed);
             }
+        }
+        if let Some(started) = auto_choice_started {
+            if ready_entry.done() && release.is_none() && !releasing {
+                if release_ctrl_at.is_some() {
+                    player.apply_host_input(InputEvent::KeyDown(ctrl))?;
+                    eprintln!("frame {completed}: auto-choice resumed Ctrl");
+                }
+                auto_choice_started = None;
+                auto_choice_banks.pop_front();
+            } else if completed - started >= AUTO_CHOICE_TIMEOUT {
+                eprintln!("frame {completed}: auto-choice timed out: {:?}; pointer={:?} movement={:?}",
+                    ready_entry.waiting(), player.host_pointer_logical_position(), player.host_pointer_move_state());
+                println!("replay_status=input_missed");
+                return Ok(());
+            }
+        } else if auto_first_choice && (!live_input || !auto_choice_banks.is_empty())
+            && release_ctrl_at.is_some() && ready_entry.done()
+            && release.is_none() && !releasing
+            && inputs.range(completed..completed.saturating_add(AUTO_CHOICE_TIMEOUT)).next().is_none()
+        {
+            // Suppress the outgoing panel even if the next bank resolves to
+            // a different button on that same panel during its exit animation.
+            if last_auto_choice.is_some_and(|(owner, region)| {
+                !button_probe::choice_target_enabled(&player, owner, region)
+            }) {
+                last_auto_choice = None;
+            }
+            if last_auto_choice.is_none()
+                && let Some((owner, region, point)) =
+                    player.host_replay_fes_choice_bank(auto_choice_banks.front().copied())?
+            {
+                player.apply_host_input(InputEvent::KeyUp(ctrl))?;
+                ready_entry.add_choice(region, point);
+                auto_choice_started = Some(completed);
+                last_auto_choice = Some((owner, region));
+                eprintln!("frame {completed}: auto-choice scene={} receiver={owner} region={region} point={point:?}",
+                    player.host_replay_story_position().0.2);
+            }
+        }
+        let mut live_action = None;
+        if live_input {
+            if completed % 30 == 0 {
+                match std::fs::read_to_string(&live_path) {
+                    Ok(contents) => {
+                        // Only process complete lines. The operator appends commands.
+                        for line in contents.split_inclusive('\n').skip(live_commands.len()) {
+                            if !line.ends_with('\n') { break; }
+                            live_commands.push(LiveInput::parse(line.trim())?);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("read live replay input"),
+                }
+            }
+            if ready_entry.done() && auto_choice_started.is_none() && release.is_none()
+                && !releasing && !inputs.contains_key(&completed)
+                && let Some(&command) = live_commands.get(live_next)
+            {
+                match command {
+                    LiveInput::Key(code) => {
+                        ensure!(code != HeadlessPlayer::FAST_FORWARD_KEY, "use ctrl up or ctrl down");
+                        live_action = Some(Action::Key(InputKey::Keyboard(code)));
+                    }
+                    LiveInput::Click { region, point } => {
+                        ensure!(player.masked_input_region_at(point)?
+                            .is_some_and(|hit| hit[0] == region && hit[8] != 0)
+                            && player.mouse_press_candidate_regions(point)?.contains(&region),
+                            "live click at {point:?} does not match enabled region {region}");
+                        ready_entry.add_choice(region, point);
+                    }
+                    LiveInput::Inspect => {
+                        button_probe.inspect(&mut player, completed)?;
+                        eprintln!("frame {completed}: live wait {}", player.host_replay_wait_diagnostics());
+                        capture(&player, output, completed)?;
+                    }
+                    LiveInput::Ctrl(held) => {
+                        player.apply_host_input(if held { InputEvent::KeyDown(ctrl) }
+                            else { InputEvent::KeyUp(ctrl) })?;
+                        release_ctrl_at = held.then_some(frames);
+                    }
+                }
+                live_next += 1;
+                eprintln!("frame {completed}: live input {live_next} accepted {command:?}");
+            }
+        }
+        if campanella_choice && ready_entry.done() && release_ctrl_at.is_none()
+            && let Some((region, point)) = player.host_campanella_first_choice()?
+        {
+            eprintln!("frame {completed}: 18 first choice ready region={region} point={point:?}");
+            capture(&player, output, completed)?;
+            ready_entry.add_choice(region, point);
+            campanella_choice = false;
+        }
+        if ready_entry.done() && release_ctrl_at.is_none()
+            && let Some((scene, group, target)) = fes_choices.front()
+            && let Some((region, point)) = player.host_replay_fes_choice(scene, *group, target)?
+        {
+            eprintln!("frame {completed}: FES choice scene={scene} group={group} target={target} region={region} point={point:?}");
+            ready_entry.add_choice(region, point);
+            fes_choices.pop_front();
         }
         let input = if let Some(controller) = route.as_deref_mut() {
             if let Some(released_at) = release_pending {
@@ -578,8 +822,18 @@ fn replay(
                     return Ok(());
                 }
             }
+        } else if !ready_entry.done() {
+            match ready_entry.poll(&mut player, completed, release.is_some() || releasing) {
+                Ok(action) => action,
+                Err(error) => {
+                    eprintln!("replay frame={completed}: {error}");
+                    eprintln!("replay wait: {}", player.host_replay_wait_diagnostics());
+                    println!("replay_status=input_missed");
+                    return Ok(());
+                }
+            }
         } else if let Some((waits, address)) = guarded_body
-            && (eden_entry.is_some() || address == 0xe0d && inputs.is_empty()
+            && (eden_entry.is_some() || has_ready_entry || address == 0xe0d && inputs.is_empty()
                 || inputs.last_key_value().is_some_and(|(last, _)| completed > *last))
         {
             let sample = legacy_body_sample(address);
@@ -738,7 +992,7 @@ fn replay(
                 }
             }
         } else {
-            inputs.get(&completed).copied()
+            inputs.get(&completed).copied().or(live_action)
         };
         if let Some(input) = input {
             let key = match input {
@@ -782,6 +1036,7 @@ fn replay(
             }
         }
         let mut retries = 0;
+        let mut ordinary_execution = OrdinaryExecutionProgress::default();
         let mut retry_sleep = std::time::Duration::ZERO;
         loop {
             let result = if measure {
@@ -886,15 +1141,21 @@ fn replay(
             }
             retries += 1;
             let stalled = if interactive {
-                tick_started.elapsed() >= std::time::Duration::from_secs(2)
+                tick_started.elapsed() >= FRAME_RETRY_TIME
             } else {
-                retries >= 128
+                // Child bodies and synchronous script loads can advance in
+                // short VM slices while the frame and root PC stay parked.
+                ordinary_execution.stalled(
+                    retries, tick_started.elapsed(), player.host_pending_ordinary_execution(),
+                )
             };
             if stalled {
                 if state_mode {
                     capture(&player, output, completed).ok();
                 }
-                eprintln!("stalled after {completed} completed frames: {}", player.host_tick_state());
+                eprintln!("stalled after {completed} completed frames: {} retries={retries} pending_ordinary_vms={:?}",
+                    player.host_tick_state(), player.host_pending_ordinary_execution()
+                        .map(|(id, pc, _)| (id, format!("{pc:#x}"))).collect::<Vec<_>>());
                 println!("replay_status=frame_stalled");
                 return Ok(());
             }
@@ -1065,7 +1326,11 @@ fn replay(
             }
         }
     }
-    if state_mode || guarded_body.is_some() || eye08_title.is_some() {
+    let ready_waiting = ready_entry.waiting();
+    if let Some(waiting) = &ready_waiting {
+        eprintln!("replay frame={frames}: ready-click {waiting}");
+    }
+    if state_mode || guarded_body.is_some() || eye08_title.is_some() || has_ready_entry || has_fes_choices || auto_first_choice {
         eprintln!("replay wait: {}", player.host_replay_wait_diagnostics());
         if guarded_body.is_some_and(|(waits, address)| address == 0xd6d
             && matches!(waits.last().copied(), Some((3, 94) | (4, 97)))) {
@@ -1073,7 +1338,10 @@ fn replay(
                 eprintln!("frame {frames}: movie {movie}");
             }
         }
-        println!("replay_status=frame_limit");
+        let status = if ready_waiting.is_some() || campanella_choice || !fes_choices.is_empty() {
+            "input_missed"
+        } else { "frame_limit" };
+        println!("replay_status={status}");
     }
     if story_trace {
         log_font_substitutions(&player, &mut logged_fonts);
@@ -1132,6 +1400,27 @@ fn capture(player: &HeadlessPlayer, output: &Path, frame: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_frame_watchdog_allows_initializers_that_update_their_stack() {
+        use std::time::Duration;
+
+        let mut progress = OrdinaryExecutionProgress::default();
+        for retry in 1..600 {
+            let state = (28, 0x100, retry);
+            assert!(!progress.stalled(retry, Duration::ZERO, [state].into_iter()));
+        }
+        let unchanged = (28, 0x100, 599);
+        for retry in 600..(599 + FRAME_RETRY_LIMIT) {
+            assert!(!progress.stalled(retry, Duration::ZERO, [unchanged].into_iter()));
+        }
+        assert!(progress.stalled(599 + FRAME_RETRY_LIMIT, Duration::ZERO, [unchanged].into_iter()));
+        assert!(progress.stalled(800, FRAME_RETRY_TIME, [(28, 0x100, 800)].into_iter()));
+        assert!(progress.stalled(ADVANCING_VM_RETRY_LIMIT, Duration::ZERO, [(28, 0x100, 900)].into_iter()));
+
+        let mut no_execution = OrdinaryExecutionProgress::default();
+        assert!(no_execution.stalled(FRAME_RETRY_LIMIT, Duration::ZERO, std::iter::empty()));
+    }
 
     #[test]
     fn invalid_frame_inputs_are_scenario_errors_before_opening_the_game() {

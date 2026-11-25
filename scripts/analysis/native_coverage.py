@@ -332,7 +332,8 @@ class RustSource:
                 closing = matching(self.mask, opening)
                 body = self.text[opening:closing + 1]
                 if not all(token in rust_mask(body) for token in (
-                    "native_task_clock_profile::exact_single_step_native", "self.current_task_id",
+                    "ordinary_native_table.as_ref()", "table.task_clock_supports_single_step()",
+                    "self.current_task_id",
                     "self.ensure_task_record", "record.clock.single_step = 1",
                     "task.clock.single_step = 1", "NativeReturn::Continue",
                 )):
@@ -340,7 +341,7 @@ class RustSource:
                 line = self.line(opening)
                 self.arms.insert(0, Arm("1074", "", {1074}, body, line, line, path))
                 self.batch_contracts[1074] = {
-                    "table": "EXACT_PE_SINGLE_STEP", "words": 0, "table_line": line,
+                    "table": "REGISTERED_TASK_SINGLE_STEP", "words": 0, "table_line": line,
                     "function": "task_values_native", "exact_words": False,
                 }
             prefix = self.mask[self.call_brace:self.call_match]
@@ -648,7 +649,7 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
         ("native_tasks", "ExportTaskStore", "export_tasks", "export_task_native",
          ["begin_export_task", "index == 691", ".complete"]),
         ("achievement_native", "AchievementState", "achievement_native", "achievement_native",
-         ["profile::recognized", "read_declarations", ".achievements.initialize", ".achievements.unlock",
+         ["has_achievement_family", "read_declarations", ".achievements.initialize", ".achievements.unlock",
           ".achievements.entries", ".achievements.reset", "self.vm_context_native"]),
         ("javascript_native", "JavaScriptStore", "javascript_native", "javascript_native",
          ["self.prepare_javascript_input", ".bind_javascript_context", "self.call_javascript_function",
@@ -683,7 +684,7 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
             for receiver, tokens in [
                 ("unlock", ("self.entries.get", "persist(root, &next)", "self.stored = next", ".unlocked = true")),
                 ("reset", ("persist(root, &BTreeSet::new())", "self.stored.clear", "entry.unlocked = false")),
-                ("initialize_local_achievements", ("profile::recognized", "read_declarations", ".achievements.initialize")),
+                ("initialize_local_achievements", ("has_achievement_family", "read_declarations", ".achievements.initialize")),
                 ("persist", ("create_new(true)", "file.write_all", "file.sync_all", "replace(&temporary")),
             ]:
                 receiver_body, _ = module.function(receiver)
@@ -714,7 +715,7 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
                 "guard_source": source.text[begin:opening],
                 "status": "conditional-platform-receiver-source-not-version-equivalence",
                 **({"behavior_limit": "Local simulator achievements only; Steam-account state/import/synchronization absent",
-                    "exact_PE_profile_source": "simulator/crates/desktop/src/achievement_profile.rs"}
+                    "registered_receiver_source": "simulator/crates/runtime/src/native_achievements.rs"}
                    if owner == "AchievementState" else {}),
                 **({"behavior_limit": "Kind55 context/load/function consumers exist;1006 stores a save-service binding but full JS save consumption remains absent",
                     "conditional_on_task_kind": True, "incomplete_consumer_indices": [1006]}
@@ -1203,8 +1204,10 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
             limitation = "Exact Yukikoi profile only; recovered SKFE subset with concrete node/geometry parsing. Further effect families and task rotation remain incomplete; active-source expansion requires separate semantic review."
         else:
             guard_source = source.mask[begin:opening]
-            if not all(token in guard_source for token in ("profile.feature(index)", "ExactConstant")):
-                raise ValueError("Tweet lost its original exact-constant precedence")
+            if "feature_constant.is_none()" not in guard_source or not all(
+                token in prefix for token in ("ordinary_native_table.as_ref()", "table.feature_constant(index)")
+            ):
+                raise ValueError("Tweet lost its registered-table constant precedence")
             body, line = require(module, function, ("args.len() != expected", "583 + index - 1018", "OwnedTaskBuffers::new", "self.route_task_command_buffers", "NativeReturn::Value(output)"))
             require(module, "register_tweet_task", ("self.data_services.native_profile", "TweetTask", "AtomicU32::new(8)", "install_buffer_receiver(62, receiver)"))
             require(module, "receive_tweet_command", ("583", "584", "585", "586", "587", "588", "task.config", "task.images", "task.tags", "task.body", "task.status.load", "self.start_tweet_worker"))
@@ -1228,7 +1231,11 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
             android = load("simulator/crates/android/src/lib.rs")
             open_body, _ = android.function("cs2_android_open")
             if "open_game(game, saves," in rust_mask(open_body):
-                require(android, "cs2_android_open_profiled_v4", ("open_game(game, saves,",))
+                profiled_body, _ = android.function("cs2_android_open_profiled_v4")
+                if "cs2_android_open_profiled_v5(game, saves," in rust_mask(profiled_body):
+                    require(android, "cs2_android_open_profiled_v5", ("open_game(game, saves,",))
+                else:
+                    require(android, "cs2_android_open_profiled_v4", ("open_game(game, saves,",))
                 require(android, "open_game", ("player.enable_host_tweet_queue", "player.load_startup"))
             else:
                 require(android, "cs2_android_open", ("player.enable_host_tweet_queue", "player.load_startup"))
@@ -2019,8 +2026,7 @@ def source_kind(arm: Arm | None) -> str:
         return "explicit-unimplemented" if arm and arm.values is not None else "unmapped"
     compact = re.sub(r"\s+", "", arm.body)
     if compact.startswith("reserved_native::call("):
-        # analyze() independently checks the complete generated table and its
-        # exact-PE byte proofs; moving constants into a table is not behavior.
+        # analyze() validates the structural gate and historical sample proofs.
         return "constant-return-only"
     if re.fullmatch(r"Ok\(NativeReturn::(?:Continue|Value\(0\))\)", compact):
         return "constant-return-only"
@@ -2029,36 +2035,29 @@ def source_kind(arm: Arm | None) -> str:
     return "source-behavior"
 
 
-def reserved_constant_bindings(blobs: dict[str, bytes]) -> dict[int, list[dict]]:
-    """Inspect the actual generated dispatch and full local constant proofs."""
+def reserved_constant_bindings(blobs: dict[str, bytes], source: RustSource) -> dict[int, list[dict]]:
+    """Validate the reserved dispatch and historical sample constant proofs."""
     path = "simulator/crates/desktop/src/reserved_native.rs"
+    table_path = "simulator/crates/runtime/src/native_table.rs"
     report_path = "reports/reserved_native_contracts_20261117.json"
-    if path not in blobs or report_path not in blobs:
-        raise ValueError("reserved native dispatcher lacks its exact-PE byte evidence")
-    text = blobs[path].decode("utf-8-sig")
-    mask = rust_mask(text)
-    if not all(token in mask for token in ("let result = match sha256", "result.ok_or(ScriptError::UnimplementedNativeCall")):
-        raise ValueError("reserved native dispatcher lost its identity/result gate")
-    actual = {}
-    pattern = r"([0-9\s|]+)\s*=>\s*Some\(NativeReturn::(Continue|Value\((\d+)\))\)\s*,"
-    for found in re.finditer(r'"([0-9a-f]{64})"\s*=>\s*match\s+index\s*\{', text):
-        opening = found.end() - 1
-        closing = matching(mask, opening)
-        payload = mask[opening + 1:closing]
-        records = {}
-        for entry in re.finditer(pattern, payload):
-            for index in numbers(entry[1]) or set():
-                if index in records:
-                    raise ValueError("duplicate reserved native outcome")
-                records[index] = (2, None) if entry[2] == "Continue" else (1, int(entry[3]))
-        residue = re.sub(pattern, "", payload)
-        if re.sub(r"_\s*=>\s*None\s*,?", "", residue).strip() or found[1] in actual:
-            raise ValueError("reserved native table contains unreviewed receiver behavior")
-        actual[found[1]] = records
+    mask = rust_mask(blobs[path].decode("utf-8-sig"))
+    table_source = rust_mask(blobs[table_path].decode("utf-8-sig"))
+    if (not all(token in mask for token in ("table.constant(index)", "constant.native_return()",
+                                           "ok_or(ScriptError::UnimplementedNativeCall"))
+            or not all(token in table_source for token in ("x86_image_base(data)", "starts_with(VM_TABLE_SETTER)",
+                                                          "constant_stub(body)"))
+            or "OrdinaryNativeTable::from_pe(&bytes)" not in source.mask):
+        raise ValueError("reserved native dispatcher lost its registered-table/body gate")
+    indices = set().union(*(arm.values or set() for arm in source.arms
+        if "reserved_native::call" in rust_mask(arm.body)
+        and "ordinary_native_table.as_ref()" in rust_mask(arm.body)))
+    if not indices:
+        raise ValueError("no reserved native slots forward the registered table")
+
     evidence = json.loads(blobs[report_path])
-    expected, bindings = {}, defaultdict(list)
+    bindings = defaultdict(list)
     for profile in evidence["profiles"]:
-        selected = {}
+        selected = set()
         for row in profile["slots"]:
             constant = row["constant"]
             status, value = constant["callback_status"], constant["output_dword"]
@@ -2068,16 +2067,20 @@ def reserved_constant_bindings(blobs: dict[str, bytes]) -> dict[int, list[dict]]
                         + bytes.fromhex("b801000000c21000") if status == 1 else None)
             if proof != template or hashlib.sha256(proof).hexdigest() != constant["complete_stub_sha256"]:
                 raise ValueError("reserved native proof is not a complete recognized function")
-            selected[row["index"]] = (status, value)
-            bindings[row["index"]].append({
+            index = row["index"]
+            if index in selected:
+                raise ValueError("duplicate reserved native sample proof")
+            selected.add(index)
+            bindings[index].append({
                 "pe_sha256": profile["sha256"], "entry_rva": row["entry_rva"],
                 "callback_status": status, "output_dword": value,
                 "proof_sha256": constant["complete_stub_sha256"],
                 "status": "exact-local-constant-bytes-not-full-game-equivalence",
             })
-        expected[profile["sha256"]] = selected
-    if actual != expected or not actual:
-        raise ValueError("reserved native source outcomes differ from exact-PE evidence")
+        if selected != indices:
+            raise ValueError("reserved native source slots differ from historical sample evidence")
+    if not bindings:
+        raise ValueError("reserved native dispatcher lacks historical sample evidence")
     return dict(bindings)
 
 
@@ -2151,7 +2154,7 @@ def analyze(root: Path) -> dict:
             for name in helper_source.functions:
                 helper_sources.setdefault(name, helper_source)
     overlays = external_dispatches(root, source, blobs)
-    reserved_bindings = reserved_constant_bindings(blobs)
+    reserved_bindings = reserved_constant_bindings(blobs, source)
     execution_evidence = runtime_execution_evidence(source, helper_sources)
     audit = json.loads(blobs[AUDIT])
     ledger = json.loads(blobs[LEDGER])
@@ -2184,7 +2187,7 @@ def analyze(root: Path) -> dict:
                   matching_arms[0] if matching_arms else None)
         kind = source_kind(active)
         if active and "reserved_native::call" in rust_mask(active.body) and index not in reserved_bindings:
-            raise ValueError("reserved native call has no exact outcome binding")
+            raise ValueError("reserved native call has no historical sample proof")
         helper_names = helpers(active) if active else []
         if index == 25:
             # The shared 25/26 arm selects integer parsing for 25.
@@ -2254,7 +2257,7 @@ def analyze(root: Path) -> dict:
         if len(tables) > 1:
             notes.append("Numeric slot occurs in multiple reference host tables. Aggregate observations cannot establish which table was used.")
         if kind == "constant-return-only":
-            notes.append("Exact local constant outcomes are bound to identified PE bytes; unknown identities are rejected."
+            notes.append("The registered ordinary table and complete callback body determine the outcome. The archived PE bindings are sample evidence."
                          if index in reserved_bindings else
                          "Only a fixed status/value is returned. Baseline reserved/no-op semantics require version-specific evidence.")
         if kind == "version-sensitive-constant":

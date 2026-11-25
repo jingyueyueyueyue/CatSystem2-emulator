@@ -17,10 +17,6 @@ impl ParticlePlugin {
     pub(crate) fn checkpoint_digest(&self) -> &str { &self.digest }
 
     pub(crate) fn capture_checkpoint(&self) -> Result<PluginState> {
-        if !family::checkpoint::supports(&self.digest) || !self.drops.is_empty()
-            || self.field.is_some() || self.burst.is_some() || self.common.is_some() {
-            bail!("PPI private checkpoint is not implemented for this SHA (live model is retained)");
-        }
         Ok(PluginState { digest: self.digest.clone(),
             family: self.family.as_ref().context("saved PPI family absent")?.capture_checkpoint()?,
             source_position: self.source_position, image_size: self.image_size, canvas: self.canvas,
@@ -35,10 +31,19 @@ impl PluginState {
         if digest != self.digest || image_size != self.image_size {
             bail!("saved PPI source identity or texture extent changed");
         }
-        let family = family::Family::prepare_checkpoint(&digest, count, image_size, self.family)?;
-        Ok(ParticlePlugin { digest, drops: Vec::new(), field: None, burst: None, common: None, family: Some(family),
-            source_position: self.source_position, image_size, canvas: self.canvas, active: self.active,
-            initialized: self.initialized, origin: self.origin, previous_time: self.previous_time,
-            elapsed: self.elapsed, previous_elapsed: self.previous_elapsed, submitted: self.submitted })
+        // Recover the model from the same resource used by live loading, then
+        // bind the saved state to it without running a start callback.
+        let mut plugin = ParticlePlugin::load(bytes, count, image_size, self.canvas)?;
+        plugin.family.as_mut().context("saved PPI family absent")?
+            .restore_checkpoint(count, image_size, self.family)?;
+        plugin.source_position = self.source_position;
+        plugin.active = self.active;
+        plugin.initialized = self.initialized;
+        plugin.origin = self.origin;
+        plugin.previous_time = self.previous_time;
+        plugin.elapsed = self.elapsed;
+        plugin.previous_elapsed = self.previous_elapsed;
+        plugin.submitted = self.submitted;
+        Ok(plugin)
     }
 }

@@ -5193,9 +5193,15 @@ impl HeadlessPlayer {
         self.data_services.messages.pointer_motion_frame == Some(self.state.clock.frame)
     }
 
-    /// Completed owner callbacks from this logical frame. Kept through Render
-    /// and commit, cleared only when the next logical scan starts. Nonzero
-    /// response still records delivery; only zero consumes the typed scan.
+    /// Frame that opened the scan whose completed callbacks are retained.
+    /// Deferred audio can keep a scan open across several logical frames.
+    pub fn host_input_route_scan_frame(&self) -> Option<u64> {
+        self.data_services.messages.key_scan_frame
+    }
+
+    /// Completed owner callbacks from the current scan, with their completion
+    /// frames. Cleared when the next scan starts. Nonzero responses record
+    /// delivery, while zero consumes the typed scan.
     pub fn host_input_route_receipts(&self) -> &[InputRouteReceipt] {
         &self.data_services.messages.input_route_receipts
     }

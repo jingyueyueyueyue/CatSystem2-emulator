@@ -2,11 +2,12 @@
 //! Recovered from Yukikoi 63de0e14: 2d87e0 -> 2bed60 -> 28d390.
 //! This is not the clear/append history-import protocol of ordinary1034.
 use super::*;
-use cs2_formats::{CstFile, CstlTable};
+use cs2_formats::CstlTable;
+use cs2_script::CstDocument;
 use crate::cst_context_native::{decode_cst_dialogue, repair_routed_scene_text};
 
 struct Scene {
-    document: CstFile,
+    document: CstDocument,
     localization: Option<CstlTable>,
     encoding: ScriptTextEncoding,
 }
@@ -123,8 +124,8 @@ fn load_scene(host: &LoggingHost<'_>, source: &[u8]) -> Result<Scene> {
     let (resolved, resource) = host.cst_resource_with_source(b"scene", source)?
         .context("LOGSTRING remake source CST is unavailable; retained history is unchanged")?;
     let encoding = host.cst_scene_encoding_override(&resource).unwrap_or(host.text_encoding);
-    let mut document = CstFile::parse(&resource.bytes).context("LOGSTRING remake source CST is malformed")?;
-    repair_routed_scene_text(&resource, document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
+    let mut document = CstDocument::parse(&resource.bytes).context("LOGSTRING remake source CST is malformed")?;
+    repair_routed_scene_text(host.resources, &resource, &mut document);
     let mut adjacent = resolved;
     if let Some(dot) = adjacent.rfind('.').filter(|&dot|
         adjacent[..dot].rfind(['/', '\\']).is_none_or(|slash| slash < dot)) {
@@ -191,14 +192,11 @@ fn base_utf8(bytes: &[u8], codec: ScriptTextEncoding) -> Result<Vec<u8>> {
 
 #[test]
 fn log_remake_keeps_declared_base_codec_and_bound_utf8_overrides() {
-    use cs2_formats::{CstLengthInfo, CstRecord, CstVariant, CstlMessage};
+    use cs2_formats::CstlMessage;
+    use cs2_script::CstRecord;
 
     let mut scene = Scene {
-        document: CstFile {
-            variant: CstVariant::Uncompressed,
-            length: CstLengthInfo { declared: 0, actual: 0 },
-            script_length: CstLengthInfo { declared: 0, actual: 0 },
-            diagnostics: Vec::new(),
+        document: CstDocument {
             records: vec![
                 CstRecord { kind: 0x21, text: b"\xc2\xa9".to_vec() },
                 CstRecord { kind: 0x20, text: b"\\r\xc2\xa9".to_vec() },

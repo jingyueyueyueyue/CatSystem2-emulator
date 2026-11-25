@@ -2,6 +2,7 @@
 //! The 0x290-byte record owns its parameters and strings; no caller VM address
 //! survives dispatch. External draw is a separate sink, never a window overlay.
 use cs2_runtime::{TaskCommand, TaskCommandBuffers, TaskCommandOutcome};
+use cs2_runtime::native_table::ParticleMessages;
 use cs2_runtime::resource_router::ResourceMode;
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, ParticleObjectState, expand_kcs_format, native_state_error,
@@ -83,6 +84,9 @@ fn kanmi_particle_operation(
 
 fn command_base(host: &LoggingHost<'_>) -> Result<u32> {
     if host.data_services.particle_external.legacy_kc_view() { return Ok(271); }
+    if let Some(messages) = registered_messages(host) {
+        return Ok(messages.base);
+    }
     let digest = host.data_services.particle_message_pe_sha256
         .or_else(|| host.data_services.native_profile.map(|profile| profile.pe_sha256));
     PROFILES.iter().find(|profile| Some(profile.0) == digest).map(|profile| profile.1)
@@ -90,10 +94,20 @@ fn command_base(host: &LoggingHost<'_>) -> Result<u32> {
 }
 
 fn camera_commands(host: &LoggingHost<'_>) -> bool {
+    if let Some(messages) = registered_messages(host) {
+        return messages.camera;
+    }
     let digest = host.data_services.particle_message_pe_sha256
         .or_else(|| host.data_services.native_profile.map(|profile| profile.pe_sha256));
     PROFILES.iter().any(|profile| profile.2
         && digest == Some(profile.0))
+}
+
+fn registered_messages(host: &LoggingHost<'_>) -> Option<ParticleMessages> {
+    host.data_services.ordinary_native_table.as_ref()
+        .and_then(|table| table.particle_messages())
+        .or_else(|| host.data_services.startup_companion_natives.as_ref()
+            .and_then(|table| table.particle_messages))
 }
 
 pub(super) fn identified_pe_sha256(sha: &str) -> Option<&'static str> {
@@ -468,7 +482,18 @@ impl LoggingHost<'_> {
                     self.load_particle_record(target, &record)?;
                 } else { self.load_particle_record(target, bytes)?; }
             },
-            1 => { self.apply_particle_command(target, 321, None)?; }
+            1 => {
+                if self.data_services.particle_external.legacy_kc_view()
+                    && let Some(particle) = self.particles.get_mut(&target)
+                    && particle.runner.is_none() && particle.plugin.is_none()
+                {
+                    // 0x4359e9 sets the start flag. The update at 0x435787
+                    // returns without executing when either KCS pointer is null.
+                    particle.enabled = true;
+                } else {
+                    self.apply_particle_command(target, 321, None)?;
+                }
+            }
             2 => { self.apply_particle_command(target, 322, None)?; }
             3 => { self.apply_particle_command(target, 323, None)?; }
             4 => { *output = self.apply_particle_command(target, 324, None)?.unwrap_or(0); }
@@ -509,8 +534,20 @@ impl LoggingHost<'_> {
                 .and_then(|candidate| candidate.map(|candidate|
                     self.resources.read_candidate(candidate)).transpose())
         } else { self.resources.read_mode(&program_name, ResourceMode::LooseFirst) }
-            .map_err(|_| native_state_error("particle program resource read failed"))?
-            .ok_or_else(|| native_state_error("particle program resource is unavailable; old state released"))?;
+            .map_err(|_| native_state_error("particle program resource read failed"))?;
+        let Some(program_bytes) = program_bytes else {
+            if !plugin && self.data_services.particle_external.legacy_kc_view() {
+                // The original kind-16 loader returns zero with its VM released
+                // at 0x4360f9. The receiver at 0x4359c7 consumes the message.
+                self.events.push(super::LogicEvent {
+                    frame: self.frame,
+                    kind: "particle-resource-missing".into(),
+                    detail: format!("target={target} program={program_name:?}"),
+                });
+                return Ok(());
+            }
+            return Err(native_state_error("particle program resource is unavailable; old state released"));
+        };
         let program = if plugin { None } else { Some(particle_vm::ParticleProgram::parse(&program_bytes)?) };
         let legacy_external = external_draw != 0 && self.data_services.particle_external.legacy_kc_view();
         if legacy_external { self.data_services.particle_external.bound_canvas()?; }
@@ -692,7 +729,6 @@ impl super::HeadlessPlayer {
             return Ok(());
         }
         self.data_services.particle_message_pe_sha256 = Some(HAPPINESS_PLAIN);
-        self.data_services.tasks.message_lists.identify_verified_companion(HAPPINESS_PLAIN);
         self.log.push("particle ABI: exact Happiness2 producer KCS + verified plain companion table; packed executable table unverified".into());
         Ok(())
     }
@@ -762,12 +798,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tunaban_parameter_command_reaches_the_particle_receiver() -> anyhow::Result<()> {
+    #[ignore = "requires a local legacy PE with the registered particle receiver"]
+    fn tunaban_parameter_command_reaches_the_registered_particle_receiver() -> anyhow::Result<()> {
         let root = crate::tests::TempDir::new();
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games/ツナバン らぶみくす/cs2.exe");
+        let mut bytes = std::fs::read(engine)?;
+        bytes.extend_from_slice(b"test overlay");
+        std::fs::write(root.0.join("cs2.exe"), bytes)?;
         let mut player = crate::HeadlessPlayer::open_with_save_root(&root.0, root.0.join("save"))?;
-        player.data_services.particle_message_pe_sha256 = identified_pe_sha256(crate::css_model::SHA);
+        assert_eq!(player.data_services.particle_message_pe_sha256, None);
         player.with_host(|host| {
             let target = host.create_task_object(16, 0, b"particle", b"")?;
+            assert_eq!(command_base(host)?, 265);
             let parameters = [42; 128];
             let program = cs2_script::KcsProgram::from_code(&[0x3b], parameters.to_vec(), 128)?;
             let mut vm = Vm::from_program(program)?;

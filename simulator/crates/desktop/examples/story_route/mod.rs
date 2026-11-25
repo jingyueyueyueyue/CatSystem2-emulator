@@ -426,7 +426,11 @@ impl MousePress {
     fn matches_receipt(&self, receipt: &InputRouteReceipt, started: u64, receiver: u32) -> bool {
         receipt.frame > started
             && receipt.frame - started <= 3
-            && receipt.key == self.key
+            && self.matches_target(receipt, receiver)
+    }
+
+    fn matches_target(&self, receipt: &InputRouteReceipt, receiver: u32) -> bool {
+        receipt.key == self.key
             && receipt.group == self.group
             && receipt.raw_mask == ButtonSource::Mouse.mask()
             && receipt.pressed == 1
@@ -1198,13 +1202,21 @@ fn log_eye08_body(frame: u64, group: i32, wait: i32, (context, load, loaded): (u
 }
 
 fn consuming_mouse_resume(
-    player: &HeadlessPlayer, press: &MousePress, frame: u64, owner: u32, [x, y]: [i32; 2],
+    player: &HeadlessPlayer, press: &MousePress, frame: u64, owner: u32, point: [i32; 2],
+    forwarding_region: Option<u32>,
+) -> bool {
+    consuming_mouse_resume_in_scan(player, press, frame, frame, owner, point, forwarding_region)
+}
+
+fn consuming_mouse_resume_in_scan(
+    player: &HeadlessPlayer, press: &MousePress, scan_frame: u64, frame: u64,
+    owner: u32, [x, y]: [i32; 2],
     forwarding_region: Option<u32>,
 ) -> bool {
     let mut receipts = player.host_input_route_receipts().iter().filter(|receipt| {
-        receipt.frame == frame && receipt.pressed != 0
+        (scan_frame..=frame).contains(&receipt.frame) && receipt.pressed != 0
     }).peekable();
-    // Kanmi first offers the click to the global forwarding region.
+    // Some scans first offer the click to the global forwarding region.
     let _ = receipts.next_if(|receipt| {
         Some(receipt.region) == forwarding_region
             && (receipt.receiver, receipt.response, receipt.key, receipt.group) == (0, 1, 0, 0)
@@ -1213,7 +1225,7 @@ fn consuming_mouse_resume(
     });
     let mut resumes = player.events().iter().rev().take_while(|event| event.frame >= frame)
         .filter(|event| event.frame == frame && event.kind == "message-resume");
-    receipts.next().is_some_and(|receipt| press.matches_receipt(receipt, frame - 1, owner))
+    receipts.next().is_some_and(|receipt| receipt.frame == frame && press.matches_target(receipt, owner))
         && receipts.next().is_none()
         && resumes.next().is_some_and(|event| event.detail == format!("message=[2, {x}, {y}, 0]"))
         && resumes.next().is_none()

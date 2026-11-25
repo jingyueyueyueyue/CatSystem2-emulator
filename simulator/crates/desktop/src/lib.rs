@@ -76,6 +76,7 @@ mod message_backend;
 mod message_platform;
 mod input_history_native;
 mod legacy_text_native;
+#[cfg(test)]
 mod legacy_native925;
 mod ordinary_native;
 mod ordinary_pair_table;
@@ -148,6 +149,7 @@ mod css_model_render;
 mod css_model_shader;
 mod backlog_native;
 mod cst_context_native;
+mod cst_legacy_choice;
 mod story_trace;
 pub use story_trace::story_trace_08::Eye08Body;
 pub use story_trace::story_trace_14::Grisaia14Body;
@@ -1335,6 +1337,7 @@ struct CstRegistration {
 #[derive(Debug, Clone, Default)]
 struct CstContextState {
     document: Option<CstDocument>,
+    command_repairs: Vec<usize>,
     position: [i32; 2],
     registrations: Vec<CstRegistration>,
     history: Vec<CstRegistration>,
@@ -3927,11 +3930,64 @@ impl LoggingHost<'_> {
                 .get(offset..offset + 4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
         };
+        let feature_constant = self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.feature_constant(index));
+        if let Some(code) = self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.immediate_task_message(index))
+        {
+            return self.immediate_task_message_native(code, arguments);
+        }
+        if let Some(code) = self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.model_transform_set_message(index))
+        {
+            return self.particle_canvas_model_transform_set_native(code, arguments, vm);
+        }
+        if index == 670 && self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_camera_relative_position())
+        {
+            return self.particle_canvas_camera_position_native(arguments, vm);
+        }
+        if index == 661 && self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_camera_direction_query())
+        {
+            return self.particle_canvas_camera_direction_native(arguments, vm);
+        }
+        if index == 660 && self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_model_position_query())
+        {
+            return self.particle_canvas_model_position_native(arguments, vm);
+        }
+        if let Some(code) = self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.model_local_transform_query_message(index))
+        {
+            return self.particle_canvas_model_local_transform_native(code, arguments, vm);
+        }
+        if let Some(code) = self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.model_visibility_message(index))
+        {
+            return self.particle_canvas_model_path_native(code, arguments, vm);
+        }
+        if index == 687 && self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_model_clear_overrides())
+        {
+            return self.particle_canvas_model_path_native(373, arguments, vm);
+        }
+        if index == 686 && self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_model_freeze_transform())
+        {
+            let code = 371 + u32::from(read_u32(arguments, 8)? != 0);
+            return self.particle_canvas_model_path_native(code, arguments, vm);
+        }
         if self.data_services.particle_external.legacy_kc_view() && matches!(index, 543 | 547 | 578 | 579 | 580 | 652) {
             return self.particle_canvas_native(index, arguments, vm);
         }
         if self.data_services.particle_external.legacy_kc_view() && matches!(index, 552 | 554 | 555) {
             return self.particle_canvas_motion_native(index, arguments, vm);
+        }
+        if let Some(code) = self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.model_motion_message(index))
+        {
+            return self.particle_canvas_motion_message_native(code, arguments, vm);
         }
         if javascript_native::JavaScriptStore::supports(index) && arguments.len() >= 4 {
             let requested = read_u32(arguments, 0)?;
@@ -3940,9 +3996,7 @@ impl LoggingHost<'_> {
             } else { requested };
             if self.data_services.tasks.message_task_state(target)
                 .is_some_and(|(kind, _, _)| kind == 55)
-                && !self.data_services.native_profile.and_then(|profile| profile.feature(index))
-                    .is_some_and(|feature| matches!(feature.kind,
-                        cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(_)))
+                && feature_constant.is_none()
             {
                 return self.javascript_native(index, arguments, vm)
                     .map_err(|cause| self.task_error(target, cause));
@@ -3954,33 +4008,23 @@ impl LoggingHost<'_> {
             return self.emote_native(index, arguments, vm);
         }
         if effekseer_native::supports(index)
-            && effekseer_native::identified(self.data_services.native_profile)
+            && effekseer_native::identified(self.data_services.ordinary_native_table.as_ref())
         {
             return self.effekseer_native(index, arguments, vm);
         }
         if let Some(result) = self.emote_geometry_native(index, arguments)? {
             return Ok(result);
         }
-        if native_tasks::RenderTaskStore::supports(index)
-            && !self.data_services.native_profile.and_then(|profile| profile.feature(index))
-                .is_some_and(|feature| matches!(feature.kind,
-                    cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(_)))
-        {
+        if native_tasks::RenderTaskStore::supports(index) && feature_constant.is_none() {
             return self.render_tasks_native(index, arguments, vm);
         }
-        if canvas_native::CanvasNativeState::supports(index)
-            && !self.data_services.native_profile.and_then(|profile| profile.feature(index))
-                .is_some_and(|feature| matches!(feature.kind,
-                    cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(_)))
-        {
+        if canvas_native::CanvasNativeState::supports(index) && feature_constant.is_none() {
             return self.canvas_native(index, arguments, vm);
         }
         if native_tasks::ExportTaskStore::supports(index) && arguments.len() >= 4
             && self.data_services.tasks.message_task_state(read_u32(arguments, 0)?)
                 .is_some_and(|(kind, deletion, _)| matches!(kind, 45 | 46) && deletion == 0)
-            && !self.data_services.native_profile.and_then(|profile| profile.feature(index))
-                .is_some_and(|feature| matches!(feature.kind,
-                    cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(_)))
+            && feature_constant.is_none()
         {
             return self.export_task_native(index, arguments, vm);
         }
@@ -3993,39 +4037,19 @@ impl LoggingHost<'_> {
         if let Some(result) = self.css_owner_lifecycle_native(index, arguments)? {
             return Ok(result);
         }
-        if achievement_native::AchievementState::supports(index)
-            && !self.data_services.native_profile.and_then(|profile| profile.feature(index))
-                .is_some_and(|feature| matches!(feature.kind,
-                    cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(_)))
-        {
+        if achievement_native::AchievementState::supports(index) && feature_constant.is_none() {
             return self.achievement_native(index, arguments, vm);
         }
-        if matches!(index, 1018..=1023)
-            && !self.data_services.native_profile.and_then(|profile| profile.feature(index))
-                .is_some_and(|feature| matches!(feature.kind,
-                    cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(_)))
-        {
+        if matches!(index, 1018..=1023) && feature_constant.is_none() {
             return self.tweet_native(index, arguments, vm);
         }
-        if let Some(feature) = self.data_services.native_profile.and_then(|profile| profile.feature(index)) {
-            match feature.kind {
-                cs2_runtime::native_profile::NativeFeatureKind::ExactConstant(result) => {
-                    return Ok(result.native_return());
-                }
-                cs2_runtime::native_profile::NativeFeatureKind::RequiresImplementation => {
-                    return Err(cs2_script::ScriptError::UnimplementedNativeCall { index });
-                }
-            }
-        }
-        if let Some(result) = legacy_native925::happiness2_companion_native(
-            index, arguments, self.data_services.particle_message_pe_sha256,
-        ) {
-            return Ok(result);
-        }
-        if let Some(result) = legacy_native925::rebellions_native(index, arguments, self.resources) {
-            return Ok(result);
+        if let Some(result) = feature_constant {
+            return Ok(result.native_return());
         }
         if index == 925 && arguments.is_empty() {
+            if self.data_services.startup_companion_natives.as_ref().is_some_and(|companion| companion.native925_zero) {
+                return Ok(NativeReturn::Value(0));
+            }
             const KANMI_SSCRIPT_SHA256: &str =
                 "17de548390b8c2b15a4f413418bbf1b408d6dee6ab830879f09cf305f5c128fd";
             let verified = match self.data_services.kanmi_native925_verified {
@@ -4043,7 +4067,7 @@ impl LoggingHost<'_> {
                 return Ok(NativeReturn::Value(0));
             }
         }
-        if matches!(index, 906..=933 | 965 | 966 | 1025 | 1027..=1030 | 1047 | 1048) {
+        if cs2_runtime::native_table::OrdinaryNativeTable::is_feature_slot(index) {
             return Err(cs2_script::ScriptError::UnimplementedNativeCall { index });
         }
         if matches!(index, 430 | 460 | 681 | 682) {
@@ -4101,6 +4125,9 @@ impl LoggingHost<'_> {
             1052 => self.dictionary_prefix_native(arguments, vm),
             651 => self.reset_task_property_native(arguments),
             739 => self.doubled_device_offset_native(arguments, vm),
+            700 if self.data_services.ordinary_native_table.as_ref()
+                .is_some_and(|table| table.has_legacy_display_rectangle()) =>
+                self.display_rectangle_native(arguments, vm),
             787 => self.display_rectangle_native(arguments, vm),
             874 => self.pack_words_native(arguments),
             875 => self.unpack_words_native(arguments, vm),
@@ -4146,6 +4173,11 @@ impl LoggingHost<'_> {
             9 => Err(native_state_error(
                 "native 9 requires exactly 4 argument bytes",
             )),
+            439 if self.data_services.ordinary_native_table.is_none()
+                && self.data_services.startup_companion_natives.as_ref()
+                    .is_some_and(|companion| companion.native439_continue)
+                && arguments.len() == 8 && read_u32(arguments, 4)? <= 1 =>
+                Ok(NativeReturn::Continue),
             // The packed Kanmi producer uses the reserved slot as a statement
             // with an owner ID and a Boolean. Bind only the verified producer.
             439 if self.data_services.particle_message_pe_sha256 == Some(
@@ -4154,15 +4186,10 @@ impl LoggingHost<'_> {
                 "7a068090a8d37c7a446a74e98448458e3d6ed75d94bb1a00022eaeb07d7a3921",
             ) && arguments.len() == 8 && read_u32(arguments, 4)? <= 1 =>
                 Ok(NativeReturn::Continue),
-            // Slot 439 in Djibril5.exe (RVA 0x80980) and Grisaia.exe
-            // (RVA 0x79660) returns status 2 without touching the result slot.
-            439 if matches!(self.css_task_sha(),
-                Some(story_trace::story_trace_10::PE | story_trace::story_trace_14::PE)) =>
-                Ok(NativeReturn::Continue),
             429 | 439 | 543..=548 | 550..=556 | 559..=563 | 573 | 575
             | 578..=581 | 626 | 627 | 642..=644 | 652 | 660 | 661
             | 670..=673 | 686 | 687 => reserved_native::call(
-                self.data_services.native_profile.map_or("", |profile| profile.pe_sha256), index,
+                self.data_services.ordinary_native_table.as_ref(), index,
             ),
             141
             | 169
@@ -4402,7 +4429,8 @@ impl LoggingHost<'_> {
             567 => self.write_text_file_native567(arguments, vm),
             934 => self.cst_alias_native(arguments, vm),
             451 | 645 | 646 | 649 | 650 | 882 | 883 => self.fes_data_native(index, arguments, vm),
-            1045 | 1046 | 1051 => utf8_text_native(index, arguments, vm),
+            1045 | 1046 => utf8_text_native(index, arguments, vm),
+            1051 => self.cst_speaker_search_native(arguments, vm),
             696..=700 | 785 | 850 | 851 | 876 | 977 | 1034 => {
                 self.backlog_native(index, arguments, vm)
             }
@@ -4806,16 +4834,6 @@ impl LoggingHost<'_> {
             164 => self.control_sound_native(164, arguments, vm),
             165 => self.control_sound_native(165, arguments, vm),
             166..=168 | 347..=349 => self.control_sound_native(index, arguments, vm),
-            400 if arguments.len() >= 8 => {
-                let slot = word(0).unwrap();
-                let name = String::from_utf8_lossy(&vm.read_string(word(4).unwrap())?).to_string();
-                if let Some(event) = self.events.last_mut() {
-                    event
-                        .detail
-                        .push_str(&format!(" sound_loop slot={slot} name={name:?}"));
-                }
-                Ok(NativeReturn::Continue)
-            }
             207 if arguments.len() == 4 => {
                 let mut matrix = [0.0_f32; 16];
                 for index in [0, 5, 10, 15] {
@@ -5415,8 +5433,9 @@ impl LoggingHost<'_> {
             )),
             1002 if arguments.len() == 8 => {
                 let target = word(0).unwrap();
-                let source = expand_kcs_format(vm, &vm.read_string(word(4).unwrap())?, 0)?;
-                let mut output = source;
+                let source = word(4).unwrap();
+                let input = vm.read_string(source)?;
+                let mut output = expand_kcs_format(vm, &input, 0)?;
                 for (find, replacement) in self.script_replacements {
                     if find.is_empty() {
                         return Err(native_state_error("native 1002 replacement key is empty"));
@@ -5424,6 +5443,9 @@ impl LoggingHost<'_> {
                     output = replace_all_non_overlapping(&output, find, replacement);
                 }
                 write_kcs_terminated(vm, target, &output, 1)?;
+                self.data_services.cst_text_origins.note_speaker_replacement(
+                    self.current_task_id, target, source, &input, &output,
+                );
                 Ok(NativeReturn::Continue)
             }
             1002 => Err(native_state_error(
@@ -5448,21 +5470,16 @@ impl LoggingHost<'_> {
                     Err(RuntimeError::ResourceNotFound(_)) => return Ok(NativeReturn::Value(0)),
                     Err(_) => return Err(native_state_error("XML resource read failed")),
                 };
-                let first_path = configuration::campanella_boot_first_path(
-                    self.css_task_sha(), &name, || particle_plugin_digest::sha256(&bytes),
-                );
+                let first_path = configuration::adv_boot_first_path(&name);
                 let Ok(document) = ConfigXml::parse_runtime_with_first_path(&bytes, first_path) else {
                     return Ok(NativeReturn::Value(0));
                 };
                 let handle = *self.next_xml_handle;
                 *self.next_xml_handle = self.next_xml_handle.saturating_add(1).max(1);
                 self.xml_handles.insert(handle, document);
-                if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA)
-                    && name.eq_ignore_ascii_case("config.int/adv.xml")
-                    && let Some(event) = self.events.last_mut()
+                if first_path.is_some() && let Some(event) = self.events.last_mut()
                 {
-                    let policy = if first_path.is_some() { "first" } else { "last" };
-                    event.detail.push_str(&format!(" xml_handle={handle} xml_boot_policy={policy}"));
+                    event.detail.push_str(&format!(" xml_handle={handle} xml_boot_policy=first"));
                 }
                 Ok(NativeReturn::Value(handle))
             }
@@ -5499,8 +5516,7 @@ impl LoggingHost<'_> {
                     parts.insert(0, b"document");
                 }
                 let value = document.integer(&parts, default as i32) as u32;
-                if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA)
-                    && parts.as_slice() == configuration::CAMPANELLA_BOOT_PATH
+                if parts.as_slice() == configuration::ADV_BOOT_PATH
                     && let Some(event) = self.events.last_mut()
                 {
                     let hit = document.text(&parts).is_some();
@@ -7316,32 +7332,62 @@ impl HeadlessPlayer {
             player.log.push(format_diagnostic(diagnostic));
         }
         player.default_entry = discover_start_entry(&player.scan.resources);
-        player.data_services.newton_legacy_gbk =
-            cst_context_native::verified_newton_text_profile(&player.scan.resources);
+        player.data_services.loose_scene_encoding =
+            cst_context_native::LooseSceneEncoding::detect(&player.scan.resources);
         player.external_size = discover_heap_size(&player.scan.resources);
-        let totsuzen_companion =
-            fes_tasks::verified_totsuzen_companion(&player.scan, player.default_entry.as_deref());
-        player.configured_shared_slots =
-            fes_tasks::startup_shared_slots(&player.scan, totsuzen_companion.is_some());
         player.auto_select = discover_auto_select(&player.scan.resources);
         player.data_services.native_profile = player.scan.engine.primary_executable.as_ref()
             .and_then(|binary| cs2_runtime::native_profile::profile_for_pe_sha256(&binary.sha256, None));
         if let Some(available) = available_memory_bytes {
             player.enable_host_fast_forward(available);
         }
+        let executable_table = cs2_runtime::native_table::OrdinaryNativeTable::from_game_executable(&player.scan);
+        player.data_services.ordinary_native_table_from_executable = executable_table.is_some();
+        player.data_services.ordinary_native_table = executable_table.or_else(|| {
+            cs2_runtime::native_table::OrdinaryNativeTable::flat_companion_natives(
+                &player.scan, player.default_entry.as_deref()?,
+            )
+        });
+        if player.data_services.ordinary_native_table.is_none() {
+            player.data_services.startup_companion_natives = player.default_entry.as_deref().and_then(|entry| {
+                cs2_runtime::native_table::OrdinaryNativeTable::startup_companion_natives(&player.scan, entry)
+            });
+        }
+        player.configured_shared_slots = discover_shared_slots(&player.scan.resources)
+            .or_else(|| {
+                player.data_services.ordinary_native_table.as_ref()
+                    .and_then(|table| table.shared_slots_default())
+            })
+            .or_else(|| {
+                player.data_services.startup_companion_natives.as_ref()
+                    .and_then(|contract| contract.shared_slots_default)
+            })
+            .unwrap_or(512);
+        player.data_services.ordinary.sequence_file_category = player
+            .data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.sequence_resource_category());
         if let Some(binary) = player.scan.engine.primary_executable.as_ref() {
-            player.data_services.task_native_profile =
-                cs2_runtime::native_task_profile::exact_task_native_profile(&binary.sha256);
-            player.data_services.tasks.message_lists.identify(&binary.sha256);
-            player.data_services.ordinary.identify(&binary.sha256);
             player.data_services.css_task_pe_sha256 = css_task_native::identified_pe_sha256(&binary.sha256);
-            player.data_services.particle_external.identify(&binary.sha256);
-            player.data_services.emote.initialize(&player.scan.resources, &binary.sha256)
-                .context("initialize identified E-mote CPU backend")?;
         }
-        if let Some(companion) = totsuzen_companion {
-            player.data_services.tasks.message_lists.identify_verified_companion(companion);
+        let legacy_kc_view = player.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.kc_view_binding())
+            || player.data_services.startup_companion_natives.as_ref()
+                .is_some_and(|table| table.kc_view_binding);
+        player.data_services.particle_external.set_legacy_kc_view(legacy_kc_view);
+        if player.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.emote_task_family())
+            || player.data_services.startup_companion_natives.as_ref()
+                .is_some_and(|table| table.emote_task_family)
+        {
+            player.data_services.emote.initialize(&player.scan.resources)
+                .context("initialize registered E-mote CPU backend")?;
         }
+        player.data_services.tasks.message_lists.identify(
+            player.data_services.ordinary_native_table.as_ref()
+                .and_then(|table| table.message_list_base()),
+            player.data_services.startup_companion_natives.as_ref()
+                .and_then(|contract| contract.message_list_base),
+        );
         player.data_services.tasks.fes.install_cpu_hooks();
         player.data_services.tasks.install_buffer_receiver(15, list_native::receive);
         player.data_services.tasks.install_buffer_receiver(54, emote_native::receive);
@@ -7384,7 +7430,8 @@ impl HeadlessPlayer {
             .push(format!("startup heap: {} bytes", player.external_size));
         player.with_host(|host| host.ensure_fes_settings())?;
         player.initialize_configuration_host()?;
-        player.with_host(|host| Ok(host.initialize_root_sound_service()?))?;
+        let entry = player.default_entry.clone();
+        player.with_host(|host| Ok(host.initialize_root_sound_service(entry.as_deref())?))?;
         player.initialize_enabled_speech().context("initialize enabled speech provider")?;
         // Prepare one immutable index snapshot during startup. A cold material
         // request must not deep-clone the archive index on the game frame.
@@ -7571,7 +7618,7 @@ impl HeadlessPlayer {
 
     pub fn load_entry(&mut self, name: impl AsRef<str>) -> Result<&LoadedEntry> {
         let name = name.as_ref();
-        let bytes = read_entry_with_fallback(&self.scan.resources, name)
+        let (bytes, resolved_name) = read_resolved_entry(&self.scan.resources, name)
             .with_context(|| format!("read script/resource entry {name}"))?;
         let loaded = if bytes.starts_with(b"KCS\0") {
             let program = measure_host_operation(HostPhase::ScriptParse, || KcsProgram::parse(&bytes))
@@ -7715,6 +7762,20 @@ impl HeadlessPlayer {
             "loaded {} {} ({} bytes): {}",
             loaded.kind, loaded.name, loaded.byte_length, loaded.detail
         ));
+        if matches!(loaded.kind.as_str(), "KCS" | "CST" | "FES")
+            && !self.data_services.ordinary_native_table_from_executable
+        {
+            self.data_services.active_scene_tool_commands = if self.default_entry.as_deref() == Some(resolved_name.as_str()) {
+                None
+            } else {
+                use cs2_runtime::native_table::OrdinaryNativeTable;
+                Some(OrdinaryNativeTable::flat_companion_natives(&self.scan, &resolved_name)
+                    .map(|table| table.scene_tool_commands())
+                    .or_else(|| OrdinaryNativeTable::startup_companion_natives(&self.scan, &resolved_name)
+                        .map(|table| table.scene_tool_commands))
+                    .unwrap_or_default())
+            };
+        }
         self.frame_phase = PlayerFramePhase::Start;
         self.particle_frame_cursor = None;
         self.loaded = Some(loaded);
@@ -8102,14 +8163,18 @@ impl HeadlessPlayer {
             self.frame_phase = PlayerFramePhase::Render;
             }
             }
-            #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-            if !self.preflight_scene_emote_poses()? {
-                // Keep the last complete canvas until a new or incompatible
-                // actor's first pose arrives. All earlier phases ran already.
-                break;
+            let retain_scene = !self.data_services.tasks.new_visible_list_sources.is_empty()
+                && self.with_host(|host| Ok(host.retain_scene_during_list_setup()))?;
+            if !retain_scene {
+                #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                if !self.preflight_scene_emote_poses()? {
+                    // Keep the last complete canvas until a new or incompatible
+                    // actor's first pose arrives. All earlier phases ran already.
+                    break;
+                }
+                self.render_scene().context("render logical scene")?;
+                self.capture_completed_frame();
             }
-            self.render_scene().context("render logical scene")?;
-            self.capture_completed_frame();
             self.commit_host_device_keys_frame();
             self.data_services.top_clock.sampled = self.data_services.top_clock.requested;
             self.frame_phase = PlayerFramePhase::Start;
@@ -10084,6 +10149,10 @@ fn format_diagnostic(diagnostic: &cs2_runtime::ScanDiagnostic) -> String {
 }
 
 fn read_entry_with_fallback(resources: &ResourceIndex, name: &str) -> Result<Vec<u8>> {
+    read_resolved_entry(resources, name).map(|(bytes, _)| bytes)
+}
+
+fn read_resolved_entry(resources: &ResourceIndex, name: &str) -> Result<(Vec<u8>, String)> {
     let _timing = measure_host_phase(HostPhase::ScriptRead);
     // A mounted virtual prefix already describes all permitted fallbacks.
     // Stripping it could load an unrelated same-named script or image.
@@ -10093,7 +10162,9 @@ fn read_entry_with_fallback(resources: &ResourceIndex, name: &str) -> Result<Vec
                 || router.groups.iter().any(|group| String::from_utf16_lossy(&group.prefix).eq_ignore_ascii_case(prefix))
         })
     {
-        return resources.read(name).map_err(anyhow::Error::new);
+        return resources.read(name)
+            .map(|bytes| (bytes, name.to_owned()))
+            .map_err(anyhow::Error::new);
     }
     let mut candidates = vec![name.to_string()];
     if !name.starts_with("system/") && !name.starts_with("system\\") {
@@ -10115,7 +10186,7 @@ fn read_entry_with_fallback(resources: &ResourceIndex, name: &str) -> Result<Vec
     let mut first_error = None;
     for candidate in candidates {
         match resources.read(&candidate) {
-            Ok(bytes) => return Ok(bytes),
+            Ok(bytes) => return Ok((bytes, candidate)),
             Err(error @ RuntimeError::ResourceNotFound(_)) => first_error = Some(error),
             Err(error) => return Err(anyhow::Error::new(error)),
         }
@@ -13176,9 +13247,7 @@ mod tests {
     }
 
     #[test]
-    fn kanmi_native925_keeps_verified_profiles_and_arity() {
-        use cs2_runtime::native_profile::{ConstantNativeReturn, known_profiles};
-
+    fn kanmi_native925_requires_verified_legacy_signature_and_arity() {
         let scratch = TempDir::new();
         let mut player =
             HeadlessPlayer::open_with_save_root(&scratch.0, scratch.0.join("profile")).unwrap();
@@ -13195,10 +13264,6 @@ mod tests {
             assert!(matches!(host.call(909, &[], &mut vm),
                 Err(cs2_script::ScriptError::UnimplementedNativeCall { index: 909 })));
 
-            host.data_services.native_profile = Some(known_profiles().iter()
-                .find(|profile| profile.constant(925) == Some(ConstantNativeReturn::Value(1)))
-                .expect("known E-mote profile with native 925 enabled"));
-            assert!(matches!(host.call(925, &[], &mut vm), Ok(NativeReturn::Value(1))));
             Ok(())
         }).unwrap();
     }

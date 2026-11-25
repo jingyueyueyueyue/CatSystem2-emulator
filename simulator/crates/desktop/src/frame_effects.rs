@@ -539,6 +539,56 @@ impl RenderTaskStore {
 }
 
 #[test]
+fn ordinary_568_supplies_the_wbreak_fragments() -> Result<()> {
+    use cs2_script::Host;
+
+    let temp = crate::tests::TempDir::new();
+    let mut player = crate::HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+    let previous = Color::rgb(192, 64, 32);
+    let current = Color::rgb(24, 80, 160);
+    let size = [player.canvas.width(), player.canvas.height()];
+    let depth = 45_000.0f32.to_bits();
+    let effect = player.with_host(|host| {
+        let plane = host.create_task_object(2, 0, b"background", b"")?;
+        let node = host.scene_nodes.get_mut(&plane).unwrap();
+        node.size = size.map(|axis| axis as f32);
+        node.position = [0., 0., 5000.];
+        node.color = 0xffc0_4020;
+        node.visible = true;
+        node.initialized = true;
+
+        let mut vm = Vm::new();
+        let capture = [0, depth].map(u32::to_le_bytes).concat();
+        host.call(568, &capture, &mut vm)?;
+        host.scene_nodes.get_mut(&plane).unwrap().color = 0xff18_50a0;
+
+        let effect = host.create_task_object(52, 0, b"wbreak", b"")?;
+        let prepare = [effect, 58, 0, depth, 8, 8, 15.0f32.to_bits(), 30.0f32.to_bits()];
+        host.call(860, &prepare.map(u32::to_le_bytes).concat(), &mut vm)?;
+        host.call(861, &[effect, 1].map(u32::to_le_bytes).concat(), &mut vm)?;
+        Ok(effect)
+    })?;
+
+    player.render_scene()?;
+    assert!(player.canvas.pixels().chunks_exact(4).all(|pixel| {
+        pixel == [previous.r, previous.g, previous.b, 255]
+    }), "each fragment must sample the previous scene without seams at the start");
+
+    player.with_host(|host| host.data_services.tasks.render.update(effect, 20))?;
+    player.render_scene()?;
+    assert!(player.canvas.pixels().chunks_exact(4).any(|pixel| {
+        pixel[0] > current.r && pixel[0] < previous.r
+    }), "moving shards must blend the previous and current scene");
+
+    player.with_host(|host| host.data_services.tasks.render.update(effect, 58))?;
+    player.render_scene()?;
+    assert!(player.canvas.pixels().chunks_exact(4).all(|pixel| {
+        pixel == [current.r, current.g, current.b, 255]
+    }), "the completed transition must show the current scene");
+    Ok(())
+}
+
+#[test]
 fn wbreak_prepare_does_not_require_a_flip_receiver_version() {
     let mut render = RenderTaskStore::default();
     let effect_id = 108;

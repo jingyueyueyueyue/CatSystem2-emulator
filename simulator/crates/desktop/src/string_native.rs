@@ -5,8 +5,6 @@ use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, cp932_char_width, native_state_error, read_u32, trim_nul};
 
 const MAX_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
-const V401_SHA256: &str =
-    "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f";
 
 fn string_address(base: u32, offset: usize) -> Result<u32> {
     let offset = u32::try_from(offset)
@@ -676,9 +674,10 @@ impl LoggingHost<'_> {
                         Err(error) => return Err(error),
                     }
                 }
-                // v401 578230 advances one byte. Yukikoi 5ffb60 uses 600a00
-                // for valid CP932 pairs; retain that existing path elsewhere.
-                let pairs = self.data_services.css_task_pe_sha256 != Some(V401_SHA256);
+                // Only a registered 41 wrapper calling the recovered
+                // byte-oriented helper opts out of CP932 pair handling.
+                let pairs = self.data_services.ordinary_native_table.as_ref()
+                    .is_none_or(|table| !table.string_split_uses_bytes());
                 let mut input = 0;
                 let mut output = 0;
                 let mut separated = true;
@@ -905,5 +904,53 @@ impl LoggingHost<'_> {
             cursor += cp932_char_width(&haystack[cursor..]);
         }
         Ok(NativeReturn::Value(haystack.len() as u32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HeadlessPlayer;
+    use cs2_runtime::native_table::OrdinaryNativeTable;
+    use cs2_script::{Host, KcsProgram};
+    use std::path::{Path, PathBuf};
+
+    fn game(path: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games").join(path)
+    }
+
+    fn split_trail_byte(path: &str, expected: &[u8]) -> anyhow::Result<()> {
+        let executable = game(path);
+        if !executable.is_file() {
+            return Ok(());
+        }
+        let table = OrdinaryNativeTable::from_pe(&std::fs::read(executable)?)
+            .expect("ordinary registered table");
+        let temp = crate::tests::TempDir::new();
+        std::fs::write(temp.0.join("startup.xml"), concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><document><INT><int00>",
+            "<name>image</name><int>image.int</int><ext>hg3</ext><dir>image</dir>",
+            "</int00></INT></document>",
+        ))?;
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+        player.with_host(|host| {
+            host.data_services.ordinary_native_table = Some(table);
+            let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?)?;
+            let target = vm.allocate_region(&[0; 8])?;
+            let source = vm.allocate_region(&[0x82, 0xa0, 0])?;
+            let separators = vm.allocate_region(&[0xa0, 0])?;
+            let arguments = [target, source, separators].map(u32::to_le_bytes).concat();
+            assert_eq!(host.call(41, &arguments, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(vm.read(target, expected.len())?, expected);
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn registered_native41_preserves_the_original_splitter_byte_unit() -> anyhow::Result<()> {
+        split_trail_byte("cs2_full_v401/system/cs2_open.exe", &[0x82, 0, 0, 0])?;
+        split_trail_byte("Yukikoi Melt/YukikoiMelt.exe", &[0x82, 0xa0, 0, 0])?;
+        Ok(())
     }
 }

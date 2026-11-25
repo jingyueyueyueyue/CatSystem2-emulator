@@ -2366,7 +2366,7 @@ mod tests {
     #[test]
     #[ignore = "requires hardware DX12 and the local PSZ fixture"]
     fn interactive_scene_composes_while_one_pose_worker_is_delayed() -> Result<()> {
-        use cs2_runtime::emote::{EmoteTick, NEKOPARA_PE_SHA256};
+        use cs2_runtime::emote::EmoteTick;
         struct Scratch(PathBuf);
         impl Drop for Scratch {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -2379,7 +2379,7 @@ mod tests {
         let bytes = index.read_archive_with_name_seed("psz.int", b"ca01_l_body_1.psz", 0x0F6BB0AE)?;
         let mut host = crate::HeadlessPlayer::open_with_save_root(&scratch.0, scratch.0.join("save"))?;
         crate::gpu_raster::enable();
-        host.data_services.emote.initialize(&index, NEKOPARA_PE_SHA256)?;
+        host.data_services.emote.initialize(&index)?;
         host.enable_host_emote_pose_jobs();
         assert!(pose_jobs_available(), "test requires the interactive indexed GPU path");
         assert!(prep_worker_limit() >= 2, "test requires two pose workers");
@@ -2724,7 +2724,7 @@ mod tests {
     #[test]
     #[ignore = "requires hardware DX12 and the local PSZ fixture"]
     fn headless_scene_prepares_single_and_multiple_emote_actors_on_changed_frames() -> Result<()> {
-        use cs2_runtime::emote::{EmoteTick, NEKOPARA_PE_SHA256};
+        use cs2_runtime::emote::EmoteTick;
 
         struct Scratch(PathBuf);
         impl Drop for Scratch {
@@ -2741,7 +2741,7 @@ mod tests {
         crate::gpu_raster::enable();
         assert!(crate::gpu_raster::emote_batch_requested(), "test requires the production batched GPU path");
         assert!(mesh::enabled(), "test requires indexed geometry");
-        host.data_services.emote.initialize(&index, NEKOPARA_PE_SHA256)?;
+        host.data_services.emote.initialize(&index)?;
         host.canvas = Canvas::new(1280, 720)?;
         host.graphics_canvas = Canvas::new(1280, 720)?;
         let viewport = CpuViewport { width: 1280, height: 720, origin_x: 640., origin_y: 600., scale: 1., time_units_per_frame: 1. };

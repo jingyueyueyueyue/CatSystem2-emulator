@@ -1367,6 +1367,157 @@ impl HeadlessPlayer {
         Some((anchor, binding))
     }
 
+    /// Resolves the first enabled option from the live choice receiver for unattended PC replay.
+    pub fn host_replay_first_fes_choice(&mut self) -> anyhow::Result<Option<(u32, u32, [i32; 2])>> {
+        self.host_replay_fes_choice_bank(None)
+    }
+
+    /// Resolves a requested bank through the same live input checks as the default choice.
+    pub fn host_replay_fes_choice_bank(
+        &mut self, requested_bank: Option<u32>,
+    ) -> anyhow::Result<Option<(u32, u32, [i32; 2])>> {
+        if !self.movie_playbacks.is_empty() || self.data_services.host_pause.paused
+            || !self.state.input.focused
+            || !self.cst_contexts.values().any(|context| context.document.is_some())
+        {
+            return Ok(None);
+        }
+        let frame = self.state.clock.frame;
+        let [width, height] = self.logical_size().map(|size| i32::try_from(size).unwrap_or(i32::MAX));
+        let (owner, fes_target) = {
+            let mut windows = self.data_services.tasks.fes.story_runtimes().filter_map(|(owner, name, runtime, _)| {
+                let driver = runtime.driver.as_ref()?;
+                let target = match (name.strip_suffix(b".fes").unwrap_or(name), driver.interpreter.current_block()) {
+                    (b"select" | b"fselect", b"WAIT") => (b"fr1".as_slice(), None),
+                    (b"select" | b"fselect", b"WAIT_USER") => (b"btn_frip".as_slice(), None),
+                    (b"select1", b"WAIT") => (b"btdata".as_slice(), None),
+                    (b"bt_sel" | b"bt_sel2", b"WAIT") => (b"btn".as_slice(), None),
+                    (b"quest_sel", b"WAIT") if self.host_story_pe_sha256() == Some(story_trace_18::PE) => {
+                        // Quest banks 0 and 1 rotate the cards. Bank 2 confirms the displayed quest.
+                        (b"btn".as_slice(), Some(2))
+                    }
+                    _ => return None,
+                };
+                (!driver.initialization_pending() && !driver.has_pending_handler()
+                    && matches!(driver.waiting(), Some(FesDriverWait::Frame { after }) if *after == frame))
+                    .then_some((owner, target))
+            });
+            let mut legacy_windows = self.scene_nodes.values().filter(|node| {
+                node.name == "select" && story_trace_09::live_child(self, node.id, node.parent, 12)
+                    && self.task_vms.get(&node.id).is_some_and(|vm| vm.program().is_some())
+            });
+            match (windows.next(), legacy_windows.next()) {
+                (Some((owner, node)), None) if windows.next().is_none() => (owner, Some(node)),
+                (None, Some(node)) if legacy_windows.next().is_none() => (node.id, None),
+                _ => return Ok(None),
+            }
+        };
+        let mut options: Vec<_> = self.input_task.regions.iter().filter_map(|entry| {
+            let region = entry.id();
+            if entry.words[8] == 0 || self.input_button_state(region)?.receiver != Some(owner) {
+                return None;
+            }
+            let bank = if let Some((name, bank)) = fes_target {
+                let (receiver, target) = self.data_services.tasks.fes.platform.region_target(region)?;
+                let target = target?;
+                if receiver != owner || target.name != name || target.bank < 0
+                    || bank.is_some_and(|bank| target.bank != bank)
+                {
+                    return None;
+                }
+                target.bank as u32
+            } else {
+                if !story_trace_09::live_child(self, region, owner, 6) {
+                    return None;
+                }
+                let number = self.scene_nodes.get(&region)?.name.strip_prefix("button ")?;
+                if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                number.parse().ok()?
+            };
+            if requested_bank.is_some_and(|requested| requested != bank) {
+                return None;
+            }
+            let [left, top, right, bottom] = entry.bounds();
+            let (left, top, right, bottom) = (left.max(0), top.max(0), right.min(width), bottom.min(height));
+            (left < right && top < bottom)
+                .then_some((bank, region, [left.midpoint(right), top.midpoint(bottom)]))
+        }).collect();
+        options.sort_unstable_by_key(|(bank, _, _)| *bank);
+        let Some(&(bank, region, point)) = options.first() else { return Ok(None); };
+        if options.get(1).is_some_and(|(next, _, _)| *next == bank) {
+            return Ok(None);
+        }
+        Ok((self.masked_input_region_at(point)?.is_some_and(|hit| hit[0] == region && hit[8] != 0)
+            && self.mouse_press_candidate_regions(point)?.contains(&region)).then_some((owner, region, point)))
+    }
+
+    pub fn host_replay_fes_choice(
+        &mut self, scene: &str, group: usize, target: &str,
+    ) -> anyhow::Result<Option<(u32, [i32; 2])>> {
+        let ((frame, _, current_scene, page_group, _), _) = self.host_replay_story_position();
+        if !current_scene.eq_ignore_ascii_case(scene) || !self.movie_playbacks.is_empty()
+            || i32::try_from(group).ok() != page_group.checked_add(1)
+        {
+            return Ok(None);
+        }
+        let mut groups = self.cst_contexts.values().filter(|context| context.story.is_scene(scene))
+            .filter_map(|context| context.document.as_ref()?.input_records(group));
+        let Some(records) = groups.next() else { return Ok(None); };
+        if groups.next().is_some() {
+            return Ok(None);
+        }
+        let mut markers = records.iter().enumerate().filter_map(|(index, record)| {
+            (record.kind == 0x30 && record.text.trim_ascii() == b"fselect").then_some(index)
+        });
+        let Some(marker) = markers.next().filter(|_| markers.next().is_none())
+        else { return Ok(None); };
+        let choices = &records[marker + 1..];
+        let mut banks = choices.iter().enumerate().filter_map(|(bank, row)| {
+            let mut words = row.text.split(|byte| byte.is_ascii_whitespace()).filter(|word| !word.is_empty());
+            let id = words.next()?;
+            (row.kind == 0x30 && id.iter().all(u8::is_ascii_digit)
+                && words.next()?.eq_ignore_ascii_case(target.as_bytes()) && words.next().is_some())
+                .then_some(bank)
+        });
+        let Some(bank) = banks.next().filter(|_| banks.next().is_none()) else { return Ok(None); };
+
+        let owner = {
+            let mut windows = self.data_services.tasks.fes.story_runtimes().filter(|(_, name, _, _)| {
+                matches!(name.strip_suffix(b".fes").unwrap_or(name), b"select" | b"fselect")
+            });
+            let Some((owner, _, runtime, _)) = windows.next().filter(|_| windows.next().is_none())
+            else { return Ok(None); };
+            let Some(driver) = &runtime.driver else { return Ok(None); };
+            if driver.initialization_pending() || driver.has_pending_handler()
+                || driver.interpreter.current_block() != b"WAIT"
+                || !matches!(driver.waiting(), Some(FesDriverWait::Frame { after }) if *after == frame)
+            {
+                return Ok(None);
+            }
+            owner
+        };
+        let mut bindings = self.input_task.regions.iter().filter_map(|entry| {
+            let region = entry.id();
+            let (receiver, target) = self.data_services.tasks.fes.platform.region_target(region)?;
+            let target = target?;
+            (receiver == owner && target.name == b"fr1" && target.bank == bank as i32
+                && entry.words[8] != 0).then_some((region, entry.bounds()))
+        });
+        let Some((region, [left, top, right, bottom])) =
+            bindings.next().filter(|_| bindings.next().is_none()) else { return Ok(None); };
+        if self.input_button_state(region).and_then(|button| button.receiver) != Some(owner) {
+            return Ok(None);
+        }
+        let [width, height] = self.logical_size().map(|size| i32::try_from(size).unwrap_or(i32::MAX));
+        let [left, top, right, bottom] = [left.max(0), top.max(0), right.min(width), bottom.min(height)];
+        if left >= right || top >= bottom { return Ok(None); }
+        let point = [left.midpoint(right), top.midpoint(bottom)];
+        Ok((self.masked_input_region_at(point)?.is_some_and(|hit| hit[0] == region && hit[8] != 0)
+            && self.mouse_press_candidate_regions(point)?.contains(&region)).then_some((region, point)))
+    }
+
     pub fn host_daydream_end1_choice(
         &mut self, scene: &str, targets: &[&str], loaded_after: u64,
     ) -> anyhow::Result<Option<([i32; 2], u32, u32)>> {
@@ -2540,6 +2691,65 @@ mod tests {
         message_window_ready, novel_wait_state, prefetched_novel_input_ready, rebellions_episode_fes_ready,
         rebellions_title_fes_ready, settled_novel_draw_without_icons, story_trace_profile,
     };
+
+    #[test]
+    fn replay_first_choice_requires_live_legacy_button_receiver_and_hit() -> anyhow::Result<()> {
+        use crate::{CstContextState, HeadlessPlayer, InputRegionState};
+        use cs2_runtime::message_object::ButtonSource;
+        use cs2_script::{CstDocument, CstRecord, KcsProgram, Vm};
+
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-replay-choice-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let result = HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = result?;
+        player.state.input.focused = true;
+        player.cst_contexts.insert(1, CstContextState {
+            document: Some(CstDocument {
+                records: vec![CstRecord { kind: 0x02, text: Vec::new() }],
+                inputs: vec![0..1],
+            }),
+            ..CstContextState::default()
+        });
+
+        let (owner, first, second) = player.with_host(|host| {
+            let owner = host.create_task_object(12, 0, b"select", b"")?;
+            let other = host.create_task_object(6, 0, b"button 0", b"")?;
+            let second = host.create_task_object(6, owner, b"button 1", b"")?;
+            let first = host.create_task_object(6, owner, b"button 0", b"")?;
+            for (region, bounds) in [
+                (other, [10, 100, 40, 130]),
+                (second, [20, 60, 60, 80]),
+                (first, [-20, 10, 40, 30]),
+            ] {
+                let mut words = [0; 15];
+                words[0] = region;
+                words[2] = ButtonSource::Mouse.mask();
+                words[3..7].copy_from_slice(&bounds.map(|value| value as u32));
+                words[8..10].fill(1);
+                host.input_task.regions.push(InputRegionState { words });
+                assert!(host.bind_input_button_owner(region, owner)?);
+            }
+            Ok((owner, first, second))
+        })?;
+        assert_eq!(player.host_replay_first_fes_choice()?, None);
+        player.register_task_vm(owner, Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 32], 32)?)?)?;
+        assert_eq!(player.host_replay_first_fes_choice()?, Some((owner, first, [20, 20])));
+
+        player.input_task.regions[0].words[3..7].copy_from_slice(&[10, 10, 30, 30]);
+        assert_eq!(player.host_replay_first_fes_choice()?, None);
+        player.input_task.regions[0].words[8] = 0;
+
+        player.input_task.regions[2].words[2] = 0;
+        assert_eq!(player.host_replay_first_fes_choice()?, None);
+        player.input_task.regions[2].words[8] = 0;
+        assert_eq!(player.host_replay_first_fes_choice()?, Some((owner, second, [40, 70])));
+
+        player.data_services.messages.input_buttons.get_mut(&second).unwrap().state.set_receiver(0);
+        assert_eq!(player.host_replay_first_fes_choice()?, None);
+        Ok(())
+    }
 
     #[test]
     fn kanmi_observes_confirmed_cst_without_releasing_input() {

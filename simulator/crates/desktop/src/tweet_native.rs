@@ -1,4 +1,4 @@
-//! SHA-bound type62 / ordinary1018..1023, independent of Effekseer/Emote.
+//! Registered type62 / ordinary1018..1023, independent of Effekseer/Emote.
 //! All pointer payloads become owned bytes before task routing or threading.
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
@@ -8,8 +8,6 @@ use cs2_script::{NativeReturn, Result, Vm};
 use crate::{LoggingHost, ScriptTextEncoding, expand_kcs_format, native_state_error, read_u32, trim_nul};
 use crate::native_tasks::OwnedTaskBuffers;
 use crate::tweet_worker::{Media, Outcome, Request};
-
-const PE: &str = "63de0e14cd8ce11ad2d68e7ed6076641ff5e5b73d822603cc52764009d812976";
 
 #[derive(Default)]
 pub(super) struct TweetStore {
@@ -60,9 +58,14 @@ fn receiver(host: &mut LoggingHost<'_>, command: TaskCommand, buffers: &mut Owne
 }
 
 impl LoggingHost<'_> {
+    fn has_registered_tweet_family(&self) -> bool {
+        self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(cs2_runtime::native_table::OrdinaryNativeTable::has_tweet_family)
+    }
+
     pub(super) fn register_tweet_task(&mut self, id: u32) -> Result<()> {
-        if self.data_services.native_profile.map(|p| p.pe_sha256) != Some(PE) {
-            return Err(native_state_error("type62 Tweet layout requires its verified PE profile"));
+        if !self.has_registered_tweet_family() {
+            return Err(native_state_error("type62 Tweet layout requires its registered receivers"));
         }
         self.data_services.tweets.tasks.insert(id, TweetTask {
             config: None, images: Default::default(), tags: Default::default(), body: Vec::new(),
@@ -74,8 +77,8 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn tweet_native(&mut self, index: u32, args: &[u8], vm: &Vm) -> Result<NativeReturn> {
-        if self.data_services.native_profile.map(|p| p.pe_sha256) != Some(PE) {
-            return Err(native_state_error("Tweet ordinary ABI requires its verified PE profile"));
+        if !self.has_registered_tweet_family() {
+            return Err(native_state_error("Tweet ordinary ABI requires its registered receivers"));
         }
         let expected = match index { 1018 => 16, 1019 | 1020 | 1023 => 8, 1021 | 1022 => 4,
             _ => return Err(native_state_error("not a Tweet native")) };

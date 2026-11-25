@@ -3,7 +3,6 @@ use super::{Action, ButtonSource, DaydreamBodyAnchor, Decision, KeyboardPress, K
 use anyhow::Result;
 use cs2_desktop::HeadlessPlayer;
 use cs2_runtime::InputKey;
-use cs2_runtime::message_object::InputRouteReceipt;
 
 pub(super) struct Click {
     pub(super) started: u64,
@@ -22,16 +21,26 @@ impl Click {
             Decision::Input(Action::Pointer { x, y, button: Some(0) }))
     }
 
-    pub(super) fn observe(&mut self, receipts: &[InputRouteReceipt]) {
-        for item in receipts.iter().filter(|item| item.frame > self.started && item.pressed != 0 && item.response <= 1) {
+    pub(super) fn observe(&mut self, player: &HeadlessPlayer) {
+        let Some(scan) = player.host_input_route_scan_frame() else { return; };
+        if scan > self.started + 1 {
+            self.rejected |= self.received.is_none();
+        }
+        if scan != self.started + 1 {
+            return;
+        }
+        let frame = player.state().clock.frame;
+        for item in player.host_input_route_receipts().iter().filter(|item| {
+            item.frame == frame && item.pressed != 0 && item.response == 0
+        }) {
             let target = (item.region, item.receiver) == (self.region, self.owner);
-            let physical = item.frame - self.started <= 3 && item.key == 0 && item.group == 0
+            let physical = item.key == 0 && item.group == 0
                 && item.pressed == 1 && !item.repeated && item.raw_mask == ButtonSource::Mouse.mask()
                 && item.physical == [RoutedPhysicalButton { source: ButtonSource::Mouse, code: 1 }];
             if target && physical && self.received.is_none() {
                 self.received = Some(item.frame);
                 eprintln!("frame {}: Daydream ordinary {} {item:?}", item.frame, self.name);
-            } else if target || item.response == 0 {
+            } else {
                 self.rejected = true;
             }
         }
@@ -95,7 +104,7 @@ impl Load {
     pub(in super::super) fn receipts(&mut self, player: &HeadlessPlayer) {
         let receipts = player.host_input_route_receipts();
         if let Some(click) = &mut self.click {
-            click.observe(receipts);
+            click.observe(player);
         }
         if let Stage::Successor { binding, started, receipt, .. } = &mut self.stage {
             let consumers = receipts.iter().filter(|item| item.frame > *started && item.pressed != 0 && item.response == 0).count();
@@ -121,10 +130,13 @@ impl Load {
         if self.failure {
             return Ok(Decision::Stop("checkpoint_mismatch", "Daydream ordinary slot open/write receipt mismatch".into()));
         }
-        if let Some(click) = &self.click
-            && (click.rejected || click.received.is_none())
-        {
-            return Ok(Decision::Stop("input_missed", format!("Daydream ordinary {} physical receipt mismatch", click.name)));
+        if let Some(click) = &self.click {
+            if click.rejected || (click.received.is_none() && frame - click.started >= idle) {
+                return Ok(Decision::Stop("input_missed", format!("Daydream ordinary {} physical receipt mismatch", click.name)));
+            }
+            if click.received.is_none() {
+                return Ok(Decision::Wait);
+            }
         }
         if let Stage::Successor { anchor, started, receipt, .. } = self.stage {
             if receipt != KeyboardPressReceipt::Verified {

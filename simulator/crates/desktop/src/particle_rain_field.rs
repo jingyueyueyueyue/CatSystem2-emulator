@@ -3,9 +3,6 @@
 use super::particle_vm::{ParticleCanvas, ParticleQuad, ParticleRandomSource,
     ParticleRenderSnapshot, ParticleVertex};
 
-pub(super) const ATLAS_SHA: &str = "6ab38b54395c896d3e07dbee014bb5d3aa95d0e2d3f26c9b70aaf976e1d1c256";
-pub(super) const SCALED_SHA: &str = "350e23b794da6953f5ee47a4780331871321bd130302176c10c65e2db61d9eb7";
-
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RainFieldKind { Atlas, Scaled }
 

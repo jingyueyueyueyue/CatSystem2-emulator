@@ -3,6 +3,7 @@
 //! it owns neither a second drawable nor an invented tessellation or depth.
 use std::collections::BTreeMap;
 
+use cs2_runtime::native_table::RasterMessages;
 use cs2_runtime::{TaskCommand, TaskCommandBuffers, TaskCommandOutcome};
 use cs2_script::{NativeReturn, Result, Vm};
 
@@ -23,14 +24,27 @@ enum Operation {
     Parameters,
 }
 
-// Ordinary wrappers and object messages are different namespaces.
-const DESCRIPTORS: &[(Option<u32>, u32, u32, Operation)] = &[
-    (Some(197), 252, 263, Operation::Start),
-    (Some(198), 253, 264, Operation::Stop),
-    (Some(200), 254, 265, Operation::Query),
-    (Some(196), 258, 269, Operation::Configure),
-    (Some(201), 259, 270, Operation::Parameters),
-];
+impl Operation {
+    const ALL: [Self; 5] = [Self::Start, Self::Stop, Self::Query, Self::Configure, Self::Parameters];
+
+    fn message(self, layout: RasterMessages) -> u32 {
+        match self {
+            Self::Start => layout.start,
+            Self::Stop => layout.stop,
+            Self::Query => layout.query,
+            Self::Configure => layout.configure,
+            Self::Parameters => layout.parameters,
+        }
+    }
+}
+
+fn raster_messages(host: &LoggingHost<'_>) -> Result<RasterMessages> {
+    host.data_services.ordinary_native_table.as_ref()
+        .and_then(|table| table.raster_messages())
+        .or_else(|| host.data_services.startup_companion_natives.as_ref()
+            .and_then(|companion| companion.raster_messages))
+        .ok_or_else(|| error("Raster vertex callback needs a verified ordinary native registry"))
+}
 
 fn hydro_code(current: bool, code: u32) -> bool {
     if current {
@@ -40,7 +54,7 @@ fn hydro_code(current: bool, code: u32) -> bool {
     }
 }
 
-fn version(host: &LoggingHost<'_>) -> Result<bool> {
+fn legacy_message_version(host: &LoggingHost<'_>) -> Result<bool> {
     match host
         .data_services
         .native_profile
@@ -228,7 +242,7 @@ impl LoggingHost<'_> {
     pub(crate) fn register_raster_task(&mut self, id: u32) -> Result<()> {
         // This packed identity is issued only after matching both producer KCS files.
         if self.data_services.particle_message_pe_sha256 != Some(KANMI_PACKED) {
-            version(self)?;
+            raster_messages(self)?;
         }
         // The thread ctor's second argument is reported as '%d fps'; manager
         // passes it to root+48 and each child factory inherits parent+48.
@@ -286,10 +300,10 @@ impl LoggingHost<'_> {
         {
             return Ok(None);
         }
-        let current = version(self)?;
         if kind == 25 {
             // Both identified Hydro vtables delegate these messages without
             // reading any record or scalar, writing output or making pixels.
+            let current = legacy_message_version(self)?;
             return Ok(
                 hydro_code(current, command.code).then_some(TaskCommandOutcome {
                     done: true,
@@ -297,9 +311,9 @@ impl LoggingHost<'_> {
                 }),
             );
         }
-        let Some((_, _, _, operation)) = DESCRIPTORS
-            .iter()
-            .find(|(_, old, new, _)| command.code == if current { *new } else { *old })
+        let messages = raster_messages(self)?;
+        let Some(operation) = Operation::ALL.into_iter()
+            .find(|operation| command.code == operation.message(messages))
         else {
             return Ok(None);
         };
@@ -310,7 +324,7 @@ impl LoggingHost<'_> {
         if deletion != 0 {
             return Ok(consumed);
         }
-        self.apply_raster_operation(id, *operation, buffers.data1.as_deref(), output)?;
+        self.apply_raster_operation(id, operation, buffers.data1.as_deref(), output)?;
         Ok(consumed)
     }
 
@@ -489,17 +503,29 @@ impl LoggingHost<'_> {
         args: &[u8],
         vm: &mut Vm,
     ) -> Result<Option<NativeReturn>> {
-        if !matches!(index, 196..=198 | 200 | 201) {
+        if !matches!(index, 196..=198 | 200 | 201 | 203) {
             return Ok(None);
         }
         let id = word(args, 0)?;
         let Some(kind @ (18 | 25)) = self.scene_nodes.get(&id).map(|node| node.kind) else {
             return Ok(None);
         };
-        let required = match index {
-            196 => 8,
-            201 => 12,
-            _ => 4,
+        if index == 203 {
+            let finalize_passthrough = self.data_services.ordinary_native_table.as_ref().map_or_else(
+                || self.data_services.startup_companion_natives.as_ref()
+                    .is_some_and(|companion| companion.raster_finalize_passthrough),
+                |table| table.raster_finalize_passes_through(),
+            );
+            return Ok((kind == 18 && args.len() == 4 && finalize_passthrough)
+                .then_some(NativeReturn::Continue));
+        }
+        let (operation, required) = match index {
+            196 => (Operation::Configure, 8),
+            197 => (Operation::Start, 4),
+            198 => (Operation::Stop, 4),
+            200 => (Operation::Query, 4),
+            201 => (Operation::Parameters, 12),
+            _ => unreachable!(),
         };
         if args.len() < required {
             return Err(error("Raster/Hydro ordinary argument record is truncated"));
@@ -518,8 +544,8 @@ impl LoggingHost<'_> {
         {
             return self.kanmi_raster_native(id, operation, args, vm).map(Some);
         }
-        let current = version(self)?;
         if kind == 25 {
+            let current = legacy_message_version(self)?;
             if index == 200 {
                 return Err(error(
                     "identified Hydro base receiver does not define a scalar query result",
@@ -577,10 +603,7 @@ impl LoggingHost<'_> {
                 Ok(Some(NativeReturn::Continue))
             };
         }
-        let (_, old, new, _) = DESCRIPTORS
-            .iter()
-            .find(|(slot, _, _, _)| *slot == Some(index))
-            .unwrap();
+        let messages = raster_messages(self)?;
         if index == 201 && word(args, 4)? != 0 {
             return Ok(Some(NativeReturn::Continue));
         }
@@ -594,7 +617,7 @@ impl LoggingHost<'_> {
             TaskCommand {
                 target: id as i32,
                 sender: self.current_task_id as i32,
-                code: if current { *new } else { *old },
+                code: operation.message(messages),
                 data: [0, 1, 0],
             },
             &mut TaskCommandBuffers {
@@ -660,13 +683,13 @@ impl LoggingHost<'_> {
         output: &mut u32,
         vm: Option<&mut Vm>,
     ) -> Result<Option<TaskCommandOutcome>> {
-        let current = version(self)?;
         if self
             .data_services
             .tasks
             .message_task_state(target)
             .is_some_and(|state| state.0 == 25)
         {
+            let current = legacy_message_version(self)?;
             if !hydro_code(current, packet[1]) {
                 return Ok(None);
             }
@@ -689,9 +712,9 @@ impl LoggingHost<'_> {
             }
             return self.route_task_command_buffers(command, &mut buffers, output, 4096);
         }
-        let Some((_, _, _, operation)) = DESCRIPTORS
-            .iter()
-            .find(|(_, old, new, _)| packet[1] == if current { *new } else { *old })
+        let messages = raster_messages(self)?;
+        let Some(operation) = Operation::ALL.into_iter()
+            .find(|operation| packet[1] == operation.message(messages))
         else {
             return Ok(None);
         };

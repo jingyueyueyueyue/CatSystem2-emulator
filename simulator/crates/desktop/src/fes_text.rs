@@ -11,7 +11,7 @@ use cs2_runtime::message_object::{
     MessageCopy, MessageDefaults, MessageEncoding, MessageObject,
     MessagePlaneDisplay,
 };
-use cs2_script::{Expression, ExpressionState, FesEvent, FesObjectDefinition, FesObjectInitialization};
+use cs2_script::{Expression, ExpressionState, FesEvent, FesObjectDefinition, FesObjectInitialization, FesProgram};
 
 use super::cst_context_native::{CstBodySource, CstSourceProbe, CstTextOrigins, body_control_only, join_body_sources};
 use super::fes_driver::{
@@ -230,6 +230,20 @@ pub(super) fn is_text_kind(kind: &[u8]) -> bool {
 
 fn is_novel(kind: &[u8]) -> bool {
     kind.eq_ignore_ascii_case(b"NVSTRING") || kind.eq_ignore_ascii_case(b"NVSTRING8")
+}
+
+fn uses_paragraph_local_draw(program: &FesProgram, command: &FesDriverCommand) -> bool {
+    if command.context.block != b"MES_INSERT" || command.source != b"str insert" {
+        return false;
+    }
+    [
+        (b"MES_SETMARK".as_slice(), b"str apendmark".as_slice()),
+        (b"MES_DRAW".as_slice(), br"str draw \0".as_slice()),
+        (b"MES_ISDRAW".as_slice(), b"str isdraw".as_slice()),
+    ].iter().all(|(block, statement)| {
+        program.block(block).is_some_and(|block|
+            block.lines.iter().any(|line| line.bytes.trim_ascii() == *statement))
+    })
 }
 
 fn is_log(kind: &[u8]) -> bool {
@@ -587,7 +601,7 @@ impl FesTextStore {
                 for key in &keys {
                     let bank = self.banks.get_mut(key).unwrap();
                     let text = normalize_text(raw, bank.message.encoding(), false, encoding)?;
-                    bank.replace_with_codec(&text, host.data_services.newton_legacy_gbk)?;
+                    bank.replace_with_codec(&text, host.data_services.has_loose_gbk_text())?;
                     bank.observe_story_source(key, host);
                 }
             } else if matches!(column, b"POS2" | b"SIZE2") {
@@ -721,9 +735,11 @@ impl FesTextStore {
                 self.layout(&keys, command, driver, shared, defaults, reset_file_font)?;
             }
             b"insert" if self.banks[&keys[0]].novel.is_some() => {
+                let paragraph_local_draw = driver.is_rebellions_message_fes_source()
+                    || uses_paragraph_local_draw(&driver.interpreter.program, command);
                 for key in &keys {
                     self.banks.get_mut(key).unwrap()
-                        .insert_novel_paragraph(driver.is_rebellions_message_fes_source());
+                        .insert_novel_paragraph(paragraph_local_draw);
                 }
             }
             b"name" => {
@@ -847,7 +863,7 @@ impl FesTextStore {
                                 raw.len(), record.source.len()),
                         });
                     }
-                    let legacy_gbk = host.data_services.newton_legacy_gbk
+                    let legacy_gbk = host.data_services.has_loose_gbk_text()
                         && record.message.encoding() == MessageEncoding::Cp932;
                     if let Some(SourcedText { text, .. }) = &decoded {
                         let bytes = if record.message.encoding() == MessageEncoding::Unicode {
@@ -1525,8 +1541,8 @@ impl TextBank {
         let novel = self.novel.as_mut().unwrap();
         novel.insert_pending = true;
         if paragraph_local_draw {
-            // Rebellions starts a new native message paragraph on insert.
-            // Our shared layout keeps earlier paragraphs in the same surface.
+            // The legacy NOVEL adapter starts a new local draw range on
+            // insert. The shared layout keeps earlier paragraphs in one surface.
             novel.preceding_markers = self.pending.iter().fold(
                 self.message.separator_offsets().len() as u32,
                 |count, request| match request {
@@ -1959,6 +1975,7 @@ pub(super) fn update_owner(
         host.data_services.message_device.load_fonts(host.resources);
     }
     let data = &mut *host.data_services;
+    let loose_gbk = data.has_loose_gbk_text();
     let next_surface = &mut data.fes_text.next_surface;
     for ((owner, name, index), bank) in &mut data.fes_text.banks {
         if *owner != view.id { continue; }
@@ -1966,7 +1983,7 @@ pub(super) fn update_owner(
             let _stage = TextHostTimer::new(TextStage::History);
             let _detail = SlowTask::new(view.id, || 34, "fes_text_log").named(name, None).code(*index);
             log::update(bank, next_surface, &mut data.message_device, view, runtime, name, *index,
-                host.backlogs, host.resources, data.newton_legacy_gbk)?;
+                host.backlogs, host.resources, loose_gbk)?;
         } else {
             let observed = bank.story_body.source.is_some();
             let forced = observed && bank.skip && !bank.story_body.eden_layout_skip_pending;
@@ -2520,12 +2537,14 @@ fn decode_text(bytes: &[u8], codec: ScriptTextEncoding) -> Result<String> {
     if codec == ScriptTextEncoding::Utf8 {
         return Ok(std::str::from_utf8(bytes)?.to_owned());
     }
-    let decoder = if codec == ScriptTextEncoding::Gbk { encoding_rs::GBK } else { encoding_rs::SHIFT_JIS };
     let mut result = String::new();
     for (index, part) in bytes.split(|&byte| byte == 0xff).enumerate() {
         if index != 0 { result.push('\u{ffff}'); }
-        let decoded = decoder.decode_without_bom_handling_and_without_replacement(part)
-            .with_context(|| format!("invalid {codec:?} FES text from declared source"))?;
+        let decoded = if codec == ScriptTextEncoding::Gbk {
+            encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(part)
+        } else {
+            cs2_runtime::message_object::decode_cp932_display(part)
+        }.with_context(|| format!("invalid {codec:?} FES text from declared source"))?;
         result.push_str(&decoded);
     }
     Ok(result)
@@ -2782,6 +2801,25 @@ fn fes_sourced_failure_reports_only_the_rejected_segment() {
 }
 
 #[test]
+fn fes_sourced_cp932_keeps_legacy_placeholder_and_raw_append() -> Result<()> {
+    let cp932 = ScriptTextEncoding::Cp932;
+    let raw = b"\\cd\x81\x75\x81\x01\x81\x01\x81\x76";
+    let decoded = decode_sourced_text(b"$str1000", raw, cp932, cp932, false,
+        |_| (raw, Some(cp932)))?.unwrap();
+    assert_eq!(decoded, "\\cd\u{300c}\u{30fb}\u{30fb}\u{300d}");
+    let mut device = DesktopMessageDevice::default();
+    let mut message = MessageObject::new(-1, MessageEncoding::Cp932);
+    let configuration = initial_configuration(MessageEncoding::Cp932, &defaults(), 0)?;
+    message.reconfigure(&configuration, None, &mut device)?;
+    message.append_decoded(raw, &decoded)?;
+    assert_eq!(message.source(), decoded);
+    assert_eq!(message.raw_appends(), &[raw.to_vec()]);
+    assert!(decode_sourced_text(b"$str1000", raw, cp932, cp932, false,
+        |_| (raw, Some(ScriptTextEncoding::Gbk))).is_err());
+    Ok(())
+}
+
+#[test]
 fn fes_sourced_text_keeps_cp932_literals_and_gbk_and_utf8_variables() {
     let raw = b"\x81\x69\xd6\xd0\x81\x6a\xe6\x97\xa5\xff";
     let decode = |expected: &[u8]| decode_sourced_text(
@@ -2895,8 +2933,8 @@ fn normalize_text(raw: &[u8], encoding: MessageEncoding, sjis: bool, resource: S
         if encoding == MessageEncoding::Cp932 {
             return Ok(raw.to_vec());
         }
-        let (text, _, errors) = encoding_rs::SHIFT_JIS.decode(raw);
-        if errors { bail!("STRING strsj input is invalid CP932"); }
+        let text = cs2_runtime::message_object::decode_cp932_display(raw)
+            .context("STRING strsj input is invalid CP932")?;
         return Ok(text.as_bytes().to_vec());
     }
     if encoding == MessageEncoding::Unicode {
@@ -2905,9 +2943,28 @@ fn normalize_text(raw: &[u8], encoding: MessageEncoding, sjis: bool, resource: S
                 .context("STRING8 text has invalid GBK resource bytes")?;
             return Ok(text.as_bytes().to_vec());
         }
-        std::str::from_utf8(raw).context("STRING8 source is not valid UTF-8")?;
+        if let Err(error) = std::str::from_utf8(raw) {
+            if resource == ScriptTextEncoding::Cp932
+                && let Some(text) = cs2_runtime::message_object::decode_cp932_display(raw)
+            {
+                return Ok(text.into_owned().into_bytes());
+            }
+            return Err(error).context("STRING8 source is not valid UTF-8");
+        }
     }
     Ok(raw.to_vec())
+}
+
+#[test]
+fn fes_unicode_input_accepts_legacy_text_from_cp932_resources() -> Result<()> {
+    let message = MessageEncoding::Unicode;
+    let cp932 = ScriptTextEncoding::Cp932;
+    let legacy = b"\x81\x75\x82\xa0\x81\x76";
+    assert_eq!(normalize_text(legacy, message, false, cp932)?, "\u{300c}\u{3042}\u{300d}".as_bytes());
+    assert_eq!(normalize_text(b"\xc2\xa9", message, false, cp932)?, b"\xc2\xa9");
+    assert!(normalize_text(legacy, message, false, ScriptTextEncoding::Utf8).is_err());
+    assert!(normalize_text(b"\x81", message, false, cp932).is_err());
+    Ok(())
 }
 
 #[test]

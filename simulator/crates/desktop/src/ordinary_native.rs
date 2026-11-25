@@ -11,7 +11,6 @@ use super::ordinary_pair_table::GroupPairs;
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LIVE_IMAGE_BYTES: usize = 256 * 1024 * 1024;
-const TSUNABAN_PE_SHA256: &str = "72c9c1e7335a92bc2f1c731275a8da34d638d1730b9d5003fb6a8e85fe5b15c8";
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct OrdinaryNativeServices {
@@ -20,7 +19,7 @@ pub(super) struct OrdinaryNativeServices {
     image_bytes: usize,
     pair_tables: BTreeMap<u32, GroupPairs>,
     preloads: super::resource_preload::ResourcePreloads,
-    sequence_file_uses_image_category: bool,
+    pub(super) sequence_file_category: Option<&'static [u8]>,
     /// The documented baseline default. A configuration host may replace it;
     /// no game/version inference is made from a native number.
     pub(super) sequence_name_mode: u32,
@@ -34,10 +33,6 @@ pub(super) struct PreparedOrdinaryData {
 }
 
 impl OrdinaryNativeServices {
-    pub(super) fn identify(&mut self, pe_sha256: &str) {
-        self.sequence_file_uses_image_category = pe_sha256 == TSUNABAN_PE_SHA256;
-    }
-
     pub(crate) fn graph_unsupported_object_count(&self) -> usize {
         self.preloads.graph_request_count()
     }
@@ -319,11 +314,7 @@ impl OrdinaryNativeServices {
                 }
                 self.sequence(handle)?;
                 let name = resource_name(vm, read_u32(args, 4)?)?;
-                let category: &[u8] = if self.sequence_file_uses_image_category {
-                    b"image"
-                } else {
-                    b"config"
-                };
+                let category = self.sequence_file_category.unwrap_or(b"config");
                 if let Some(bytes) = self.read_resource(resources, category, &name)? {
                     self.sequence(handle)?.load_file(bytes)?;
                 }

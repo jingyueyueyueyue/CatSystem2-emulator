@@ -1,6 +1,4 @@
-//! ISLAND's identified translation DLL HG-3 receiver, independently expressed
-//! from its fixed byte evidence. No DLL loading, PNG/CRC name aliases, global
-//! filename overrides, or retained replacement pixel store.
+//! HG-3 slice replacement using the translation patch's CRC-keyed PNG layout.
 use cs2_formats::{HgFile, HgFrame};
 use cs2_renderer::RgbaFrame;
 use cs2_runtime::{ResourceIndex, RuntimeError};
@@ -8,36 +6,18 @@ use cs2_script::Result;
 
 use crate::native_state_error;
 
-const GAME: &str = "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1";
-const GAME_CHS: &str = "7bd9f6dcc7d62868d4ad9cc68d5580452e71bd907540ec4f993d960d051d2c45";
-const DLL: &str = "782674f1eac817b1842f6d0f0d416c17e86fadfb8fb640d335a1da3ce6cabb27";
-const PACK: &str = "45e3f1840c6ef15826d85446f6f6f8142be3fd52ddc5c1e87389f625973162a3";
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const TO_RGBA: [usize; 4] = [2, 1, 0, 3];
 
-/// This is a compatibility profile for three exact on-disk identities. The
-/// plain-file API deliberately bypasses resource aliases and patch mounts.
-pub(super) fn identify(resources: &ResourceIndex) -> Result<bool> {
-    let mut game = false;
-    for (name, expected) in [("ISLAND.exe", GAME), ("ISLAND_CHS.exe", GAME_CHS)] {
-        if let Some(bytes) = plain_file(resources, name)?
-            && crate::particle_plugin_digest::sha256(&bytes) == expected {
-            game = true;
-            break;
-        }
-    }
-    if !game { return Ok(false); }
-    for (name, expected) in [("Accelerator.dll", DLL), ("cnimage.int", PACK)] {
-        let Some(bytes) = plain_file(resources, name)? else { return Ok(false); };
-        if crate::particle_plugin_digest::sha256(&bytes) != expected { return Ok(false); }
-    }
-    let Some(archive) = resources.archive_index("cnimage.int") else {
-        return Err(native_state_error("identified ISLAND cnimage.int is absent from archive inventory"));
-    };
-    if !archive.is_readable() || archive.entries.len() != 458 || archive.is_encrypted() {
-        return Err(native_state_error("identified ISLAND FUYINPAK directory is not readable"));
-    }
-    Ok(true)
+pub(super) fn identify(resources: &ResourceIndex) -> bool {
+    resources.archive_index("cnimage.int").is_some_and(|archive| {
+        archive.is_readable() && !archive.is_encrypted()
+            && archive.entries.iter().any(|entry| {
+                entry.raw_name.strip_suffix(b".png").is_some_and(|key| {
+                    key.len() == 8 && key.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+                })
+            })
+    })
 }
 
 fn plain_file(resources: &ResourceIndex, name: &str) -> Result<Option<Vec<u8>>> {

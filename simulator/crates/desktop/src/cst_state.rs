@@ -169,6 +169,7 @@ impl HeadlessPlayer {
                 _ => return Err(native_state_error("invalid saved CST text encoding")) };
             contexts.insert(saved.handle, CstContextState {
                 document: saved.document.as_ref().map(CstDocumentSnapshot::restore).transpose()?,
+                command_repairs: Vec::new(),
                 position: saved.position,
                 registrations: parse_cst_table(&saved.registrations)?,
                 history: parse_cst_table(&saved.history)?,

@@ -8,11 +8,49 @@ use std::path::Path;
 use crate::{RuntimeError, RuntimeResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Section {
-    virtual_address: u32,
+pub(crate) struct Section {
+    name: [u8; 8],
+    pub(crate) virtual_address: u32,
     virtual_size: u32,
     raw_address: u32,
     raw_size: u32,
+    characteristics: u32,
+}
+
+impl Section {
+    pub(crate) fn executable(self) -> bool {
+        self.characteristics & 0x2000_0000 != 0
+    }
+
+    pub(crate) fn is_readable_data(self) -> bool {
+        // IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA
+        self.characteristics & 0x6000_00e0 == 0x4000_0040
+    }
+
+    pub(crate) fn is_flat_text_code(self) -> bool {
+        // IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_CODE, without MEM_EXECUTE.
+        self.characteristics & 0x6000_00e0 == 0x4000_0020
+            && self.name == *b".text\0\0\0"
+            && self.virtual_address != 0
+            && self.raw_address == self.virtual_address
+            && self.raw_size != 0
+            && self.raw_size == self.virtual_size
+    }
+
+    pub(crate) fn file_bytes_from(self, data: &[u8], rva: u32) -> Option<&[u8]> {
+        let start = rva.checked_sub(self.virtual_address)?;
+        let size = if self.virtual_size == 0 {
+            self.raw_size
+        } else {
+            self.raw_size.min(self.virtual_size)
+        };
+        if start >= size {
+            return None;
+        }
+        let start = usize::try_from(self.raw_address.checked_add(start)?).ok()?;
+        let end = usize::try_from(self.raw_address.checked_add(size)?).ok()?;
+        data.get(start..end)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,12 +64,16 @@ pub fn archive_name_seed(path: &Path) -> RuntimeResult<Option<u32>> {
         path: path.to_path_buf(),
         source,
     })?;
-    let key = resource_bytes(&bytes, b"KEY_CODE", b"KEY")?
+    archive_name_seed_from_pe(&bytes)
+}
+
+pub(crate) fn archive_name_seed_from_pe(bytes: &[u8]) -> RuntimeResult<Option<u32>> {
+    let key = resource_bytes(bytes, b"KEY_CODE", b"KEY")?
         .map(|bytes| bytes.into_iter().map(|byte| byte ^ 0xcd).collect())
         .unwrap_or_else(|| b"windmill".to_vec());
-    let (encrypted_vcode, legacy) = match resource_bytes(&bytes, b"V_CODE2", b"DATA")? {
+    let (encrypted_vcode, legacy) = match resource_bytes(bytes, b"V_CODE2", b"DATA")? {
         Some(code) => (code, false),
-        None => match resource_bytes(&bytes, b"V_CODE", b"DATA")? {
+        None => match resource_bytes(bytes, b"V_CODE", b"DATA")? {
             Some(code) => (code, true),
             None => return Ok(None),
         },
@@ -109,7 +151,7 @@ fn resource_bytes(
     Ok(Some(bytes.to_vec()))
 }
 
-fn parse_sections(data: &[u8]) -> RuntimeResult<Vec<Section>> {
+fn coff_header_offset(data: &[u8]) -> RuntimeResult<usize> {
     if data.get(..2) != Some(b"MZ") {
         return Err(RuntimeError::Archive(
             "PE DOS signature is invalid".to_string(),
@@ -121,33 +163,66 @@ fn parse_sections(data: &[u8]) -> RuntimeResult<Vec<Section>> {
         0,
     )?)
     .map_err(|_| RuntimeError::Archive("PE header offset is too large".to_string()))?;
-    if data.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0") {
+    let coff = pe_offset
+        .checked_add(4)
+        .ok_or_else(|| RuntimeError::Archive("PE header offset is too large".to_string()))?;
+    if data.get(pe_offset..coff) != Some(b"PE\0\0") {
         return Err(RuntimeError::Archive("PE signature is invalid".to_string()));
     }
-    let coff = pe_offset + 4;
-    let section_count = usize::from(u16_at(data, coff + 2)?);
-    let optional_length = usize::from(u16_at(data, coff + 16)?);
-    let optional = coff + 20;
-    let section_table = optional + optional_length;
-    let mut sections = Vec::with_capacity(section_count);
-    for index in 0..section_count {
-        let offset =
-            section_table
-                .checked_add(index.checked_mul(40).ok_or_else(|| {
-                    RuntimeError::Archive("PE section table overflows".to_string())
-                })?)
-                .ok_or_else(|| RuntimeError::Archive("PE section table overflows".to_string()))?;
-        let section = data
-            .get(offset..offset + 40)
-            .ok_or_else(|| RuntimeError::Archive("PE section table is truncated".to_string()))?;
-        sections.push(Section {
+    Ok(coff)
+}
+
+pub(crate) fn x86_image_layout(data: &[u8]) -> Option<(u32, u32)> {
+    let coff = coff_header_offset(data).ok()?;
+    let optional_offset = coff.checked_add(20)?;
+    let header = data.get(coff..optional_offset)?;
+    let optional_length = usize::from(u16_at(header, 16).ok()?);
+    let optional = data.get(optional_offset..optional_offset.checked_add(optional_length)?)?;
+    if u16_at(header, 0).ok()? != 0x014c || u16_at(optional, 0).ok()? != 0x010b {
+        return None;
+    }
+    Some((u32_at(optional, 28).ok()?, u32_at(optional, 16).ok()?))
+}
+
+pub(crate) fn x86_data_directory(data: &[u8], index: usize) -> Option<(u32, u32)> {
+    let coff = coff_header_offset(data).ok()?;
+    let optional_offset = coff.checked_add(20)?;
+    let header = data.get(coff..optional_offset)?;
+    let optional_length = usize::from(u16_at(header, 16).ok()?);
+    let optional = data.get(optional_offset..optional_offset.checked_add(optional_length)?)?;
+    if u16_at(optional, 0).ok()? != 0x010b
+        || index >= usize::try_from(u32_at(optional, 92).ok()?).ok()?
+    {
+        return None;
+    }
+    let entry = index.checked_mul(8)?.checked_add(96)?;
+    Some((u32_at(optional, entry).ok()?, u32_at(optional, entry + 4).ok()?))
+}
+
+pub(crate) fn parse_sections(data: &[u8]) -> RuntimeResult<Vec<Section>> {
+    let coff = coff_header_offset(data)?;
+    let optional = coff
+        .checked_add(20)
+        .ok_or_else(|| RuntimeError::Archive("PE COFF header offset overflows".to_string()))?;
+    let header = data
+        .get(coff..optional)
+        .ok_or_else(|| RuntimeError::Archive("PE COFF header is truncated".to_string()))?;
+    let section_count = usize::from(u16_at(header, 2)?);
+    let optional_length = usize::from(u16_at(header, 16)?);
+    let section_table = optional
+        .checked_add(optional_length)
+        .and_then(|start| data.get(start..start.checked_add(section_count * 40)?))
+        .ok_or_else(|| RuntimeError::Archive("PE section table is truncated".to_string()))?;
+    section_table.chunks_exact(40).map(|section| {
+        Ok(Section {
+            name: section[..8].try_into().unwrap(),
             virtual_size: u32_at(section, 8)?,
             virtual_address: u32_at(section, 12)?,
             raw_size: u32_at(section, 16)?,
             raw_address: u32_at(section, 20)?,
-        });
-    }
-    Ok(sections)
+            characteristics: u32_at(section, 36)?,
+        })
+    }).collect()
 }
 
 fn resource_directory_rva(data: &[u8]) -> RuntimeResult<u32> {
@@ -180,7 +255,7 @@ fn rva_to_offset(sections: &[Section], rva: u32) -> Option<usize> {
         {
             return None;
         }
-        usize::try_from(section.raw_address + (rva - section.virtual_address)).ok()
+        usize::try_from(section.raw_address.checked_add(rva - section.virtual_address)?).ok()
     })
 }
 

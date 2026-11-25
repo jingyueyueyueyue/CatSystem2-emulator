@@ -319,7 +319,7 @@ mod tests {
         let spec = spec.ok_or_else(|| anyhow::anyhow!("body fixture profile absent"))?;
         let (completion, gate) = mpsc::channel();
         let target = player.with_host(|host| {
-            host.data_services.emote.initialize(host.resources, NEKOPARA_PE_SHA256)?;
+            host.data_services.emote.initialize(host.resources)?;
             host.data_services.emote.loads.resources = None;
             host.data_services.emote.loads.gate = Some(Arc::new(Mutex::new(gate)));
             Ok(host.create_task_object(54, host.current_task_id, b"m2plane", b"")?)

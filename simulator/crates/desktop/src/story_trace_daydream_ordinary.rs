@@ -75,6 +75,7 @@ impl HeadlessPlayer {
             || self.data_services.host_quit_requested || !self.state.input.pressed.is_empty()
             || !self.pending_messages.is_empty() || !self.pending_fes_events.is_empty()
             || !self.data_services.pending_host_input.is_empty() || !self.movie_playbacks.is_empty()
+            || self.host_pointer_move_state().remaining > 0
             || !self.cst_contexts.is_empty() || self.message_wait_address != Some(0xd6d)
             || !self.vm.as_ref().is_some_and(|vm| vm.waiting_for_message())
         {

@@ -125,8 +125,6 @@ pub use variable_timeline::{
     CpuVariableTimelineInfo, CpuVariableTimelines, emote_variable_easing_exponent,
 };
 
-pub const NEKOPARA_PE_SHA256: &str =
-    "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc";
 pub const M2PLANE_TASK_TYPE: u32 = 54;
 pub const MAX_PSB_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -152,7 +150,7 @@ pub enum EmoteError {
 impl fmt::Display for EmoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownProfile => write!(f, "E-mote requires the exact identified PE profile"),
+            Self::UnknownProfile => write!(f, "E-mote requires an identified M2 task registration"),
             Self::UnknownTask(id) => write!(f, "E-mote task {id} is not registered"),
             Self::WrongTaskType(kind) => write!(f, "E-mote requires task type54, received {kind}"),
             Self::DuplicateTask(id) => write!(f, "E-mote task {id} is already registered"),
@@ -784,16 +782,12 @@ impl EmoteServices {
         self.bound && self.backend.is_some()
     }
 
-    pub fn bind_pe_sha256(&mut self, sha256: &str) -> bool {
-        let matched = NEKOPARA_PE_SHA256.eq_ignore_ascii_case(sha256);
-        // Binding is initialization only. Do not silently transplant live
-        // objects or a backend from one game into another profile.
-        if !matched {
-            self.bound = false;
-        } else if self.tasks.is_empty() {
-            self.bound = true;
+    pub fn bind_m2_tasks(&mut self) -> Result<()> {
+        if !self.tasks.is_empty() {
+            return Err(EmoteError::Backend("cannot bind M2 while tasks are alive".into()));
         }
-        self.bound && matched
+        self.bound = true;
+        Ok(())
     }
 
     pub fn set_backend(&mut self, backend: Box<dyn EmoteBackend>) -> Result<()> {
@@ -1348,8 +1342,8 @@ mod tests {
     #[test]
     fn no_backend_cannot_register_an_apparently_working_task() {
         let mut services = EmoteServices::default();
-        assert!(!services.bind_pe_sha256(&"0".repeat(64)));
-        assert!(services.bind_pe_sha256(NEKOPARA_PE_SHA256));
+        assert!(matches!(services.register_task(7, 54), Err(EmoteError::UnknownProfile)));
+        services.bind_m2_tasks().unwrap();
         assert!(!services.backend_ready());
         assert!(matches!(
             services.register_task(7, 54),

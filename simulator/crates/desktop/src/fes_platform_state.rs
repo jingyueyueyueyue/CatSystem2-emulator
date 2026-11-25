@@ -77,7 +77,10 @@ impl FesTaskPlatform {
 
     fn decode_checkpoint(bytes: &[u8]) -> Result<Self> {
         if let Some(bytes) = bytes.strip_prefix(TAG) {
-            if bytes.starts_with(&2u32.to_le_bytes()) {
+            // The graph codec stores the struct field count before its version.
+            let has_image_masks = bytes.get(..4) == Some(&3u32.to_le_bytes())
+                && bytes.get(4..8) == Some(&2u32.to_le_bytes());
+            if has_image_masks {
                 let saved: PlatformWithMasks<Self, BTreeMap<(u32, String), u8>> = decode_component(bytes)?;
                 let mut platform = saved.platform;
                 platform.image_masks = saved.image_masks;

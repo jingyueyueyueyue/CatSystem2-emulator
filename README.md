@@ -39,6 +39,8 @@ python -B scripts/analysis/run_playthrough_batch.py --player $replay --game-root
 
 固定帧场景的 `ctrl-hold:起始帧:释放帧` 持续按住 Ctrl，两个帧号从 0 起算，释放帧需小于总帧数。[PC 开场回归清单](scripts/analysis/pc_ctrl_opening_regression.json) 可配合 `--fast-text --reuse-attempts`，根据已有回执跳过相同条件的用例。`fast_forward_state` 事件记录实际切换，`last_story_position` 记录最后的剧情位置。
 
+首通批次传入 `--progress reports/batch_progress.json`，从账本读取通关、阻断和续跑状态，并自动跳过已登记通关的游戏。通过 `--indices` 选中本轮待核验的游戏。不使用账本时可用 `--skip-cleared`，从归档中寻找符合条件的结局回执。
+
 Android 使用已安装的模拟器，从游戏库选中平板上已导入的原游戏目录。需要采集真机日志或测试剧情时，使用 `scripts/analysis/android_story_replay.py` 或 `android_story_drive.py`，传入当前设备、游戏目录和已安装 APK 的身份。
 
 ### 扫描全部游戏的脚本
@@ -56,6 +58,10 @@ python -B -X utf8 scripts/analysis/kcs_dispatch_inventory.py "$report-kcs.json" 
 ## 构建模拟器
 
 引擎或宿主改动需要生成新版时，Windows 使用 `python -B scripts/build/cs2_workspace.py build --integration`。Android 使用 `python -B scripts/build/android_workspace.py build --integration`。测试时可统一复用生成的版本。`CS2_BUILD_CACHE_ROOT` 可设置为绝对路径，集中保存构建缓存。
+
+PC 后台批测使用 `python -B scripts/build/cs2_workspace.py build --integration --story-replay --profile playthrough` 生成优化回放器。将构建输出中的 EXE 路径传给 `--player`。
+
+批测配置可在 `inputs` 中加入 `auto-first-choice`，与 `ctrl-hold:起始帧:结束帧` 配合使用。通过 `ready-click` 进入正文的场景也可以使用 `ctrl-after-ready`，在入口点击得到确认后开始长按 Ctrl。回放器在快进期间从实际 FES 选择面板取首个可选项，松开 Ctrl，确认面板消费点击后继续快进。`auto-choice-banks:1,0` 可按实际选项编号先选第二项，再选第一项。列表用完后取首个可选项。回放日志记录选择位置、按钮区域和输入回执。也可以为该轮安排具名选项或固定点击。
 
 ## 补丁配置
 

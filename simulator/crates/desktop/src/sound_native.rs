@@ -6,6 +6,7 @@ use crate::{
 };
 use cs2_runtime::{AudioControl, TaskCommand, TaskCommandBuffers};
 use cs2_script::{NativeReturn, Vm};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -142,9 +143,7 @@ impl LoggingHost<'_> {
         if channel >= 64 {
             return Ok(NativeReturn::Value(0));
         }
-        let task = self.default_sound_task()?.ok_or_else(|| {
-            audio_script_error("FES sound mode loading requires a kind 13 sound task")
-        })?;
+        let task = self.required_sound_task()?;
         self.load_sound_task_record_mode(
             task, channel, false, false, name, selector, 0, mode, duration,
         )
@@ -160,9 +159,7 @@ impl LoggingHost<'_> {
         duration: u32,
     ) -> cs2_script::Result<NativeReturn> {
         if let Some(result) = self.resume_task_sound_load()? { return Ok(result); }
-        let task = self.default_sound_task()?.ok_or_else(|| {
-            audio_script_error("FES sound mode loading requires a kind 13 sound task")
-        })?;
+        let task = self.required_sound_task()?;
         self.load_sound_task_record_mode(
             task, group, true, by_key, name, selector, 0, mode, duration,
         )
@@ -641,14 +638,28 @@ impl LoggingHost<'_> {
                 "expanded sound name exceeds 259 encoded bytes",
             ));
         }
-        let name = decode_name(self.text_encoding, bytes)?;
+        let (name, encoded) = match decode_name(self.text_encoding, bytes) {
+            Ok(name) => (name, Cow::Borrowed(bytes)),
+            Err(cause) => {
+                // Unicode CST readers can pass a UTF-8 command argument to
+                // a narrow sound wrapper. Its resource name still has to fit
+                // the narrow loader's filename record and category matcher.
+                let Ok(name) = std::str::from_utf8(bytes) else {
+                    return Err(cause);
+                };
+                let Ok(encoded) = encode_name(self.text_encoding, name) else {
+                    return Ok(Vec::new());
+                };
+                (name.to_owned(), Cow::Owned(encoded))
+            }
+        };
         let names = if name.rfind(['/', '\\']).is_some_and(|offset| offset > 0) {
             vec![name.clone()]
         } else {
             let category = if self.sound_config_enabled != 0 {
-                self.sound_config.file_part(bytes).map(|part| part.archive.clone())
+                self.sound_config.file_part(&encoded).map(|part| part.archive.clone())
             } else {
-                self.legacy_sound_archive_name(bytes)?
+                self.legacy_sound_archive_name(&encoded)?
             };
             let Some(category) = category else { return Ok(Vec::new()); };
             self.media_category_candidates(&category, &name)?
@@ -781,6 +792,15 @@ mod async_load_tests {
 
     #[test]
     fn native935_cold_material_wait_keeps_frames_siblings_and_instruction_order() {
+        exercise_cold_material_wait(false);
+    }
+
+    #[test]
+    fn native935_preserves_the_last_canvas_during_list_setup() {
+        exercise_cold_material_wait(true);
+    }
+
+    fn exercise_cold_material_wait(register_image: bool) {
         use cs2_script::{KcsProgram, Operand};
         let (_scratch, mut player, cleanup) = player();
         // Cold, unique name; cache warmup for replacement.wav must not satisfy it.
@@ -796,15 +816,47 @@ mod async_load_tests {
         MATERIAL_DELAYS.lock().unwrap().insert(_scratch.0.join(&name).to_string_lossy().into_owned(),
             Arc::new(MaterialGate { release: std::sync::Mutex::new(gate), entered: Some(entered), timeout: Duration::from_secs(2) }));
         let mut code = Vec::new();
-        for value in [8, 0, 64, 1, 0] {
-            let operand = Operand::immediate(value);
-            code.push(0x25); code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
-        }
-        code.push(0x2b);
-        for value in [935, 20] {
+        player.render_scene().unwrap();
+        let old_pixel = player.canvas.pixel(0, 0).unwrap();
+        let new_pixel = cs2_renderer::Color::rgb(25, 95, 175);
+        player.with_host(|host| {
+            let plane = host.create_task_object(2, 0, b"presentation probe", b"")?;
+            let node = host.scene_nodes.get_mut(&plane).unwrap();
+            node.size = [8., 8.];
+            node.position = [0., 0., 5000.];
+            node.color = 0xff19_5faf;
+            node.visible = true;
+            node.initialized = true;
+            Ok(())
+        }).unwrap();
+        let push = |code: &mut Vec<u8>, value| {
             let operand = Operand::immediate(value);
             code.push(operand.flags.bits()); code.extend_from_slice(&operand.payload.to_le_bytes());
+        };
+        if register_image {
+            let (list, wrapper) = player.with_host(|host| {
+                let list = host.create_task_object(15, host.current_task_id, b"image list", b"")?;
+                host.initialize_fes_image_list(list, 16, 16)?;
+                let image = cs2_renderer::RgbaFrame::from_rgba8(1, 1, vec![240, 80, 32, 255])?;
+                Ok((list, host.register_image_wrapper(image, false)?))
+            }).unwrap();
+            for value in [list, 70, wrapper, 4f32.to_bits(), 4f32.to_bits(), 0, 0, 0,
+                1f32.to_bits(), 1f32.to_bits(), 255, 1, 0] {
+                code.push(0x25);
+                push(&mut code, value);
+            }
+            code.push(0x2b);
+            push(&mut code, 257);
+            push(&mut code, 52);
         }
+        for value in [8, 0, 64, 1, 0] {
+            code.push(0x25);
+            push(&mut code, value);
+        }
+        let sound_pc = code.len();
+        code.push(0x2b);
+        push(&mut code, 935);
+        push(&mut code, 20);
         code.push(0x3b);
         let mut vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 512], 64).unwrap()).unwrap();
         vm.write(64, format!("{name}\0").as_bytes()).unwrap();
@@ -823,7 +875,7 @@ mod async_load_tests {
             }
             assert!(Instant::now() < entered_deadline, "the actual material worker must acknowledge entry");
             assert!(player.advance_host_frame_with_retries(1000).unwrap());
-            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 30);
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, sound_pc);
             std::thread::yield_now();
         }
         let frame = player.state.clock.frame;
@@ -833,22 +885,24 @@ mod async_load_tests {
             let frame_started = Instant::now();
             assert!(player.advance_host_frame_with_retries(1000).unwrap());
             max_frame = max_frame.max(frame_started.elapsed());
-            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, 30,
+            assert_eq!(player.vm.as_ref().unwrap().instruction_pointer, sound_pc,
                 "native935 must keep the following opcode ordered behind material completion");
             assert!(player.sound_channels.get(&8).is_none_or(|state| state.prepared_audio.is_none()));
+            assert_eq!(player.canvas.pixel(0, 0).unwrap(), if register_image { old_pixel } else { new_pixel });
         }
         assert_eq!(player.state.clock.frame, frame + 4);
         assert!(player.data_services.tasks.task_clock(sibling).unwrap().current > 0);
         eprintln!("async_sound_material gated_frames=4 wall_us={} max_frame_us={}", start.elapsed().as_micros(), max_frame.as_micros());
         material_ready.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while player.vm.as_ref().unwrap().instruction_pointer == 30 {
+        while player.vm.as_ref().unwrap().instruction_pointer == sound_pc {
             assert!(Instant::now() < deadline);
             player.advance_host_frame_with_retries(1000).unwrap();
             std::thread::yield_now();
         }
         assert_eq!(player.sound_channels[&8].resource.as_deref(), Some(name.as_str()));
         assert!(player.sound_channels[&8].prepared_audio.is_some());
+        assert_eq!(player.canvas.pixel(0, 0).unwrap(), new_pixel);
         MATERIAL_DELAYS.lock().unwrap().remove(&_scratch.0.join(&name).to_string_lossy().into_owned());
         let _ = cleanup.send(Ok(()));
     }
@@ -1093,6 +1147,52 @@ mod async_load_tests {
         for value in [2_u16, 16] { bytes.extend_from_slice(&value.to_le_bytes()); }
         bytes.extend_from_slice(b"data"); bytes.extend_from_slice(&2_u32.to_le_bytes()); bytes.extend_from_slice(&0_i16.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn native_sound_load_accepts_unicode_cst_input() -> anyhow::Result<()> {
+        use cs2_script::{Host, KcsProgram};
+
+        let (_scratch, mut player, cleanup) = player();
+        let root = player.current_task_id;
+        player.sound_groups.push(crate::SoundGroup {
+            key: 1, id: 0, label: b"se".to_vec(), range: [8, 9],
+        });
+        player.with_host(|host| Ok(host.create_task_object(13, root, b"sound", b"")?))?;
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 512], 64)?)?;
+        let group_args = [1_u32, 0, 64, 1, 1, 0].map(u32::to_le_bytes).concat();
+        let single_args = [8_u32, 0, 64, 1, 0].map(u32::to_le_bytes).concat();
+        // The GBK scene contains the base archive's CP932 command bytes.
+        // The Unicode scene reader passes this spelling to native 936.
+        let raw = b"se[\x82\xc7\x82\xb3\x82\xc1]";
+        let unicode = ScriptTextEncoding::Gbk.decode(raw);
+        assert!(decode_name(ScriptTextEncoding::Cp932, unicode.as_bytes()).is_err());
+        assert!(encode_name(ScriptTextEncoding::Cp932, &unicode).is_err());
+        vm.write(64, &[unicode.as_bytes(), b"\0"].concat())?;
+        for fast_forward in [false, true] {
+            player.data_services.fast_forward = fast_forward;
+            player.with_host(|host| {
+                assert_eq!(host.call(936, &group_args, &mut vm)?, NativeReturn::Value(u32::MAX));
+                assert_eq!(host.call(935, &single_args, &mut vm)?, NativeReturn::Value(0));
+                assert!(host.load_sound_group_name_mode(1, true, unicode.as_bytes(), 1, 0, 0)?
+                    == NativeReturn::Value(u32::MAX));
+                Ok(())
+            })?;
+            assert!(!player.sound_channels.contains_key(&8));
+            assert!(player.data_services.sound_async.task_loads.is_empty());
+        }
+        player.with_host(|host| {
+            let name = "sound/\u{6708}.wav";
+            assert!(decode_name(ScriptTextEncoding::Cp932, name.as_bytes()).is_err());
+            let narrow = encode_name(ScriptTextEncoding::Cp932, name)?;
+            assert_eq!(host.sound_resource_names(&narrow)?, [name]);
+            assert_eq!(host.sound_resource_names(name.as_bytes())?, [name]);
+            assert_eq!(host.sound_resource_names(b"sound/replacement.wav")?, ["sound/replacement.wav"]);
+            assert!(host.sound_resource_names(b"sound/\x81").is_err());
+            Ok(())
+        })?;
+        cleanup.send(Ok(()))?;
+        Ok(())
     }
 
     #[test]

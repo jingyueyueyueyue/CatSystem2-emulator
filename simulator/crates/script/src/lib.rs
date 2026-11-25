@@ -477,12 +477,13 @@ impl KcsProgram {
     }
 
     fn from_code_with_header(
-        code: Vec<u8>,
+        mut code: Vec<u8>,
         data: Vec<u8>,
         stack_size: usize,
         header: KcsHeader,
     ) -> Result<Self> {
-        let instructions = decode_instructions(&code)?;
+        let mut instructions = decode_instructions(&code)?;
+        widen_legacy_cst_command_buffer(&mut code, &mut instructions, stack_size);
         let mut instruction_pages =
             vec![InstructionPage::default(); code.len().div_ceil(INSTRUCTION_PAGE_BYTES)];
         for (index, instruction) in instructions.iter().enumerate() {
@@ -534,6 +535,75 @@ impl KcsProgram {
         // The number of earlier starts in this page is the decoded index's
         // distance from its first instruction.
         Some(page.first as usize + (page.starts & (bit - 1)).count_ones() as usize)
+    }
+}
+
+fn widen_legacy_cst_command_buffer(
+    code: &mut [u8],
+    instructions: &mut [Instruction],
+    stack_size: usize,
+) {
+    const COMMAND_CAPACITY: u32 = 0x1000;
+    if stack_size < COMMAND_CAPACITY as usize * 2 {
+        return;
+    }
+    let imm = Operand::immediate;
+    let is = |instruction: &Instruction, opcode, operands: &[Operand]| {
+        instruction.opcode == opcode && instruction.operands == operands
+    };
+    for start in 1..instructions.len() {
+        if !is(&instructions[start - 1], 0x31, &[imm(4)])
+            || !is(&instructions[start], 0x31, &[imm(0x80)])
+        {
+            continue;
+        }
+        let tail = &instructions[start + 1..];
+        let Some(end) = tail.iter().position(|i| matches!(i.opcode, 0x2c | 0x31 | 0x32))
+        else { continue };
+        if tail[end].opcode != 0x2c {
+            continue;
+        }
+        let body = &tail[..end];
+        let Some(case) = body.iter().find(|i| {
+            i.opcode == 0x34 && i.operands[0] == imm(0x30) && i.operands[1].flags == TypeFlags::DWORD
+        }) else { continue };
+        let Ok(branch) = body.binary_search_by_key(&(case.operands[1].payload as usize), |i| i.offset)
+        else { continue };
+        let Some(read) = body.get(branch..branch + 19) else { continue };
+        let context = read[0].operands.first().copied().unwrap_or(imm(0));
+        let is_context_field = |instruction, offset| {
+            is(instruction, 0x3e, &[context, Operand::new(0x23, offset)])
+        };
+        let local = imm(0x14);
+        if context.flags != TypeFlags::new(0x06)
+            || !is(&read[0], 0x3e, &[context, imm(0)])
+            || !is(&read[1], 0x25, &[Operand::new(0x53, 0)])
+            || !is(&read[2], 0x3d, &[local])
+            || !is_context_field(&read[3], 0x24)
+            || !is(&read[4], 0x25, &[Operand::new(0x73, 0x24)])
+            || !is_context_field(&read[5], 0x28)
+            || !is(&read[6], 0x25, &[Operand::new(0x73, 0x28)])
+            || !is(&read[7], 0x2b, &[imm(327), imm(16)])
+            || !is(&read[8], 0x3c, &[])
+            || !is(&read[9], 0x3d, &[local])
+            || !is(&read[10], 0x2b, &[imm(278), imm(4)])
+            || !is(&read[11], 0x3c, &[])
+            || !is(&read[12], 0x3d, &[imm(0)])
+            || !is(&read[13], 0x25, &[Operand::new(0xf1, 0)])
+            || !is(&read[14], 0x3d, &[local])
+            || read[15..17].iter().any(|i| i.opcode != 0x25 || i.operands[0].flags != TypeFlags::DWORD)
+            || !is(&read[17], 0x2b, &[imm(45), imm(16)])
+            || !is(&read[18], 0x3c, &[])
+        {
+            continue;
+        }
+        // The command read and in-place expansion share the last frame local.
+        // Reserve the legacy global command buffer's size so argument pushes
+        // and subsequent calls cannot overwrite the temporary string.
+        let instruction = &mut instructions[start];
+        instruction.operands[0] = imm(COMMAND_CAPACITY);
+        let operand = instruction.offset + 2;
+        code[operand..operand + 4].copy_from_slice(&COMMAND_CAPACITY.to_le_bytes());
     }
 }
 
@@ -2504,6 +2574,71 @@ mod tests {
 
     fn program(code: &[u8]) -> KcsProgram {
         KcsProgram::from_code(code, vec![0; 128], 512).unwrap()
+    }
+
+    #[test]
+    fn legacy_cst_command_survives_argument_push_after_read() {
+        let imm = Operand::immediate;
+        let local = imm(0x14);
+        let context = Operand::new(0x06, 0);
+        let mut code = Vec::new();
+        instruction(&mut code, 0x25, &[imm(64)]);
+        instruction(&mut code, 0x2a, &[imm(18), imm(4)]);
+        code.push(0x3b);
+        instruction(&mut code, 0x31, &[imm(4)]);
+        let buffer = code.len();
+        instruction(&mut code, 0x31, &[imm(0x80)]);
+        instruction(&mut code, 0x25, &[imm(0x30)]);
+        code.push(0x33);
+        let branch = code.len() as u32 + 11;
+        instruction(&mut code, 0x34, &[imm(0x30), imm(branch)]);
+        instruction(&mut code, 0x3e, &[context, imm(0)]);
+        instruction(&mut code, 0x25, &[Operand::new(0x53, 0)]);
+        instruction(&mut code, 0x3d, &[local]);
+        for offset in [0x24, 0x28] {
+            instruction(&mut code, 0x3e, &[context, Operand::new(0x23, offset)]);
+            instruction(&mut code, 0x25, &[Operand::new(0x73, offset)]);
+        }
+        instruction(&mut code, 0x2b, &[imm(327), imm(16)]);
+        code.push(0x3c);
+        instruction(&mut code, 0x3d, &[local]);
+        let expand = code.len();
+        instruction(&mut code, 0x2b, &[imm(278), imm(4)]);
+        code.push(0x3c);
+        instruction(&mut code, 0x3d, &[imm(0)]);
+        instruction(&mut code, 0x25, &[Operand::new(0xf1, 0)]);
+        instruction(&mut code, 0x3d, &[local]);
+        for address in [4, 8] {
+            instruction(&mut code, 0x25, &[imm(address)]);
+        }
+        instruction(&mut code, 0x2b, &[imm(45), imm(16)]);
+        code.push(0x3c);
+        instruction(&mut code, 0x2c, &[imm(0), imm(4)]);
+
+        let mut command = b"bg 4 quake".to_vec();
+        command.extend(b" 5,-10,-4".repeat(26));
+        command.push(0);
+        let mut vm = Vm::from_program(KcsProgram::from_code(&code, vec![0; 512], 0x2800).unwrap()).unwrap();
+        let mut host = |index, args: &[u8], vm: &mut Vm| {
+            let address = |offset| u32::from_le_bytes(args[offset..offset + 4].try_into().unwrap());
+            match index {
+                327 => vm.write(address(4), &command)?,
+                278 => assert_eq!(vm.read_string(address(0))?, command[..command.len() - 1]),
+                45 => {
+                    let mut text = vm.read_string(address(4))?;
+                    text.push(0);
+                    vm.write(address(0), &text)?;
+                }
+                _ => unreachable!(),
+            }
+            Ok(NativeReturn::Continue)
+        };
+        assert_eq!(vm.run(&mut host, 100).unwrap(), Step::Halted);
+        assert_eq!(vm.read(64, command.len()).unwrap(), command);
+
+        code[expand + 2..expand + 6].copy_from_slice(&279_u32.to_le_bytes());
+        let unrelated = KcsProgram::from_code(&code, vec![0; 512], 0x2800).unwrap();
+        assert_eq!(unrelated.instruction_at(buffer).unwrap().operands, [imm(0x80)]);
     }
 
     fn sample_root() -> Option<PathBuf> {

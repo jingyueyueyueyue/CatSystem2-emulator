@@ -5,8 +5,9 @@ use super::native_tasks::OwnedTaskBuffers;
 use super::{LoggingHost, SceneNode, expand_kcs_format, read_u32};
 use cs2_renderer::Canvas;
 use cs2_runtime::effekseer::{
-    Effect, Error, Manager, NATIVE_COMMANDS, PE_SHA256, Quad, Resource, Texture, Vertex,
+    Effect, Error, Manager, NATIVE_COMMANDS, Quad, Resource, Texture, Vertex,
 };
+use cs2_runtime::native_table::OrdinaryNativeTable;
 use cs2_runtime::{ResourceIndex, TaskCommand, TaskCommandOutcome};
 use cs2_script::{NativeReturn, Result, ScriptError, Vm};
 use std::sync::Arc;
@@ -18,8 +19,8 @@ pub(super) struct EffekseerStore {
 fn error(e: impl std::fmt::Display) -> ScriptError {
     super::native_state_error_owned(format!("type61 Effekseer: {e}"))
 }
-pub(super) fn identified(profile: Option<&cs2_runtime::native_profile::FeatureProfile>) -> bool {
-    profile.is_some_and(|p| p.pe_sha256.eq_ignore_ascii_case(PE_SHA256))
+pub(super) fn identified(table: Option<&OrdinaryNativeTable>) -> bool {
+    table.is_some_and(OrdinaryNativeTable::has_effekseer_family)
 }
 pub(super) fn supports(index: u32) -> bool {
     NATIVE_COMMANDS.iter().any(|d| d.0 == index)
@@ -63,8 +64,8 @@ pub(super) fn receive(
         return Ok(None);
     }
     let id = command.target as u32;
-    if !identified(host.data_services.native_profile) {
-        return Err(error("unidentified Effekseer PE profile"));
+    if !identified(host.data_services.ordinary_native_table.as_ref()) {
+        return Err(error("unrecognized Effekseer command receiver"));
     }
     if !host.data_services.effekseer.manager.contains(id) {
         return Err(error(Error::Task(id)));
@@ -351,10 +352,8 @@ impl LoggingHost<'_> {
         {
             return Ok(None);
         }
-        if !identified(self.data_services.native_profile) {
-            return Err(error(
-                "type61 rotation wrapper requires the recovered PE fingerprint",
-            ));
+        if !identified(self.data_services.ordinary_native_table.as_ref()) {
+            return Err(error("type61 rotation requires an Effekseer command receiver"));
         }
         let vector = args
             .get(4..16)
@@ -375,10 +374,8 @@ impl LoggingHost<'_> {
         Ok(Some(NativeReturn::Continue))
     }
     pub(super) fn effekseer_register_task_hook(&mut self, id: u32) -> Result<()> {
-        if !identified(self.data_services.native_profile) {
-            return Err(error(
-                "type61 constructor requires recovered PE fingerprint",
-            ));
+        if !identified(self.data_services.ordinary_native_table.as_ref()) {
+            return Err(error("type61 constructor requires an Effekseer command receiver"));
         }
         self.data_services
             .effekseer
@@ -409,8 +406,8 @@ impl LoggingHost<'_> {
         if args.len() < size {
             return Err(error("missing native arguments"));
         }
-        if !identified(self.data_services.native_profile) {
-            return Err(error("ordinary Effekseer ABI has no matching fingerprint"));
+        if !identified(self.data_services.ordinary_native_table.as_ref()) {
+            return Err(error("unrecognized ordinary Effekseer ABI"));
         }
         let target = read_u32(args, 0)?;
         // Unlike M2, these three wrappers skip the zero target directly.

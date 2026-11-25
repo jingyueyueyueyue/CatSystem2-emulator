@@ -5130,8 +5130,22 @@ impl FontRasterizer {
 
     pub fn rasterize(&self, character: char, size: u32) -> Result<GlyphMask> {
         let metrics = self.metrics(character, size)?;
+        self.rasterize_indexed(self.font.lookup_glyph_index(character), size, metrics)
+    }
+
+    /// Draws the selected face's glyph zero, the font's missing-glyph outline.
+    pub fn rasterize_missing_glyph(&self, size: u32, bold: bool, italic: bool) -> Result<GlyphMask> {
+        Self::validate_metrics_size(size)?;
+        let metrics = self.font.metrics_indexed(0, size as f32);
+        Self::validate_metrics(metrics)?;
+        let glyph = self.rasterize_indexed(0, size, metrics)?;
+        let glyph = if bold { embolden_glyph(&glyph)? } else { glyph };
+        if italic { italicize_glyph(&glyph) } else { Ok(glyph) }
+    }
+
+    fn rasterize_indexed(&self, index: u16, size: u32, metrics: fontdue::Metrics) -> Result<GlyphMask> {
         let baseline = self.baseline(size);
-        let (_, coverage) = self.font.rasterize(character, size as f32);
+        let (_, coverage) = self.font.rasterize_indexed(index, size as f32);
         let coverage = coverage
             .into_iter()
             .map(|value| {
@@ -5250,18 +5264,28 @@ impl FontRasterizer {
     }
 
     fn metrics(&self, character: char, size: u32) -> Result<fontdue::Metrics> {
-        if size == 0 {
-            return Err(RendererError::InvalidEffectParameter { name: "font size" });
-        }
-        if size > i32::MAX as u32 {
-            return Err(RendererError::ScaledDimensionsOverflow);
-        }
+        Self::validate_metrics_size(size)?;
         if !self.has_character(character) {
             return Err(RendererError::Decode {
                 message: format!("font is missing U+{:04X}", character as u32),
             });
         }
         let metrics = self.font.metrics(character, size as f32);
+        Self::validate_metrics(metrics)?;
+        Ok(metrics)
+    }
+
+    fn validate_metrics_size(size: u32) -> Result<()> {
+        if size == 0 {
+            return Err(RendererError::InvalidEffectParameter { name: "font size" });
+        }
+        if size > i32::MAX as u32 {
+            return Err(RendererError::ScaledDimensionsOverflow);
+        }
+        Ok(())
+    }
+
+    fn validate_metrics(metrics: fontdue::Metrics) -> Result<()> {
         let advance = metrics.advance_width.round();
         if !metrics.advance_width.is_finite()
             || advance < i32::MIN as f32
@@ -5272,7 +5296,7 @@ impl FontRasterizer {
             return Err(RendererError::ScaledDimensionsOverflow);
         }
         glyph_len(metrics.width as u32, metrics.height as u32)?;
-        Ok(metrics)
+        Ok(())
     }
 }
 

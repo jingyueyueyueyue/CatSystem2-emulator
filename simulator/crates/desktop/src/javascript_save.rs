@@ -1,5 +1,5 @@
-//! V401 JS save consumers, recovered from the registration pairs and PE.
-//! cfSaveData(135900) writes the bound CSS; cfIsExistSave(135430) loads a
+//! JS save consumers, selected by the registered CSS and notification ABI.
+//! cfSaveData writes the bound CSS; cfIsExistSave loads a
 //! separate CSS and checks its unsigned tag. Load/update notify the actual
 //! registered parent KCS through its synchronous receiver, retaining budget state.
 use std::fs::{self, File, OpenOptions};
@@ -11,7 +11,6 @@ use cs2_runtime::{TaskCommand, RuntimeResult};
 use crate::native_tasks::OwnedTaskBuffers;
 use super::{Adapter, JavaScriptCall, LogicEvent, Value, native_state_error, uint};
 
-const V401: &str = "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f";
 const MAX_SAVE_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) struct SaveDispatch {
@@ -28,10 +27,10 @@ pub(super) fn supports(operation: &str) -> bool {
 
 impl Adapter<'_, '_> {
     pub(super) fn save_call(&mut self, call: &JavaScriptCall, budget: usize) -> RuntimeResult<Option<Value>> {
-        let sha = self.host.data_services.native_profile.map(|profile| profile.pe_sha256)
-            .or(self.host.data_services.css_task_pe_sha256);
-        if sha != Some(V401) {
-            return Err(native_state_error("JavaScript save callback needs its exact PE descriptor"));
+        if !self.host.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.javascript_save_callbacks_registered())
+        {
+            return Err(native_state_error("JavaScript save callback needs a recognized CSS and notification registration"));
         }
         if budget == 0 { return Ok(None); }
         if self.record.save_dispatch.is_some()
@@ -220,4 +219,88 @@ fn read_bounded(path: &Path) -> std::result::Result<Vec<u8>, ReadFailure> {
     file.take(MAX_SAVE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(ReadFailure::Io)?;
     if bytes.len() > MAX_SAVE_BYTES { return Err(ReadFailure::Limit); }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HeadlessPlayer;
+    use crate::javascript_native::JsRecord;
+    use cs2_runtime::javascript::JavaScriptHost;
+    use cs2_script::{KcsProgram, NativeReturn, Vm};
+    use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+    #[test]
+    #[ignore = "requires the installed V401 sample and its archived ordinary save"]
+    fn javascript_save_queries_and_writes_through_the_opened_game() -> anyhow::Result<()> {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let game = workspace.join("games/cs2_full_v401");
+        let original = workspace.join(concat!(
+            "archive/2026-11/20261118_194934_952041_v401_visibility/",
+            "20261119_v401_save_quit_confirm.profile/save0000.dat",
+        ));
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("cs2-js-save-{}-{nonce}", std::process::id())));
+        fs::create_dir(&scratch.0)?;
+        fs::copy(&original, scratch.0.join("save0000.dat"))?;
+        let original_file = CssFile::parse(&fs::read(&original)?)?;
+        assert_eq!(original_file.tag(), 1000);
+
+        let mut player = HeadlessPlayer::open_with_save_root(&game, &scratch.0)?;
+        player.data_services.native_profile = None;
+        player.data_services.css_task_pe_sha256 = None;
+        let request = |operation: &str, args: &[u32]| JavaScriptCall {
+            operation: operation.into(),
+            arguments: args.iter().map(|&word| Value::Number(f64::from(word))).collect(),
+        };
+        let original_query = request("cfIsExistSave", &[0, 1000, 1000]);
+        let written_query = request("cfIsExistSave", &[1, 1000, 1000]);
+        player.with_host(|host| {
+            let owner = host.create_task_object(55, 0, b"save regression", b"")?;
+            host.css_handles.insert(1, original_file.clone());
+            let vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 8], 0)?)?;
+            let binding = [owner, 1].map(u32::to_le_bytes).concat();
+            assert_eq!(host.javascript_native(1006, &binding, &vm)?, NativeReturn::Continue);
+            let mut record = JsRecord::default();
+            let mut adapter = Adapter { host, owner, record: &mut record };
+            assert_eq!(adapter.javascript_call(&original_query, 1)?, Some(Value::Number(1.)));
+            let above_tag = request("cfIsExistSave", &[0, 0x8000_0000, u32::MAX]);
+            assert_eq!(adapter.javascript_call(&above_tag, 1)?, Some(Value::Number(-1.)));
+            assert_eq!(adapter.javascript_call(&written_query, 1)?, Some(Value::Number(0.)));
+            let write = request("cfSaveData", &[1]);
+            assert_eq!(adapter.javascript_call(&write, 0)?, None);
+            assert_eq!(adapter.javascript_call(&written_query, 1)?, Some(Value::Number(0.)));
+            assert_eq!(adapter.javascript_call(&write, 1)?, Some(Value::Boolean(true)));
+            Ok(())
+        })?;
+        drop(player);
+
+        let mut reopened = HeadlessPlayer::open_with_save_root(&game, &scratch.0)?;
+        reopened.with_host(|host| {
+            let owner = host.create_task_object(55, 0, b"save regression", b"")?;
+            let mut record = JsRecord::default();
+            let mut adapter = Adapter { host, owner, record: &mut record };
+            assert_eq!(adapter.javascript_call(&written_query, 1)?, Some(Value::Number(1.)));
+            Ok(())
+        })?;
+        let written = CssFile::parse(&fs::read(scratch.0.join("save0001.dat"))?)?;
+        assert_eq!(written.used_bytes()?, original_file.used_bytes()?);
+        assert_eq!(fs::read(scratch.0.join("save0000.dat"))?, fs::read(&original)?);
+
+        reopened.data_services.ordinary_native_table = None;
+        reopened.with_host(|host| {
+            let mut record = JsRecord::default();
+            let mut adapter = Adapter { host, owner: 0, record: &mut record };
+            let error = adapter.javascript_call(&original_query, 1).unwrap_err();
+            assert!(error.to_string().contains("recognized CSS and notification registration"));
+            Ok(())
+        })
+    }
 }

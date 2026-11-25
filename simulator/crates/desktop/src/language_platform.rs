@@ -73,8 +73,9 @@ impl HeadlessPlayer {
     /// optional declaration source; startup supplies APP/title. gamedef is
     /// parsed but is not treated as a user-language override without a contract.
     pub(super) fn initialize_languages(&mut self) -> Result<()> {
-        let pe_sha256 = self.data_services.native_profile.map(|profile| profile.pe_sha256);
-        self.data_services.language.configure_prefix_query(pe_sha256);
+        let story_prefixes = self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.language_query_uses_story_prefixes());
+        self.data_services.language.configure_prefix_query(story_prefixes);
         let startup = optional_config(&self.scan.resources, "startup.xml")?;
         let language = optional_config(&self.scan.resources, "language.xml")?;
         let _game_defaults = optional_config(&self.scan.resources, "gamedef.xml")?;
@@ -707,7 +708,43 @@ fn wide_nul(units: &[u16]) -> &[u16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cs2_script::{Host, KcsProgram, NativeReturn, Vm};
     use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+    #[test]
+    #[ignore = "requires the installed NEKOPARA Vol. 3 and an isolated save root"]
+    fn native1036_uses_the_language_layout_from_the_opened_game() -> Result<()> {
+        let game = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../../games/",
+            "[170526][NEKO WORKs] \u{30cd}\u{30b3}\u{3071}\u{3089} vol.3 steam\u{7248} (files)",
+            "/nekopara_vol3",
+        ));
+        let saves = std::env::var_os("CS2_SIDECAR9_PROFILE").expect("isolated profile required");
+        let mut player = HeadlessPlayer::open_with_save_root(game, PathBuf::from(saves).join("native1036"))?;
+        let assert_query = |player: &mut HeadlessPlayer, first: &[u8], second: &[u8]| {
+            player.data_services.language.languages = LanguageState {
+                prefixes: vec![b"en".to_vec(), b"jp".to_vec(), b"cn".to_vec()],
+                default_index: 0,
+                primary_index: 0,
+                message_index: 2,
+                subtitle_index: 1,
+            };
+            player.with_host(|host| {
+                let program = KcsProgram::from_code(&[0x3b], vec![0; 64], 0)?;
+                let mut vm = Vm::from_program(program)?;
+                let args = [4u32, 16].map(u32::to_le_bytes).concat();
+                assert_eq!(host.call(1036, &args, &mut vm)?, NativeReturn::Continue);
+                assert_eq!(vm.read(4, 3)?, first);
+                assert_eq!(vm.read(16, 3)?, second);
+                Ok(())
+            })
+        };
+        assert_query(&mut player, b"cn\0", b"jp\0")?;
+
+        player.data_services.ordinary_native_table = None;
+        player.initialize_languages()?;
+        assert_query(&mut player, b"en\0", b"cn\0")
+    }
 
     #[test]
     fn cold_open_loads_private_ui_and_main_tables_independently() {

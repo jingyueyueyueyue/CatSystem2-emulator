@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use cs2_renderer::{Canvas, Color, ImageDrawOptions, Point, RgbaFrame};
+use cs2_runtime::native_profile::ConstantNativeReturn;
+use cs2_runtime::native_table::RenderArgumentOrder;
 use cs2_runtime::{TaskCommand, TaskCommandBuffers, TaskCommandOutcome};
 use cs2_script::{NativeReturn, Vm};
 
@@ -30,10 +32,6 @@ const GRISAIA_LABYRINTH: &str = "ac226c8455eff72114d6b1b9929fae01ac49ba90b8ba579
 const GRISAIA_EDEN: &str = "c2af2ee9baf4b26a3c2cf8a1c867f15f92b54ad1ac5fac381858046a47818f6c";
 const HAKUCHUUMU: &str = "1f3288d5fd5408bee4d395faab708aca78c9eeaa6c172dc06dcce09c844ba9d5";
 const HATSUMIRA: &str = "c48d383c335c5b283bb0c17bd9f14b2b8bfef4a2e3d635365157b1c69498df78";
-const HAPPINESS2_COMPANION_PE: &str =
-    "5869b7d03a636c200f5042f0c3fc37878a362615bf724f58d47aec5eb8b2d44c";
-const HAPPINESS2_SCRIPT_CODE: &str =
-    "4076e8aaaeda6f9f9da88731643b9e5ad32999353d9b93fd1b1282c980b77fb9";
 const ISLAND: &str = "474cc11d875d7be9df9581f3a55d64698ccf4e760c44013df403cced85e505f1";
 const KAMIKAZE: &str = "f6af7437475b8c066be973245aa79688bea510ca1192264add4f1914ebee4c0e";
 const KANMI: &str = "c264b2465889c78723079a694d2654ef1091253db657a735e92f58b75031aa26";
@@ -70,6 +68,7 @@ pub(crate) struct RenderTaskStore {
     tasks: BTreeMap<u32, RenderTask>,
     effects: frame_effects::FrameEffects,
     unprofiled_duration_first_draw: Option<bool>,
+    unverified_argument_order_reported: [bool; 2],
     callback_owner: Option<u32>,
     auxiliary: Option<RgbaFrame>,
     auxiliary_second: Option<RgbaFrame>,
@@ -478,10 +477,32 @@ impl LoggingHost<'_> {
             // The wrapper skips dispatch entirely when the mask is zero.
             return Ok(NativeReturn::Continue);
         }
+        let companion = self.data_services.startup_companion_natives.as_ref();
+        let companion_order = match (index, kind, companion) {
+            (527, 38, Some(companion)) => companion.draw_order,
+            (530, 39, Some(companion)) => companion.wipe_order,
+            _ => None,
+        };
+        let render_order = if matches!(index, 527 | 530)
+            && let Some(table) = self.data_services.ordinary_native_table.as_ref()
+        {
+            match table.render_argument_order(index) {
+                Some(order) => Some(order),
+                None if table.constant(index) == Some(ConstantNativeReturn::Continue) => {
+                    return Ok(NativeReturn::Continue);
+                }
+                None => {
+                    return Err(self.task_error(id, cs2_runtime::RuntimeError::Host(
+                        format!("ordinary native {index} has an unsupported render argument layout"),
+                    )));
+                }
+            }
+        } else {
+            companion_order
+        };
         let sudden_wipe = kind == 39 && vm.program_code_sha256() == Some(SUDDEN_SCRIPT_CODE);
-        let happiness_wipe = kind == 39
-            && self.data_services.particle_message_pe_sha256 == Some(HAPPINESS2_COMPANION_PE)
-            && vm.program_code_sha256() == Some(HAPPINESS2_SCRIPT_CODE);
+        let companion_draw = kind == 38 && companion.is_some_and(|companion| companion.draw_order.is_some());
+        let companion_wipe = kind == 39 && companion.is_some_and(|companion| companion.wipe_order.is_some());
         let mut output = 0;
         let bytes = match index {
             521 => {
@@ -489,11 +510,16 @@ impl LoggingHost<'_> {
                 record.extend_from_slice(&args[8..32]);
                 record
             }
-            527 => self.native_draw_configuration(args)?.to_vec(),
+            527 => match render_order {
+                Some(order) => draw_configuration(args, order == RenderArgumentOrder::DurationFirst),
+                None => self.native_draw_configuration(args)?,
+            }.to_vec(),
             523 | 525 => args[4..].to_vec(),
+            530 if render_order.is_some() => {
+                wipe_configuration(args, render_order == Some(RenderArgumentOrder::DurationFirst)).to_vec()
+            }
             530 => {
-                let pe = happiness_wipe.then_some(HAPPINESS2_COMPANION_PE)
-                    .or_else(|| self.css_task_sha().filter(|&sha| matches!(sha, KAMIKAZE | TSUNABAN)))
+                let pe = self.css_task_sha().filter(|&sha| duration_first_wipe_profile(Some(sha)))
                     .or_else(|| self.data_services.native_profile.map(|profile| profile.pe_sha256))
                     .or_else(|| {
                         // The verified Kanmi sscript passes [task, duration, mode, depth, mask] at 0xb478e.
@@ -503,7 +529,11 @@ impl LoggingHost<'_> {
                     })
                     .or_else(|| (sudden_wipe && self.verified_sudden_draw_source()).then_some(SUDDEN_WIPE_PE))
                     .or_else(|| self.verified_rebellions_draw_source().then_some(REBELLIONS_DRAW_PE));
-                wipe_configuration(args, pe).to_vec()
+                let duration_first = duration_first_wipe_profile(pe);
+                if !duration_first {
+                    self.report_unverified_render_argument_order(index);
+                }
+                wipe_configuration(args, duration_first).to_vec()
             }
             _ => Vec::new(),
         };
@@ -536,17 +566,14 @@ impl LoggingHost<'_> {
             Some(TSUNABAN) if index != 520 || output == 0 => Some("08-render-native"),
             Some(UTATE_SHA) if index != 520 || output == 0 => Some("utate-rdraw-native"),
             _ if sudden_wipe && (index != 520 || output == 0) => Some("sudden-rwipe-native"),
-            _ if happiness_wipe && kind == 39 && (index != 520 || output == 0) =>
-                Some("happiness-rwipe-native"),
-            _ if (index != 520 || output == 0)
-                && self.data_services.particle_message_pe_sha256 == Some(HAPPINESS2_COMPANION_PE) =>
-                Some("happiness-rdraw-native"),
+            _ if companion_wipe && (index != 520 || output == 0) => Some("companion-rwipe-native"),
+            _ if companion_draw && (index != 520 || output == 0) => Some("companion-rdraw-native"),
             _ if self.data_services.native_profile.is_some_and(|profile| profile.pe_sha256 == NEKOPARA) =>
                 Some("neko-rdraw-native"),
             _ => None,
         };
         let draw_call = kind == 38 && matches!(index, 520 | 527 | 528);
-        let wipe_call = (sudden_wipe || happiness_wipe || matches!(pe, Some(KAMIKAZE | TSUNABAN)))
+        let wipe_call = (sudden_wipe || companion_wipe || matches!(pe, Some(KAMIKAZE | TSUNABAN)))
             && kind == 39 && matches!(index, 520 | 530 | 531);
         if (draw_call || wipe_call)
             && self.data_services.story_trace
@@ -595,8 +622,6 @@ impl LoggingHost<'_> {
             true
         } else if let Some(profile) = self.data_services.native_profile {
             duration_first_draw_profile(profile.pe_sha256)
-        } else if self.data_services.particle_message_pe_sha256 == Some(HAPPINESS2_COMPANION_PE) {
-            true
         } else {
             match self.data_services.tasks.render.unprofiled_duration_first_draw {
                 Some(verified) => verified,
@@ -610,7 +635,24 @@ impl LoggingHost<'_> {
                 }
             }
         };
+        if !duration_first {
+            self.report_unverified_render_argument_order(527);
+        }
         Ok(draw_configuration(args, duration_first))
+    }
+
+    fn report_unverified_render_argument_order(&mut self, index: u32) {
+        let reported = &mut self.data_services.tasks.render.unverified_argument_order_reported
+            [usize::from(index == 530)];
+        if *reported {
+            return;
+        }
+        *reported = true;
+        self.events.push(super::LogicEvent {
+            frame: self.frame,
+            kind: "render-native-argument-order-unverified".into(),
+            detail: format!("ordinary native {index}: no registered wrapper or verified companion; using record order"),
+        });
     }
 
     fn verified_rebellions_draw_source(&self) -> bool {
@@ -1318,14 +1360,18 @@ fn draw_configuration(args: &[u8], duration_first: bool) -> [u8; 12] {
     record
 }
 
-fn wipe_configuration(args: &[u8], pe_sha256: Option<&str>) -> [u8; 20] {
-    let mut record = [0; 20];
-    let duration_first = matches!(
+fn duration_first_wipe_profile(pe_sha256: Option<&str>) -> bool {
+    matches!(
         pe_sha256,
-        Some(AUGUST | HAKUCHUUMU | HAPPINESS2_COMPANION_PE | HATSUMIRA | ISLAND | KAMIKAZE | KANMI
+        Some(V401 | AUGUST | CAMPANELLA_SHA | DJIBRIL | GRISAIA_FRUIT | GRISAIA_LABYRINTH | GRISAIA_EDEN
+            | HAKUCHUUMU | HATSUMIRA | ISLAND | KAMIKAZE | KANMI
             | KOKONATSU | NEKOPARA | NEWTON | NEWTON_LOCAL | REBELLIONS_DRAW_PE | SUDDEN_WIPE_PE
-            | TSUNABAN | YUKIKOI)
-    );
+            | TSUNABAN | UTATE_SHA | YUKIKOI)
+    )
+}
+
+fn wipe_configuration(args: &[u8], duration_first: bool) -> [u8; 20] {
+    let mut record = [0; 20];
     record[..12].copy_from_slice(&draw_configuration(args, duration_first));
     record[12..16].copy_from_slice(&args[16..20]);
     record
@@ -1336,6 +1382,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_568_captures_previous_pixels_for_draw() -> Result<()> {
+        let temp = crate::tests::TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+        let previous = Color::rgb(192, 64, 32);
+        let current = Color::rgb(24, 80, 160);
+        let depth = 45_000f32;
+        let draw = player.with_host(|host| {
+            let plane = host.create_task_object(2, 0, b"background", b"")?;
+            let node = host.scene_nodes.get_mut(&plane).unwrap();
+            node.size = [16., 16.];
+            node.position = [0., 0., 5000.];
+            node.color = 0xffc0_4020;
+            node.visible = true;
+            node.initialized = true;
+
+            let mut vm = Vm::new();
+            let capture_range = [0f32, depth].map(f32::to_le_bytes).concat();
+            cs2_script::Host::call(host, 568, &capture_range, &mut vm)?;
+            host.scene_nodes.get_mut(&plane).unwrap().color = 0xff18_50a0;
+
+            let draw = host.create_task_object(38, 0, b"rdraw", b"")?;
+            let record = [0, depth.to_bits(), 20].map(u32::to_le_bytes).concat();
+            host.render_task_command_bytes(draw, RenderTaskOperation::ConfigureDraw, 0, Some(&record), &mut 0)?;
+            host.render_task_command_bytes(draw, RenderTaskOperation::EnableDraw, 1, None, &mut 0)?;
+            Ok(draw)
+        })?;
+
+        player.render_scene()?;
+        assert_eq!(player.canvas.pixel(1, 1)?, previous);
+        player.with_host(|host| host.data_services.tasks.render.update(draw, 20))?;
+        player.render_scene()?;
+        assert_eq!(player.canvas.pixel(1, 1)?, current);
+        Ok(())
+    }
+
+    #[test]
     fn tsunaban_and_kamikaze_wipe_use_duration_before_float_arguments() {
         // Native 530 at VA 0x445640 and 0x479810 writes the duration at record +8.
         let mode = 1.0f32.to_bits();
@@ -1343,9 +1425,9 @@ mod tests {
         let args = [11u32, 30, mode, depth, 12].map(u32::to_le_bytes).concat();
         let expected = [mode, depth, 30, 12, 0].map(u32::to_le_bytes).concat();
         for runtime in [TSUNABAN, KAMIKAZE] {
-            assert_eq!(wipe_configuration(&args, Some(runtime)).as_slice(), expected);
+            assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(runtime))).as_slice(), expected);
         }
-        assert_eq!(wipe_configuration(&args, None)[8..12], depth.to_le_bytes());
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None))[8..12], depth.to_le_bytes());
     }
 
     #[test]
@@ -1354,18 +1436,8 @@ mod tests {
         let depth = 45_000f32.to_bits();
         let args = [64u32, 178, 0, depth, 17].map(u32::to_le_bytes).concat();
         let expected = [0, depth, 178, 17, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(SUDDEN_WIPE_PE)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, None)[8..12], depth.to_le_bytes());
-    }
-
-    #[test]
-    fn happiness_wipe31b_preserves_duration_and_mask() {
-        // Companion slot 530 at 005a5ac0 stages [mode, depth, duration] for message 0189.
-        let depth = 45_000f32.to_bits();
-        let args = [35u32, 58, 0, depth, 506].map(u32::to_le_bytes).concat();
-        let expected = [0, depth, 58, 506, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(HAPPINESS2_COMPANION_PE)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, None)[8..12], depth.to_le_bytes());
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(SUDDEN_WIPE_PE))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None))[8..12], depth.to_le_bytes());
     }
 
     #[test]
@@ -1375,9 +1447,9 @@ mod tests {
         let args = [13u32, 38, mode, split_depth, 345].map(u32::to_le_bytes).concat();
         let expected = [mode, split_depth, 38, 345, 0].map(u32::to_le_bytes).concat();
         let unchanged = [38, mode, split_depth, 345, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(AUGUST)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(AUGUST))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(V401))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1412,8 +1484,8 @@ mod tests {
         let args = [28u32, 98, 0, 0x472f_c800, 260].map(u32::to_le_bytes).concat();
         let expected = [0u32, 0x472f_c800, 98, 260, 0].map(u32::to_le_bytes).concat();
         let unchanged = [98u32, 0, 0x472f_c800, 260, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(KANMI)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(KANMI))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1421,9 +1493,9 @@ mod tests {
         let args = [13u32, 13, 0, 0x472f_c800, 1231].map(u32::to_le_bytes).concat();
         let expected = [0u32, 0x472f_c800, 13, 1231, 0].map(u32::to_le_bytes).concat();
         let unchanged = [13u32, 0, 0x472f_c800, 1231, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(HATSUMIRA)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(HATSUMIRA))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(V401))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1433,9 +1505,9 @@ mod tests {
         let args = [65u32, 38, mode, split_depth, 259].map(u32::to_le_bytes).concat();
         let expected = [mode, split_depth, 38, 259, 0].map(u32::to_le_bytes).concat();
         let unchanged = [38, mode, split_depth, 259, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(HAKUCHUUMU)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(HAKUCHUUMU))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(V401))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1472,10 +1544,10 @@ mod tests {
         let args = [12u32, 58, 0, depth, 1332].map(u32::to_le_bytes).concat();
         let expected = [0, depth, 58, 1332, 0].map(u32::to_le_bytes).concat();
         let unchanged = [58, 0, depth, 1332, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(NEKOPARA)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(KOKONATSU)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(NEKOPARA))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(KOKONATSU))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(V401))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1483,9 +1555,9 @@ mod tests {
         let args = [39u32, 28, 0, 0x472f_c800, 265].map(u32::to_le_bytes).concat();
         let expected = [0u32, 0x472f_c800, 28, 265, 0].map(u32::to_le_bytes).concat();
         let unchanged = [28u32, 0, 0x472f_c800, 265, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(YUKIKOI)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(YUKIKOI))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(V401))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1574,9 +1646,9 @@ mod tests {
         let args = [12u32, 28, 0, depth, 1181].map(u32::to_le_bytes).concat();
         let expected = [0u32, depth, 28, 1181, 0].map(u32::to_le_bytes).concat();
         let unchanged = [28u32, 0, depth, 1181, 0].map(u32::to_le_bytes).concat();
-        assert_eq!(wipe_configuration(&args, Some(ISLAND)).as_slice(), expected);
-        assert_eq!(wipe_configuration(&args, Some(V401)).as_slice(), unchanged);
-        assert_eq!(wipe_configuration(&args, None).as_slice(), unchanged);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(ISLAND))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(V401))).as_slice(), expected);
+        assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(None)).as_slice(), unchanged);
     }
 
     #[test]
@@ -1648,7 +1720,9 @@ mod tests {
     }
 
     #[test]
-    fn happiness2_verified_companion_draw_composes_until_deadline() -> Result<()> {
+    fn happiness2_registered_companion_render_uses_draw_and_wipe_abi() -> Result<()> {
+        use cs2_script::Host;
+
         let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../games/Happiness\u{ff01}2 \u{6a31}\u{82b1}\u{76db}\u{5178}");
         if !game.is_dir() {
@@ -1662,8 +1736,7 @@ mod tests {
             assert_eq!(host.data_services.tasks.render.callback_owner, Some(previous));
             assert_eq!(host.delete_task_native(&previous.to_le_bytes())?, NativeReturn::Continue);
             assert!(!host.data_services.tasks.render.has_composition());
-            let companion = host.data_services.particle_message_pe_sha256.take();
-            assert_eq!(companion, Some(HAPPINESS2_COMPANION_PE));
+            host.data_services.particle_message_pe_sha256 = None;
             let id = host.create_task_object(38, 0, b"rdraw", b"")?;
             assert!(host.update_ordinary_children(0, 1, 1, 20_000)?);
             assert!(!host.task_parents.contains_key(&previous));
@@ -1674,11 +1747,10 @@ mod tests {
                 .map(u32::to_le_bytes)
                 .concat();
             assert_eq!(host.native_draw_configuration(&args)?, args[4..]);
-            host.data_services.particle_message_pe_sha256 = companion;
 
             let mut vm = Vm::new();
             assert_eq!(
-                host.render_tasks_native(527, &args, &mut vm)?,
+                host.call(527, &args, &mut vm)?,
                 NativeReturn::Continue
             );
             let origin = host.data_services.tasks.task_clock(id).unwrap().origin;
@@ -1718,6 +1790,28 @@ mod tests {
                     NativeReturn::Value(u32::from(elapsed < duration))
                 );
             }
+
+            let wipe = host.create_task_object(39, 0, b"rwipe", b"")?;
+            let mask = 506;
+            host.image_handles.insert(mask, RgbaFrame::from_rgba8(1, 1, vec![200, 200, 200, 255])?);
+            let wipe_duration = 58;
+            let wipe_args = [wipe, wipe_duration, 0, split_depth.to_bits(), mask]
+                .map(u32::to_le_bytes).concat();
+            assert_eq!(host.call(530, &wipe_args, &mut vm)?, NativeReturn::Continue);
+            let task = &host.data_services.tasks.render.tasks[&wipe];
+            assert_eq!(task.raw_configuration[..5], [0, split_depth.to_bits(), wipe_duration, mask, 0]);
+            assert_eq!(task.duration, wipe_duration);
+
+            let before = task.raw_configuration;
+            let invalid_mask = [wipe, 2, 0, split_depth.to_bits(), 0].map(u32::to_le_bytes).concat();
+            assert_eq!(host.call(530, &invalid_mask, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.data_services.tasks.render.tasks[&wipe].raw_configuration, before);
+
+            host.data_services.startup_companion_natives = None;
+            let record_order = [wipe, 0, split_depth.to_bits(), 43, mask]
+                .map(u32::to_le_bytes).concat();
+            assert_eq!(host.call(530, &record_order, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.data_services.tasks.render.tasks[&wipe].duration, 43);
             Ok(())
         })
     }
@@ -1794,7 +1888,7 @@ mod tests {
         let args = [30u32, 90, 0, depth, 1231].map(u32::to_le_bytes).concat();
         let expected = [0u32, depth, 90, 1231, 0].map(u32::to_le_bytes).concat();
         for pe in [NEWTON, NEWTON_LOCAL] {
-            assert_eq!(wipe_configuration(&args, Some(pe)).as_slice(), expected);
+            assert_eq!(wipe_configuration(&args, duration_first_wipe_profile(Some(pe))).as_slice(), expected);
         }
     }
 
@@ -1823,7 +1917,15 @@ mod tests {
                 let args = [id, duration, 0, 45_000f32.to_bits()].map(u32::to_le_bytes).concat();
                 let mut vm = Vm::new();
                 assert_eq!(host.render_tasks_native(527, &args, &mut vm)?, NativeReturn::Continue);
-                if expected_profile.is_none() {
+                if let Some(table) = host.data_services.ordinary_native_table.as_ref() {
+                    assert_eq!(
+                        table.render_argument_order(527),
+                        Some(RenderArgumentOrder::DurationFirst),
+                        "{}",
+                        game.display(),
+                    );
+                    assert_eq!(host.data_services.tasks.render.unprofiled_duration_first_draw, None);
+                } else if expected_profile.is_none() {
                     assert_eq!(host.data_services.tasks.render.unprofiled_duration_first_draw, Some(true));
                 }
                 let origin = host.data_services.tasks.task_clock(id).unwrap().origin;

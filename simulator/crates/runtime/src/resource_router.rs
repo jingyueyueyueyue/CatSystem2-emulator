@@ -2,38 +2,21 @@
 //! Paths are UTF-16; only prefix comparison is ASCII insensitive. No path
 //! normalization, global candidate sorting, resource decoding or I/O happens here.
 use crate::{RuntimeError, RuntimeResult};
-use encoding_rs::SHIFT_JIS;
+use encoding_rs::{GBK, SHIFT_JIS};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-const ISLAND_TEXT_ARCHIVES: [((&str, u64, &str), (&str, u64, &str)); 2] = [
-    (
-        ("scene.int", 2_187_392, "4b510173fee978d6af3baab0c3c78e26694e556790704193037dc34edeeda7de"),
-        ("cnscene.int", 3_142_412, "6c3447a90a6a0bc706d2805cb3c58d8089478a24b51691a76d9f0fc468d0751a"),
-    ),
-    (
-        ("fes.int", 171_679, "96152bcf12f60204c32238ce1eed08ccbe75a39befe9aad47ffe214ce0c12d05"),
-        ("cnfes.int", 172_736, "6bc9f5d3033457555a885802fe820170b917b43df19598f4f7d2fe205ab5919d"),
-    ),
+// Probe the actual script codec within each legacy archive. A numbered update
+// can also be a Japanese archive, even if it contains a same-named scene.
+const GBK_SCENE_ARCHIVES: [(&str, &[&str]); 3] = [
+    ("scene.int", &["aft_002.cst", "BLAOP1_END.cst"]),
+    ("update01.int", &["op.cst", "com01.cst"]),
+    ("update05.int", &["common00.cst", "common01.cst"]),
 ];
-
-// CST encodings of verified translation archives. The original archives can
-// have the same filenames, so the encoding must follow the actual source.
-const GBK_SCENE_ARCHIVES: [(&str, u64, &str); 3] = [
-    ("scene.int", 1_404_734, "1c0f5ab05cb0df54d6ac7e9a1ea451c43930eb0c51712c7fbd7203ba53fb0042"),
-    ("update01.int", 3_826_793, "2b8367abd2628ed6f533a9fedfa528124296bb8369f4adfe48c4347dfe8652e9"),
-    ("update05.int", 1_185_840, "3849fda950a7425a778eaeaceace3248195b2c8d6543c29ecf7047181f6c28ef"),
-];
-const DAYDREAM_PATCH: (&str, u64, &str) = (
-    "update03.int", 28_078_220, "cac79038baad0a266ce1e1ca75143285f2b09ad895e7b1af1af3a61df807c0f9",
-);
-const CAMPANELLA_GLYPH_PATCH: (&str, u64, &str) = (
-    "update00.int", 3_028_489, "c7465d70274449232d3e6161f0eefdac3af4dc28351746030b20c834456da974",
-);
-const UTATE_GLYPH_PATCH: (&str, u64, &str) = (
-    "update02.int", 1_339_656, "d0bab21e300ed168cc822297c4805ef054272b50380ab4c81fbb7b25f37e043e",
-);
+const DAYDREAM_PATCH: (&str, &[&str]) = ("update03.int", &["prologue.cst", "c00_01.cst"]);
+const CAMPANELLA_GLYPH_PATCH: &str = "update00.int";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameLanguage {
@@ -528,19 +511,20 @@ impl ResourceRouter {
         builder.router.patches = patches.into_iter().filter(|(_, _, entry)| entry.is_readable())
             .map(|(_, archive, entry)| ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() }).collect();
         builder.bind_localization_patches()?;
+        let gbk_archives = GBK_SCENE_ARCHIVES.map(|(name, scenes)| builder.gbk_scene_archive(name, scenes));
+        let daydream = builder.gbk_scene_archive(DAYDREAM_PATCH.0, DAYDREAM_PATCH.1);
+        let campanella = builder.campanella_patch();
         // This patch replaced the base scene archive on disk. Keep its codec
         // even in Japanese mode so the remaining installed text is readable.
-        if let Some(archive) = builder.verified_archive(GBK_SCENE_ARCHIVES[0]) {
+        if let Some(archive) = gbk_archives[0] {
             builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
         }
         if index.game_language() == GameLanguage::Japanese {
-            let disabled = GBK_SCENE_ARCHIVES.into_iter().skip(1)
-                .chain([CAMPANELLA_GLYPH_PATCH, UTATE_GLYPH_PATCH, DAYDREAM_PATCH])
-                .filter_map(|patch| builder.verified_archive(patch)).collect::<Vec<_>>();
-            builder.router.patches.retain(|mount| !disabled.contains(&mount.archive));
+            let disabled = [gbk_archives[1], gbk_archives[2], campanella, builder.utate_glyph_patch(), daydream];
+            builder.router.patches.retain(|mount| !disabled.contains(&Some(mount.archive)));
             return Ok(builder.router);
         }
-        builder.router.campanella_glyph_patch = builder.verified_archive(CAMPANELLA_GLYPH_PATCH);
+        builder.router.campanella_glyph_patch = campanella;
         let labyrinth_patch = base.join(crate::resource::LABYRINTH_PATCH);
         if let Some((archive, entry)) = index.archives().iter().enumerate()
             .find(|(_, entry)| entry.is_readable() && physical_path_equal(&entry.path, &labyrinth_patch))
@@ -550,13 +534,10 @@ impl ResourceRouter {
             });
             builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
         }
-        for fingerprint in GBK_SCENE_ARCHIVES.into_iter().skip(1) {
-            if let Some(archive) = builder.verified_archive(fingerprint) {
-                builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
-            }
+        for archive in gbk_archives.into_iter().skip(1).flatten() {
+            builder.router.localized_scene_encodings.push((archive, LocalizedSceneEncoding::Gbk));
         }
-        // The CST members of this exact Daydream patch use GBK.
-        builder.router.daydream_gbk_scene_archive = builder.verified_archive(DAYDREAM_PATCH);
+        builder.router.daydream_gbk_scene_archive = daydream;
 
         Ok(builder.router)
     }
@@ -619,9 +600,22 @@ impl MountBuilder<'_> {
     }
 
     fn bind_island_translation(&mut self) {
-        for (original, translated) in ISLAND_TEXT_ARCHIVES {
-            let Some(chinese) = self.verified_archive(translated) else { continue; };
-            let Some(japanese) = self.verified_archive(original) else { continue; };
+        for (original, translated, marker) in [
+            ("scene.int", "cnscene.int", "BAD_02.cst"),
+            ("fes.int", "cnfes.int", "title.fes"),
+        ] {
+            let Some(chinese) = self.archive_named(translated) else { continue; };
+            let Some(japanese) = self.archive_named(original) else { continue; };
+            // These archives substitute the original slot, so a partial
+            // overlay belongs in the ordinary localization manifest instead.
+            let names: BTreeSet<_> = self.index.archives()[chinese].entries.iter()
+                .map(|entry| entry.raw_name.to_ascii_lowercase()).collect();
+            if !names.contains(marker.to_ascii_lowercase().as_bytes())
+                || !self.index.archives()[japanese].entries.iter().all(|entry|
+                    names.contains(&entry.raw_name.to_ascii_lowercase()))
+            {
+                continue;
+            }
             let mut mounted = false;
             for slot in &mut self.router.slots {
                 if let Some(mount) = &mut slot.archive && mount.archive == japanese {
@@ -630,7 +624,7 @@ impl MountBuilder<'_> {
                 }
             }
             if mounted {
-                if translated.0 == "cnscene.int" {
+                if translated == "cnscene.int" {
                     self.router.island_chinese_scene = Some(chinese);
                 } else {
                     self.router.island_chinese_fes = Some(chinese);
@@ -639,22 +633,74 @@ impl MountBuilder<'_> {
         }
     }
 
-    fn verified_archive(&self, (name, size, sha256): (&str, u64, &str)) -> Option<usize> {
+    fn archive_named(&self, name: &str) -> Option<usize> {
         let path = self.base.join(name);
-        let (archive, entry) = self.index.archives().iter().enumerate()
-            .find(|(_, entry)| physical_path_equal(&entry.path, &path) && entry.is_readable())?;
-        if !self.index.files().iter().any(|file| file.relative_path == entry.path && file.size == size) {
+        self.index.archives().iter().position(|entry|
+            physical_path_equal(&entry.path, &path) && entry.is_readable())
+    }
+
+    fn archive_scene(&self, archive: usize, member: &str) -> Option<cs2_script::CstDocument> {
+        let path = self.index.root().join(&self.index.archives()[archive].path);
+        let candidate = self.index.archive_candidates(member).find(|candidate| {
+            matches!(&candidate.location, crate::ResourceLocation::Archive { path: source, .. }
+                if *source == path)
+        })?;
+        let bytes = self.index.read_candidate_bounded(candidate, 256 * 1024).ok()??;
+        cs2_script::CstDocument::parse(&bytes).ok()
+    }
+
+    fn gbk_scene_archive(&self, name: &str, probes: &[&str]) -> Option<usize> {
+        let archive = self.archive_named(name)?;
+        probes.iter().any(|name| {
+            let Some(scene) = self.archive_scene(archive, name) else { return false; };
+            let dialogue = scene.records.iter().filter(|line| matches!(line.kind, 0x20 | 0x21));
+            dialogue.clone().any(|line|
+                SHIFT_JIS.decode_without_bom_handling_and_without_replacement(&line.text).is_none())
+                && dialogue.into_iter().all(|line|
+                    GBK.decode_without_bom_handling_and_without_replacement(&line.text).is_some())
+        }).then_some(archive)
+    }
+
+    fn campanella_patch(&self) -> Option<usize> {
+        let patch = self.archive_named(CAMPANELLA_GLYPH_PATCH)?;
+        let scene = self.archive_named("scene.int")?;
+        let transition = self.archive_scene(patch, "C301_02_end.cst")?;
+        let destination = self.archive_scene(scene, "C301_03.cst")?;
+        (transition.records.iter().any(|record| record.kind == 0x30 && record.text == b"next C301_03")
+            && !destination.records.is_empty()
+            && self.index.archives()[patch].entries.iter().any(|entry|
+                entry.name.eq_ignore_ascii_case("C301_03.cst") && entry.size == 0))
+            .then_some(patch)
+    }
+
+    fn utate_glyph_patch(&self) -> Option<usize> {
+        let archive = self.archive_named("update02.int")?;
+        let entries = &self.index.archives()[archive].entries;
+        if !entries.iter().any(|entry| entry.name.eq_ignore_ascii_case("01_end.cst"))
+            || !entries.iter().all(|entry| entry.name.to_ascii_lowercase().ends_with(".cst"))
+        {
             return None;
         }
-        let file = std::fs::File::open(self.index.root().join(&entry.path)).ok()?;
+        let local_file = |name: &str| {
+            let path = self.base.join(name);
+            self.index.files().iter().find(|file| physical_path_equal(&file.relative_path, &path))
+        };
+        local_file("UTATEMEGURI.id")?;
+        local_file("UtateMeguriSimplifiedChinese.otf")?;
+        let config = local_file("uif_config.json")?;
         let mut bytes = Vec::new();
-        file.take(size + 1).read_to_end(&mut bytes).ok()?;
-        if bytes.len() as u64 != size {
+        std::fs::File::open(self.index.root().join(&config.relative_path)).ok()?
+            .take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 64 * 1024 {
             return None;
         }
-        let mut digest = crate::sha256::Sha256::default();
-        digest.update(&bytes);
-        (digest.finish() == sha256).then_some(archive)
+        let config: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let substitutions = &config["character_substitution"];
+        let source = substitutions["source_characters"].as_str()?;
+        let target = substitutions["target_characters"].as_str()?;
+        (substitutions["enable"].as_bool() == Some(true) && !source.is_empty()
+            && source.chars().count() == target.chars().count())
+            .then_some(archive)
     }
 
     fn register(&mut self, prefix: &str, directory: &str) -> RuntimeResult<Option<u8>> {
@@ -810,6 +856,18 @@ mod island_translation_tests {
             }
         }
         assert!(!router.is_island_chinese_scene(&index, &index.root().join("scene.int")));
+
+        let japanese = crate::ResourceIndex::scan_with_language(index.root(), GameLanguage::Japanese).unwrap();
+        for (category, name, pack) in [
+            (b"scene".as_slice(), "BAD_02", "scene.int"),
+            (b"fes".as_slice(), "title", "fes.int"),
+        ] {
+            let names = japanese.category_names(category, name).unwrap();
+            let candidate = japanese.resolve_mode_candidate(&names[0], ResourceMode::LooseFirst)
+                .unwrap().unwrap();
+            assert!(matches!(&candidate.location, crate::ResourceLocation::Archive { path, .. }
+                if *path == japanese.root().join(pack)));
+        }
     }
 }
 
@@ -822,7 +880,7 @@ mod localization_manifest_tests {
     #[test]
     fn campanella_loads_the_base_scene_after_the_localized_transition() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/祝福のカンパネラ");
-        if !root.join(CAMPANELLA_GLYPH_PATCH.0).is_file() { return; }
+        if !root.join(CAMPANELLA_GLYPH_PATCH).is_file() { return; }
         let index = crate::ResourceIndex::scan_with_language(root, GameLanguage::Localized).unwrap();
         let select_scene = |source| {
             index.category_names(b"scene", source).unwrap().into_iter().find_map(|name|
@@ -847,6 +905,12 @@ mod localization_manifest_tests {
         digest.update(&bytes);
         assert_eq!(digest.finish(), "4b027e93e53dd26746d5220c202e47cfadadc94fc4a6277aacb8f35ca12a75e2");
         assert!(!cs2_script::CstDocument::parse(&bytes).unwrap().records.is_empty());
+
+        let japanese = crate::ResourceIndex::scan_with_language(index.root(), GameLanguage::Japanese).unwrap();
+        let transition = japanese.resolve_mode_candidate("scene.int/C301_02_end.cst", ResourceMode::LooseFirst)
+            .unwrap().unwrap();
+        assert!(matches!(&transition.location, crate::ResourceLocation::Archive { path, .. }
+            if *path == japanese.root().join("scene.int")));
     }
 
     fn write_archive(path: &Path, name: &[u8], payload: &[u8]) {
@@ -857,6 +921,84 @@ mod localization_manifest_tests {
         bytes[76..80].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.extend_from_slice(payload);
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn legacy_gbk_update_is_identified_by_its_scene_bytes() {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-legacy-gbk-{}-{timestamp}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let scene = |text: &[u8]| {
+            let mut bytes = b"CatScene\0\0\0\0".to_vec();
+            let length = (31 + text.len()) as u32;
+            for word in [length, length - 16, 1, 8, 12, 1, 0, 0] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            bytes.extend_from_slice(&[1, 0x20]);
+            bytes.extend_from_slice(text);
+            bytes.push(0);
+            bytes
+        };
+        let patch = root.join("update01.int");
+        write_archive(&root.join("scene.int"), b"op.cst", &scene(b"original"));
+        for text in [b"\xd6\xd0\xb9\xfa".as_slice(), b"\xc4\xe3\xba\xc3\xd6\xd0\xb9\xfa"] {
+            let translated = scene(text);
+            write_archive(&patch, b"op.cst", &translated);
+            let index = crate::ResourceIndex::scan(&root).unwrap();
+            assert_eq!(index.resource_router().unwrap().localized_scene_encoding(&index, &patch),
+                Some(LocalizedSceneEncoding::Gbk));
+            assert_eq!(index.read_mode("scene.int/op.cst", ResourceMode::LooseFirst).unwrap(), Some(translated));
+        }
+        let japanese = crate::ResourceIndex::scan_with_language(&root, GameLanguage::Japanese).unwrap();
+        assert_eq!(japanese.read_mode("scene.int/op.cst", ResourceMode::LooseFirst).unwrap(), Some(scene(b"original")));
+        drop(japanese);
+        write_archive(&patch, b"op.cst", &scene(b"\x82\xa0"));
+        let japanese_update = crate::ResourceIndex::scan_with_language(&root, GameLanguage::Japanese).unwrap();
+        assert_eq!(japanese_update.read_mode("scene.int/op.cst", ResourceMode::LooseFirst).unwrap(), Some(scene(b"\x82\xa0")));
+        drop(japanese_update);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_legacy_archives_keep_their_language_routing() {
+        let games = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+        for (game, archive, daydream) in [
+            ("灰色的乐园v1", "scene.int", false),
+            ("灰色的果实", "update01.int", false),
+            ("突然之间发现我已恋上你", "update05.int", false),
+            ("白昼夢の青写真", "update03.int", true),
+        ] {
+            let root = games.join(game);
+            if !root.is_dir() { continue; }
+            for language in [GameLanguage::Localized, GameLanguage::Japanese] {
+                let index = crate::ResourceIndex::scan_with_language(&root, language).unwrap();
+                let router = index.resource_router().unwrap();
+                let (archive_id, entry) = index.archives().iter().enumerate().find(|(_, entry)|
+                    physical_path_equal(&entry.path, Path::new(archive))).unwrap();
+                let path = index.root().join(&entry.path);
+                let localized = language == GameLanguage::Localized;
+                let base = archive == "scene.int";
+                assert_eq!(router.localized_scene_encoding(&index, &path),
+                    ((localized || base) && !daydream).then_some(LocalizedSceneEncoding::Gbk),
+                    "{game} {language:?}");
+                assert_eq!(router.is_daydream_gbk_scene_archive(&index, &path), localized && daydream,
+                    "{game} {language:?}");
+                assert_eq!(router.patches.iter().any(|mount| mount.archive == archive_id),
+                    localized && !base, "{game} {language:?}");
+            }
+        }
+        let utate = games.join("うたてめぐり");
+        if utate.join("update02.int").is_file() {
+            for language in [GameLanguage::Localized, GameLanguage::Japanese] {
+                let index = crate::ResourceIndex::scan_with_language(&utate, language).unwrap();
+                let router = index.resource_router().unwrap();
+                let archive = |name: &str| index.archives().iter().position(|entry|
+                    physical_path_equal(&entry.path, Path::new(name))).unwrap();
+                assert!(router.patches.iter().any(|mount| mount.archive == archive("update00.int")));
+                assert_eq!(router.patches.iter().any(|mount| mount.archive == archive("update02.int")),
+                    language == GameLanguage::Localized);
+            }
+        }
     }
 
     #[test]

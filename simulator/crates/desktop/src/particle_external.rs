@@ -1,4 +1,4 @@
-//! Independently recovered kcView particle producer, Campanella SHA below.
+//! Legacy kcView particle producer.
 //! Creation text is a graph path, not a surface-size/configuration language.
 use std::collections::BTreeMap;
 use cs2_renderer::RgbaFrame;
@@ -29,8 +29,8 @@ pub(super) struct ExternalParticle {
 }
 
 impl ParticleExternalStore {
-    pub(super) fn identify(&mut self, sha256: &str) {
-        self.legacy_kc_view = sha256 == CAMPANELLA_SHA;
+    pub(super) fn set_legacy_kc_view(&mut self, supported: bool) {
+        self.legacy_kc_view = supported;
     }
 
     pub(super) fn legacy_kc_view(&self) -> bool { self.legacy_kc_view }

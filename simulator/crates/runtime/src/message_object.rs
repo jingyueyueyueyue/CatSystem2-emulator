@@ -5,6 +5,7 @@
 //! pixel work; a made-up font advance or a successful empty painter is not a
 //! substitute. Native routing belongs to the desktop adapter.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -25,6 +26,40 @@ const MAX_ENTRIES: usize = 1_000_000;
 
 fn invalid(message: &'static str) -> ScriptError {
     ScriptError::InvalidStructuredText { offset: 0, message }
+}
+
+pub fn decode_cp932_display(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    let cp932 = encoding_rs::SHIFT_JIS;
+    if let Some(text) = cp932.decode_without_bom_handling_and_without_replacement(bytes) {
+        return Some(text);
+    }
+
+    // Win32's CP932 display conversion consumes 81 01 as one U+30FB.
+    // Check the character boundary before substituting its CP932 spelling.
+    let mut normalized = bytes.to_vec();
+    let mut index = 0;
+    while let Some(&lead) = bytes.get(index) {
+        if matches!(lead, 0x81..=0x9f | 0xe0..=0xfc) && index + 1 < bytes.len() {
+            if lead == 0x81 && bytes[index + 1] == 0x01 {
+                normalized[index + 1] = 0x45;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    cp932.decode_without_bom_handling_and_without_replacement(&normalized)
+        .map(|text| Cow::Owned(text.into_owned()))
+}
+
+#[test]
+fn cp932_display_preserves_character_boundaries_and_rejects_other_errors() {
+    assert_eq!(decode_cp932_display(b"\x81\x75\x81\x01\x81\x01\x81\x76").as_deref(),
+        Some("\u{300c}\u{30fb}\u{30fb}\u{300d}"));
+    assert_eq!(decode_cp932_display(b"\x82\x81\x01\x81\x01").as_deref(),
+        Some("\u{ff41}\u{0001}\u{30fb}"));
+    assert!(decode_cp932_display(b"\x81\x01\x81").is_none());
+    assert!(decode_cp932_display(b"\x81\x02").is_none());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2202,11 +2237,8 @@ impl MessageObject {
                         codec.decode_without_bom_handling_and_without_replacement(part)
                             .ok_or_else(|| invalid("message append has invalid GBK input"))?
                     } else {
-                        let (decoded, _, errors) = codec.decode(part);
-                        if errors {
-                            return Err(invalid("message append has invalid CP932 input"));
-                        }
-                        decoded
+                        decode_cp932_display(part)
+                            .ok_or_else(|| invalid("message append has invalid CP932 input"))?
                     };
                     text.push_str(&decoded);
                 }
@@ -3001,6 +3033,23 @@ mod reveal_tests {
     }
 
     #[test]
+    fn legacy_gbk_substitute_byte_does_not_request_a_glyph() {
+        let mut backend = RecordingBackend::default();
+        let mut message = timed_message(&mut backend, None);
+        let raw = b"\xd6\xd0\x1aB";
+        message.append_legacy_gbk(raw).unwrap();
+        message.prepare(None, &mut backend).unwrap();
+
+        let displayed: String = message.atoms().iter().filter_map(|atom| match atom.kind {
+            MessageAtomKind::Glyph { character, .. } => Some(character),
+            _ => None,
+        }).collect();
+        assert_eq!(displayed, "\u{300c}ABC\u{4e2d}B");
+        assert!(message.source().ends_with("\u{4e2d}\u{1a}B"));
+        assert_eq!(message.raw_appends().last().unwrap(), raw);
+    }
+
+    #[test]
     fn message_reveal_ticks_cross_character_deadlines_without_input() {
         let mut backend = RecordingBackend::default();
         let scale = Some(5);
@@ -3392,6 +3441,11 @@ impl MarkupParser<'_> {
         }
         if character == '\0' {
             return Err(self.error(start, "message contains a zero scalar"));
+        }
+        if character == '\u{1a}' {
+            // Legacy code-page conversions can emit SUB for an unencodable character.
+            // Keep it in the source and omit it from the display and reveal timing.
+            return Ok(());
         }
         if character == '\u{ffff}' {
             return self.emit(MessageAtomKind::Separator, start);

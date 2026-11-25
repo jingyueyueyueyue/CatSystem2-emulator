@@ -557,7 +557,7 @@ pub(super) fn update_characters(
     Ok(())
 }
 
-fn apply_tone(image: RgbaFrame, tone: [i32; 3]) -> Result<RgbaFrame> {
+pub(in crate) fn apply_tone(image: RgbaFrame, tone: [i32; 3]) -> Result<RgbaFrame> {
     if tone == NEUTRAL_TONE {
         return Ok(image);
     }

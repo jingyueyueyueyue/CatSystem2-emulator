@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use cs2_desktop::{HeadlessPlayer, HostSettingKind, HostSettingsEdit, HostWindowRequest};
 use cs2_runtime::message_object::{ButtonSource, RoutedPhysicalButton};
+use std::collections::VecDeque;
 use super::Action;
 
 pub(super) enum TitleAction {
@@ -112,6 +113,168 @@ impl EdenEntry {
             && player.mouse_press_candidate_regions([x, y])?.contains(&region)
         {
             self.pressed = Some(frame);
+            return Ok(Some(Action::Pointer { x, y, button: Some(0) }));
+        }
+        Ok(None)
+    }
+}
+
+struct ReadyClick {
+    region: u32,
+    point: [i32; 2],
+    require_root_resume: bool,
+}
+
+struct ReadyPress {
+    frame: u64,
+    receiver: u32,
+    routed: bool,
+    resumed: Option<u64>,
+    retry_hovered: bool,
+    retries: u8,
+}
+
+pub(super) fn choice_target_enabled(player: &HeadlessPlayer, receiver: u32, region: u32) -> bool {
+    player.input_button_state(region).and_then(|button| button.receiver) == Some(receiver)
+        && player.host_replay_input_regions().any(|hit| hit[0] == region && hit[8] != 0)
+}
+
+#[derive(Default)]
+pub(super) struct ReadyEntry {
+    clicks: VecDeque<ReadyClick>,
+    hovered: bool,
+    pressed: Option<ReadyPress>,
+}
+
+impl ReadyEntry {
+    pub fn add(&mut self, value: &str) -> Result<()> {
+        let (region, point) = value.split_once(':').context("expected ready-click:region:x,y")?;
+        let (x, y) = point.split_once(',').context("expected ready-click:region:x,y")?;
+        self.clicks.push_back(ReadyClick {
+            region: region.parse()?, point: [x.parse()?, y.parse()?], require_root_resume: true,
+        });
+        Ok(())
+    }
+
+    pub fn add_choice(&mut self, region: u32, point: [i32; 2]) {
+        self.clicks.push_back(ReadyClick { region, point, require_root_resume: false });
+    }
+
+    pub fn regions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.clicks.iter().map(|click| click.region)
+    }
+
+    pub fn done(&self) -> bool {
+        self.clicks.is_empty()
+    }
+
+    pub fn waiting(&self) -> Option<String> {
+        let click = self.clicks.front()?;
+        Some(match &self.pressed {
+            Some(press) => format!(
+                "region={} point={:?} pressed={} receiver={} routed={} resumed={:?} retries={}",
+                click.region, click.point, press.frame, press.receiver, press.routed, press.resumed,
+                press.retries,
+            ),
+            None => format!("region={} point={:?} awaiting enabled button", click.region, click.point),
+        })
+    }
+
+    pub fn poll(&mut self, player: &mut HeadlessPlayer, frame: u64, busy: bool)
+        -> Result<Option<Action>>
+    {
+        let Some(&ReadyClick { region, point: [x, y], require_root_resume }) = self.clicks.front()
+        else { return Ok(None); };
+        if let Some(press) = self.pressed.as_mut() {
+            let hits = player.host_input_route_receipts().iter().filter(|receipt| {
+                receipt.frame == frame && !receipt.repeated && receipt.pressed == 1
+                    && (receipt.region, receipt.receiver) == (region, press.receiver)
+                    && receipt.raw_mask == ButtonSource::Mouse.mask()
+                    && receipt.physical == [RoutedPhysicalButton { source: ButtonSource::Mouse, code: 1 }]
+            });
+            press.routed |= hits.filter(|receipt| require_root_resume || receipt.response == 0).count() == 1;
+            let message = format!("message=[2, {x}, {y}, 0]");
+            if player.events().iter().rev().take_while(|event| event.frame == frame)
+                .any(|event| event.kind == "message-resume" && event.detail == message)
+            {
+                press.resumed = Some(frame);
+            }
+            let target_withdrawn = || !choice_target_enabled(player, press.receiver, region);
+            // Legacy FES menus can resume the VM directly. Accept the exact
+            // click message once its previously verified target withdraws.
+            if !require_root_resume && (press.routed
+                || (press.resumed.is_some() && target_withdrawn()))
+            {
+                eprintln!("frame {frame}: choice-click region={region} receiver={} routed={} resumed={:?}",
+                    press.receiver, press.routed, press.resumed);
+                self.clicks.pop_front();
+                self.hovered = false;
+                self.pressed = None;
+                return Ok(None);
+            }
+            // Some menu callbacks resume the ordinary script without a typed press receipt.
+            // In that path the same pointer target must withdraw after the script resumes.
+            if require_root_resume && let Some(resumed) = press.resumed
+                && (press.routed || target_withdrawn())
+            {
+                eprintln!("frame {frame}: ready-click region={region} receiver={} resumed={resumed} routed={}",
+                    press.receiver, press.routed);
+                self.clicks.pop_front();
+                self.hovered = false;
+                self.pressed = None;
+                return Ok(None);
+            }
+            // Keep observing the outstanding press while re-hovering. The
+            // callback can consume the original edge during that frame.
+            if !require_root_resume && !busy && frame >= press.frame.saturating_add(12)
+                && press.resumed.is_none() && press.retries < 2 && !target_withdrawn()
+                && player.masked_input_region_at([x, y])?.is_some_and(|hit| hit[0] == region && hit[8] != 0)
+                && player.mouse_press_candidate_regions([x, y])?.contains(&region)
+            {
+                if !press.retry_hovered {
+                    press.retry_hovered = true;
+                    return Ok(Some(Action::Pointer { x, y, button: None }));
+                }
+                if player.host_pointer_move_state().remaining <= 0 {
+                    eprintln!("frame {frame}: retrying unconsumed choice-click region={region} receiver={}", press.receiver);
+                    press.frame = frame;
+                    press.retry_hovered = false;
+                    press.retries += 1;
+                    return Ok(Some(Action::Pointer { x, y, button: Some(0) }));
+                }
+            }
+            return Ok(None);
+        }
+        // Choice input already waits for the replay's outstanding press and
+        // Ctrl release. A script can leave unrelated logical key slots latched.
+        if busy || (require_root_resume && player.device_key_scan_state().records()
+            .iter().flatten().any(|key| key.mask & 3 != 0))
+        {
+            return Ok(None);
+        }
+        if !self.hovered {
+            if player.input_button_state(region).is_some_and(|button| button.receiver.is_some()) {
+                self.hovered = true;
+                return Ok(Some(Action::Pointer { x, y, button: None }));
+            }
+            return Ok(None);
+        }
+        let point = [x, y];
+        // A choice press moves to its verified point again before button-down.
+        // Give an in-flight script cursor animation time to finish first.
+        let pointer_ready = if require_root_resume {
+            player.host_pointer_logical_position() == point
+        } else {
+            player.host_pointer_move_state().remaining <= 0
+        };
+        if pointer_ready
+            && player.masked_input_region_at(point)?.is_some_and(|hit| hit[0] == region && hit[8] != 0)
+            && player.mouse_press_candidate_regions(point)?.contains(&region)
+            && let Some(receiver) = player.input_button_state(region).and_then(|button| button.receiver)
+        {
+            self.pressed = Some(ReadyPress {
+                frame, receiver, routed: false, resumed: None, retry_hovered: false, retries: 0,
+            });
             return Ok(Some(Action::Pointer { x, y, button: Some(0) }));
         }
         Ok(None)

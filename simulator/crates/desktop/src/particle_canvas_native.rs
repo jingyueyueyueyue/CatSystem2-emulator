@@ -1,7 +1,12 @@
 //! SHA-specific kcTask3DView messages. Campanella:543->332/333,
 //! 547->340,552->360,554->363,555->365,578->352,579/580->353/354,652->368.
+//! Immediate task messages are recognized from their registered ordinary wrappers.
 //! 553 sends361 to an unhandled branch in this PE; do not guess it as362.
 use cs2_runtime::{TaskCommand, TaskCommandBuffers, TaskCommandOutcome};
+use cs2_runtime::model_state::{
+    decode_local_transform, encode_local_transform, model_rotation_matrix,
+    model_transform_from_rotation_matrix,
+};
 use cs2_script::{NativeReturn, Result, Vm};
 use super::{LoggingHost, native_state_error, read_u32, trim_nul, expand_kcs_format};
 
@@ -30,6 +35,319 @@ impl LoggingHost<'_> {
         let result=self.route_task_command_buffers(command,&mut buffers,&mut value,4096)?;
         if result.is_some_and(|o|!o.done) {return Ok(NativeReturn::Retry);}
         Ok(if index!=552 {NativeReturn::Value(value)} else {NativeReturn::Continue})
+    }
+
+    pub(super) fn immediate_task_message_native(&mut self, code: u32, args: &[u8]) -> Result<NativeReturn> {
+        let required = if matches!(code, 355 | 359) { 4 } else { 8 };
+        if args.len() != required {
+            return Err(native_state_error("immediate task message native has an invalid argument length"));
+        }
+        let command = TaskCommand {
+            target: read_u32(args, 0)? as i32,
+            sender: self.current_task_id as i32,
+            code,
+            data: [0, if required == 8 { read_u32(args, 4)? } else { 0 }, 0],
+        };
+        let mut buffers = super::native_tasks::OwnedTaskBuffers::new(None, None)?;
+        let result = self.route_task_command_buffers(command, &mut buffers, &mut 0, 4096)?;
+        if result.is_some_and(|outcome| !outcome.done) {
+            return Ok(NativeReturn::Retry);
+        }
+        Ok(NativeReturn::Continue)
+    }
+
+    pub(super) fn particle_canvas_camera_direction_native(
+        &self, args: &[u8], vm: &mut Vm,
+    ) -> Result<NativeReturn> {
+        if args.len() != 12 {
+            return Err(native_state_error("3D camera direction query requires 12 argument bytes"));
+        }
+        let target = read_u32(args, 0)?;
+        let addresses = [read_u32(args, 4)?, read_u32(args, 8)?];
+        for address in addresses {
+            match vm.read(address, 12) {
+                Ok(_) => {},
+                Err(cs2_script::ScriptError::MemoryOutOfBounds { .. }) => return Ok(NativeReturn::Continue),
+                Err(error) => return Err(error),
+            }
+        }
+
+        // Message 358 addresses one live canvas and cannot yield.
+        let vectors = self.data_services.particle_external.canvases.get(&target)
+            .filter(|_| self.task_is_reachable(target))
+            .map(|canvas| canvas.camera_direction_vectors())
+            .transpose()
+            .map_err(|error| super::native_state_error_owned(format!("3D camera direction query failed: {error}")))?
+            .flatten()
+            .unwrap_or([[0.0; 3], [1.0, 0.0, 0.0]]);
+        for (address, vector) in addresses.into_iter().zip(vectors) {
+            let mut bytes = [0; 12];
+            for (out, value) in bytes.chunks_exact_mut(4).zip(vector) {
+                out.copy_from_slice(&value.to_le_bytes());
+            }
+            vm.write(address, &bytes)?;
+        }
+        Ok(NativeReturn::Continue)
+    }
+
+    pub(super) fn particle_canvas_camera_position_native(
+        &self, args: &[u8], vm: &mut Vm,
+    ) -> Result<NativeReturn> {
+        if args.len() != 8 {
+            return Err(native_state_error("3D camera-relative position requires 8 argument bytes"));
+        }
+        let target = read_u32(args, 0)?;
+        let address = read_u32(args, 4)?;
+        if address == u32::MAX {
+            return Ok(NativeReturn::Continue);
+        }
+        // The synchronous message 343 transforms a position in place. Its
+        // wrapper uses unit scale and rotation, and only copies XYZ to the VM.
+        if let Some(canvas) = self.data_services.particle_external.canvases.get(&target)
+            .filter(|canvas| canvas.configured && canvas.loaded && self.task_is_reachable(target))
+        {
+            let source = vm.read(address, 12)?;
+            let position = [0, 4, 8].map(|offset| {
+                f32::from_le_bytes(source[offset..offset + 4].try_into().unwrap())
+            });
+            let mut output = [0; 12];
+            for (word, value) in output.chunks_exact_mut(4).zip(canvas.camera_relative_position(position)) {
+                word.copy_from_slice(&value.to_le_bytes());
+            }
+            vm.write(address, &output)?;
+        }
+        Ok(NativeReturn::Continue)
+    }
+
+    pub(super) fn particle_canvas_model_position_native(
+        &mut self, args: &[u8], vm: &mut Vm,
+    ) -> Result<NativeReturn> {
+        if args.len() != 12 {
+            return Err(native_state_error("3D model position query requires 12 argument bytes"));
+        }
+        let command = TaskCommand {
+            target: read_u32(args, 0)? as i32,
+            sender: self.current_task_id as i32,
+            code: 357,
+            data: [0; 3],
+        };
+        let path = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
+        let path = trim_nul(&path);
+        if path.len() >= 260 {
+            return Err(native_state_error("3D model position path exceeds its 260-byte buffer"));
+        }
+        let address = read_u32(args, 8)?;
+        match vm.read(address, 12) {
+            Ok(_) => {},
+            Err(cs2_script::ScriptError::MemoryOutOfBounds { .. }) => return Ok(NativeReturn::Continue),
+            Err(error) => return Err(error),
+        }
+        let mut path = path.to_vec();
+        path.push(0);
+        let mut buffers = super::native_tasks::OwnedTaskBuffers::new(Some(path), Some(vec![0; 12]))?;
+        let result = self.route_task_command_buffers(command, &mut buffers, &mut 0, 4096)?;
+        if result.is_some_and(|outcome| !outcome.done) {
+            return Ok(NativeReturn::Retry);
+        }
+        vm.write(address, buffers.data1().expect("owned position output"))?;
+        Ok(NativeReturn::Continue)
+    }
+
+    pub(super) fn particle_canvas_model_local_transform_native(
+        &mut self, code: u32, args: &[u8], vm: &mut Vm,
+    ) -> Result<NativeReturn> {
+        if args.len() != 20 {
+            return Err(native_state_error("3D local transform query requires 20 argument bytes"));
+        }
+        let command = TaskCommand {
+            target: read_u32(args, 0)? as i32,
+            sender: self.current_task_id as i32,
+            code,
+            data: [0; 3],
+        };
+        let mut outputs = [None; 3];
+        for (slot, (offset, size)) in outputs.iter_mut().zip([(8, 12), (12, 12), (16, 64)]) {
+            let address = read_u32(args, offset)?;
+            if address == u32::MAX {
+                continue;
+            }
+            match vm.read(address, size) {
+                Ok(_) => *slot = Some(address),
+                Err(cs2_script::ScriptError::MemoryOutOfBounds { .. }) => {},
+                Err(error) => return Err(error),
+            }
+        }
+        let mut buffers = if let Some(pending) = self.pending_owned_task_buffers(command) {
+            pending
+        } else {
+            let path = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
+            let path = trim_nul(&path);
+            if path.len() >= 260 {
+                return Err(native_state_error("3D local transform path exceeds its 260-byte buffer"));
+            }
+            let mut path = path.to_vec();
+            path.push(0);
+            super::native_tasks::OwnedTaskBuffers::new(Some(path), Some(vec![0; 48]))?
+        };
+        let result = self.route_task_command_buffers(command, &mut buffers, &mut 0, 4096)?;
+        if result.is_some_and(|outcome| !outcome.done) {
+            return Ok(NativeReturn::Retry);
+        }
+        // The receiver leaves its scratch untouched when the model or node is absent.
+        // The PE wrapper could read uninitialized data here. Preserve the caller's outputs.
+        if buffers.data1_write_length() != 0 {
+            let bytes = buffers.data1().expect("owned local transform output");
+            if let Some(address) = outputs[0] {
+                vm.write(address, &bytes[..12])?;
+            }
+            if let Some(address) = outputs[1] {
+                vm.write(address, &bytes[16..28])?;
+            }
+            if let Some(address) = outputs[2] {
+                let values = decode_local_transform(bytes)
+                    .map_err(|_| native_state_error("3D local transform output is truncated"))?;
+                let quaternion = [values[6], values[7], values[8], values[9]].map(f32::from_bits);
+                let mut output = [0; 64];
+                for (word, value) in output.chunks_exact_mut(4)
+                    .zip(model_rotation_matrix(quaternion).into_iter().flatten())
+                {
+                    word.copy_from_slice(&value.to_le_bytes());
+                }
+                vm.write(address, &output)?;
+            }
+        }
+        Ok(NativeReturn::Continue)
+    }
+
+    pub(super) fn particle_canvas_model_path_native(
+        &mut self, code: u32, args: &[u8], vm: &Vm,
+    ) -> Result<NativeReturn> {
+        let required = if matches!(code, 336 | 371 | 372) { 12 } else { 8 };
+        if args.len() != required {
+            return Err(native_state_error("3D model path command has an invalid argument length"));
+        }
+        let command = TaskCommand {
+            target: read_u32(args, 0)? as i32,
+            sender: self.current_task_id as i32,
+            code,
+            data: [0, if code == 336 { read_u32(args, 8)? } else { 0 }, 0],
+        };
+        let mut buffers = if let Some(pending) = self.pending_owned_task_buffers(command) {
+            pending
+        } else {
+            let path = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
+            let path = trim_nul(&path);
+            if path.len() >= 260 {
+                return Err(native_state_error("3D model path exceeds its 260-byte buffer"));
+            }
+            let mut path = path.to_vec();
+            path.push(0);
+            super::native_tasks::OwnedTaskBuffers::new(Some(path), None)?
+        };
+        let mut value = 0;
+        let result = self.route_task_command_buffers(command, &mut buffers, &mut value, 4096)?;
+        Ok(if result.is_some_and(|outcome| !outcome.done) {
+            NativeReturn::Retry
+        } else if code == 337 {
+            NativeReturn::Value(value)
+        } else {
+            NativeReturn::Continue
+        })
+    }
+
+    pub(super) fn particle_canvas_model_transform_set_native(
+        &mut self, code: u32, args: &[u8], vm: &Vm,
+    ) -> Result<NativeReturn> {
+        if args.len() != 20 {
+            return Err(native_state_error("3D model transform requires 20 argument bytes"));
+        }
+        let command = TaskCommand {
+            target: read_u32(args, 0)? as i32,
+            sender: self.current_task_id as i32,
+            code,
+            data: [0; 3],
+        };
+        let mut buffers = if let Some(pending) = self.pending_owned_task_buffers(command) {
+            pending
+        } else {
+            let read_vector = |offset, default| -> Result<[f32; 3]> {
+                let address = read_u32(args, offset)?;
+                if address == u32::MAX { return Ok(default); }
+                let bytes = vm.read(address, 12)?;
+                Ok([0, 4, 8].map(|at| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())))
+            };
+            let [x, y, z] = read_vector(8, [0.0; 3])?;
+            let position = if matches!(code, 345 | 347) { [-x, y, -z] } else { [x, y, z] };
+            let scale = read_vector(12, [1.0; 3])?;
+            let rotation_address = read_u32(args, 16)?;
+            let mut rotation = super::particle_canvas::identity();
+            if rotation_address != u32::MAX {
+                let bytes = vm.read(rotation_address, 64)?;
+                for (value, bytes) in rotation.iter_mut().flatten().zip(bytes.chunks_exact(4)) {
+                    *value = f32::from_le_bytes(bytes.try_into().unwrap());
+                }
+            }
+            let path = expand_kcs_format(vm, &vm.read_string(read_u32(args, 4)?)?, 0)?;
+            let path = trim_nul(&path);
+            if path.len() >= 260 {
+                return Err(native_state_error("3D model transform path exceeds its 260-byte buffer"));
+            }
+            let mut path = path.to_vec();
+            path.push(0);
+            let values = model_transform_from_rotation_matrix(position, scale, rotation)
+                .map_err(|error| super::native_state_error_owned(format!("3D model transform: {error}")))?;
+            super::native_tasks::OwnedTaskBuffers::new(Some(path), Some(encode_local_transform(&values).to_vec()))?
+        };
+        let result = self.route_task_command_buffers(command, &mut buffers, &mut 0, 4096)?;
+        Ok(if result.is_some_and(|outcome| !outcome.done) {
+            NativeReturn::Retry
+        } else {
+            NativeReturn::Continue
+        })
+    }
+
+    pub(super) fn particle_canvas_motion_message_native(
+        &mut self, code: u32, args: &[u8], vm: &Vm,
+    ) -> Result<NativeReturn> {
+        let required = if code == 362 { 24 } else { 12 };
+        if args.len() != required {
+            return Err(native_state_error("3D model motion message has an invalid argument length"));
+        }
+        let command = TaskCommand {
+            target: read_u32(args, 0)? as i32,
+            sender: self.current_task_id as i32,
+            code,
+            data: [0, if code == 364 { read_u32(args, 8)? } else { 0 }, 0],
+        };
+        let mut buffers = if let Some(pending) = self.pending_owned_task_buffers(command) {
+            pending
+        } else {
+            let expand = |offset, capacity| -> Result<Vec<u8>> {
+                let name = expand_kcs_format(vm, &vm.read_string(read_u32(args, offset)?)?, 0)?;
+                let name = trim_nul(&name);
+                if name.len() >= capacity {
+                    return Err(native_state_error("3D model motion path exceeds its wrapper buffer"));
+                }
+                let mut name = name.to_vec();
+                name.push(0);
+                Ok(name)
+            };
+            let (path, data) = match code {
+                362 => (expand(4, 260)?, Some(args[8..24].to_vec())),
+                364 => (expand(4, 260)?, None),
+                // In this receiver, 348 consumes the message after both paths
+                // have been formatted by the original wrapper.
+                348 => (expand(4, 256)?, Some(expand(8, 256)?)),
+                _ => return Err(native_state_error("unrecognized 3D model motion message")),
+            };
+            super::native_tasks::OwnedTaskBuffers::new(Some(path), data)?
+        };
+        let result = self.route_task_command_buffers(command, &mut buffers, &mut 0, 4096)?;
+        Ok(if result.is_some_and(|outcome| !outcome.done) {
+            NativeReturn::Retry
+        } else {
+            NativeReturn::Continue
+        })
     }
 
     pub(super) fn legacy_particle_canvas(&self, kind: u32) -> bool {
@@ -162,6 +480,9 @@ impl LoggingHost<'_> {
                 let canvas = self.data_services.particle_external.canvases.get_mut(&target).unwrap();
                 if let Some(camera) = canvas.resolve(&path).filter(|&i| canvas.nodes[i].is_camera()) {
                     canvas.selected_camera = Some(camera);
+                    canvas.refresh_camera_basis().map_err(|error| {
+                        super::native_state_error_owned(format!("3D camera selection: {error}"))
+                    })?;
                 }
             }
             336 | 337 => {
@@ -223,6 +544,31 @@ impl LoggingHost<'_> {
                     }
                 }
             }
+            // 41f839 writes the PE's manager flag at task+2b8. The owning
+            // PE has no read of that field, and the CPU canvas draws directly.
+            355 => {}
+            357 => {
+                let canvas = &self.data_services.particle_external.canvases[&target];
+                if canvas.loaded {
+                    let path = bounded_name(data(0)?)?;
+                    if let Some(index) = canvas.resolve_object(&path) {
+                        let position = canvas.model_position(index).map_err(|error| {
+                            super::native_state_error_owned(format!("3D model position query failed: {error}"))
+                        })?;
+                        let output = buffers.data1.as_deref_mut().and_then(|bytes| bytes.get_mut(..12))
+                            .ok_or_else(|| native_state_error("3D position query needs 12 writable output bytes"))?;
+                        for (word, value) in output.chunks_exact_mut(4).zip(position) {
+                            word.copy_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                }
+            }
+            359 => {
+                self.data_services.particle_external.canvases.get_mut(&target).unwrap()
+                    .refresh_camera_basis().map_err(|error| {
+                        super::native_state_error_owned(format!("3D camera basis refresh: {error}"))
+                    })?;
+            }
             360 | 362 | 363 | 365 => {
                 // Fixed table41fd3c:360 bind,362 play,363 query. Resolve the
                 // path before reading the second owned record, as the PE does.
@@ -257,6 +603,8 @@ impl LoggingHost<'_> {
                     }
                 }
             }
+            // Original receiver 41fc6e immediately returns a zero result.
+            364 | 366 => *output = 0,
             368 => {
                 let bytes = data(1)?;
                 self.data_services.particle_external.bind(target,[f32::from_bits(read_u32(bytes,0)?),f32::from_bits(read_u32(bytes,4)?)])?;

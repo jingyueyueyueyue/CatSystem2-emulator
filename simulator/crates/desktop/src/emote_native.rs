@@ -17,7 +17,7 @@ use cs2_runtime::emote::{
     CpuM2ModelSource, EmoteArchiveVersion,
     CpuM2ProfileSelection, CpuM2ResetBankSeeds, CpuM2SplineConfig, CpuViewport, EmoteBatchValue, EmoteBuffer,
     EmoteCommand, EmoteDispatchShape, EmoteError, EmoteNativeDescriptor, EmotePacking,
-    EmoteRasterFrame, EmoteReply, EmoteResource, EmoteServices, EmoteTick, NEKOPARA_PE_SHA256,
+    EmoteRasterFrame, EmoteReply, EmoteResource, EmoteServices, EmoteTick,
     emote_native_descriptor,
 };
 use cs2_runtime::resource_router::ResourceMode;
@@ -871,12 +871,8 @@ impl EmoteNativeServices {
     pub(super) fn has_pending_loads(&self) -> bool { self.loads.has_pending() }
     pub(super) fn cancel_pending_loads_for(&mut self, id: u32) { self.loads.cancel(id); }
 
-    pub(super) fn initialize(&mut self, resources: &ResourceIndex, sha256: &str) -> Result<()> {
-        if !NEKOPARA_PE_SHA256.eq_ignore_ascii_case(sha256) {
-            return Ok(());
-        }
-        self.state.bind_pe_sha256(sha256);
-        // Fixed-profile startup names; dimensions come from the actual file.
+    pub(super) fn initialize(&mut self, resources: &ResourceIndex) -> Result<()> {
+        // The M2 view configuration defines the startup resources and dimensions.
         let bytes = resources
             .read_category(b"m2config", "m2view.cnf")
             .map_err(|e| error(EmoteError::Backend(e.to_string())))?;
@@ -930,6 +926,7 @@ impl EmoteNativeServices {
             );
         }
         self.state.set_backend(Box::new(backend)).map_err(error)?;
+        self.state.bind_m2_tasks().map_err(error)?;
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         if crate::gpu_raster::emote_requested() {
             crate::gpu_raster::prewarm_emote();
@@ -1642,7 +1639,7 @@ mod tests {
         let mut player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"))?;
         let result = player.with_host(|host| {
             let emote = &mut host.data_services.emote;
-            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            emote.state.bind_m2_tasks().map_err(error)?;
             let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
             emote.state.set_backend(Box::new(CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?)).map_err(error)?;
             emote.surface_fade_default = Some(0);
@@ -1671,7 +1668,7 @@ mod tests {
         let mut player = player?;
         player.with_host(|host| {
             let emote = &mut host.data_services.emote;
-            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            emote.state.bind_m2_tasks().map_err(error)?;
             let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
             let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
             emote.state.set_backend(Box::new(backend)).map_err(error)?;
@@ -1806,7 +1803,7 @@ mod tests {
         let mut player = player?;
         player.with_host(|host| {
             let emote = &mut host.data_services.emote;
-            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            emote.state.bind_m2_tasks().map_err(error)?;
             let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
             let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
             emote.state.set_backend(Box::new(backend)).map_err(error)?;
@@ -1861,7 +1858,7 @@ mod tests {
         let mut player = player?;
         player.with_host(|host| {
             let emote = &mut host.data_services.emote;
-            assert!(emote.state.bind_pe_sha256(NEKOPARA_PE_SHA256));
+            emote.state.bind_m2_tasks().map_err(error)?;
             let viewport = CpuViewport::original_neko_target(1280, 720).map_err(error)?;
             let backend = CpuEmoteBackend::new_original_task_clock(viewport).map_err(error)?;
             emote.state.set_backend(Box::new(backend)).map_err(error)?;

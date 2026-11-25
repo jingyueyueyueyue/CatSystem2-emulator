@@ -39,19 +39,37 @@ pub(super) enum Operation {
 }
 
 impl LoggingHost<'_> {
-    /// Historical scheduler predicate: covers device waits AND audio/model
-    /// material preparation so every suspended owner still submits frames.
+    /// Device and model waits can resume on a later logical frame.
     pub(super) fn task_waits_for_audio(&self, owner: u32) -> bool {
+        // Image preparation can interrupt a compound scene update after it has
+        // registered a layer but before it has set its position and opacity.
+        // Retry the same logical frame so those intermediate layers stay private.
+        if self.data_services.image_manager.pending_image_owners().any(|caller|
+            self.data_services.tasks.audio_wait_reaches(caller, owner)) {
+            return false;
+        }
+        self.task_has_pending_audio(owner)
+            || self.data_services.emote.pending_load_owners().any(|caller|
+                self.data_services.tasks.audio_wait_reaches(caller, owner))
+    }
+
+    fn task_has_pending_audio(&self, owner: u32) -> bool {
         self.sound_channels.values().filter_map(|state| state.pending_start.as_ref())
             .any(|pending| self.data_services.tasks.audio_wait_reaches(pending.owner, owner))
             || self.data_services.sound_async.task_loads.keys().any(|&caller|
                 self.data_services.tasks.audio_wait_reaches(caller, owner))
             || self.data_services.sound_async.cancelled.iter().any(|&cancelled|
                 self.data_services.tasks.audio_wait_reaches(cancelled, owner))
-            || self.data_services.emote.pending_load_owners().any(|caller|
-                self.data_services.tasks.audio_wait_reaches(caller, owner))
-            || self.data_services.image_manager.pending_image_owners().any(|caller|
-                self.data_services.tasks.audio_wait_reaches(caller, owner))
+    }
+
+    pub(super) fn retain_scene_during_list_setup(&mut self) -> bool {
+        // A newly bound source may still need its motion or alpha setup when
+        // the sound call returns. Keep the canvas while the sound task advances.
+        let mut owners = std::mem::take(&mut self.data_services.tasks.new_visible_list_sources);
+        owners.retain(|&owner| self.task_has_pending_audio(owner));
+        let retain_scene = !owners.is_empty();
+        self.data_services.tasks.new_visible_list_sources = owners;
+        retain_scene
     }
 
     pub(super) fn cancel_audio_channel_start(&mut self, channel: u32) -> cs2_script::Result<()> {

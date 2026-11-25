@@ -308,9 +308,10 @@ impl LoggingHost<'_> {
 
     pub(crate) fn task_values_native(&mut self, index: u32, args: &[u8]) -> Result<NativeReturn> {
         if index == 1074 {
-            let digest = self.data_services.native_profile.map_or("", |profile| profile.pe_sha256);
-            if !cs2_runtime::native_task_clock_profile::exact_single_step_native(digest) {
-                return Err(native_state_error("task single-step native needs its exact PE clock descriptor"));
+            if !self.data_services.ordinary_native_table.as_ref()
+                .is_some_and(|table| table.task_clock_supports_single_step())
+            {
+                return Err(native_state_error("task single-step native needs its registered clock wrapper and update"));
             }
             self.ensure_task_record(self.current_task_id)?;
             let record = self.data_services.tasks.records.get_mut(&self.current_task_id).unwrap();
@@ -528,6 +529,13 @@ impl LoggingHost<'_> {
             return Ok(Some(TaskCommandOutcome { done, propagate: false }));
         }
         if deletion != 0 { return Ok(Some(consumed)); }
+        if kind == 42 && command.code == 341
+            && self.data_services.ordinary_native_table.as_ref()
+                .is_some_and(|table| table.has_unhandled_task_message_341())
+        {
+            // This dispatch table leaves command 341 unhandled by the view.
+            return Ok(Some(TaskCommandOutcome { done: true, propagate: true }));
+        }
         if let Some(outcome) = self.receive_legacy_plane_input91(command)? {
             return Ok(Some(outcome));
         }

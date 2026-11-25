@@ -5,7 +5,7 @@ use cs2_script::Result;
 use super::super::particle_vm::{ParticleCanvas, ParticleQuad, ParticleRandomSource,
     ParticleRenderSnapshot, ParticleVertex};
 #[path = "particle_family_profiles.rs"]
-mod profiles;
+pub(super) mod profiles;
 #[path = "particle_family_path.rs"]
 mod paths;
 #[path = "particle_family_sprite.rs"]
@@ -43,7 +43,7 @@ impl Default for Particle {
 
 #[derive(Debug)]
 pub(super) struct Family {
-    profile: &'static profiles::Profile,
+    profile: profiles::Profile,
     path: Option<paths::PathFamily>,
     sprite: Option<sprites::SpriteFamily>,
     particles: Vec<Particle>,
@@ -64,10 +64,40 @@ pub(super) struct Family {
 }
 
 impl Family {
-    pub(super) fn supports(sha256: &str) -> bool { profiles::identify(sha256).is_some() }
+    pub(super) fn uses_family(pe: &cs2_runtime::particle_plugin_pe::ParticlePluginPe<'_>, sha256: &str) -> bool {
+        Self::identify(pe, sha256).is_some()
+    }
 
-    pub(super) fn new(sha256: &str, count: u32, image: [f32;2]) -> Result<Option<Self>> {
-        let Some(profile) = profiles::identify(sha256) else { return Ok(None); };
+    pub(super) fn load(pe: &cs2_runtime::particle_plugin_pe::ParticlePluginPe<'_>, sha256: &str,
+        count: u32, image: [f32; 2]) -> Result<Option<Self>> {
+        let Some(profile) = Self::identify(pe, sha256) else { return Ok(None); };
+        Self::new(profile, count, image).map(Some)
+    }
+
+    fn identify(pe: &cs2_runtime::particle_plugin_pe::ParticlePluginPe<'_>, sha256: &str) -> Option<profiles::Profile> {
+        use super::plugin_layout::{self, DarkField};
+
+        if plugin_layout::is_sakura(pe) {
+            Some(profiles::SAKURA_PROFILE)
+        } else if let Some(oscillation) = plugin_layout::question_oscillation(pe) {
+            Some(if oscillation { profiles::QUESTION_PROFILE } else { profiles::QUESTION_A_PROFILE })
+        } else if let Some(field) = plugin_layout::dark_field(pe) {
+            Some(match field {
+                DarkField::SingleCenter => profiles::DARK_PROFILE,
+                DarkField::ThreeCenters => profiles::DARK_TRI_PROFILE,
+                DarkField::Rising => profiles::DARK_RISING_PROFILE,
+                DarkField::Ground => profiles::DARK_GROUND_PROFILE,
+            })
+        } else if let Some(effect) = plugin_layout::path_effect(pe) {
+            Some(*profiles::path_effect(effect))
+        } else if let Some(effect) = plugin_layout::sprite_effect(pe) {
+            Some(profiles::Profile { sha256: "", model: Model::Sprite(effect) })
+        } else {
+            profiles::identify(sha256).copied()
+        }
+    }
+
+    fn new(profile: profiles::Profile, count: u32, image: [f32;2]) -> Result<Self> {
         if matches!(profile.model,Model::Path(profiles::PathProfile {kind:profiles::PathKind::Star|profiles::PathKind::StarLegacy,..}))
             && count/7>1 && count/(count/7)>7 {
             return Err(super::super::native_state_error("star emitter count exceeds the recovered seven-color table"));
@@ -89,11 +119,11 @@ impl Family {
         }
         let path = if let Model::Path(p) = profile.model {Some(paths::PathFamily::new(p,count,image))} else {None};
         let sprite = if let Model::Sprite(p) = profile.model {Some(sprites::SpriteFamily::new(p,count,image))} else {None};
-        Ok(Some(Self { profile, particles: if path.is_some() || sprite.is_some() {Vec::new()} else {vec![Particle::default(); count as usize]}, path,sprite,
+        Ok(Self { profile, particles: if path.is_some() || sprite.is_some() {Vec::new()} else {vec![Particle::default(); count as usize]}, path,sprite,
             image, viewport_half: [0.;2], render_mode: 0, counter: 0, active_count: 0,
             center: [0.;2], field_centers: [[0.;2];3], field_scale_parameter: 0.,
             gravity: 0., horizontal: 0., peak_alpha: 0, initial_scale: 1.,
-            question_durations: [0;5], question_rotation: 0. }))
+            question_durations: [0;5], question_rotation: 0. })
     }
 
     pub(super) fn reset_extent(&mut self, image: [f32;2]) {

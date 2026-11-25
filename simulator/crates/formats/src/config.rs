@@ -27,6 +27,11 @@ pub enum ConfigError {
 }
 
 impl ConfigXml {
+    /// Read the original encoding label before runtime XML normalization.
+    pub fn runtime_declared_encoding(data: &[u8]) -> Result<&[u8], ConfigError> {
+        runtime_declaration(&data[..data.len().min(MAX_XML_SIZE)]).map(|(_, encoding)| encoding)
+    }
+
     /// Runtime XML: a leading 1.0 declaration, direct
     /// text normalization, and last-text-wins path merging. The first NUL or
     /// completed root ends input. Fields keep this API's rooted paths; only

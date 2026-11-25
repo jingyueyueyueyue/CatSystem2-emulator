@@ -1,6 +1,6 @@
 use super::{
     Action, Decision, KeyboardPress, KeyboardPressReceipt, MousePress, NovelWindowLifetime,
-    consuming_mouse_resume,
+    consuming_mouse_resume_in_scan,
 };
 use anyhow::ensure;
 use cs2_desktop::{HeadlessPlayer, LogicEvent};
@@ -163,18 +163,18 @@ struct Entry {
     screen: &'static str,
     point: [i32; 2],
     region: u32,
-    candidates: &'static [u32],
+    press_path: &'static [u32],
     button: &'static [u8],
     bank: i32,
     forward: Option<u32>,
 }
 
 const ENTRY: [Entry; 3] = [
-    Entry { screen: "title", point: [480, 667], region: 16, candidates: &[3, 16, 28, 7],
+    Entry { screen: "title", point: [480, 667], region: 16, press_path: &[3, 16],
         button: b"btn1", bank: 0, forward: Some(3) },
-    Entry { screen: "epselect", point: [353, 308], region: 14, candidates: &[3, 14, 20, 7],
+    Entry { screen: "epselect", point: [353, 308], region: 14, press_path: &[3, 14],
         button: b"epbtn", bank: 0, forward: Some(3) },
-    Entry { screen: "confirm2", point: [723, 418], region: 15, candidates: &[15, 3, 16, 47, 7],
+    Entry { screen: "confirm2", point: [723, 418], region: 15, press_path: &[15],
         button: b"btn", bank: 1, forward: None },
 ];
 
@@ -286,20 +286,26 @@ impl RebellionsRoute {
         }
         let frame = player.host_story_trace().0;
         match &mut self.phase {
-            Phase::Click { index, owner, started } if frame == *started + 1 => {
+            Phase::Click { index, owner, started } if frame > *started => {
+                let expected_scan = *started + 1;
+                let Some(scan) = player.host_input_route_scan_frame() else { return; };
+                if scan != expected_scan {
+                    if scan > expected_scan {
+                        self.phase = Phase::Failed("Rebellions input scan ended without the expected click receipt and root resume");
+                    }
+                    return;
+                }
                 let entry = &ENTRY[*index];
                 let expected = MousePress {
-                    candidates: entry.candidates.to_vec(), region: entry.region, key: 0, group: 0, response: 0,
+                    candidates: entry.press_path.to_vec(), region: entry.region, key: 0, group: 0, response: 0,
                 };
                 if root_wait(player, frame)
-                    && consuming_mouse_resume(player, &expected, frame, *owner, entry.point, entry.forward)
+                    && consuming_mouse_resume_in_scan(player, &expected, scan, frame, *owner, entry.point, entry.forward)
                 {
-                    eprintln!("frame {frame}: verified Rebellions {} click region={} receiver={} and VM resume",
+                    eprintln!("frame {frame}: verified Rebellions {} click region={} receiver={} and VM resume (scan opened at {scan})",
                         entry.screen, entry.region, owner);
                     self.phase = if *index + 1 == ENTRY.len() { Phase::FirstPage } else { Phase::Entry(*index + 1) };
                     self.since = frame;
-                } else {
-                    self.phase = Phase::Failed("Rebellions click did not produce the expected consume and root resume");
                 }
             }
             Phase::Enter { before, started, receipt, .. } => {
@@ -354,7 +360,8 @@ impl RebellionsRoute {
                 eprintln!("frame {frame}: Rebellions {} hover owner={live_owner} hit={hit:?} candidates={candidates:?} bound={bound}", entry.screen);
                 if live_owner != *owner || player.host_pointer_logical_position() != entry.point
                     || !hit.is_some_and(|words| words[0] == entry.region && words[8] != 0)
-                    || candidates.as_slice() != entry.candidates || !bound
+                    // The verified consumer ends dispatch before any later candidate.
+                    || !candidates.starts_with(entry.press_path) || !bound
                 {
                     return Ok(Decision::Stop("checkpoint_mismatch", format!("Rebellions {} live target changed", entry.screen)));
                 }
@@ -362,7 +369,11 @@ impl RebellionsRoute {
                 let [x, y] = entry.point;
                 return Ok(Decision::Input(Action::Pointer { x, y, button: Some(0) }));
             }
-            Phase::Click { .. } => return Ok(Decision::Stop("input_missed", "Rebellions click receipt frame missing".into())),
+            Phase::Click { started, .. } => {
+                return Ok(if frame - *started < idle { Decision::Wait } else {
+                    Decision::Stop("input_missed", "Rebellions input scan did not confirm the click before the idle limit".into())
+                });
+            }
             Phase::FirstPage => {
                 let Some(page) = Body::observe(player) else { return Ok(self.wait(player, frame, idle)); };
                 if page.scene != OPENING || page.position != (0, 13) {

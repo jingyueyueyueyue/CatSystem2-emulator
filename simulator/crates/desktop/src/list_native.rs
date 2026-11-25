@@ -613,7 +613,7 @@ pub(super) fn receive(
     output: &mut u32,
     budget: usize,
 ) -> cs2_script::Result<Option<cs2_runtime::TaskCommandOutcome>> {
-    if command.code != 19 && !(285..=319).contains(&command.code) {
+    if !matches!(command.code, 19 | 269 | 285..=319) {
         return Ok(None);
     }
     let id = command.target as u32;
@@ -1039,6 +1039,12 @@ fn receive_inner(
                 list.enabled = command.data[1] != 0;
             }
         }
+        269 => {
+            let wrapper = host.data_services.list_native.entries.get(&stamp)
+                .and_then(|entry| entry.current_wrapper())
+                .unwrap_or(0);
+            buffers.write_data1(&wrapper.to_le_bytes())?;
+        }
         313 => {
             let handle = match host.data_services.list_native.entries.get(&stamp) {
                 Some(entry) => current_pixels(host, &entry)?,
@@ -1299,6 +1305,9 @@ fn register_owned(
             .insert(stamp, shared);
         registration_history(host, id, key)?;
         invalidate_entry(host, id, key);
+        if visible {
+            host.data_services.tasks.new_visible_list_sources.insert(command.sender as u32);
+        }
         return Ok(());
     } else {
         let resource = host
@@ -1371,6 +1380,15 @@ fn register_owned(
         }
     };
     let previous = host.data_services.list_native.entries.remove(&stamp);
+    let new_visible_source = visible && !legacy_empty && previous.as_ref().is_none_or(|previous| {
+        let previous = previous.borrow();
+        match (previous.source, source) {
+            (Source::Resource { handle: old, .. }, Source::Resource { handle: new, .. }) => {
+                old != new || !previous.visible
+            }
+            _ => matches!(previous.source, Source::Empty) || !previous.visible,
+        }
+    });
     if frames.is_empty() && !legacy_empty {
         if let Some(previous) = previous.as_ref() {
             let mut previous = previous.borrow_mut();
@@ -1444,6 +1462,9 @@ fn register_owned(
     }
     registration_history(host, id, key)?;
     invalidate_entry(host, id, key);
+    if new_visible_source {
+        host.data_services.tasks.new_visible_list_sources.insert(command.sender as u32);
+    }
     Ok(())
 }
 
@@ -1947,7 +1968,14 @@ impl LoggingHost<'_> {
         } else {
             0
         };
-        let (data, second) = match contract.command {
+        let command = if index == 657 && self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_legacy_list_wrapper_query())
+        {
+            269
+        } else {
+            contract.command
+        };
+        let (data, second) = match command {
             286 | 288 => {
                 let source = read_u32(args, 8)?;
                 let field = match index { 622 | 623 => 4, 707 | 708 => 8, 732 => 12, _ => 0 };
@@ -1982,7 +2010,7 @@ impl LoggingHost<'_> {
             316 => ([0, 1, 0], Some(args[4..20].to_vec())),
             304 => ([slot, 1, 0], Some(u32::MAX.to_le_bytes().to_vec())),
             291 => ([0, 1, 0], Some(vec![0; 4])),
-            313 => ([slot, 1, 0], Some(vec![0; 4])),
+            269 | 313 => ([slot, 1, 0], Some(vec![0; 4])),
             302 => ([0, slot, 0], None),
             285 | 289 | 314 => ([slot, read_u32(args, 8)?, 0], None),
             292 | 310 => ([0, slot, 0], None),
@@ -1996,7 +2024,7 @@ impl LoggingHost<'_> {
             cs2_runtime::TaskCommand {
                 target: id as i32,
                 sender: self.current_task_id as i32,
-                code: contract.command,
+                code: command,
                 data,
             },
             &mut buffers,

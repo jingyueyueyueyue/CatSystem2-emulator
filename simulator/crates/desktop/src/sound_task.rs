@@ -7,8 +7,6 @@ use cs2_script::{NativeReturn, Result, Vm};
 
 use super::{LoggingHost, SoundGroup, audio_script_error, read_u32, trim_nul};
 
-#[path = "sound_context_profile.rs"]
-mod creation_context_profile;
 #[path = "sound_task_state.rs"]
 pub(crate) mod checkpoint;
 
@@ -151,56 +149,45 @@ impl SoundTaskChannel {
 
 impl LoggingHost<'_> {
     /// Raw Top query numbers differ from our canonical typed command35.
-    /// Only independently identified images may bootstrap this service.
     fn discover_root_sound_query_code(&self) -> Option<u32> {
-        let sha = self.data_services.native_profile.map(|profile| profile.pe_sha256)
-            .or(self.data_services.css_task_pe_sha256)
-            .or(self.data_services.particle_message_pe_sha256);
-        super::sound_loop_table::legacy_sound_loop_root_query(sha).or_else(|| match sha {
-            Some("659d5f069f3c97f69a61e12449cf1510b45e48a10649b9ac6977c2b93d6d28ad") => Some(31),
-            Some("5869b7d03a636c200f5042f0c3fc37878a362615bf724f58d47aec5eb8b2d44c") => Some(35),
-            _ if self.data_services.native_profile.is_some() => Some(35),
-            _ => None,
-        })
+        self.data_services.ordinary_native_table.as_ref()
+            .and_then(|table| table.root_sound_query())
+            .or_else(|| self.data_services.startup_companion_natives.as_ref()
+                .and_then(|companion| companion.root_sound_query))
     }
 
     fn root_sound_query_code(&self) -> Option<u32> {
         self.data_services.sounds.root_query_code
     }
 
-    pub(super) fn initialize_root_sound_service(&mut self) -> Result<()> {
+    pub(super) fn initialize_root_sound_service(&mut self, startup_entry: Option<&str>) -> Result<()> {
         if self.data_services.sounds.root_task.is_some() {
             return Ok(());
         }
-        let mut query = self.discover_root_sound_query_code();
-        if query.is_none() && self.verified_utate_sound_loop_source()? {
-            query = Some(32);
-        }
-        if query.is_none() {
-            query = self.rebellions_sound_loop_query()?;
-        }
+        let query = self.discover_root_sound_query_code();
         self.data_services.sounds.root_query_code = query;
-        if query.is_none()
-            && !self.verified_kanmi_sound_loop_source()?
-            && !self.verified_sudden_sound_loop_source()?
-        {
+        if query.is_none() && !startup_entry.is_some_and(|entry| {
+            super::sound_loop_table::startup_loads_sound_loops(self.resources, entry)
+        }) {
             return Ok(());
         }
         if self.data_services.sounds.ever_created {
             return Err(audio_script_error("root sound service must be initialized before script sound tasks"));
         }
-        self.ensure_task_record(0)?;
         // PE Top constructors create type13 "SOUND TASK" before entering KCS:
         // V401 b9e4c..b9eb3, Newton a7157..a71b3, NEKO 1ddbfd..1ddc59,
         // Campanella 17f98..17ff2, Utate 1765b..176b5, Kamikaze 1893e,
         // Djibril5/Sudden's companion 189ee, Grisaia 1884e, and Tsunaban 17d58
         // (all RVAs). Packed sources have a portable SOUND owner but do not
         // publish a raw Top query number for an unverified image.
-        // The normal factory inserts parent/index/clock/store ownership, so
-        // its existing tree Body and Release phases also own this service.
+        self.create_root_sound_service().map(|_| ())
+    }
+
+    fn create_root_sound_service(&mut self) -> Result<u32> {
+        self.ensure_task_record(0)?;
         let id = self.create_task_object(13, 0, b"SOUND TASK", &[])?;
         self.data_services.sounds.root_task = Some(id);
-        Ok(())
+        Ok(id)
     }
 
     /// Internal wrappers use canonical35, just as loop records use canonical199.
@@ -227,36 +214,40 @@ impl LoggingHost<'_> {
             sender: packet[0] as i32, code: 35, data: [packet[2], packet[3], 0] }, output)?.is_some())
     }
 
-    pub(super) fn query_root_sound_task(&mut self) -> Result<Option<u32>> {
+    fn query_root_sound_task(&mut self) -> Result<Option<u32>> {
         let mut output = 0;
         let outcome = self.route_task_command_buffers(TaskCommand {
             target: 0, sender: self.current_task_id as i32, code: 35, data: [0; 3],
         }, &mut super::native_tasks::OwnedTaskBuffers::new(None, None)?, &mut output, 4096)?;
         match outcome {
             Some(result) if result.done && !result.propagate => {
-                if output == 0 { return Ok(None); }
-                if !self.task_is_reachable(output) || !self.data_services.tasks.message_task_state(output)
-                    .is_some_and(|(kind, _, _)| kind == 13) {
-                    return Err(audio_script_error("root35 returned a task without a reachable kind13 sound receiver"));
-                }
-                Ok(Some(output))
+                Ok((output != 0).then_some(output))
             }
             Some(result) if !result.done => Err(audio_script_error("root sound query unexpectedly suspended")),
             _ => self.default_sound_task(),
         }
     }
 
-    pub(super) fn register_sound_task(&mut self, id: u32, context: &[u8]) -> Result<()> {
-        // Native66 submits inherited caller bytes through command26 after
-        // construction. In the identified sound classes this reaches both
-        // default receivers without reading the context, so it is not an
-        // audio configuration packet. The generic task record owns its bytes.
-        let sha = self.data_services.native_profile.map_or("", |profile| profile.pe_sha256);
-        if !context.is_empty() && !creation_context_profile::ignores_creation_context(sha) {
-            return Err(audio_script_error(
-                "sound creation context requires an identified receiver contract",
-            ));
+    pub(super) fn required_sound_task(&mut self) -> Result<u32> {
+        let id = match self.query_root_sound_task()? {
+            Some(id) => id,
+            None if !self.data_services.sounds.ever_created
+                && self.task_is_reachable(0)
+                && self.data_services.tasks.message_task_state(0).is_some_and(|(_, deletion, _)| deletion == 0) =>
+            {
+                self.create_root_sound_service()?
+            }
+            None => return Err(audio_script_error("no live root sound service")),
+        };
+        if !self.task_is_reachable(id) || !self.data_services.tasks.message_task_state(id)
+            .is_some_and(|(kind, deletion, _)| kind == 13 && deletion == 0)
+        {
+            return Err(audio_script_error("sound command requires a reachable kind 13 receiver"));
         }
+        Ok(id)
+    }
+
+    pub(super) fn register_sound_task(&mut self, id: u32) -> Result<()> {
         self.ensure_legacy_sound_settings()?;
         let stereo = self.data_services.legacy_sound.stereo;
         self.data_services.sounds.ever_created = true;
@@ -285,7 +276,7 @@ impl LoggingHost<'_> {
         stereo: bool,
         jtalk: bool,
     ) -> Result<()> {
-        self.register_sound_task(id, &[])?;
+        self.register_sound_task(id)?;
         let task = self.data_services.sounds.tasks.get_mut(&id).unwrap();
         task.enabled = enabled;
         task.stereo = stereo;
@@ -361,7 +352,7 @@ impl LoggingHost<'_> {
         if deletion != 0 {
             return Ok(true);
         }
-        self.register_sound_task(id, &[])?;
+        self.register_sound_task(id)?;
         let mut task = self.data_services.sounds.tasks.remove(&id).unwrap();
         let result = if !task.enabled {
             *output = 0;
@@ -402,7 +393,7 @@ impl LoggingHost<'_> {
                 "sound queue target differs from receiver",
             ));
         }
-        self.register_sound_task(id, &[])?;
+        self.register_sound_task(id)?;
         let task = self.data_services.sounds.tasks.get_mut(&id).unwrap();
         if !task.enabled {
             *output = 0;
@@ -466,7 +457,7 @@ impl LoggingHost<'_> {
         if deletion != 0 {
             return Ok(true);
         }
-        self.register_sound_task(id, &[])?;
+        self.register_sound_task(id)?;
         if !self.data_services.sounds.tasks[&id].enabled {
             *output = 0;
             return Ok(true);
@@ -1656,7 +1647,7 @@ impl LoggingHost<'_> {
     /// Called from kind13's real task body after TaskClock::update. Queue
     /// inputs are retained on failure; successful commands are not repeated.
     pub(super) fn update_sound_task(&mut self, id: u32) -> Result<()> {
-        self.register_sound_task(id, &[])?;
+        self.register_sound_task(id)?;
         // Queued commands are executed by the sound service, which owns
         // their completion even though no script VM remains on the stack.
         let caller = self.current_task_id;
@@ -1848,6 +1839,169 @@ impl LoggingHost<'_> {
 
 fn sound_specific(code: u32) -> bool {
     code == 19 || (180..=229).contains(&code)
+}
+
+#[cfg(test)]
+mod sound_loop_native_tests {
+    use super::*;
+    use crate::{HeadlessPlayer, tests::TempDir};
+    use cs2_script::{Host, KcsProgram};
+    use std::fs;
+
+    fn native400(player: &mut HeadlessPlayer, slot: u32, name: &[u8]) -> anyhow::Result<NativeReturn> {
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![], 0)?)?;
+        let address = vm.allocate_region(name)?;
+        player.with_host(|host| Ok(host.call(400, &[slot, address].map(u32::to_le_bytes).concat(), &mut vm)?))
+    }
+
+    #[test]
+    #[ignore = "requires a local legacy PE with the registered Top sound receiver"]
+    fn root_sound_bootstraps_from_the_registered_legacy_query() -> anyhow::Result<()> {
+        let directory = TempDir::new();
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games/祝福のカンパネラ/cs2.exe");
+        let mut bytes = fs::read(engine)?;
+        bytes.extend_from_slice(b"test overlay");
+        fs::write(directory.0.join("cs2.exe"), bytes)?;
+        let mut player = HeadlessPlayer::open_with_save_root(&directory.0, directory.0.join("profile"))?;
+        assert!(player.data_services.native_profile.is_none());
+        assert_eq!(player.data_services.sounds.root_query_code, Some(31));
+        let root_sound = player.data_services.sounds.root_task.unwrap();
+        assert_eq!(player.task_parents[&root_sound], 0);
+        player.with_host(|host| {
+            let mut output = 0;
+            assert!(host.receive_root_sound_message_query(0, [0, 31, 0, 0], &mut output)?);
+            assert_eq!(output, root_sound);
+            assert!(!host.receive_root_sound_message_query(0, [0, 35, 0, 0], &mut output)?);
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "requires installed games with a launcher, localized companion, or packed startup"]
+    fn root_sound_uses_effective_startup_and_engine_contract() -> anyhow::Result<()> {
+        let profile = TempDir::new();
+        let games = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+        for (name, query) in [
+            ("\u{3046}\u{305f}\u{3066}\u{3081}\u{3050}\u{308a}", Some(32)),
+            ("\u{79d8}\u{5bc6}\u{6e38}\u{620f} \u{53cd}\u{53db}", Some(33)),
+            ("\u{7a81}\u{7136}\u{4e4b}\u{95f4}\u{53d1}\u{73b0}\u{6211}\u{5df2}\u{604b}\u{4e0a}\u{4f60}", Some(32)),
+            ("\u{5c1a}\u{6709}\u{4f73}\u{871c}\u{4f34}\u{604b}\u{5fc3}", None),
+        ] {
+            let mut player = HeadlessPlayer::open_with_save_root(games.join(name), profile.0.join(name))?;
+            assert_eq!(player.data_services.sounds.root_query_code, query, "{name}");
+            let root = player.data_services.sounds.root_task.expect("root sound service");
+            assert_eq!(player.task_parents[&root], 0);
+            player.load_startup()?;
+            player.run_frames(1, 4096)?;
+            assert_eq!(player.data_services.sounds.root_task, Some(root));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native400_uses_configured_slot_and_installs_a_lazy_typed_receiver() -> anyhow::Result<()> {
+        let directory = TempDir::new();
+        fs::create_dir(directory.0.join("media"))?;
+        fs::write(directory.0.join("startup.xml"), br#"<?xml version="1.0" encoding="Shift_JIS"?><document><INT>
+          <int07><name>music</name><int>music.int</int><dir>media</dir><ext>ogg</ext></int07>
+        </INT></document>"#)?;
+        fs::write(directory.0.join("media/points.txt"), b"theme 5 27\nmedia/second.ogg 2 -1")?;
+        fs::write(directory.0.join("media/other.txt"), b"media/third.ogg 6 31")?;
+        let mut player = HeadlessPlayer::open_with_save_root(&directory.0, directory.0.join("profile"))?;
+        assert!(player.data_services.native_profile.is_none());
+        assert_eq!(player.data_services.sounds.root_task, None);
+
+        assert_eq!(native400(&mut player, 7, b"points.txt\0")?, NativeReturn::Continue);
+        let root = player.data_services.sounds.root_task.unwrap();
+        assert_eq!(player.task_parents[&root], 0);
+        assert_eq!(player.data_services.sounds.root_query_code, None);
+        let loops = &player.data_services.sounds.tasks[&root].loops;
+        assert_eq!(loops[b"music.int/theme.ogg".as_slice()], [5, 27]);
+        assert_eq!(loops[b"media/second.ogg".as_slice()], [2, -1]);
+
+        assert_eq!(native400(&mut player, 7, b"media/other.txt\0")?, NativeReturn::Continue);
+        assert_eq!(player.data_services.sounds.tasks.len(), 1);
+        assert_eq!(player.data_services.sounds.root_task, Some(root));
+        assert_eq!(player.data_services.sounds.tasks[&root].loops[b"media/third.ogg".as_slice()], [6, 31]);
+        Ok(())
+    }
+
+    #[test]
+    fn native400_missing_empty_and_invalid_ranges_do_not_create_a_receiver() -> anyhow::Result<()> {
+        let directory = TempDir::new();
+        fs::create_dir(directory.0.join("media"))?;
+        fs::write(directory.0.join("media/empty.txt"), b"")?;
+        fs::write(directory.0.join("media/ignored.txt"), b"// comment\nmedia/song.ogg 9 8")?;
+        let mut player = HeadlessPlayer::open_with_save_root(&directory.0, directory.0.join("profile"))?;
+        for name in [b"media/missing.txt\0".as_slice(), b"media/empty.txt\0", b"media/ignored.txt\0"] {
+            assert_eq!(native400(&mut player, 19, name)?, NativeReturn::Continue);
+        }
+        assert!(!player.data_services.sounds.ever_created);
+        assert!(player.data_services.sounds.tasks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn native400_uses_an_existing_kind13_receiver() -> anyhow::Result<()> {
+        let directory = TempDir::new();
+        fs::create_dir(directory.0.join("media"))?;
+        fs::write(directory.0.join("media/points.txt"), b"media/song.ogg 9 13")?;
+        let mut player = HeadlessPlayer::open_with_save_root(&directory.0, directory.0.join("profile"))?;
+        let owner = player.with_host(|host| Ok(host.create_task_object(13, 0, b"existing sound", &[])?))?;
+
+        assert_eq!(native400(&mut player, 19, b"media/points.txt\0")?, NativeReturn::Continue);
+        assert_eq!(player.data_services.sounds.root_task, None);
+        assert_eq!(player.data_services.sounds.tasks.len(), 1);
+        assert_eq!(player.data_services.sounds.tasks[&owner].loops[b"media/song.ogg".as_slice()], [9, 13]);
+        Ok(())
+    }
+
+    #[test]
+    fn fes_uses_one_root_sound_receiver_without_a_pe_profile() -> anyhow::Result<()> {
+        let directory = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory.0, directory.0.join("profile"))?;
+        assert!(player.data_services.native_profile.is_none());
+        assert!(player.data_services.sounds.root_task.is_none());
+        let root = player.with_host(|host| {
+            // An empty filename or unmatched group still needs the typed
+            // receiver so FES can query the result of its load.
+            assert_eq!(host.load_sound_name_mode(8, b"", 1, 0, 0)?, NativeReturn::Value(0));
+            assert_eq!(host.load_sound_group_name_mode(0, true, b"", 1, 0, 0)?,
+                NativeReturn::Value(u32::MAX));
+            Ok(host.required_sound_task()?)
+        })?;
+        assert_eq!(player.data_services.sounds.root_task, Some(root));
+        assert_eq!(player.data_services.sounds.tasks.len(), 1);
+        assert_eq!(player.task_parents[&root], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_66_sound_task_preserves_inherited_context_without_a_pe_profile() -> anyhow::Result<()> {
+        let directory = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&directory.0, directory.0.join("profile"))?;
+        assert!(player.data_services.native_profile.is_none());
+        let mut vm = Vm::from_program(KcsProgram::from_code(&[0x3b], vec![], 0)?)?;
+        let name = vm.allocate_region(b"sound child\0")?;
+        let context = [0x81, 0x40, 0xff];
+        let child = player.with_host(|host| {
+            let parent = host.create_unloaded_ordinary_task(0, &context)?;
+            host.current_task_id = parent;
+            let NativeReturn::Value(child) = host.call(
+                66, &[13, parent, name].map(u32::to_le_bytes).concat(), &mut vm,
+            )? else {
+                anyhow::bail!("native 66 did not return a sound task");
+            };
+            assert_eq!(host.data_services.tasks.task_context(child), Some(context.as_slice()));
+            Ok(child)
+        })?;
+        let sound = &player.data_services.sounds.tasks[&child];
+        assert!(sound.enabled);
+        assert_eq!(sound.stereo, player.data_services.legacy_sound.stereo);
+        assert!(sound.pending.is_empty());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -988,6 +988,11 @@ impl ResourceIndex {
         Ok(self.startup_configuration_ref()?.cloned())
     }
 
+    /// The declaration in the same startup XML selected for resource routing.
+    pub fn startup_declared_encoding(&self) -> Option<&[u8]> {
+        ConfigXml::runtime_declared_encoding(self.routing_startup.as_deref()?).ok()
+    }
+
     fn startup_configuration_ref(&self) -> RuntimeResult<Option<&ConfigXml>> {
         if let Some(cause) = &self.routing_error { return Err(RuntimeError::Host(cause.clone())); }
         let Some(bytes) = self.routing_startup.as_deref() else { return Ok(None); };
@@ -1656,7 +1661,7 @@ fn find_archive_name_seeds(root: &Path, paths: &[PathBuf]) -> Vec<u32> {
     executables.sort_by_key(|path| executable_seed_rank(path));
     let mut seeds = Vec::new();
     for path in executables {
-        if let Some(seed) = crate::pe_resources::archive_name_seed(&root.join(path))
+        if let Some(seed) = crate::pe_resources::archive_name_seed(path)
             .ok()
             .flatten()
             && !seeds.contains(&seed)

@@ -107,7 +107,7 @@ impl Default for ImageManager {
 }
 
 impl super::HeadlessPlayer {
-    /// Allow interactive frames to continue while native710 prepares images.
+    /// Prepare native710 images off-thread and resume the same logical frame.
     /// Offline players keep the synchronous native contract unless opted in.
     pub fn enable_host_async_images(&mut self) {
         self.data_services.image_manager.async_enabled = true;
@@ -815,7 +815,7 @@ impl LoggingHost<'_> {
                 // Keep the precise read/directory failure. Only successful
                 // identity decisions are derived cached state.
                 let enabled = self.resources.game_language() != cs2_runtime::resource_router::GameLanguage::Japanese
-                    && island_patch::identify(self.resources)?;
+                    && island_patch::identify(self.resources);
                 self.data_services.image_manager.island_patch_enabled = Some(enabled);
                 enabled
             }
@@ -1075,6 +1075,58 @@ mod fast_forward_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn pending_image_load_retains_the_frame_until_script_resumes() -> anyhow::Result<()> {
+        let scratch = Scratch::new()?;
+        let mut player = super::super::HeadlessPlayer::open_with_save_root(&scratch.0, scratch.0.join("profile"))?;
+        player.enable_host_async_images();
+        let (completion, gate) = std::sync::mpsc::channel();
+        let manager = &mut player.data_services.image_manager;
+        manager.aliases_initialized = true;
+        manager.image_loads.gate = Some(Arc::new(std::sync::Mutex::new(gate)));
+        let mut code = Vec::new();
+        let mut data = vec![0; 64];
+        for (address, name) in [(0, b"image/first.jpg\0".as_slice()), (32, b"image/second.jpg\0")] {
+            data[address..address + name.len()].copy_from_slice(name);
+            for (opcode, operands) in [(0x25, &[address as u32][..]), (0x2b, &[710, 4][..])] {
+                code.push(opcode);
+                for &value in operands {
+                    let operand = cs2_script::Operand::immediate(value);
+                    code.push(operand.flags.bits());
+                    code.extend_from_slice(&operand.payload.to_le_bytes());
+                }
+            }
+        }
+        code.push(0x3b);
+        let vm = Vm::from_program(cs2_script::KcsProgram::from_code(&code, data, 64)?)?;
+        let owner = player.current_task_id;
+        player.data_services.tasks.set_factory_external(vm.external_binding());
+        player.data_services.tasks.register_external_task(owner, 0, &player.data_services.language.languages)?;
+        player.vm = Some(vm);
+
+        let frame = player.state.clock.frame + 1;
+        let completed_materials = |player: &super::super::HeadlessPlayer| {
+            player.events().iter().filter(|event| event.kind == "image-material" && event.frame == frame).count()
+        };
+        for loaded in 0..2 {
+            for _ in 0..3 {
+                assert!(!player.advance_host_frame_with_retries(1000)?);
+                assert_eq!(player.state.clock.frame, frame);
+                assert_eq!(completed_materials(&player), loaded);
+            }
+            completion.send(())?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !player.data_services.image_manager.image_loads.result_ready(owner) {
+                assert!(std::time::Instant::now() < deadline, "image worker did not complete");
+                std::thread::yield_now();
+            }
+        }
+        assert!(player.advance_host_frame_with_retries(1000)?);
+        assert_eq!(player.state.clock.frame, frame);
+        assert_eq!(completed_materials(&player), 2);
+        Ok(())
     }
 
     #[test]

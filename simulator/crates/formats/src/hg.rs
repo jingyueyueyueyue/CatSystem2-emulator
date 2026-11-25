@@ -461,8 +461,11 @@ fn decode_encoded_pixels(
             .ok_or(HgError::Truncated)?;
         let decompressed_length =
             usize::try_from(alpha_decompressed_length).map_err(|_| HgError::InvalidFrame)?;
-        let alpha =
-            inflate_exact(compressed, decompressed_length).ok_or(HgError::InvalidCompression)?;
+        let alpha = match inflate_exact(compressed, decompressed_length) {
+            Some(alpha) => alpha,
+            None if has_blank_jpeg_placeholder_alpha(frame, encoded, compressed, &rgba) => vec![0; 4],
+            None => return Err(HgError::InvalidCompression),
+        };
         if alpha.len() < expected_alpha {
             return Err(HgError::InvalidFrame);
         }
@@ -488,6 +491,29 @@ fn decode_encoded_pixels(
         }
     }
     Ok(rgba)
+}
+
+fn has_blank_jpeg_placeholder_alpha(
+    frame: &HgFrame,
+    encoded: &HgEncodedImage,
+    compressed: &[u8],
+    rgba: &[u8],
+) -> bool {
+    // Some legacy empty overlays use the same tiny black JPEG and a stale
+    // alpha stream. Their original canvas and anchor still locate the overlay.
+    encoded.encoding == HgImageEncoding::JpegAlpha
+        && frame.width == 2
+        && frame.height == 2
+        && frame.bit_depth == 32
+        && frame.offset == [0, 0]
+        && frame.canvas_size[0] > frame.width
+        && frame.canvas_size[1] > frame.height
+        && frame.is_transparent == 1
+        && encoded.data_length == 631
+        && encoded.alpha_decompressed_length == Some(4)
+        && compressed.len() == 12
+        && compressed.starts_with(&[0x78, 0xda])
+        && rgba.chunks_exact(4).all(|pixel| pixel[..3] == [0, 0, 0])
 }
 
 fn decode_hg2_pixels(

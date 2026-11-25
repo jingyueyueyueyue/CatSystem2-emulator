@@ -1,14 +1,15 @@
 //! CST scene loading/localization and history variable snapshots.
 //! Original binaries are used only as static byte evidence, never executed.
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cs2_formats::{ConfigXml, CstlTable};
 use cs2_runtime::{ResourceIndex, ResourceLocation};
 use cs2_runtime::resource_router::{LocalizedSceneEncoding, ResourceMode};
-use cs2_script::{CstDocument, NativeReturn, Result, ScriptError, Vm};
+use cs2_script::{CstDocument, CstRecord, Instruction, NativeReturn, Operand, Result, ScriptError, Vm};
 use cs2_script::cst_history::{HistorySnapshot, history_blocks, prepend_history_snapshot};
 
 use super::{LogicEvent, LoggingHost, ScriptTextEncoding, native_state_error, native_state_error_owned, read_u32, trim_nul,
@@ -26,7 +27,6 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
 pub(super) const NEWTON_PE: &str = "3b359fc2d737d5ceed454d6b65e6e5b5e6dfb4a24cf88ee361df86e454203f18";
 pub(super) const NEWTON_LOCALIZED_PE: &str = "6f75ae3877e018de1982a68f1089c127870d895d748c6290dd2ee85cd8daa4de";
-const NEKOPARA_PE_SHA256: &str = "c71c5b85e6eca660474f156d96b0021a53a5f05690dd077d7861d72ff5b11adc";
 const MAX_BODY_SOURCES: usize = 64;
 const MAX_SOURCE_OBSERVATIONS: usize = 32;
 static NEXT_BODY_LOAD: AtomicU64 = AtomicU64::new(1);
@@ -393,6 +393,13 @@ struct CstByteOrigin {
     bytes: Vec<u8>,
     codec: ScriptTextEncoding,
     body: Vec<CstBodySource>,
+    speaker: Option<CstSpeakerOrigin>,
+}
+
+#[derive(Clone, Copy)]
+enum CstSpeakerOrigin {
+    Record,
+    Searched { suffix_offset: usize },
 }
 
 #[derive(Default)]
@@ -401,6 +408,7 @@ pub(super) struct CstTextOrigins {
     shared: BTreeMap<u32, CstByteOrigin>,
     body_loads: BTreeMap<u32, u64>,
     source_probes: BTreeMap<u32, CstSourceProbeLoad>,
+    neko_trace_source: OnceCell<bool>,
     neko_scene_loads: BTreeMap<u32, NekoSceneLoad>,
     happiness_cst_calls: BTreeMap<u32, HappinessCstCall>,
 }
@@ -439,25 +447,94 @@ enum NekoHelper {
     ReturnedToGetAttM2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CstLoadOperation {
+    Call,
+    Return,
+    Reload,
+    Restore,
+}
+
+fn cst_load_operation(vm: &Vm) -> Option<CstLoadOperation> {
+    let program = vm.program()?;
+    let next_pc = vm.instruction_pointer;
+    let at = program.instructions.binary_search_by_key(&next_pc, |instruction| instruction.offset).ok()?;
+    let before = |count: usize| program.instructions.get(at.checked_sub(count)?..at);
+    let immediate = Operand::immediate;
+    let native = |instruction: &Instruction, id, bytes| {
+        instruction.opcode == 0x2b && instruction.operands == [immediate(id), immediate(bytes)]
+    };
+    let opcodes = |instructions: &[Instruction], expected: &[u8]| {
+        instructions.iter().map(|instruction| instruction.opcode).eq(expected.iter().copied())
+    };
+    let base = before(1)?.first()?;
+    if !native(base, 325, 8) { return None; }
+
+    // The calls store the old CST location with native 865. Their return
+    // blocks recover it with native 866 before calling the same CST loader.
+    if let Some(code) = before(12)
+        && native(&code[0], 865, 8) && native(&code[5], 13, 8)
+        && opcodes(&code[1..5], &[0x3c, 0x3d, 0x3d, 0x25])
+        && opcodes(&code[6..11], &[0x3c, 0x3e, 0x25, 0x3d, 0x25])
+        && code[8].operands == [Operand::new(0x53, 0)]
+        && code[10].operands == [Operand::new(0xf1, code[9].operands[0].payload)]
+        && program.instructions[at].opcode == 0x27
+    {
+        return Some(CstLoadOperation::Call);
+    }
+    if let Some(code) = before(8)
+        && native(&code[0], 866, 8)
+        && opcodes(&code[1..7], &[0x27, 0x3e, 0x25, 0x3d, 0x3e, 0x25])
+        && code[3].operands == [Operand::new(0x53, 0)]
+        && code[5].operands == [Operand::new(0x46, code[4].operands[0].payload), Operand::new(0xa3, 0)]
+        && code[6].operands == [Operand::new(0xe1, 0)]
+        && opcodes(program.instructions.get(at..at + 3)?, &[0x3d, 0x15, 0x27])
+    {
+        return Some(CstLoadOperation::Return);
+    }
+    if let Some(code) = before(12)
+        && opcodes(&code[..5], &[0x31, 0x31, 0x3d, 0x3d, 0x25])
+        && native(&code[5], 13, 8)
+        && opcodes(&code[6..11], &[0x3c, 0x3e, 0x25, 0x3d, 0x25])
+        && code[8].operands == [Operand::new(0x53, 0)]
+        && code[10].operands == [Operand::new(0xf1, code[9].operands[0].payload)]
+        && opcodes(program.instructions.get(at..at + 3)?, &[0x3d, 0x15, 0x27])
+    {
+        return Some(CstLoadOperation::Reload);
+    }
+    if let Some(code) = before(8)
+        && native(&code[0], 21, 8)
+        && opcodes(&code[1..7], &[0x14, 0x27, 0x3e, 0x25, 0x3e, 0x25])
+        && code[4].operands == [Operand::new(0x53, 0)]
+        && code[5].operands.get(1) == Some(&Operand::new(0xa3, 0))
+        && code[6].operands == [Operand::new(0xe1, 0)]
+        && opcodes(program.instructions.get(at..at + 2)?, &[0x3c, 0x29])
+    {
+        return Some(CstLoadOperation::Restore);
+    }
+    None
+}
+
 impl NekoSceneLoad {
-    fn resume(self, member: &str, pc: Option<usize>, frame: u64) -> Option<(u64, u64)> {
+    fn resume(self, member: &str, operation: Option<CstLoadOperation>, frame: u64) -> Option<(u64, u64)> {
         if member != self.member {
             return None;
         }
-        match (self.helper, pc) {
-            (None, Some(0x14464 | 0x14e91 | 0x14f97 | 0x15178)) => Some((self.id, self.loaded_at)),
-            (Some((entered, NekoHelper::ReturnedToGetAttM2)), Some(0x14f97 | 0x15178))
-            | (Some((entered, NekoHelper::GetAttM2)), Some(0x15178))
+        use CstLoadOperation::{Call, Reload, Restore, Return};
+        match (self.helper, operation) {
+            (None, Some(Reload | Call | Return | Restore)) => Some((self.id, self.loaded_at)),
+            (Some((entered, NekoHelper::ReturnedToGetAttM2)), Some(Return | Restore))
+            | (Some((entered, NekoHelper::GetAttM2)), Some(Restore))
                 if entered == frame => Some((self.id, self.loaded_at)),
             _ => None,
         }
     }
 
-    fn helper_step(self, pc: Option<usize>, frame: u64) -> Option<(Self, &'static str, &'static str)> {
-        let stage = match (self.helper, pc) {
-            (None, Some(0x14e91)) => NekoHelper::GetAttM2,
-            (Some((entered, NekoHelper::GetAttM2)), Some(0x14e91)) if entered == frame => NekoHelper::GetAtt,
-            (Some((entered, NekoHelper::GetAtt)), Some(0x14f97)) if entered == frame => NekoHelper::ReturnedToGetAttM2,
+    fn helper_step(self, operation: Option<CstLoadOperation>, frame: u64) -> Option<(Self, &'static str, &'static str)> {
+        let stage = match (self.helper, operation) {
+            (None, Some(CstLoadOperation::Call)) => NekoHelper::GetAttM2,
+            (Some((entered, NekoHelper::GetAttM2)), Some(CstLoadOperation::Call)) if entered == frame => NekoHelper::GetAtt,
+            (Some((entered, NekoHelper::GetAtt)), Some(CstLoadOperation::Return)) if entered == frame => NekoHelper::ReturnedToGetAttM2,
             _ => return None,
         };
         let (name, digest) = match stage {
@@ -529,22 +606,29 @@ impl CstTextOrigins {
 
     /// Refresh native 278's encoding. Only a proven no-op preserves the input body tag.
     pub(super) fn record(&mut self, task: u32, address: u32, bytes: &[u8], codec: ScriptTextEncoding) {
-        let body = self.returned_origin(task, address, bytes)
-            .filter(|origin| origin.codec == codec && self.body_is_current(&origin.body)
-                && !bytes.windows(4).any(|marker| marker == b"$str"))
+        let origin = self.returned_origin(task, address, bytes)
+            .filter(|origin| origin.codec == codec && !bytes.windows(4).any(|marker| marker == b"$str"));
+        let body = origin.filter(|origin| self.body_is_current(&origin.body))
             .map_or_else(Vec::new, |origin| origin.body.clone());
-        self.record_with_body(task, address, bytes, codec, body);
+        let speaker = origin.and_then(|origin| origin.speaker).map(|_| CstSpeakerOrigin::Record);
+        self.record_origin(task, address, bytes, codec, body, speaker);
     }
 
     fn record_with_body(&mut self, task: u32, address: u32, bytes: &[u8], codec: ScriptTextEncoding,
         body: Vec<CstBodySource>,
+    ) {
+        self.record_origin(task, address, bytes, codec, body, None);
+    }
+
+    fn record_origin(&mut self, task: u32, address: u32, bytes: &[u8], codec: ScriptTextEncoding,
+        body: Vec<CstBodySource>, speaker: Option<CstSpeakerOrigin>,
     ) {
         let key = (task, address);
         self.returned.retain(|(old, ..)| *old != key);
         if self.returned.len() == 64 {
             self.returned.pop_front();
         }
-        self.returned.push_back((key, CstByteOrigin { bytes: bytes.to_vec(), codec, body }));
+        self.returned.push_back((key, CstByteOrigin { bytes: bytes.to_vec(), codec, body, speaker }));
     }
 
     pub(super) fn invalidate_returned(&mut self, task: u32, address: u32) {
@@ -579,7 +663,7 @@ impl CstTextOrigins {
         if let Some(origin) = self.returned_origin(task, address, bytes)
             .filter(|origin| !bytes.is_ascii() || !origin.body.is_empty())
         {
-            let origin = CstByteOrigin { bytes: bytes.to_vec(), codec: origin.codec, body: origin.body.clone() };
+            let origin = CstByteOrigin { bytes: bytes.to_vec(), codec: origin.codec, body: origin.body.clone(), speaker: None };
             self.shared.insert(id, origin);
         } else {
             self.shared.remove(&id);
@@ -604,7 +688,7 @@ impl CstTextOrigins {
         if bytes.is_ascii() {
             self.shared.remove(&id);
         } else {
-            self.shared.insert(id, CstByteOrigin { bytes: bytes.to_vec(), codec, body: Vec::new() });
+            self.shared.insert(id, CstByteOrigin { bytes: bytes.to_vec(), codec, body: Vec::new(), speaker: None });
         }
     }
 
@@ -636,27 +720,16 @@ impl CstTextOrigins {
         let prefix = if append { vm.read_string(target).ok()? } else { Vec::new() };
         let prefix_codec = self.returned(task, target, &prefix);
         let suffix_codec = self.returned(task, source, &suffix);
-        // Hatsumira's sscript appends the color-default command and the body
-        // separately to its message rebuild cache at native 15/next PC 0xeae.
-        let hatsumira_color_reset = append && target == 0x23af8 && vm.instruction_pointer == 0xeae
-            && (prefix == b"\\cd" || suffix == b"\\cd")
-            && vm.program_code_sha256() == Some(super::story_trace::story_trace_12::SSCRIPT_CODE)
-            && [target, source].into_iter().zip([&prefix, &suffix]).any(|(address, bytes)| {
-                self.returned_origin(task, address, bytes).is_some_and(|origin| {
-                    origin.codec == ScriptTextEncoding::Cp932 && self.body_is_current(&origin.body)
-                        && matches!(origin.body.as_slice(), [tag] if self.source_probes
-                            .get(&tag.context_handle).is_some_and(|load|
-                                matches!(load.probe, CstSourceProbe::Hatsumira12 | CstSourceProbe::Hatsumira12PostOp)
-                                    && load.load_id == tag.load_id))
-                })
-            });
+        // A message-cache append can concatenate a standalone default-color
+        // control and tagged dialogue. The control contributes no CST record.
         let body_part = |address, bytes: &[u8]| {
             if let Some(origin) = self.returned_origin(task, address, bytes)
                 && self.body_is_current(&origin.body)
             {
                 return Some(origin.body.as_slice());
             }
-            (body_control_only(bytes) || hatsumira_color_reset && bytes == b"\\cd").then_some(&[][..])
+            (body_control_only(bytes) || append && bytes == b"\\cd")
+                .then_some(&[][..])
         };
         let body = body_part(target, &prefix).zip(body_part(source, &suffix))
             .and_then(|(prefix, suffix)| join_body_sources(prefix, suffix)).unwrap_or_default();
@@ -667,7 +740,62 @@ impl CstTextOrigins {
             (true, true) if !body.is_empty() => suffix_codec.or(prefix_codec)?,
             _ => return None,
         };
-        Some(CstRawCopy { prefix, suffix, codec, body })
+        let speaker = !append && self.returned_origin(task, source, &suffix)
+            .is_some_and(|origin| origin.speaker.is_some());
+        Some(CstRawCopy { prefix, suffix, codec, body, speaker })
+    }
+
+    fn note_speaker_search(&mut self, task: u32, address: u32, query: u32, found: u32, vm: &Vm) {
+        let Some((_, origin)) = self.returned.iter_mut().find(|(key, origin)| {
+            *key == (task, address) && origin.codec == ScriptTextEncoding::Utf8 && origin.speaker.is_some()
+        }) else { return; };
+        origin.speaker = Some(CstSpeakerOrigin::Record);
+        if !vm.read_string(query).is_ok_and(|query| query == b"\x81\x97")
+            || !vm.read_string(address).is_ok_and(|bytes| bytes == origin.bytes)
+        {
+            return;
+        }
+        const SEPARATOR: &[u8] = "\u{ff20}".as_bytes();
+        let found = found as usize;
+        let suffix_offset = if found == origin.bytes.len() {
+            0
+        } else if origin.bytes.get(found..).is_some_and(|tail| tail.starts_with(SEPARATOR)) {
+            let offset = found + SEPARATOR.len();
+            if offset == origin.bytes.len() { 0 } else { offset }
+        } else {
+            return;
+        };
+        origin.speaker = Some(CstSpeakerOrigin::Searched { suffix_offset });
+    }
+
+    pub(super) fn note_speaker_replacement(
+        &mut self, task: u32, target: u32, source: u32, input: &[u8], output: &[u8],
+    ) {
+        let codec = self.returned_origin(task, source, input)
+            .filter(|origin| origin.speaker.is_some() && input == output)
+            .map(|origin| origin.codec);
+        self.invalidate_returned(task, target);
+        if let Some(codec) = codec {
+            self.record_origin(task, target, output, codec, Vec::new(), Some(CstSpeakerOrigin::Record));
+        }
+    }
+
+    fn capture_searched_speaker_copy(&mut self, task: u32, source: u32, vm: &Vm) -> Option<(usize, CstRawCopy)> {
+        let (origin, offset) = self.returned.iter_mut().rev().find_map(|((owner, base), origin)| {
+            let Some(CstSpeakerOrigin::Searched { suffix_offset }) = origin.speaker else { return None; };
+            if *owner != task || source.checked_sub(*base)? as usize != suffix_offset
+                || !vm.read_string(*base).is_ok_and(|bytes| bytes == origin.bytes)
+            {
+                return None;
+            }
+            Some((origin, suffix_offset))
+        })?;
+        origin.speaker = Some(CstSpeakerOrigin::Record);
+        let suffix = &origin.bytes[offset..];
+        if suffix.is_ascii() { return None; }
+        Some((offset, CstRawCopy {
+            prefix: Vec::new(), suffix: suffix.to_vec(), codec: origin.codec, body: Vec::new(), speaker: true,
+        }))
     }
 
     fn finish_copy(&mut self, task: u32, target: u32, copy: Option<CstRawCopy>, vm: &Vm) {
@@ -676,7 +804,8 @@ impl CstTextOrigins {
             && let Ok(bytes) = vm.read_string(target)
             && copy.prefix.iter().chain(&copy.suffix).eq(bytes.iter())
         {
-            self.record_with_body(task, target, &bytes, copy.codec, copy.body);
+            let speaker = copy.speaker.then_some(CstSpeakerOrigin::Record);
+            self.record_origin(task, target, &bytes, copy.codec, copy.body, speaker);
         }
     }
 }
@@ -686,69 +815,68 @@ struct CstRawCopy {
     suffix: Vec<u8>,
     codec: ScriptTextEncoding,
     body: Vec<CstBodySource>,
+    speaker: bool,
 }
 
-const SSCRIPT_SPEAKER_COPY_NEXT_PC: usize = 0x1476;
-const SSCRIPT_SPEAKER_SCRATCH: u32 = 0x8000_176c;
+pub(super) struct LooseSceneEncoding {
+    directory: PathBuf,
+    corroborated_gbk: bool,
+}
 
-fn capture_sscript_speaker_copy(
-    source: u32,
-    vm: &Vm,
-    origins: &CstTextOrigins,
-) -> Option<CstRawCopy> {
-    const SSCRIPT_CODE_SHA256: &str = "3024880f72c31051d071f6cfb6c1b4125086de3b355691a903293e4dfb826fa6";
-    if vm.instruction_pointer != SSCRIPT_SPEAKER_COPY_NEXT_PC {
-        return None;
+impl LooseSceneEncoding {
+    pub(super) fn detect(resources: &ResourceIndex) -> Option<Self> {
+        let label = resources.startup_declared_encoding()?;
+        if ![b"GB2312".as_slice(), b"GBK", b"GB18030"].iter().any(|codec| label.eq_ignore_ascii_case(codec)) {
+            return None;
+        }
+
+        let names = resources.category_names(b"scene", "probe.cst").ok()?;
+        let (prefix, _) = names.first()?.split_once(['/', '\\'])?;
+        let slot = resources.resource_router()?.slots.iter().find(|slot| {
+            !slot.loose_directory.is_empty() && slot.loose_enabled
+                && String::from_utf16_lossy(&slot.prefix).eq_ignore_ascii_case(prefix)
+        })?;
+        let relative = PathBuf::from(String::from_utf16(&slot.loose_directory).ok()?);
+        let directory = resources.root().join(&relative);
+
+        // A startup declaration describes the XML. Require evidence from the
+        // actual mounted directory before using it for dual-decodable scenes.
+        let corroborated_gbk = resources.files().iter().filter(|file| {
+            file.relative_path.parent() == Some(relative.as_path())
+                && file.relative_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cst"))
+                && (1..=256 * 1024).contains(&file.size)
+        }).take(16).filter(|file| {
+            let Some(member) = file.relative_path.file_name().and_then(|name| name.to_str()) else { return false; };
+            let Some(candidate) = resources.resolve_mode_candidate(&format!("{prefix}/{member}"), ResourceMode::LooseFirst)
+                .ok().flatten() else { return false; };
+            if !matches!(&candidate.location, ResourceLocation::File { path }
+                if *path == resources.root().join(&file.relative_path))
+            {
+                return false;
+            }
+            resources.read_candidate_bounded(candidate, 256 * 1024).ok().flatten()
+                .and_then(|bytes| CstDocument::parse(&bytes).ok())
+                .is_some_and(|scene| has_gbk_dialogue(&scene))
+        }).take(2).count() == 2;
+
+        Some(Self { directory, corroborated_gbk })
     }
-    let offset = source.checked_sub(SSCRIPT_SPEAKER_SCRATCH)?;
-    if matches!(offset, 9 | 12) {
-        // The AUGUST handler copies the bytes after the fullwidth @.
-        let (group, record, length, digest) = if offset == 9 {
-            (1, 83, 18, "8fc31bbe2d569dce62fa4e759f0cd6bb32bce9f64fc5138a1120d2bfc6be4e19")
-        } else {
-            (2, 88, 21, "60542969ed192aa25f9dee45c5b19f614d90d943216107867d4e022b01fa3efc")
-        };
-        let current_read = origins.source_probes.keys().any(|&handle| {
-            origins.source_record_observations(handle).iter().any(|entry| {
-                entry.probe == CstSourceProbe::August
-                    && entry.native == 1037
-                    && (entry.source.group, entry.source.absolute_record) == (group, record)
-                    && entry.kind == 0x21
-                    && entry.stored_codec == ScriptTextEncoding::Cp932
-                    && entry.output_codec == ScriptTextEncoding::Utf8
-                    && entry.output_bytes == length
-                    && !entry.localized
-            })
-        });
-        if !current_read
-            || sha256(&vm.read_string(SSCRIPT_SPEAKER_SCRATCH).ok()?) != digest
+
+    pub(super) fn corroborated_gbk(&self) -> bool { self.corroborated_gbk }
+
+    fn encoding_for(&self, source: &SourcedResource, document: Option<&CstDocument>) -> Option<ScriptTextEncoding> {
+        let ResourceLocation::File { path } = &source.source.location else { return None; };
+        if path.parent() != Some(self.directory.as_path())
+            || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cst"))
         {
             return None;
         }
-    } else if !matches!(offset, 0 | 3) {
-        return None;
+        let use_gbk = |scene: &CstDocument| {
+            has_gbk_dialogue(scene) || self.corroborated_gbk && require_gbk_records(scene).is_ok()
+        };
+        document.map_or_else(|| CstDocument::parse(&source.bytes).is_ok_and(|scene| use_gbk(&scene)), use_gbk)
+            .then_some(ScriptTextEncoding::Gbk)
     }
-    let suffix = vm.read_string(source).ok()?;
-    if suffix.is_ascii() || std::str::from_utf8(&suffix).is_err()
-        || vm.program_code_sha256()? != SSCRIPT_CODE_SHA256
-    {
-        return None;
-    }
-    Some(CstRawCopy { prefix: Vec::new(), suffix, codec: ScriptTextEncoding::Utf8, body: Vec::new() })
-}
-
-pub(super) fn verified_newton_text_profile(resources: &ResourceIndex) -> bool {
-    let Some(config) = resources.find("config/startup.xml").filter(|candidate| candidate.size == 39_216)
-    else { return false; };
-    let Ok(config) = resources.read_candidate(config) else { return false; };
-    if sha256(&config) != "8019386a793415a0520a7182fa8c9b4e4e4bec20e9e4caaf6e509f503ce64f3f" {
-        return false;
-    }
-    let Ok(names) = resources.category_names(b"kcs", "sscript") else { return false; };
-    let Some(script) = names.iter().find_map(|name| resources.find(name))
-        .filter(|candidate| candidate.size == 145_552) else { return false; };
-    resources.read_candidate(script).is_ok_and(|bytes|
-        sha256(&bytes) == "1f581def5d97d2f8a5ecb465f4ee5803fa30788d7c8fba0852b4b26ce769c5c4")
 }
 
 fn newton_loose_scene(root: &Path, source: &SourcedResource) -> bool {
@@ -856,8 +984,6 @@ fn verified_gbk_scene(root: &Path, resource: &SourcedResource) -> bool {
             relative.to_string_lossy().replace('\\', "/").eq_ignore_ascii_case(expected))
     };
     let digest = match &resource.source.location {
-        ResourceLocation::File { path } if relative_matches(path, "scene/com_001A.cst") =>
-            "91e7241ee4dc6b0c36d697913cf22bb9649d7ea5b924b88e199a3bcb6e8f4e5b",
         ResourceLocation::Archive { path, .. } if relative_matches(path, "update03.int")
             && resource.source.name.eq_ignore_ascii_case("prologue.cst") =>
             "4f713b09acbe41fd0d19e072eb3d5f89d3ee34854904aa8300640f0ba00e05e8",
@@ -867,10 +993,6 @@ fn verified_gbk_scene(root: &Path, resource: &SourcedResource) -> bool {
         ResourceLocation::Archive { path, .. } if relative_matches(path, "scene.int")
             && resource.source.name.eq_ignore_ascii_case("BLAOP1_END.cst") =>
             "c09bcb90152977cd9d21b68ec019d627ccc80136036503a5ce376a2ae6020561",
-        ResourceLocation::Archive { path, .. } if relative_matches(path, "scene.int") => {
-            let Some(digest) = rebellions_gbk_member_digest(&resource.source.name) else { return false; };
-            digest
-        }
         ResourceLocation::Archive { path, .. } if relative_matches(path, "update01.int")
             && resource.source.name.eq_ignore_ascii_case("op.cst") =>
             "2596c7c430dabed8e1e3144c50c4b8672b59b1d452e4b92b7e18cf0c9f409817",
@@ -894,39 +1016,152 @@ fn require_gbk_records(document: &CstDocument) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn repair_routed_scene_text<'a>(
+fn has_gbk_dialogue(document: &CstDocument) -> bool {
+    document.records.iter().any(|record| {
+        matches!(record.kind, 0x20 | 0x21)
+            && encoding_rs::SHIFT_JIS
+                .decode_without_bom_handling_and_without_replacement(&record.text)
+                .is_none()
+    }) && require_gbk_records(document).is_ok()
+}
+
+fn has_archive_gbk_dialogue(document: &CstDocument) -> bool {
+    document.records.iter().any(|record| {
+        matches!(record.kind, 0x20 | 0x21)
+            && std::str::from_utf8(&record.text).is_err()
+            && cs2_runtime::message_object::decode_cp932_display(&record.text).is_none()
+    }) && require_gbk_records(document).is_ok()
+}
+
+fn is_root_scene_archive(root: &Path, resource: &SourcedResource) -> bool {
+    matches!(&resource.source.location, ResourceLocation::Archive { path, .. }
+        if path.strip_prefix(root).is_ok_and(|relative| relative.as_os_str().eq_ignore_ascii_case("scene.int")))
+}
+
+fn verified_rebellions_scene(root: &Path, resource: &SourcedResource) -> bool {
+    is_root_scene_archive(root, resource)
+        && rebellions_gbk_member_digest(&resource.source.name)
+            .is_some_and(|digest| sha256(&resource.bytes) == digest)
+}
+
+fn ambiguous_gbk_successor(document: &CstDocument) -> Option<&[u8]> {
+    if document.inputs.len() != 2 {
+        return None;
+    }
+    let [before, draw, first, second, end] = document.input_records(0)? else { return None; };
+    let [jump] = document.input_records(1)? else { return None; };
+    let successor = jump.text.strip_prefix(b"next ")?;
+    if jump.kind != 0x30 || successor.is_empty()
+        || !successor.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        || first.kind != 0x20 || second.kind != 0x20 || !second.text.starts_with(b"\\n")
+        || [before, draw, end].into_iter().any(|record| {
+            matches!(record.kind, 0x20 | 0x21) || record.kind == 0x30 && record.text.starts_with(b"next ")
+        })
+    {
+        return None;
+    }
+
+    // Both dialogue records are valid CP932 too. In that reading their text
+    // contains half-width kana and private-use characters.
+    for (record, needs_comma) in [(first, false), (second, true)] {
+        let gbk = encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(&record.text)?;
+        let cp932 = cs2_runtime::message_object::decode_cp932_display(&record.text)?;
+        if std::str::from_utf8(&record.text).is_ok() || !gbk.ends_with('\u{3002}')
+            || !cp932.contains(|ch| matches!(ch, '\u{e000}'..='\u{e757}'))
+            || !cp932.contains(|ch| matches!(ch, '\u{ff66}'..='\u{ff9f}'))
+            || (needs_comma && !gbk.contains('\u{ff0c}'))
+        {
+            return None;
+        }
+    }
+    require_gbk_records(document).ok()?;
+    Some(successor)
+}
+
+pub(super) fn repair_routed_scene_text(
+    resources: &ResourceIndex,
     resource: &SourcedResource,
-    mut records: impl Iterator<Item = (&'a mut u8, &'a mut Vec<u8>)>,
+    document: &mut CstDocument,
 ) {
     let ResourceLocation::Archive { path, .. } = &resource.source.location else { return; };
-    if !path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("update05.int")) { return; }
-    // These members in the Ikikoi translation store GBK directly after the
-    // record marker. The matching original input groups give the missing kinds.
-    let (digest, repairs): (&str, &[(usize, u8)]) = match resource.source.name.to_ascii_lowercase().as_str() {
-        "common01.cst" => ("80bf853d65d55a8683c3860ab4453973404da781bcca092589a8283d22fa4ac1", &[(46, 0x20)]),
-        "common04.cst" => ("a39a1232b1e851a459100effe0ce8854b6edc712bd566f2b15e7fab692c1fc07", &[(203, 0x20)]),
-        "eika_ind01.cst" => ("5ae10adb207b1beb02b836416538769c34691ddde647d1a3af7d72f437c8f3ba", &[(2430, 0x20), (2536, 0x20), (2936, 0x20)]),
-        "ry_ei_com01_01a.cst" => ("96d9d76f65f8b0014231c7fbd6ed109e1c36e36e7ed15750608aa3af3e9cbc6b", &[(58, 0x20)]),
-        "ry_ei_com01_02a.cst" => ("03e560f0bfc176275af67a35227699ba93a346ee3e7713725842c01b23623ee3", &[(120, 0x20)]),
-        "tane_ind02.cst" => ("02f829a725a93343109e90edeaef7c3cd75500c6d8b106f11241abc7e68877fb", &[(2017, 0x20)]),
-        "tane_ind10_ero7.cst" => ("b461633a85aaf61934a7ea62e51ab8e851a560c593b604c761d5c727c60d730d", &[(129, 0x21)]),
-        "tmg_ind07_ero2.cst" => ("47b2c353add29259e335a6db0ee6722143ab2b7a230d4fc4fd8ed452a22e0fcd", &[(731, 0x21)]),
-        _ => return,
-    };
-    if sha256(&resource.bytes) != digest { return; }
-    let mut next = 0;
-    for &(index, restored_kind) in repairs {
-        let Some((kind, text)) = records.nth(index - next) else { break; };
-        text.insert(0, *kind);
-        *kind = restored_kind;
-        next = index + 1;
+    let Some(router) = resources.resource_router() else { return; };
+    if !path.strip_prefix(resources.root()).ok().is_some_and(|relative|
+        relative.as_os_str().eq_ignore_ascii_case("update05.int"))
+        || router.localized_scene_encoding(resources, path) != Some(LocalizedSceneEncoding::Gbk)
+        || !document.records.iter().any(|record| (0x81..=0xfe).contains(&record.kind))
+    {
+        return;
     }
+
+    // The official update sometimes changes the group layout relative to scene.int.
+    // Only aligned original members can supply missing kinds.
+    let mut repairs = None;
+    for candidate in resources.archive_candidates(&resource.source.name) {
+        let ResourceLocation::Archive { path, .. } = &candidate.location else { continue; };
+        if !path.strip_prefix(resources.root()).ok().is_some_and(|relative|
+            ["scene.int", "update01.int"].iter().any(|name| relative.as_os_str().eq_ignore_ascii_case(name)))
+            || router.localized_scene_encoding(resources, path).is_some()
+        {
+            continue;
+        }
+        let Some(original) = resources.read_candidate(candidate).ok().and_then(|bytes|
+            CstDocument::parse(&bytes).ok()) else { continue; };
+        let Some(candidate_repairs) = missing_gbk_text_kinds(document, &original) else { continue; };
+        if repairs.as_ref().is_some_and(|prior| prior != &candidate_repairs) { return; }
+        repairs = Some(candidate_repairs);
+    }
+    for (index, kind) in repairs.into_iter().flatten() {
+        let record = &mut document.records[index];
+        record.text.insert(0, record.kind);
+        record.kind = kind;
+    }
+}
+
+fn missing_gbk_text_kinds(localized: &CstDocument, original: &CstDocument) -> Option<Vec<(usize, u8)>> {
+    if localized.inputs != original.inputs || localized.records.len() != original.records.len() {
+        return None;
+    }
+    let mut repairs = Vec::new();
+    for range in &localized.inputs {
+        let translated = localized.records.get(range.clone())?;
+        let reference = original.records.get(range.clone())?;
+        let before = repairs.len();
+        for (ordinal, (record, base)) in translated.iter().zip(reference).enumerate() {
+            if record.kind == base.kind && record.kind < 0x80 { continue; }
+            if !(0x81..=0xfe).contains(&record.kind) || !matches!(base.kind, 0x20 | 0x21)
+                || base.text.is_empty()
+                || encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(&base.text).is_none()
+            {
+                return None;
+            }
+            let text = [&[record.kind], record.text.as_slice()].concat();
+            encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(&text)?;
+            repairs.push((range.start + ordinal, base.kind));
+        }
+        if repairs.len() != before && (reference.last()?.kind != 0x02
+            || !translated.iter().zip(reference).all(|(record, base)| {
+                match base.kind {
+                    0x20 | 0x21 => true,
+                    // One localized quake command uses GBK full-width commas.
+                    0x30 if record.text != base.text && base.text.is_ascii() => {
+                        encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(&record.text)
+                            .is_some_and(|text| text.chars().map(|ch| if ch == '\u{ff0c}' { ',' } else { ch })
+                                .eq(base.text.iter().copied().map(char::from)))
+                    }
+                    _ => record.text == base.text,
+                }
+            }))
+        {
+            return None;
+        }
+    }
+    Some(repairs)
 }
 
 pub(super) fn decode_cst_dialogue(bytes: &[u8], codec: ScriptTextEncoding) -> Result<Cow<'_, str>> {
     let bytes = trim_nul(bytes);
     let decoded = match codec {
-        ScriptTextEncoding::Cp932 => encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(bytes),
+        ScriptTextEncoding::Cp932 => cs2_runtime::message_object::decode_cp932_display(bytes),
         ScriptTextEncoding::Gbk => encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(bytes),
         ScriptTextEncoding::Utf8 => std::str::from_utf8(bytes).ok().map(Cow::Borrowed),
     };
@@ -935,31 +1170,152 @@ pub(super) fn decode_cst_dialogue(bytes: &[u8], codec: ScriptTextEncoding) -> Re
 
 type CstCommandRepair = (usize, usize, usize, &'static [u8], &'static [u8]);
 
-const REBELLIONS_DATE_CONDITIONS: [(&[u8], &[u8]); 2] = [
+fn repair_cg_blend_selectors(document: &mut CstDocument) -> Vec<(usize, usize)> {
+    const COMMAND: u8 = 0x30;
+    let mut repaired = Vec::new();
+    for (group, range) in document.inputs.iter().enumerate() {
+        let Some(records) = document.records.get_mut(range.clone()) else { continue; };
+        for ordinal in 0..records.len() {
+            let (before, tail) = records.split_at_mut(ordinal);
+            let Some((record, after)) = tail.split_first_mut() else { continue; };
+            if record.kind != COMMAND { continue; }
+            let Some(fields) = record.text.strip_prefix(b"cg ") else { continue; };
+            let Some(separator) = fields.iter().position(|byte| *byte == b' ') else { continue; };
+            let Some(id) = fields[..separator].strip_suffix(b"]") else { continue; };
+            let Some(blend) = fields[separator..].strip_prefix(b" blend ") else { continue; };
+            if id.is_empty() || !id.iter().all(u8::is_ascii_digit)
+                || blend.is_empty() || !blend.iter().all(u8::is_ascii_digit)
+            {
+                continue;
+            }
+
+            // Confirm the same CG layer from its asset load and position in this input group.
+            let prefix = [&b"cg "[..], id, b" "].concat();
+            let layer_tail = |row: &cs2_script::CstRecord| -> bool {
+                row.kind == COMMAND && row.text.starts_with(&prefix)
+            };
+            let has_asset = before.iter().any(|row| layer_tail(row) && {
+                let asset = &row.text[prefix.len()..];
+                asset.contains(&b',') && !asset.iter().any(u8::is_ascii_whitespace)
+            });
+            let has_position = after.iter().any(|row|
+                layer_tail(row) && row.text[prefix.len()..].starts_with(b"pos "));
+            if has_asset && has_position {
+                record.text.remove(3 + separator - 1);
+                repaired.push((group, range.start + ordinal));
+            }
+        }
+    }
+    repaired
+}
+
+fn repair_plane_quake_selectors(document: &mut CstDocument) -> Vec<(usize, usize)> {
+    let mut repaired = Vec::new();
+    for (group, range) in document.inputs.iter().enumerate() {
+        let Some(records) = document.records.get_mut(range.clone()) else { continue; };
+        for (ordinal, record) in records.iter_mut().enumerate() {
+            if record.kind != 0x30 { continue; }
+            let Some(fields) = record.text.strip_prefix(b"pl ") else { continue; };
+            let Some(separator) = fields.iter().position(|byte| *byte == b' ') else { continue; };
+            let Some(selector) = fields[..separator].strip_suffix(b"]") else { continue; };
+            if !selector.iter().all(u8::is_ascii_digit)
+                || !std::str::from_utf8(selector).is_ok_and(|selector| selector.parse::<i32>().is_ok())
+            {
+                continue;
+            }
+            let Some(keyframes) = fields[separator..].strip_prefix(b" quake ") else { continue; };
+            let Ok(keyframes) = std::str::from_utf8(keyframes) else { continue; };
+            let mut keyframes = keyframes.split_ascii_whitespace().peekable();
+            if keyframes.peek().is_none() || !keyframes.all(|keyframe| {
+                let mut values = keyframe.split(',');
+                matches!((values.next(), values.next(), values.next(), values.next()),
+                    (Some(frames), Some(x), Some(y), None)
+                        if frames.parse::<u32>().is_ok() && x.parse::<i32>().is_ok()
+                            && y.parse::<i32>().is_ok())
+            }) {
+                continue;
+            }
+
+            // The source command uses one plane number and complete quake keyframes.
+            record.text.remove(3 + separator - 1);
+            repaired.push((group, range.start + ordinal));
+        }
+    }
+    repaired
+}
+
+const DATE_CONDITIONS: [(&[u8], &[u8]); 2] = [
     (br"if (( #80 > 0 )&&(( #81 < 1 )||( \81 > 19 )) #81 = #9 / 10000",
          b"if (( #80 > 0 )&&(( #81 < 1 )||( #81 > 19 ))) #81 = #9 / 10000"),
     (br"if (( #80 > 0 )&&(( #81 < 1 )||( \81 > 19 )) #9 = #81 * 10000 + #80",
          b"if (( #80 > 0 )&&(( #81 < 1 )||( #81 > 19 ))) #9 = #81 * 10000 + #80"),
 ];
 
-const KANMI_POSITIONS: &[CstCommandRepair] = &[
-    (207, 3, 975, b"eg 1 pos %3[-18] %4[-10]", b"eg 1 pos -18 -10"),
-    (208, 2, 986, b"eg 1 pos %3[-18] %4[-10]", b"eg 1 pos -18 -10"),
-    (209, 2, 996, b"eg 1 pos %3[-18] %4[-10]", b"eg 1 pos -18 -10"),
-];
+const EFFECT_POSITION_TEMPLATE: &[u8] = b"eg 1 pos %3[-18] %4[-10]";
+const EFFECT_POSITION_DEFAULTS: &[u8] = b"eg 1 pos -18 -10";
 
-fn rebellions_date_repairs(document: &CstDocument) -> Vec<CstCommandRepair> {
+fn effect_position_asset(records: &[CstRecord]) -> Option<&[u8]> {
+    let [asset, scale, place, blend, draw] = records else { return None; };
+    if records.iter().any(|record| record.kind != 0x30)
+        || scale.text != b"eg 1 scale 100% 100%" || place.text != EFFECT_POSITION_TEMPLATE
+        || !matches!(blend.text.as_slice(), b"eg 1 blend 50" | b"eg 1 blend 100" | b"eg 1 blend 150")
+        || draw.text != b"rdraw 60"
+    {
+        return None;
+    }
+    asset.text.strip_prefix(b"eg 1 ").filter(|name|
+        !name.is_empty() && !name.iter().any(u8::is_ascii_whitespace))
+}
+
+fn effect_position_has_background(document: &CstDocument, group: usize, asset: &[u8]) -> bool {
+    (group + 1..=group + 4).filter_map(|group| document.input_records(group)).any(|records| {
+        records.windows(3).any(|rows| {
+            rows.iter().all(|record| record.kind == 0x30)
+                && rows[0].text.strip_prefix(b"bg 1 ") == Some(asset)
+                && rows[1].text == b"bg 1 scale 100% 100%"
+                && rows[2].text == b"bg 1 pos -18 -10"
+        })
+    })
+}
+
+fn effect_position_repairs(document: &CstDocument) -> Vec<CstCommandRepair> {
     let mut repairs = Vec::new();
     for (group, range) in document.inputs.iter().enumerate() {
         let Some(records) = document.input_records(group) else { continue; };
-        for (first, pair) in records.windows(2).enumerate() {
-            if !pair.iter().zip(REBELLIONS_DATE_CONDITIONS).all(|(record, (original, _))|
+        for (start, block) in records.windows(5).enumerate() {
+            if let Some(asset) = effect_position_asset(block)
+                && effect_position_has_background(document, group, asset)
+            {
+                let ordinal = start + 2;
+                repairs.push((group, ordinal, range.start + ordinal,
+                    EFFECT_POSITION_TEMPLATE, EFFECT_POSITION_DEFAULTS));
+            }
+        }
+    }
+    repairs
+}
+
+fn date_condition_repairs(document: &CstDocument) -> Vec<CstCommandRepair> {
+    // The valid range check and the date fields around the pair identify the block.
+    let date_block = [
+        b"#81 = #80 / 10000".as_slice(),
+        b"if (( #80 > 0 )&&( #81 > 0 )&&( #81 < 20 )) #9 = #80",
+        DATE_CONDITIONS[0].0,
+        DATE_CONDITIONS[1].0,
+        b"#6 = #81",
+        b"#82 = #80 / 100 % 100",
+    ];
+    let mut repairs = Vec::new();
+    for (group, range) in document.inputs.iter().enumerate() {
+        let Some(records) = document.input_records(group) else { continue; };
+        for (first, block) in records.windows(date_block.len()).enumerate() {
+            if !block.iter().zip(date_block).all(|(record, original)|
                 record.kind == 0x30 && record.text.as_slice() == original)
             {
                 continue;
             }
-            for (offset, (original, repaired)) in REBELLIONS_DATE_CONDITIONS.into_iter().enumerate() {
-                let ordinal = first + offset;
+            for (offset, (original, repaired)) in DATE_CONDITIONS.into_iter().enumerate() {
+                let ordinal = first + 2 + offset;
                 repairs.push((group, ordinal, range.start + ordinal, original, repaired));
             }
         }
@@ -990,7 +1346,7 @@ fn repair_scene_commands(document: &mut CstDocument, repairs: &[CstCommandRepair
 impl LoggingHost<'_> {
     fn cst_source_probe(&self, resource: &SourcedResource) -> Option<CstSourceProbe> {
         let root = self.resources.root();
-        if self.data_services.newton_legacy_gbk
+        if self.data_services.has_loose_gbk_text()
             && matches!(self.css_task_sha(), Some(NEWTON_PE | NEWTON_LOCALIZED_PE))
             && let Some(member) = resource.source.name.rsplit(['/', '\\']).next()
             && (member.eq_ignore_ascii_case("com_001A.cst")
@@ -1130,8 +1486,7 @@ impl LoggingHost<'_> {
         {
             Some(CstSourceProbe::Kamikaze)
         } else if resource.source.name.as_bytes().get(..2).is_some_and(|head| head.eq_ignore_ascii_case(b"A_"))
-            && rebellions_gbk_member_digest(&resource.source.name).is_some()
-            && verified_gbk_scene(self.resources.root(), resource)
+            && verified_rebellions_scene(root, resource)
             && self.resources.resolve_plain_file("REBELLIONS.exe").ok().flatten()
                 .filter(|candidate| candidate.size == 4_350_976)
                 .and_then(|candidate| self.resources.read_candidate_bounded(candidate, 4_350_976).ok().flatten())
@@ -1151,18 +1506,28 @@ impl LoggingHost<'_> {
         }
     }
 
+    pub(super) fn cst_speaker_search_native(&mut self, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
+        let result = super::utf8_text_native(1051, args, vm)?;
+        if let NativeReturn::Value(found) = result {
+            self.data_services.cst_text_origins.note_speaker_search(
+                self.current_task_id, read_u32(args, 0)?, read_u32(args, 4)?, found, vm,
+            );
+        }
+        Ok(result)
+    }
+
     pub(super) fn cst_string_copy_native(&mut self, index: u32, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
         let packet = if args.len() >= 8 { args } else { vm.native_argument_storage(8)? };
         let target = read_u32(packet, 0)?;
         let source = read_u32(packet, 4)?;
         let task = self.current_task_id;
-        let copy = if matches!(index, 13 | 15) {
-            self.data_services.cst_text_origins.capture_raw_copy(task, target, source, index == 15, vm)
-        } else { None };
-        let speaker_copy = if copy.is_none() && index == 13 {
-            capture_sscript_speaker_copy(source, vm, &self.data_services.cst_text_origins)
-        } else { None };
-        let trace_len = speaker_copy.as_ref().map(|source| source.suffix.len());
+        let origins = &mut self.data_services.cst_text_origins;
+        let speaker_copy = if index == 13 { origins.capture_searched_speaker_copy(task, source, vm) } else { None };
+        let trace_speaker = speaker_copy.as_ref().map(|(offset, copy)| (*offset, copy.suffix.len()));
+        let copy = speaker_copy.map(|(_, copy)| copy).or_else(|| {
+            matches!(index, 13 | 15).then(||
+                origins.capture_raw_copy(task, target, source, index == 15, vm)).flatten()
+        });
         let color_reset = copy.as_ref().and_then(|copy| {
             (index == 15 && target == 0x23af8 && vm.instruction_pointer == 0xeae
                 && (copy.prefix == b"\\cd" || copy.suffix == b"\\cd"))
@@ -1170,7 +1535,7 @@ impl LoggingHost<'_> {
         });
         let result = self.string_copy_native(index, args, vm);
         let origins = &mut self.data_services.cst_text_origins;
-        origins.finish_copy(task, target, if result.is_ok() { copy.or(speaker_copy) } else { None }, vm);
+        origins.finish_copy(task, target, if result.is_ok() { copy } else { None }, vm);
         if self.data_services.story_trace && let Some(source) = color_reset
             && let Ok(bytes) = vm.read_string(target)
             && origins.returned_origin(task, target, &bytes).is_some_and(|origin| origin.body == [source])
@@ -1180,7 +1545,7 @@ impl LoggingHost<'_> {
                 detail: format!("task={task} target={target:#x} bytes={} source={source:?}", bytes.len()),
             });
         }
-        if self.data_services.story_trace && let Some(length) = trace_len
+        if self.data_services.story_trace && let Some((offset, length)) = trace_speaker
             && let Ok(bytes) = vm.read_string(target)
             && origins.returned(task, target, &bytes) == Some(ScriptTextEncoding::Utf8)
         {
@@ -1188,8 +1553,8 @@ impl LoggingHost<'_> {
                 frame: self.frame,
                 kind: "cst-text-sourced-copy".into(),
                 detail: format!(
-                    "task={task} native=13 next_pc={:#x} scratch_offset={} bytes={length} source=sscript-speaker/Utf8",
-                    vm.instruction_pointer, source - SSCRIPT_SPEAKER_SCRATCH,
+                    "task={task} native=13 next_pc={:#x} scratch_offset={offset} bytes={length} source=sscript-speaker/Utf8",
+                    vm.instruction_pointer,
                 ),
             });
         }
@@ -1348,37 +1713,48 @@ impl LoggingHost<'_> {
         // A wrong signature keeps the old scene; a recognized container with
         // rejected outer length clears only its scene, not its history/position.
         let mut encoding = self.text_encoding;
+        let mut command_repairs = Vec::new();
         let loaded = if signature && valid_length {
             let mut document = measure_host_operation(HostPhase::ScriptParse, || CstDocument::parse(bytes))?;
-            repair_routed_scene_text(&resource, document.records.iter_mut().map(|record| (&mut record.kind, &mut record.text)));
-            let source_encoding = self.cst_scene_encoding_override(&resource);
+            repair_routed_scene_text(self.resources, &resource, &mut document);
+            for (group, record) in repair_cg_blend_selectors(&mut document) {
+                self.events.push(LogicEvent {
+                    frame: self.frame,
+                    kind: "cst-command-compat".into(),
+                    detail: format!("handle={handle} scene={:?} group={group} record={record} removed stray CG selector bracket", resource.source.name),
+                });
+            }
+            for (group, record) in repair_plane_quake_selectors(&mut document) {
+                self.events.push(LogicEvent {
+                    frame: self.frame,
+                    kind: "cst-command-compat".into(),
+                    detail: format!("handle={handle} scene={:?} group={group} record={record} removed stray plane quake selector bracket", resource.source.name),
+                });
+            }
+            let restored = super::cst_legacy_choice::restore_legacy_choices(
+                self.resources, &resource, &mut document, vm.program());
+            if !restored.is_empty() && self.data_services.story_trace {
+                self.events.push(LogicEvent {
+                    frame: self.frame,
+                    kind: "cst-legacy-choice".into(),
+                    detail: format!("handle={handle} scene={:?} groups={restored:?}", resource.source.name),
+                });
+            }
+            let source_encoding = self.cst_scene_encoding_override_with_document(&resource, Some(&document));
             if let Some(source_encoding) = source_encoding {
                 if source_encoding == ScriptTextEncoding::Gbk {
                     require_gbk_records(&document)?;
                 }
                 encoding = source_encoding;
             }
-            match vm.program_code_sha256().filter(|_| {
-                matches!(&resource.source.location, ResourceLocation::Archive { path, .. }
-                    if path.strip_prefix(self.resources.root()).ok().is_some_and(|relative|
-                        relative.as_os_str().eq_ignore_ascii_case("scene.int")))
-            }) {
-                Some("508090f8d1f1716e69c42101e298802f5b0d706474161b4790a1a084883a2ccc")
-                    if source_encoding == Some(ScriptTextEncoding::Gbk)
-                        && rebellions_gbk_member_digest(&resource.source.name).is_some()
-                        && let Some((member, _)) = resource.source.name.rsplit_once('.') =>
-                {
-                    let repairs = rebellions_date_repairs(&document);
-                    repair_scene_commands(&mut document, &repairs, &member.to_ascii_uppercase(),
-                        handle, self.frame, self.events);
-                }
-                Some("7a068090a8d37c7a446a74e98448458e3d6ed75d94bb1a00022eaeb07d7a3921")
-                    if resource.source.name.eq_ignore_ascii_case("sc01.cst")
-                        && matches!(self.cst_source_probe(&resource), Some(CstSourceProbe::Kanmi)) =>
-                {
-                    repair_scene_commands(&mut document, KANMI_POSITIONS, "sc01", handle, self.frame, self.events);
-                }
-                _ => {}
+            let mut repairs = date_condition_repairs(&document);
+            repairs.extend(effect_position_repairs(&document));
+            let scene = resource.source.name.strip_suffix(".cst")
+                .or_else(|| resource.source.name.strip_suffix(".CST"))
+                .unwrap_or(&resource.source.name);
+            repair_scene_commands(&mut document, &repairs, scene, handle, self.frame, self.events);
+            if self.data_services.story_trace {
+                command_repairs.extend(repairs.iter().map(|repair| repair.2));
             }
             Some(document)
         } else { None };
@@ -1386,6 +1762,7 @@ impl LoggingHost<'_> {
         let probe = (self.data_services.story_trace && signature && success)
             .then(|| self.cst_source_probe(&resource)).flatten();
         let happiness_probe = probe.and_then(CstSourceProbe::happiness_scene).is_some();
+        let operation = (success && self.data_services.story_trace).then(|| cst_load_operation(vm)).flatten();
         let mut happiness_return = None;
         if signature {
             let happiness_member = if success && self.data_services.story_trace
@@ -1393,8 +1770,8 @@ impl LoggingHost<'_> {
                     == Some("5869b7d03a636c200f5042f0c3fc37878a362615bf724f58d47aec5eb8b2d44c")
                 && matches!(&resource.source.location, ResourceLocation::Archive { path, .. }
                     if path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("scene.int")))
-                && (happiness_probe || resource.source.name == "sub_getatt.cst")
-                && vm.program_code_sha256() == Some("4076e8aaaeda6f9f9da88731643b9e5ad32999353d9b93fd1b1282c980b77fb9")
+                && (happiness_probe && operation == Some(CstLoadOperation::Return)
+                    || resource.source.name == "sub_getatt.cst" && operation == Some(CstLoadOperation::Call))
             {
                 Some(resource.source.name.as_str())
             } else {
@@ -1438,6 +1815,7 @@ impl LoggingHost<'_> {
                 .ok_or_else(|| native_state_error("CST context handle is invalid"))?;
             if signature {
                 context.document = loaded;
+                context.command_repairs = command_repairs;
                 if success {
                     context.position = [0, 0];
                     context.encoding = encoding;
@@ -1507,10 +1885,11 @@ impl LoggingHost<'_> {
                 let pinned_member = neko_origin.as_ref()
                     .filter(|(_, _, expected, actual)| neko_main_table && actual == expected)
                     .map(|&(_, member, _, _)| member);
-                let neko_pc = (neko_archive.is_some_and(|archive| archive.eq_ignore_ascii_case("scene.int"))
-                    || neko_resource.is_some()) && vm.program_code_sha256()
-                    == Some("bf9933a33675e5e44d34f7486d54aa6b53bb3f32a74c2fe0393b5a43efc6f4ad");
-                let neko_pc = neko_pc.then_some(vm.instruction_pointer);
+                let neko_operation = operation.filter(|_| {
+                    neko_archive.is_some_and(|archive| archive.eq_ignore_ascii_case("scene.int"))
+                        || neko_resource.is_some()
+                });
+                let neko_pc = neko_operation.map(|_| vm.instruction_pointer);
                 let origins = &mut self.data_services.cst_text_origins;
                 origins.body_loads.retain(|handle, _| self.cst_contexts.contains_key(handle));
                 origins.source_probes.retain(|handle, _| self.cst_contexts.contains_key(handle));
@@ -1518,7 +1897,7 @@ impl LoggingHost<'_> {
                 origins.happiness_cst_calls.retain(|handle, call|
                     call.frame == self.frame && self.cst_contexts.contains_key(handle));
                 let preserved = pinned_member.and_then(|member| {
-                    previous_neko.and_then(|scene| scene.resume(member, neko_pc, self.frame))
+                    previous_neko.and_then(|scene| scene.resume(member, neko_operation, self.frame))
                 });
                 if preserved.is_none()
                     && let Some((_, member, _, digest)) = &neko_origin
@@ -1539,7 +1918,7 @@ impl LoggingHost<'_> {
                     loaded_at = source_loaded_at;
                     origins.neko_scene_loads.insert(handle, NekoSceneLoad { member, id: load_id, loaded_at, helper: None });
                 } else if let Some((scene, name, digest)) = previous_neko
-                    .and_then(|scene| scene.helper_step(neko_pc, self.frame))
+                    .and_then(|scene| scene.helper_step(neko_operation, self.frame))
                     && resource.source.name.eq_ignore_ascii_case(name)
                     && sha256(&resource.bytes) == digest
                 {
@@ -1694,20 +2073,9 @@ impl LoggingHost<'_> {
         let text = trim_nul(&text);
         write_kcs_terminated(vm, target, text, 1)?;
         if self.data_services.story_trace && index == 327 && record.kind == 0x30 {
-            let repaired = match target {
-                0x65c72 if context.encoding == ScriptTextEncoding::Gbk
-                    && context.story.scene_name().get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case("A_"))
-                    && REBELLIONS_DATE_CONDITIONS.iter().any(|(_, repaired)| text == *repaired) =>
-                {
-                    Some((context.story.scene_name(), document.inputs[input as usize].start + ordinal as usize))
-                }
-                0x797f0 if context.story.is_scene("sc01") => KANMI_POSITIONS.iter()
-                    .find(|(group, record, _, _, repaired)|
-                        *group as i32 == input && *record as i32 == ordinal && text == *repaired)
-                    .map(|(_, _, absolute, _, _)| ("sc01", *absolute)),
-                _ => None,
-            };
-            if let Some((scene, absolute)) = repaired {
+            let absolute = document.inputs[input as usize].start + ordinal as usize;
+            if context.command_repairs.contains(&absolute) {
+                let scene = context.story.scene_name();
                 self.events.push(LogicEvent { frame: self.frame, kind: "cst-command-compat-read".into(),
                     detail: format!("scene={scene} handle={handle} group={input} record={absolute} native={index} ordinal={ordinal} command={:?}",
                         String::from_utf8_lossy(text)),
@@ -1749,7 +2117,9 @@ impl LoggingHost<'_> {
                             || (main_prefix.is_none() && requested.is_empty() && localized.is_none()))
             });
             let absolute_record = document.inputs[input as usize].start + ordinal as usize;
-            if let Some(load_id) = load {
+            if record.kind == 0x21 {
+                origins.record_origin(self.current_task_id, target, text, codec, Vec::new(), Some(CstSpeakerOrigin::Record));
+            } else if let Some(load_id) = load {
                 origins.record_with_body(self.current_task_id, target, text, codec, vec![CstBodySource {
                     context_handle: handle, load_id, group: input, absolute_record,
                 }]);
@@ -1785,7 +2155,19 @@ impl LoggingHost<'_> {
 
     pub(super) fn trace_neko_cstl(&self) -> bool {
         self.data_services.story_trace
-            && self.data_services.native_profile.is_some_and(|profile| profile.pe_sha256 == NEKOPARA_PE_SHA256)
+            && *self.data_services.cst_text_origins.neko_trace_source.get_or_init(|| {
+                let Some((archive, _, scene, table)) = neko_cst_resource("scene.int", "01.cst")
+                    else { return false; };
+                [(b"01.cst".as_slice(), scene), (b"01.cstl".as_slice(), table)]
+                    .into_iter().all(|(member, digest)| {
+                        self.cst_resource_with_source(b"scene", member).ok().flatten().is_some_and(|(_, resource)| {
+                            matches!(&resource.source.location, ResourceLocation::Archive { path, .. }
+                                if path.strip_prefix(self.resources.root()).is_ok_and(|relative|
+                                    relative.as_os_str().eq_ignore_ascii_case(archive)))
+                                && sha256(&resource.bytes) == digest
+                        })
+                    })
+            })
     }
 
     pub(super) fn cst_snapshot_native(
@@ -1914,6 +2296,14 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn cst_scene_encoding_override(&self, resource: &SourcedResource) -> Option<ScriptTextEncoding> {
+        self.cst_scene_encoding_override_with_document(resource, None)
+    }
+
+    fn cst_scene_encoding_override_with_document(
+        &self,
+        resource: &SourcedResource,
+        document: Option<&CstDocument>,
+    ) -> Option<ScriptTextEncoding> {
         if let ResourceLocation::Archive { path, .. } = &resource.source.location
             && let Some(encoding) = self.resources.resource_router()
                 .and_then(|router| router.localized_scene_encoding(self.resources, path))
@@ -1928,9 +2318,28 @@ impl LoggingHost<'_> {
             if self.resources.resource_router().is_some_and(|router|
                 router.is_island_chinese_scene(self.resources, path)
                     || router.is_daydream_gbk_scene_archive(self.resources, path)));
-        (gbk_archive || verified_gbk_scene(self.resources.root(), resource)
-            || self.data_services.newton_legacy_gbk && newton_loose_scene(self.resources.root(), resource))
-            .then_some(ScriptTextEncoding::Gbk)
+        if gbk_archive || verified_gbk_scene(self.resources.root(), resource) {
+            return Some(ScriptTextEncoding::Gbk);
+        }
+        if let ResourceLocation::Archive { path, .. } = &resource.source.location
+            && self.resources.archive_candidates(&resource.source.name)
+                .any(|candidate| candidate == &resource.source)
+        {
+            let use_gbk = |scene: &CstDocument| {
+                has_archive_gbk_dialogue(scene) || ambiguous_gbk_successor(scene)
+                    .and_then(|next| self.cst_resource_with_source(b"scene", next).ok().flatten())
+                    .is_some_and(|(_, next)| {
+                        matches!(&next.source.location, ResourceLocation::Archive { path: next_path, .. }
+                            if path == next_path)
+                            && CstDocument::parse(&next.bytes).is_ok_and(|next| has_archive_gbk_dialogue(&next))
+                    })
+            };
+            return document.map_or_else(
+                || CstDocument::parse(&resource.bytes).is_ok_and(|scene| use_gbk(&scene)),
+                use_gbk,
+            ).then_some(ScriptTextEncoding::Gbk);
+        }
+        self.data_services.loose_scene_encoding.as_ref()?.encoding_for(resource, document)
     }
 
     pub(super) fn cst_resource_with_source(&self, category: &[u8], name: &[u8]) -> Result<Option<(String, SourcedResource)>> {
@@ -1967,29 +2376,29 @@ mod source_encoding_tests {
 
     #[test]
     fn neko_scene_body_provenance_follows_only_verified_reload_edges() {
+        use CstLoadOperation::{Call, Reload, Restore, Return};
         let scene = NekoSceneLoad { member: "01.cst", id: 3, loaded_at: 1500, helper: None };
-        assert_eq!(scene.resume("01.cst", Some(0x14464), 1536), Some((3, 1500)));
-        assert_eq!(scene.resume("02.cst", Some(0x14464), 1536), None);
-        assert_eq!(scene.resume("01.cst", Some(0x141e0), 1536), None);
-        assert_eq!(scene.resume("01.cst", Some(0xb1a58), 1536), None);
-        let (helper, name, _) = scene.helper_step(Some(0x14e91), 1536).unwrap();
+        assert_eq!(scene.resume("01.cst", Some(Reload), 1536), Some((3, 1500)));
+        assert_eq!(scene.resume("02.cst", Some(Reload), 1536), None);
+        assert_eq!(scene.resume("01.cst", None, 1536), None);
+        let (helper, name, _) = scene.helper_step(Some(Call), 1536).unwrap();
         assert_eq!(name, "sub_getattm2.cst");
-        assert_eq!(helper.resume("01.cst", Some(0x14f97), 1536), None);
-        assert_eq!(helper.resume("01.cst", Some(0x15178), 1536), Some((3, 1500)));
-        assert_eq!(helper.resume("02.cst", Some(0x15178), 1536), None);
-        assert_eq!(helper.resume("01.cst", Some(0x15178), 1537), None);
-        assert_eq!(helper.resume("01.cst", Some(0x14464), 1536), None);
+        assert_eq!(helper.resume("01.cst", Some(Return), 1536), None);
+        assert_eq!(helper.resume("01.cst", Some(Restore), 1536), Some((3, 1500)));
+        assert_eq!(helper.resume("02.cst", Some(Restore), 1536), None);
+        assert_eq!(helper.resume("01.cst", Some(Restore), 1537), None);
+        assert_eq!(helper.resume("01.cst", Some(Reload), 1536), None);
         assert_eq!(helper.resume("01.cst", None, 1536), None);
-        assert!(helper.helper_step(Some(0x14e91), 1537).is_none());
-        let (nested, name, _) = helper.helper_step(Some(0x14e91), 1536).unwrap();
+        assert!(helper.helper_step(Some(Call), 1537).is_none());
+        let (nested, name, _) = helper.helper_step(Some(Call), 1536).unwrap();
         assert_eq!(name, "sub_getatt.cst");
-        assert_eq!(nested.resume("01.cst", Some(0x14f97), 1536), None);
-        assert!(nested.helper_step(Some(0x14e91), 1536).is_none());
-        assert!(nested.helper_step(Some(0x14f97), 1537).is_none());
-        let (returned, name, _) = nested.helper_step(Some(0x14f97), 1536).unwrap();
+        assert_eq!(nested.resume("01.cst", Some(Return), 1536), None);
+        assert!(nested.helper_step(Some(Call), 1536).is_none());
+        assert!(nested.helper_step(Some(Return), 1537).is_none());
+        let (returned, name, _) = nested.helper_step(Some(Return), 1536).unwrap();
         assert_eq!(name, "sub_getattm2.cst");
-        assert_eq!(returned.resume("01.cst", Some(0x14f97), 1536), Some((3, 1500)));
-        assert_eq!(returned.resume("01.cst", Some(0x14f97), 1537), None);
+        assert_eq!(returned.resume("01.cst", Some(Return), 1536), Some((3, 1500)));
+        assert_eq!(returned.resume("01.cst", Some(Return), 1537), None);
     }
 
     #[test]
@@ -2052,6 +2461,55 @@ mod source_encoding_tests {
         origins.invalidate_returned(4, 0x100);
         origins.publish(4, 0x100, 1000, utf8);
         assert_eq!(origins.shared(1000, utf8), None);
+    }
+
+    #[test]
+    fn utf8_speaker_suffix_requires_a_cst_read_and_matching_search() -> Result<()> {
+        let mut origins = CstTextOrigins::default();
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0; 4096])?;
+        let task = 43;
+        let (read, scratch, copy, query) = (0x8000_01a0, 0x8000_0220, 0x8000_0340, 0x8000_04b0);
+        let name = "\u{9752}\u{5199}\u{771f}";
+        vm.write(query, b"\x81\x97\0")?;
+        for (input, offset) in [(format!("old\u{ff20}{name}"), 6), (name.to_owned(), 0),
+            (format!("{name}\u{ff20}"), 0)]
+        {
+            let mut input_bytes = input.as_bytes().to_vec();
+            input_bytes.push(0);
+            vm.write(read, &input_bytes)?;
+            vm.write(scratch, &input_bytes)?;
+            origins.record_origin(task, read, input.as_bytes(), ScriptTextEncoding::Utf8, Vec::new(),
+                Some(CstSpeakerOrigin::Record));
+            let raw_copy = origins.capture_raw_copy(task, scratch, read, false, &vm);
+            origins.finish_copy(task, scratch, raw_copy, &vm);
+            assert!(origins.capture_searched_speaker_copy(task, scratch + offset, &vm).is_none());
+            let NativeReturn::Value(found) = super::super::utf8_text_native(1051, &args(&[scratch, query]), &mut vm)?
+                else { panic!("native 1051 did not return the search position"); };
+            origins.note_speaker_search(task, scratch, query, found, &vm);
+            assert!(origins.capture_searched_speaker_copy(task + 1, scratch + offset, &vm).is_none());
+            assert!(origins.capture_searched_speaker_copy(task, scratch + offset + 1, &vm).is_none());
+            let (actual, origin) = origins.capture_searched_speaker_copy(task, scratch + offset, &vm).unwrap();
+            assert_eq!(actual, offset as usize);
+            let expected = if offset == 0 { input.as_bytes() } else { name.as_bytes() };
+            let mut output = expected.to_vec();
+            output.push(0);
+            vm.write(copy, &output)?;
+            origins.finish_copy(task, copy, Some(origin), &vm);
+            origins.publish(task, copy, 1001, expected);
+            assert_eq!(origins.shared(1001, expected), Some(ScriptTextEncoding::Utf8));
+            assert!(origins.capture_searched_speaker_copy(task, scratch + offset, &vm).is_none());
+
+            origins.note_speaker_search(task, scratch, query, found, &vm);
+            vm.write(scratch, b"overwritten\0")?;
+            assert!(origins.capture_searched_speaker_copy(task, scratch + offset, &vm).is_none());
+
+            vm.write(scratch, &input_bytes)?;
+            origins.record_with_body(task, scratch, input.as_bytes(), ScriptTextEncoding::Utf8, Vec::new());
+            origins.note_speaker_search(task, scratch, query, found, &vm);
+            assert!(origins.capture_searched_speaker_copy(task, scratch + offset, &vm).is_none());
+        }
+        Ok(())
     }
 
     #[test]
@@ -2203,6 +2661,274 @@ mod source_encoding_tests {
     }
 
     #[test]
+    fn cg_blend_selector_requires_same_group_layer_evidence() {
+        let command = |text: &[u8]| CstRecord { kind: 0x30, text: text.to_vec() };
+        let records = vec![command(b"cg 7 face,1,c"), command(b"cg 3 other,1,e"),
+            command(b"cg 7] blend 0"), command(b"cg 3 blend 0"), command(b"cg 7 pos -150 0")];
+        let mut document = CstDocument { inputs: vec![0..5], records };
+        let original = document.clone();
+        assert_eq!(repair_cg_blend_selectors(&mut document), [(0, 2)]);
+        assert_eq!(document.records[2].text, b"cg 7 blend 0");
+        assert!(repair_cg_blend_selectors(&mut document).is_empty());
+
+        for (index, replacement) in [(0, &b"cg 1 face,1,c"[..]), (2, b"cg 7]] blend 0"),
+            (2, b"cg 7] blend [0]"), (4, b"cg 3 pos -150 0")]
+        {
+            let mut variant = original.clone();
+            variant.records[index] = command(replacement);
+            assert!(repair_cg_blend_selectors(&mut variant).is_empty());
+        }
+        let mut separate = original;
+        separate.inputs = vec![0..4, 4..5];
+        assert!(repair_cg_blend_selectors(&mut separate).is_empty());
+    }
+
+    #[test]
+    fn plane_quake_selectors_repair_only_complete_scalar_commands() {
+        let rows = [
+            (0x30, b"pl 2] quake 6,10,10 6,-10,-10 6,-5,10 6,10,-5".as_slice()),
+            (0x30, b"pl 0] quake 9,30,30 9,-10,-30 9,-30,10 8,20,-20 6,-5,10 5,5,-5"),
+            (0x30, b"pl [0-30] quake 6,10,10"),
+            (0x30, b"pl [0,2] quake 6,10,10"),
+            (0x30, b"pl 0 quake 6,10,10"),
+            (0x30, b"cg 2] quake 6,10,10"),
+            (0x30, b"pl 2] pos 60"),
+            (0x30, b"pl 2]] quake 6,10,10"),
+            (0x30, b"pl ($1+=2)] quake 6,10,10"),
+            (0x30, b"pl 2] quake 6,10"),
+            (0x30, b"pl 2] quake 6,10,10 6,10,10,10"),
+            (0x30, b"pl 2] quake "),
+            (0x20, b"pl 2] quake 6,10,10"),
+        ];
+        let mut document = CstDocument {
+            inputs: vec![0..1, 1..rows.len()],
+            records: rows.into_iter().map(|(kind, text)| CstRecord { kind, text: text.to_vec() }).collect(),
+        };
+        let original = document.clone();
+        assert_eq!(repair_plane_quake_selectors(&mut document), [(0, 0), (1, 1)]);
+        assert_eq!(document.records[0].text, b"pl 2 quake 6,10,10 6,-10,-10 6,-5,10 6,10,-5");
+        assert_eq!(document.records[1].text, b"pl 0 quake 9,30,30 9,-10,-30 9,-30,10 8,20,-20 6,-5,10 5,5,-5");
+        assert_eq!(document.records[2..], original.records[2..]);
+        assert_eq!(document.inputs, original.inputs);
+        assert!(repair_plane_quake_selectors(&mut document).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the installed Utatemeguri scenes and an isolated profile path"]
+    fn plane_quake_selectors_load_and_read_from_real_utate_scenes() -> anyhow::Result<()> {
+        let game = std::env::var_os("CS2_UTATE_TEST_GAME").expect("installed game root required");
+        let profile = std::env::var_os("CS2_UTATE_TEST_PROFILE").expect("isolated profile required");
+        let mut player = crate::HeadlessPlayer::open_with_save_root(game, profile)?;
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0; 4096])?;
+        let scene_name = 0x8000_0100;
+        let destination = 0x8000_0200;
+
+        player.with_host(|host| {
+            let (_, resource) = host.cst_resource_with_source(b"scene", b"00_01.cst")?.unwrap();
+            let original = CstDocument::parse(&resource.bytes)?;
+            let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
+                anyhow::bail!("no CST context handle");
+            };
+            vm.write(scene_name, b"00_01.cst\0")?;
+            assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
+            for (group, ordinal) in [(137, 11), (145, 7)] {
+                assert_eq!(original.input_records(group).unwrap()[ordinal].text,
+                    b"pl 2] quake 6,10,10 6,-10,-10 6,-5,10 6,10,-5");
+                host.call(327, &args(&[handle, destination, group as u32, ordinal as u32]), &mut vm)?;
+                assert_eq!(vm.read_string(destination)?, b"pl 2 quake 6,10,10 6,-10,-10 6,-5,10 6,10,-5");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "requires the installed scene and an isolated profile path"]
+    fn cst_effect_position_repairs_load_without_program_identity() -> anyhow::Result<()> {
+        let game = std::env::var_os("CS2_KANMI_TEST_GAME").expect("installed game root required");
+        let profile = std::env::var_os("CS2_KANMI_TEST_PROFILE").expect("isolated profile required");
+        let mut player = crate::HeadlessPlayer::open_with_save_root(game, profile)?;
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0; 4096])?;
+        assert!(vm.program().is_none());
+        let scene_name = 0x8000_0100;
+        let destination = 0x8000_0200;
+        player.with_host(|host| {
+            let (_, resource) = host.cst_resource_with_source(b"scene", b"sc01.cst")?.unwrap();
+            let mut document = CstDocument::parse(&resource.bytes)?;
+            let positions = [(207, 3, 975), (208, 2, 986), (209, 2, 996)];
+            assert_eq!(effect_position_repairs(&document).iter().map(|r| (r.0, r.1, r.2))
+                .collect::<Vec<_>>(), positions);
+            document.records[1009].text = b"bg 1 pos 18 -10".to_vec();
+            assert!(effect_position_repairs(&document).is_empty());
+
+            let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
+                anyhow::bail!("no CST context handle");
+            };
+            vm.write(scene_name, b"sc01.cst\0")?;
+            assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
+            for (group, ordinal, _) in positions {
+                host.call(327, &args(&[handle, destination, group as u32, ordinal as u32]), &mut vm)?;
+                assert_eq!(vm.read_string(destination)?, EFFECT_POSITION_DEFAULTS);
+            }
+            host.call(327, &args(&[handle, destination, 211, 4]), &mut vm)?;
+            assert_eq!(vm.read_string(destination)?, b"bg 1 pos -18 -10");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cst_date_conditions_require_the_complete_command_block_in_one_group() {
+        let records = [
+            b"wait".as_slice(),
+            b"#81 = #80 / 10000",
+            b"if (( #80 > 0 )&&( #81 > 0 )&&( #81 < 20 )) #9 = #80",
+            DATE_CONDITIONS[0].0,
+            DATE_CONDITIONS[1].0,
+            b"#6 = #81",
+            b"#82 = #80 / 100 % 100",
+        ].into_iter().map(|text| CstRecord { kind: 0x30, text: text.to_vec() }).collect();
+        let original = CstDocument { inputs: vec![0..1, 1..7], records };
+        let repairs = date_condition_repairs(&original);
+        assert_eq!(repairs.iter().map(|&(group, ordinal, record, ..)| (group, ordinal, record))
+            .collect::<Vec<_>>(), [(1, 2, 3), (1, 3, 4)]);
+
+        let mut repaired = original.clone();
+        let mut events = Vec::new();
+        repair_scene_commands(&mut repaired, &repairs, "date_fixture", 11, 42, &mut events);
+        assert_eq!(events.len(), 2);
+        assert_eq!(repaired.records[3].text, DATE_CONDITIONS[0].1);
+        assert_eq!(repaired.records[4].text, DATE_CONDITIONS[1].1);
+        assert!(date_condition_repairs(&repaired).is_empty());
+        assert_eq!(repaired.inputs, original.inputs);
+        assert_eq!(repaired.records[..3], original.records[..3]);
+        assert_eq!(repaired.records[5..], original.records[5..]);
+
+        let mut variant = original.clone();
+        variant.inputs = vec![0..2, 2..7];
+        assert!(date_condition_repairs(&variant).is_empty());
+        let mut variant = original.clone();
+        variant.records[4].kind = 0x20;
+        assert!(date_condition_repairs(&variant).is_empty());
+        let mut variant = original;
+        variant.records[5].text = b"#6 = #82".to_vec();
+        assert!(date_condition_repairs(&variant).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the installed Rebellions scenes and an isolated profile path"]
+    fn cst_date_conditions_load_and_read_from_real_rebellions_scenes() -> anyhow::Result<()> {
+        use cs2_script::expression::{ExpressionState, eval_expression};
+
+        let game = std::env::var_os("CS2_REBELLIONS_TEST_GAME").expect("installed game root required");
+        let profile = std::env::var_os("CS2_SIDECAR9_PROFILE").expect("isolated profile required");
+        let save_root = Path::new(&profile).join("rebellions-date-conditions");
+        let mut player = crate::HeadlessPlayer::open_with_save_root(game, save_root)?;
+        let mut vm = Vm::new();
+        vm.bind_external(vec![0; 4096])?;
+        let scene_name = 0x8000_0100;
+        let destination = 0x8000_0200;
+        assert!(vm.program().is_none());
+
+        player.with_host(|host| {
+            let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
+                anyhow::bail!("no CST context handle");
+            };
+            for (name, group, first) in [
+                (b"A_01_01.cst\0", 13, 20),
+                (b"B_01_01.cst\0", 59, 33),
+                (b"C_01_02.cst\0", 0, 28),
+            ] {
+                let (_, resource) = host.cst_resource_with_source(b"scene", trim_nul(name))?.unwrap();
+                let original = CstDocument::parse(&resource.bytes)?;
+                let source_pair = original.input_records(group).unwrap();
+                vm.write(scene_name, name)?;
+                assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
+                let mut commands = Vec::new();
+                for (offset, (original, expected)) in DATE_CONDITIONS.into_iter().enumerate() {
+                    let ordinal = first + offset;
+                    assert_eq!(source_pair[ordinal].text, original);
+                    assert!(crate::split_cst_condition(original).is_err());
+                    host.call(327, &args(&[handle, destination, group as u32, ordinal as u32]), &mut vm)?;
+                    let read = vm.read_string(destination)?;
+                    assert_eq!(read, expected);
+                    commands.push(read);
+                }
+                for (previous_date, expected_month, expected_date) in [(110_201, 11, 110_201), (0, 0, 230_101)] {
+                    let mut state = ExpressionState::default();
+                    state.shared[9] = previous_date;
+                    state.shared[80] = 230_101;
+                    state.shared[81] = 23;
+                    for command in &commands {
+                        let (condition, assignment) = crate::split_cst_condition(command)?.unwrap();
+                        if eval_expression(condition, &mut state)? != 0 {
+                            eval_expression(assignment, &mut state)?;
+                        }
+                    }
+                    assert_eq!(state.shared[81], expected_month);
+                    assert_eq!(state.shared[9], expected_date);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ikikoi_missing_kind_requires_matching_group_and_valid_gbk() {
+        let record = |kind, text: &[u8]| CstRecord { kind, text: text.to_vec() };
+        let original = CstDocument {
+            records: vec![record(0x30, b"pcm scene_001"), record(0x21, b"\x82\xa0"),
+                record(0x20, b"\x82\xa2"), record(0x02, b"")],
+            inputs: std::iter::once(0..4).collect(),
+        };
+        let mut revised = original.clone();
+        revised.records[1] = record(0xd6, b"\xd0");
+        revised.records[2] = record(0xb9, b"\xfa revised");
+        assert_eq!(missing_gbk_text_kinds(&revised, &original), Some(vec![(1, 0x21), (2, 0x20)]));
+
+        let mut invalid_text = revised.clone();
+        invalid_text.records[2].text[0] = b'\x7f';
+        assert_eq!(missing_gbk_text_kinds(&invalid_text, &original), None);
+
+        let mut other_command = original.clone();
+        other_command.records[0].text = b"pcm scene_002".to_vec();
+        assert_eq!(missing_gbk_text_kinds(&revised, &other_command), None);
+
+        let mut other_groups = original.clone();
+        other_groups.inputs = vec![0..2, 2..4];
+        assert_eq!(missing_gbk_text_kinds(&revised, &other_groups), None);
+
+        let mut title_marker = original.clone();
+        title_marker.records[1] = record(0x30, b"title scene_001");
+        assert_eq!(missing_gbk_text_kinds(&revised, &title_marker), None);
+    }
+
+    fn uncompressed_cst(document: &CstDocument) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut offsets = Vec::new();
+        for record in &document.records {
+            offsets.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            strings.extend_from_slice(&[1, record.kind]);
+            strings.extend_from_slice(&record.text);
+            strings.push(0);
+        }
+        let offset_table = document.inputs.len() * 8;
+        let string_table = offset_table + offsets.len();
+        let script_len = string_table + strings.len();
+        let mut bytes = b"CatScene".to_vec();
+        for value in [0, 16 + script_len, script_len, document.inputs.len(), offset_table, string_table] {
+            bytes.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        for range in &document.inputs {
+            bytes.extend_from_slice(&(range.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(range.start as u32).to_le_bytes());
+        }
+        bytes.extend_from_slice(&offsets);
+        bytes.extend_from_slice(&strings);
+        bytes
+    }
+
+    #[test]
     fn ikikoi_localized_cst_load_restores_the_ten_missing_record_types() -> anyhow::Result<()> {
         let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games/突然之间发现我已恋上你");
         if !game.join("UPDATE05.int").is_file() { return Ok(()); }
@@ -2223,6 +2949,42 @@ mod source_encoding_tests {
             (b"tmg_ind07_ero2.cst\0", &[(194, 2, 0x21)]),
         ];
         player.with_host(|host| {
+            let patch_index = host.resources.archives().iter().position(|archive|
+                archive.path.as_os_str().eq_ignore_ascii_case("update05.int")).unwrap();
+            let patch_path = host.resources.root().join(&host.resources.archives()[patch_index].path);
+            let mut verified_members = 0;
+            let mut repaired_records = 0;
+            for (member, bytes) in host.resources.read_archive_candidates_by_index(patch_index) {
+                if !member.name.to_ascii_lowercase().ends_with(".cst") { continue; }
+                let source = host.resources.archive_candidates(&member.name).find(|candidate|
+                    matches!(&candidate.location, ResourceLocation::Archive { path, offset, .. }
+                        if path == &patch_path && *offset == member.offset)).unwrap();
+                let resource = SourcedResource { source: source.clone(), bytes: bytes? };
+                let original = CstDocument::parse(&resource.bytes)?;
+                let mut repaired = original.clone();
+                repair_routed_scene_text(host.resources, &resource, &mut repaired);
+                let changed = original.records.iter().zip(&repaired.records)
+                    .filter(|(before, after)| before != after).count();
+                let expected = scenes.iter().find_map(|(name, repairs)|
+                    trim_nul(name).eq_ignore_ascii_case(member.name.as_bytes()).then_some(repairs.len()));
+                assert_eq!(changed, expected.unwrap_or(0), "{}", member.name);
+                verified_members += 1;
+                repaired_records += changed;
+                if member.name.eq_ignore_ascii_case("common01.cst") {
+                    let mut revised = original;
+                    let record = revised.inputs[6].start;
+                    revised.records[record].text.extend_from_slice(b" revised");
+                    let expected_text = [&[revised.records[record].kind], &revised.records[record].text[..]].concat();
+                    let bytes = uncompressed_cst(&revised);
+                    assert_ne!(bytes, resource.bytes);
+                    let revised_resource = SourcedResource { source: source.clone(), bytes };
+                    let mut revised = CstDocument::parse(&revised_resource.bytes)?;
+                    repair_routed_scene_text(host.resources, &revised_resource, &mut revised);
+                    assert_eq!(revised.records[record], CstRecord { kind: 0x20, text: expected_text });
+                }
+            }
+            assert_eq!((verified_members, repaired_records), (156, 10));
+
             let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
                 anyhow::bail!("no CST context handle");
             };
@@ -2315,6 +3077,8 @@ mod source_encoding_tests {
         vm.bind_external(vec![0; 4096])?;
         let scene_name = 0x8000_0100;
         let destination = 0x8000_0200;
+        let unbound_language = 0x8000_0800;
+        vm.write(unbound_language, b"unbound-language\0")?;
         player.with_host(|host| {
             let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
                 anyhow::bail!("no CST context handle");
@@ -2326,31 +3090,105 @@ mod source_encoding_tests {
             assert_eq!(host.cst_scene_encoding_override(&later), Some(ScriptTextEncoding::Gbk));
             assert_eq!(host.cst_scene_encoding_override(&japanese), None);
 
+            let archive_index = host.resources.archives().iter().position(|archive|
+                archive.path.as_os_str().eq_ignore_ascii_case("scene.int")).unwrap();
+            let archive_path = host.resources.root().join(&host.resources.archives()[archive_index].path);
+            let mut member_count = 0;
+            let mut strong_gbk = 0;
+            let mut corroborated_gbk = 0;
+            for (member, bytes) in host.resources.read_archive_candidates_by_index(archive_index) {
+                let name = member.name.to_ascii_lowercase();
+                if !name.ends_with(".cst") { continue; }
+                let source = host.resources.archive_candidates(&member.name).find(|candidate|
+                    matches!(&candidate.location, ResourceLocation::Archive { path, offset, .. }
+                        if path == &archive_path && *offset == member.offset)).unwrap();
+                let resource = SourcedResource { source: source.clone(), bytes: bytes? };
+                let scene = CstDocument::parse(&resource.bytes)?;
+                let expected_gbk = match name.as_str() {
+                    "a_05_09_h.cst" | "a_05_09_h_1.cst" => false,
+                    "a17_2_h.cst" | "r_ha01_start.cst" | "r_ha02_start.cst" => true,
+                    _ => rebellions_gbk_member_digest(&name).is_some(),
+                };
+                let selected = host.cst_scene_encoding_override_with_document(&resource, Some(&scene));
+                assert_eq!(selected, expected_gbk.then_some(ScriptTextEncoding::Gbk), "{}", member.name);
+                member_count += 1;
+                if expected_gbk && has_archive_gbk_dialogue(&scene) { strong_gbk += 1; }
+                if expected_gbk && ambiguous_gbk_successor(&scene).is_some() { corroborated_gbk += 1; }
+            }
+            assert_eq!((member_count, strong_gbk, corroborated_gbk), (316, 81, 1));
+
+            let (_, ambiguous) = host.cst_resource_with_source(b"scene", b"A_04_15_H.cst")?.unwrap();
+            let mut different_successor = CstDocument::parse(&ambiguous.bytes)?;
+            let jump = different_successor.inputs[1].start;
+            for next in [b"next C_01_01".as_slice(), b"next no_such_scene"] {
+                different_successor.records[jump].text = next.to_vec();
+                assert_eq!(ambiguous_gbk_successor(&different_successor), Some(&next[5..]));
+                assert_eq!(host.cst_scene_encoding_override_with_document(&ambiguous, Some(&different_successor)), None);
+            }
+            different_successor.records[jump].text = b"next R_HA01_start".to_vec();
+            assert_eq!(host.cst_scene_encoding_override_with_document(&ambiguous, Some(&different_successor)),
+                Some(ScriptTextEncoding::Gbk));
+            let first_command = different_successor.inputs[0].start;
+            different_successor.records[first_command].text = b"next C_01_01".to_vec();
+            assert_eq!(host.cst_scene_encoding_override_with_document(&ambiguous, Some(&different_successor)), None);
+
+            let mut revised = patched.clone();
+            let mut document = CstDocument::parse(&patched.bytes)?;
+            document.records[12].text.extend_from_slice(b" revised");
+            revised.bytes = uncompressed_cst(&document);
+            assert!(!verified_rebellions_scene(host.resources.root(), &revised));
+            assert_eq!(host.cst_scene_encoding_override(&revised), Some(ScriptTextEncoding::Gbk));
+
             let mut same_name = patched.clone();
             same_name.bytes = japanese.bytes;
             assert_eq!(host.cst_scene_encoding_override(&same_name), None);
+            let mut relocated = patched.clone();
+            if let ResourceLocation::Archive { path, .. } = &mut relocated.source.location {
+                *path = host.resources.root().join("update01.int");
+            }
+            assert_eq!(host.cst_scene_encoding_override(&relocated), None);
+            let mut wrong_offset = patched.clone();
+            if let ResourceLocation::Archive { offset, .. } = &mut wrong_offset.source.location {
+                *offset += 1;
+            }
+            assert_eq!(host.cst_scene_encoding_override(&wrong_offset), None);
             let mut loose = patched;
             loose.source.location = ResourceLocation::File {
                 path: host.resources.root().join("scene/A_01_01.cst"),
             };
             assert_eq!(host.cst_scene_encoding_override(&loose), None);
 
-            for (name, ordinal, codec, expected) in [
-                (b"A_01_01.cst\0", 12, ScriptTextEncoding::Gbk,
+            let cases: &[(&[u8], u32, u32, ScriptTextEncoding, &str)] = &[
+                (b"A_01_01.cst\0", 0, 12, ScriptTextEncoding::Gbk,
                     "\u{2015}\u{2015}\u{4ed6}\u{505a}\u{4e86}\u{4e00}\u{4e2a}\u{68a6}\u{3002}"),
-                (b"C_01_01.cst\0", 16, ScriptTextEncoding::Cp932,
+                (b"A_04_15_H.cst\0", 0, 2, ScriptTextEncoding::Gbk,
+                    "\u{53f8}\u{6545}\u{610f}\u{7684}\u{9732}\u{51fa}\u{574f}\u{7b11}\u{3002}"),
+                (b"A_05_09_H.cst\0", 0, 117, ScriptTextEncoding::Cp932,
+                    "\u{6728}\u{3005}\u{306e}\u{9699}\u{9593}\u{304b}\u{3089}\u{8997}\u{304f}\u{7a7a}\u{306b}\u{306f}\u{3001}\u{7121}\u{6570}\u{306e}\u{661f}\u{305f}\u{3061}\u{304c}\u{8f1d}\u{3044}\u{3066}\u{3044}\u{305f}\u{3002}"),
+                (b"A_05_09_H.cst\0", 9, 6, ScriptTextEncoding::Cp932, "\u{77b3}"),
+                (b"A_05_09_H_1.cst\0", 0, 0, ScriptTextEncoding::Cp932, "next R_HA03_start"),
+                (b"C_01_01.cst\0", 0, 16, ScriptTextEncoding::Cp932,
                     "\u{2015}\u{2015}\u{5f7c}\u{306f}\u{3001}\u{5922}\u{3092}\u{898b}\u{3066}\u{3044}\u{305f}\u{3002}"),
-            ] {
+            ];
+            for &(name, group, ordinal, codec, expected) in cases {
                 vm.write(scene_name, name)?;
                 assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
                 assert_eq!(host.cst_contexts[&handle].encoding, codec);
-                let read_args = args(&[handle, destination, 0, ordinal]);
+                let read_args = args(&[handle, destination, group, ordinal]);
+                let record = &host.cst_contexts[&handle].document.as_ref().unwrap()
+                    .input_records(group as usize).unwrap()[ordinal as usize];
+                let kind = record.kind;
                 host.read_cst_record(327, &read_args, &mut vm)?;
                 let raw = vm.read_string(destination)?;
-                host.call(278, &args(&[destination]), &mut vm)?;
-                host.call(276, &args(&[1000, destination]), &mut vm)?;
-                assert_eq!(host.data_services.cst_text_origins.shared(1000, &raw), Some(codec));
+                if matches!(kind, 0x20 | 0x21) {
+                    let shared = if kind == 0x20 { 1000 } else { 1001 };
+                    host.call(278, &args(&[destination]), &mut vm)?;
+                    host.call(276, &args(&[shared, destination]), &mut vm)?;
+                    assert_eq!(host.data_services.cst_text_origins.shared(shared, &raw), Some(codec));
+                }
                 host.read_cst_record(1037, &read_args, &mut vm)?;
+                assert_eq!(vm.read_string(destination)?, expected.as_bytes());
+                host.read_cst_record(1038, &args(&[handle, destination, group, ordinal, unbound_language]), &mut vm)?;
                 assert_eq!(vm.read_string(destination)?, expected.as_bytes());
             }
             Ok(())
@@ -2431,20 +3269,35 @@ mod source_encoding_tests {
                 anyhow::bail!("no CST context handle");
             };
             let (virtual_name, winner) = host.cst_resource_with_source(b"scene", trim_nul(filename))?.unwrap();
-            assert!(verified_gbk_scene(host.resources.root(), &winner));
+            if fallback == "scene.int" {
+                assert!(host.data_services.has_loose_gbk_text());
+                let (_, ambiguous) = host.cst_resource_with_source(b"scene", b"staff_room.cst")?.unwrap();
+                assert_eq!(host.cst_scene_encoding_override(&ambiguous), Some(ScriptTextEncoding::Gbk));
+                host.data_services.loose_scene_encoding.as_mut().unwrap().corroborated_gbk = false;
+                assert_eq!(host.cst_scene_encoding_override(&ambiguous), None);
+                host.data_services.loose_scene_encoding.as_mut().unwrap().corroborated_gbk = true;
+            }
+            let uses_gbk = |source: &SourcedResource| {
+                if fallback == "scene.int" {
+                    host.cst_scene_encoding_override(source) == Some(ScriptTextEncoding::Gbk)
+                } else {
+                    verified_gbk_scene(host.resources.root(), source)
+                }
+            };
+            assert!(uses_gbk(&winner));
             let mut changed = winner.clone();
             changed.bytes[0] ^= 1;
-            assert!(!verified_gbk_scene(host.resources.root(), &changed));
+            assert!(!uses_gbk(&changed));
             let mut moved = winner.clone();
             match &mut moved.source.location {
                 ResourceLocation::File { path } => *path = host.resources.root().join("other/com_001A.cst"),
                 ResourceLocation::Archive { path, .. } => *path = host.resources.root().join("update02.int"),
             }
-            assert!(!verified_gbk_scene(host.resources.root(), &moved));
+            assert!(!uses_gbk(&moved));
             if matches!(&winner.source.location, ResourceLocation::Archive { .. }) {
                 moved.source.location = winner.source.location.clone();
                 moved.source.name = "other.cst".into();
-                assert!(!verified_gbk_scene(host.resources.root(), &moved));
+                assert!(!uses_gbk(&moved));
             }
 
             assert_eq!(host.call(325, &args(&[handle, scene_name]), &mut vm)?, NativeReturn::Value(1));
@@ -2519,11 +3372,8 @@ mod source_encoding_tests {
     }
 
     #[test]
-    #[ignore = "requires the pinned installed Newton game and an isolated profile path"]
+    #[ignore = "requires the installed Newton game and an isolated profile path"]
     fn sidecar9_newton_origin_cache_and_fallback() -> anyhow::Result<()> {
-        let root = std::env::var_os("CS2_SIDECAR9_NEWTON").expect("installed game root required");
-        let scan = cs2_runtime::GameRoot::open(root)?.scan()?;
-        assert!(verified_newton_text_profile(&scan.resources));
         check_scene("CS2_SIDECAR9_NEWTON", b"com_001A.cst\0", &[15, 23], "scene.int")
     }
 

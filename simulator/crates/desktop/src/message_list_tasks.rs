@@ -42,14 +42,12 @@ struct MessageListTask {
 
 impl MessageListStore {
     pub(crate) fn supports(index: u32) -> bool { matches!(index, 570..=572) }
-    pub(crate) fn identify(&mut self, sha256: &str) {
-        self.base = message_base_for_pe(sha256);
-    }
-
-    pub(crate) fn identify_verified_companion(&mut self, sha256: &str) {
-        if self.base.is_none() {
-            self.identify(sha256);
-        }
+    pub(crate) fn identify(
+        &mut self,
+        registered: Option<u32>,
+        companion_registered: Option<u32>,
+    ) {
+        self.base = registered.or(companion_registered);
     }
 
     pub(super) fn register(&mut self, id: u32) {
@@ -126,6 +124,13 @@ impl LoggingHost<'_> {
         // address, an image wrapper, or a copied struct from caller memory.
         if source != 0 && !self.cst_contexts.contains_key(&source) {
             return Err(native_state_error("native 571 source is not a CST context"));
+        }
+        // An ordinary script can clear its optional inspector binding during
+        // teardown even when the inspector was never created.
+        if index == 571 && args.len() == 8 && target == 0 && source == 0
+            && !self.data_services.tasks.message_lists.tasks.contains_key(&target)
+        {
+            return Ok(NativeReturn::Continue);
         }
         let base = message_base(self).ok_or_else(||
             native_state_error("message-list command ABI needs an identified PE"))?;
@@ -349,10 +354,47 @@ fn message_base(host: &LoggingHost<'_>) -> Option<u32> {
     host.data_services.tasks.message_lists.base
 }
 
-fn message_base_for_pe(sha256: &str) -> Option<u32> {
-    let profile = cs2_runtime::native_task_profile::exact_task_native_profile(sha256)?;
-    let [create, bind, refresh] = profile.message_list?;
-    // Refuse a future incompatible layout; wrapper identities alone do not
-    // license assigning arbitrary operations to intervening message numbers.
-    (bind == create + 3 && refresh == create + 2).then_some(create)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_list_kamikaze_initializes_from_registered_receiver() -> anyhow::Result<()> {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../games/\u{30ab}\u{30df}\u{30ab}\u{30bc}\u{2606}\u{30a8}\u{30af}\u{30b9}\u{30d7}\u{30ed}\u{30fc}\u{30e9}\u{30fc}!",
+        );
+        if !game.join("cs2.exe").is_file() { return Ok(()); }
+        let temp = crate::tests::TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&game, temp.0.join("profile"))?;
+        player.with_host(|host| {
+            assert_eq!(message_base(host), Some(404));
+            let inspector = host.create_task_object(47, 0, b"message list", b"")?;
+            let args = [inspector, 0].map(u32::to_le_bytes).concat();
+            assert_eq!(host.message_list_native(571, &args)?, NativeReturn::Continue);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn message_list_unbind_without_an_inspector() -> anyhow::Result<()> {
+        let temp = crate::tests::TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+        player.with_host(|host| {
+            assert!(host.task_is_reachable(0));
+            assert!(matches!(host.message_list_native(571, &[0; 8])?, NativeReturn::Continue));
+            assert!(matches!(host.message_list_native(572, &[0; 4])?, NativeReturn::Continue));
+            assert!(host.message_list_native(570, &[0; 4]).is_err());
+            assert!(host.message_list_native(571, &[0; 9]).is_err());
+            assert!(host.message_list_native(571, &[0, 0, 0, 0, 1, 0, 0, 0]).is_err());
+
+            let inspector = host.create_task_object(47, 0, b"message list", b"")?;
+            let args = [inspector, 0].map(u32::to_le_bytes).concat();
+            assert!(host.message_list_native(571, &args).is_err());
+            host.data_services.tasks.message_lists.base = Some(437);
+            host.data_services.tasks.message_lists.tasks.get_mut(&inspector).unwrap().source = 10;
+            assert!(matches!(host.message_list_native(571, &args)?, NativeReturn::Continue));
+            assert_eq!(host.data_services.tasks.message_lists.tasks[&inspector].source, 0);
+            Ok(())
+        })
+    }
 }
