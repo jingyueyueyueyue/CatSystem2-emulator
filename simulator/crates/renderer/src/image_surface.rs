@@ -41,7 +41,18 @@ impl RgbaFrame {
         pixels: Vec<u8>,
         metadata: FrameMetadata,
     ) -> Result<Self> {
-        let expected = native_rgba_len(width, height, NATIVE_SURFACE_LIMIT)?;
+        Self::from_native_rgba8_with_limit(width, height, pixels, metadata, NATIVE_SURFACE_LIMIT)
+    }
+
+    /// Restores a native allocation subject to its owner's byte budget.
+    pub fn from_native_rgba8_with_limit(
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        metadata: FrameMetadata,
+        limit: usize,
+    ) -> Result<Self> {
+        let expected = native_rgba_len(width, height, limit)?;
         if pixels.len() != expected {
             return Err(RendererError::BufferLength { expected, actual: pixels.len() });
         }

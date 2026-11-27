@@ -2,11 +2,11 @@
 //! retain their actual type (including resource-name bytes and tuple keys).
 //! Structs use declaration order. Defaults on the FES driver allow trailing
 //! fields to be added without invalidating earlier driver checkpoints.
-use serde::{Deserialize, Serialize, de, ser};
+use serde::{Serialize, de, ser};
 use std::fmt;
 use std::ops::RangeInclusive;
 
-const LIMIT: usize = super::MAX_GRAPH_BYTES;
+const WORK_LIMIT: usize = super::MAX_COMPONENT_BYTES;
 #[derive(Debug)]
 pub(super) struct Error(String);
 impl fmt::Display for Error {
@@ -18,31 +18,34 @@ impl de::Error for Error { fn custom<T: fmt::Display>(value: T) -> Self { Self(v
 type Result<T> = std::result::Result<T, Error>;
 fn bad() -> Error { Error("invalid or excessive host graph wire".into()) }
 
-pub(super) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut writer = Writer { bytes: Vec::new(), depth: 0 };
+pub(super) fn encode<T: Serialize>(value: &T, prefix: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut writer = Writer { bytes: Vec::new(), depth: 0, limit };
+    writer.put(prefix)?;
     value.serialize(&mut writer)?;
     Ok(writer.bytes)
 }
-pub(super) fn decode<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    if bytes.len() > LIMIT { return Err(bad()); }
+pub(super) fn decode<T: de::DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T> {
+    if bytes.len() > limit { return Err(bad()); }
     let mut reader = Reader { bytes, depth: 0, work: 0 };
     let value = T::deserialize(&mut reader)?;
     if !reader.bytes.is_empty() { return Err(bad()); }
     Ok(value)
 }
 
-struct Writer { bytes: Vec<u8>, depth: usize }
+struct Writer { bytes: Vec<u8>, depth: usize, limit: usize }
 impl Writer {
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.bytes.len().checked_add(bytes.len()).is_none_or(|len| len > LIMIT) { return Err(bad()); }
+        if self.bytes.len().checked_add(bytes.len()).is_none_or(|len| len > self.limit) {
+            return Err(Error(format!("host graph wire exceeds {} MiB", self.limit / (1024 * 1024))));
+        }
+        self.bytes.try_reserve(bytes.len()).map_err(|error| Error(error.to_string()))?;
         self.bytes.extend_from_slice(bytes); Ok(())
     }
     fn count(&mut self, len: usize) -> Result<()> {
-        if len > LIMIT { return Err(bad()); }
         self.put(&u32::try_from(len).map_err(|_| bad())?.to_le_bytes())
     }
     fn compound(&mut self, len: usize, map: bool) -> Result<Compound<'_>> {
-        if self.depth >= 128 { return Err(bad()); }
+        if len > WORK_LIMIT || self.depth >= 128 { return Err(bad()); }
         self.count(len)?; self.depth += 1;
         Ok(Compound { writer: self, remaining: len.checked_mul(if map { 2 } else { 1 }).ok_or_else(bad)? })
     }
@@ -129,19 +132,19 @@ impl ser::SerializeStructVariant for Compound<'_> {
 struct Reader<'de> { bytes: &'de [u8], depth: usize, work: usize }
 impl<'de> Reader<'de> {
     fn take(&mut self, length: usize) -> Result<&'de [u8]> {
-        self.work = self.work.checked_add(1).filter(|&work| work <= LIMIT).ok_or_else(bad)?;
+        self.work = self.work.checked_add(1).filter(|&work| work <= WORK_LIMIT).ok_or_else(bad)?;
         let (head, tail) = self.bytes.split_at_checked(length).ok_or_else(bad)?;
         self.bytes = tail; Ok(head)
     }
     fn count(&mut self) -> Result<usize> {
         let len = u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| bad())?) as usize;
-        if len > LIMIT { return Err(bad()); } Ok(len)
+        Ok(len)
     }
     fn sequence<V: de::Visitor<'de>>(
         &mut self, visitor: V, expected: Option<RangeInclusive<usize>>, map: bool,
     ) -> Result<V::Value> {
         let len = self.count()?;
-        if expected.is_some_and(|expected| !expected.contains(&len)) || self.depth >= 128 { return Err(bad()); }
+        if len > WORK_LIMIT || expected.is_some_and(|expected| !expected.contains(&len)) || self.depth >= 128 { return Err(bad()); }
         self.depth += 1;
         let mut access = Access { reader: self, left: len.checked_mul(if map { 2 } else { 1 }).ok_or_else(bad)? };
         let result = if map { visitor.visit_map(&mut access) } else { visitor.visit_seq(&mut access) };

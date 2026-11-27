@@ -52,7 +52,7 @@ mod resource_surface;
 mod island_patch;
 #[path = "image_material_async.rs"]
 mod material_async;
-pub(super) use state::{ImageCacheSnapshot, PreparedImageCache, PreparedResourceLayers, capture_frame, restore_frame};
+pub(super) use state::{ImageCacheSnapshot, PreparedImageCache, PreparedResourceLayers, capture_frame, restore_frame, restore_list_frame};
 
 pub(super) struct ImageManager {
     /// Interactive host policy, deliberately absent from saved image state.

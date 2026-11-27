@@ -5,6 +5,12 @@ use thiserror::Error;
 
 const CSS_HEADER_SIZE: usize = 16;
 const CSS_BLOCK_SIZE: usize = 0x80000;
+pub const HOST_GRAPH_MAGIC: &[u8] = b"CS2HOSTGRPH4";
+// One full 512 MiB image allocation plus the remaining host state.
+pub const MAX_HOST_GRAPH_BYTES: usize = 768 * 1024 * 1024;
+// Room for record framing, allocation rounding and zlib expansion.
+pub const MAX_HOST_GRAPH_CSS_BYTES: usize = MAX_HOST_GRAPH_BYTES + 2 * 1024 * 1024;
+const PORTABLE_CSS: &[u8; 4] = b"CSG\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CssRecord {
@@ -80,15 +86,21 @@ impl CssFile {
 
     /// Signature-only optional recognition, matching the container loader.
     pub fn from_css(data: &[u8]) -> Result<Option<Self>, CssError> {
-        if data.get(..4) != Some(b"CSS\0") { return Ok(None); }
+        if !matches!(data.get(..4), Some(b"CSS\0" | b"CSG\0")) { return Ok(None); }
         Self::parse(data).map(Some)
     }
 
+    pub fn file_size_limit(signature: &[u8]) -> usize {
+        if signature == PORTABLE_CSS { MAX_HOST_GRAPH_CSS_BYTES } else { MAX_BUFFER }
+    }
+
     pub fn parse(data: &[u8]) -> Result<Self, CssError> {
-        if data.len() > MAX_BUFFER {
+        let portable = data.get(..4) == Some(PORTABLE_CSS);
+        let limit = Self::file_size_limit(data.get(..4).unwrap_or_default());
+        if data.len() > limit {
             return Err(CssError::TooLarge);
         }
-        if data.get(..4) != Some(b"CSS\0") {
+        if !portable && data.get(..4) != Some(b"CSS\0") {
             return Err(CssError::InvalidSignature);
         }
         if data.len() < CSS_HEADER_SIZE {
@@ -100,7 +112,7 @@ impl CssFile {
         let capacity = (used_length as usize / CSS_BLOCK_SIZE + 1)
             .checked_mul(CSS_BLOCK_SIZE)
             .ok_or(CssError::TooLarge)?;
-        if capacity > MAX_BUFFER {
+        if capacity > limit {
             return Err(CssError::TooLarge);
         }
         let end = CSS_HEADER_SIZE
@@ -113,8 +125,13 @@ impl CssFile {
         // Decode into capacity, keep bytes written before a checksum/data
         // error, and do not replace the declared used length with total_out.
         let mut storage = zero_storage(capacity)?;
-        let inflation = inflate_container(&data[CSS_HEADER_SIZE..end], &mut storage);
+        let inflation = inflate_container(&data[CSS_HEADER_SIZE..end], &mut storage, limit);
+        if portable && (!inflation.stream_end || inflation.output_truncated
+            || inflation.output_written != used_length) {
+            return Err(CssError::InvalidCompression);
+        }
         let records = record_view(&storage, capacity)?;
+        if portable && !contains_host_graph(&records) { return Err(CssError::InvalidRecord); }
         Ok(Self {
             used_length,
             tag,
@@ -152,13 +169,16 @@ impl CssFile {
     pub fn from_storage_state(
         tag: u32, logical_capacity: u32, used_length: u32, storage: Vec<u8>,
     ) -> Result<Self, CssError> {
-        if storage.len() > MAX_BUFFER || logical_capacity as usize > MAX_BUFFER {
+        if storage.len() > MAX_HOST_GRAPH_CSS_BYTES {
             return Err(CssError::TooLarge);
         }
         if logical_capacity as usize > storage.len() {
             return Err(CssError::Truncated);
         }
         let records = record_view(&storage, logical_capacity as usize)?;
+        if storage.len() > MAX_BUFFER && !contains_host_graph(&records) {
+            return Err(CssError::TooLarge);
+        }
         Ok(Self { used_length, tag, records, logical_capacity, storage, inflation: None })
     }
 
@@ -199,8 +219,18 @@ impl CssFile {
     }
 
     pub fn append(&mut self, id: u32, data: &[u8]) -> Result<(), CssError> {
-        let length = u32::try_from(data.len()).map_err(|_| CssError::TooLarge)?;
         if data.len() > MAX_BUFFER { return Err(CssError::TooLarge); }
+        self.append_with_limit(id, data, self.storage_limit())
+    }
+
+    pub fn append_host_graph(&mut self, id: u32, data: &[u8]) -> Result<(), CssError> {
+        if data.len() > MAX_HOST_GRAPH_BYTES { return Err(CssError::TooLarge); }
+        if !data.starts_with(HOST_GRAPH_MAGIC) { return Err(CssError::InvalidRecord); }
+        self.append_with_limit(id, data, MAX_HOST_GRAPH_BYTES + CSS_BLOCK_SIZE)
+    }
+
+    fn append_with_limit(&mut self, id: u32, data: &[u8], limit: usize) -> Result<(), CssError> {
+        let length = u32::try_from(data.len()).map_err(|_| CssError::TooLarge)?;
         let mut header = [0; 8];
         header[..4].copy_from_slice(&id.to_le_bytes());
         header[4..].copy_from_slice(&length.to_le_bytes());
@@ -237,8 +267,8 @@ impl CssFile {
         let mut candidate = self.clone();
         // 0x6eac10 invokes the grow/write helper twice. Its block arithmetic
         // depends on used-length transitions, not round_up(new used).
-        candidate.append_bytes(&header)?;
-        candidate.append_bytes(data)?;
+        candidate.append_bytes(&header, limit)?;
+        candidate.append_bytes(data, limit)?;
         candidate.records = record_view(&candidate.storage, candidate.logical_capacity as usize)?;
         candidate.inflation = None;
         *self = candidate;
@@ -259,6 +289,10 @@ impl CssFile {
         candidate.logical_capacity -= length as u32;
         candidate.used_length = candidate.used_length.wrapping_sub(length as u32);
         candidate.records = record_view(&candidate.storage, candidate.logical_capacity as usize)?;
+        if candidate.storage.len() > MAX_BUFFER && !contains_host_graph(&candidate.records) {
+            if candidate.logical_capacity as usize > MAX_BUFFER { return Err(CssError::TooLarge); }
+            candidate.storage.truncate(MAX_BUFFER);
+        }
         candidate.inflation = None;
         *self = candidate;
         Ok(true)
@@ -267,30 +301,33 @@ impl CssFile {
     pub fn to_css(&self) -> Result<Vec<u8>, CssError> {
         if self.used_length > self.logical_capacity { return Err(CssError::UsedOutOfBounds); }
         let body = self.used_bytes()?;
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        let graph = contains_host_graph(&self.records);
+        let compression = if graph && body.len() >= MAX_BUFFER { Compression::fast() } else { Compression::best() };
+        let mut encoder = ZlibEncoder::new(vec![0; CSS_HEADER_SIZE], compression);
         encoder.write_all(body).map_err(|_| CssError::TooLarge)?;
-        let compressed = encoder.finish().map_err(|_| CssError::TooLarge)?;
-        let compressed_length = u32::try_from(compressed.len()).map_err(|_| CssError::TooLarge)?;
-        if CSS_HEADER_SIZE.checked_add(compressed.len()).is_none_or(|length| length > MAX_BUFFER) {
+        let mut output = encoder.finish().map_err(|_| CssError::TooLarge)?;
+        let compressed_length = u32::try_from(output.len() - CSS_HEADER_SIZE).map_err(|_| CssError::TooLarge)?;
+        let portable = body.len() >= MAX_BUFFER || output.len() > MAX_BUFFER;
+        let limit = if portable && graph { MAX_HOST_GRAPH_CSS_BYTES } else { MAX_BUFFER };
+        if (portable && !graph) || output.len() > limit {
             return Err(CssError::TooLarge);
         }
-        let mut output = Vec::with_capacity(16 + compressed.len());
-        output.extend_from_slice(b"CSS\0");
-        output.extend_from_slice(&compressed_length.to_le_bytes());
-        output.extend_from_slice(&self.used_length.to_le_bytes());
-        output.extend_from_slice(&self.tag.to_le_bytes());
-        output.extend_from_slice(&compressed);
+        output[..4].copy_from_slice(if portable { PORTABLE_CSS } else { b"CSS\0" });
+        output[4..8].copy_from_slice(&compressed_length.to_le_bytes());
+        output[8..12].copy_from_slice(&self.used_length.to_le_bytes());
+        output[12..16].copy_from_slice(&self.tag.to_le_bytes());
         Ok(output)
     }
 
     pub fn snapshot(&self) -> Result<Vec<u8>, CssError> {
         if self.used_length > self.logical_capacity { return Err(CssError::UsedOutOfBounds); }
         let body = self.used_bytes()?;
-        if CSS_HEADER_SIZE.checked_add(body.len()).is_none_or(|length| length > MAX_BUFFER) {
+        let portable = self.logical_capacity as usize > MAX_BUFFER || CSS_HEADER_SIZE + body.len() > MAX_BUFFER;
+        if portable && !contains_host_graph(&self.records) {
             return Err(CssError::TooLarge);
         }
         let mut output = Vec::with_capacity(16 + body.len());
-        output.extend_from_slice(&0u32.to_le_bytes());
+        output.extend_from_slice(if portable { PORTABLE_CSS } else { &[0; 4] });
         output.extend_from_slice(&self.logical_capacity.to_le_bytes());
         output.extend_from_slice(&self.used_length.to_le_bytes());
         output.extend_from_slice(&self.tag.to_le_bytes());
@@ -306,7 +343,9 @@ impl CssFile {
         let used_length = u32_at(data, 8).ok_or(CssError::Truncated)?;
         let tag = u32_at(data, 12).ok_or(CssError::Truncated)?;
         let used = used_length as usize;
-        if capacity > MAX_BUFFER { return Err(CssError::TooLarge); }
+        let portable = data.get(..4) == Some(PORTABLE_CSS) && capacity > MAX_BUFFER;
+        let limit = if portable { MAX_HOST_GRAPH_CSS_BYTES } else { MAX_BUFFER };
+        if capacity > limit { return Err(CssError::TooLarge); }
         if used > capacity { return Err(CssError::UsedOutOfBounds); }
         let end = CSS_HEADER_SIZE.checked_add(used).ok_or(CssError::TooLarge)?;
         if data.len() < end { return Err(CssError::Truncated); }
@@ -315,6 +354,7 @@ impl CssFile {
         // containing-record suffix as well as the old pointer DWORD.
         storage[..used].copy_from_slice(&data[CSS_HEADER_SIZE..end]);
         let records = record_view(&storage, capacity)?;
+        if portable && !contains_host_graph(&records) { return Err(CssError::InvalidRecord); }
         Ok(Self {
             used_length,
             tag,
@@ -325,16 +365,20 @@ impl CssFile {
         })
     }
 
-    fn append_bytes(&mut self, bytes: &[u8]) -> Result<(), CssError> {
+    fn storage_limit(&self) -> usize {
+        if self.storage.len() > MAX_BUFFER { MAX_HOST_GRAPH_BYTES + CSS_BLOCK_SIZE } else { MAX_BUFFER }
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8], limit: usize) -> Result<(), CssError> {
         let used = self.used_length as usize;
         if used > self.storage.len() { return Err(CssError::UsedOutOfBounds); }
-        let new_used = used.checked_add(bytes.len()).filter(|&used| used <= MAX_BUFFER)
+        let new_used = used.checked_add(bytes.len()).filter(|&used| used <= limit)
             .ok_or(CssError::TooLarge)?;
         let crossed = new_used / CSS_BLOCK_SIZE - used / CSS_BLOCK_SIZE;
         if crossed != 0 {
             let capacity = (self.logical_capacity as usize).checked_add(
                 crossed.checked_mul(CSS_BLOCK_SIZE).ok_or(CssError::TooLarge)?
-            ).filter(|&capacity| capacity <= MAX_BUFFER).ok_or(CssError::TooLarge)?;
+            ).filter(|&capacity| capacity <= limit).ok_or(CssError::TooLarge)?;
             let mut replacement = zero_storage(capacity)?;
             // Reallocation copies logical capacity, not retained allocation.
             let previous = self.logical_capacity as usize;
@@ -350,14 +394,17 @@ impl CssFile {
 }
 
 fn zero_storage(capacity: usize) -> Result<Vec<u8>, CssError> {
-    if capacity > MAX_BUFFER { return Err(CssError::TooLarge); }
     let mut storage = Vec::new();
     storage.try_reserve_exact(capacity).map_err(|_| CssError::AllocationFailed)?;
     storage.resize(capacity, 0);
     Ok(storage)
 }
 
-fn inflate_container(input: &[u8], storage: &mut [u8]) -> CssInflationStatus {
+fn contains_host_graph(records: &[CssRecord]) -> bool {
+    records.iter().any(|record| record.data.starts_with(HOST_GRAPH_MAGIC))
+}
+
+fn inflate_container(input: &[u8], storage: &mut [u8], limit: usize) -> CssInflationStatus {
     let mut decoder = Decompress::new(true);
     let mut result = CssInflationStatus::default();
     let mut scratch = [0u8; 0x1000];
@@ -377,7 +424,7 @@ fn inflate_container(input: &[u8], storage: &mut [u8]) -> CssInflationStatus {
         // The original helper continues consuming input after capacity is
         // full. Keep that behavior for bounded streams, with an explicit
         // diagnostic when discarded expansion would exceed the reader limit.
-        if decoder.total_out() > MAX_BUFFER as u64 {
+        if decoder.total_out() > limit as u64 {
             result.limit_reached = true;
             break;
         }
@@ -458,6 +505,33 @@ fn zero_tail_start(data: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_css_roundtrips_a_file_over_the_ordinary_limit() -> Result<(), CssError> {
+        let mut payload = vec![0; MAX_BUFFER + 1024];
+        let mut rng = 0xaceu32;
+        for pixel in payload.as_chunks_mut::<4>().0 {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            *pixel = rng.to_le_bytes();
+        }
+        payload[..HOST_GRAPH_MAGIC.len()].copy_from_slice(HOST_GRAPH_MAGIC);
+        let mut file = CssFile::new(1000);
+        assert_eq!(file.append(42, &payload), Err(CssError::TooLarge));
+        file.append_host_graph(42, &payload)?;
+        let mut encoded = file.to_css()?;
+        drop(file);
+        assert!(encoded.len() > MAX_BUFFER);
+        assert_eq!(&encoded[..4], PORTABLE_CSS);
+        encoded[..4].copy_from_slice(b"CSS\0");
+        assert_eq!(CssFile::parse(&encoded).unwrap_err(), CssError::TooLarge);
+        encoded[..4].copy_from_slice(PORTABLE_CSS);
+        let restored = CssFile::from_css(&encoded)?.unwrap();
+        assert_eq!(restored.try_record(42)?, Some(payload.as_slice()));
+        assert_eq!(restored.inflation_status().unwrap().output_written, restored.used_len());
+        Ok(())
+    }
 
     #[test]
     fn css_append_rolls_back_an_invalid_write_inside_logical_capacity() {

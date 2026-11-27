@@ -76,9 +76,7 @@ impl CanvasNativeState {
             offscreen: self.offscreen.as_ref().map(capture_offscreen).transpose()?,
         };
         if let Some(overflow) = overflow {
-            let mut payload = OVERFLOW_TAG.to_vec();
-            payload.extend(wire::encode_component(&(state, overflow))?);
-            Ok(payload)
+            Ok(wire::encode_image_component(&(state, overflow), OVERFLOW_TAG)?)
         } else {
             Ok(wire::encode_component(&state)?)
         }
@@ -86,7 +84,7 @@ impl CanvasNativeState {
 
     pub(crate) fn prepare_graph_restore(bytes: &[u8], logical: [u32; 2], memory: ImageListMemory) -> Result<(Self, Option<VramOverflow>)> {
         let (s, overflow): (Snapshot, Option<VramOverflow>) = if let Some(bytes) = bytes.strip_prefix(OVERFLOW_TAG) {
-            let (state, overflow) = wire::decode_component(bytes)?;
+            let (state, overflow) = wire::decode_image_component(bytes)?;
             (state, Some(overflow))
         } else {
             (wire::decode_component(bytes)?, None)

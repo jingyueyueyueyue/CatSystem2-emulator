@@ -217,9 +217,18 @@ pub(crate) fn capture_frame(frame: &RgbaFrame) -> ImageFrameSnapshot {
 }
 
 pub(crate) fn restore_frame(s: &ImageFrameSnapshot) -> anyhow::Result<RgbaFrame> {
+    restore_frame_with_limit(s, MAX_PIXELS)
+}
+
+pub(crate) fn restore_list_frame(s: &ImageFrameSnapshot, memory: crate::fes_task_platform::ImageListMemory) -> anyhow::Result<RgbaFrame> {
+    let limit = if s.container == 0 { memory.limit() as usize } else { MAX_PIXELS };
+    restore_frame_with_limit(s, limit)
+}
+
+fn restore_frame_with_limit(s: &ImageFrameSnapshot, limit: usize) -> anyhow::Result<RgbaFrame> {
     use cs2_renderer::HgContainer;
     let size = (s.size[0] as usize).checked_mul(s.size[1] as usize).and_then(|n| n.checked_mul(4));
-    if size != Some(s.rgba.len()) || s.rgba.len() > MAX_PIXELS || !matches!(s.bit_depth, 24 | 32) {
+    if size != Some(s.rgba.len()) || s.rgba.len() > limit || !matches!(s.bit_depth, 24 | 32) {
         anyhow::bail!("saved image has invalid dimensions, storage size or pixel depth");
     }
     let m = FrameMetadata {
@@ -229,6 +238,6 @@ pub(crate) fn restore_frame(s: &ImageFrameSnapshot) -> anyhow::Result<RgbaFrame>
         frame_id: s.frame_id, bit_depth: s.bit_depth, offset: s.offset,
         canvas_size: s.canvas_size, base: s.base, alpha_flag: s.alpha_flag,
     };
-    Ok(RgbaFrame::from_native_rgba8(s.size[0], s.size[1], s.rgba.clone(), m)?
+    Ok(RgbaFrame::from_native_rgba8_with_limit(s.size[0], s.size[1], s.rgba.clone(), m, limit)?
         .with_hg_attributes(HgFrameAttributes::new(s.attributes.clone())))
 }

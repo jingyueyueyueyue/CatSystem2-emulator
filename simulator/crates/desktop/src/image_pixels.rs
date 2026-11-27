@@ -175,7 +175,7 @@ impl LoggingHost<'_> {
 }
 
 fn rebuild(frame: &RgbaFrame, pixels: Vec<u8>) -> Result<RgbaFrame> {
-    RgbaFrame::from_native_rgba8(frame.width(), frame.height(), pixels, frame.metadata())
+    RgbaFrame::from_native_rgba8_with_limit(frame.width(), frame.height(), pixels, frame.metadata(), frame.pixels().len())
         .map(|rebuilt| rebuilt.with_raw_metadata(frame.metadata()).with_hg_attributes(frame.hg_attributes().clone()))
         .map_err(|_| native_state_error("ordinary image pixel rebuild failed"))
 }

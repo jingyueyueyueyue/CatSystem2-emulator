@@ -64,6 +64,7 @@ fn texture_extent(tile: [u32; 2], grid: [u32; 2]) -> Result<[u32; 2]> {
 pub(super) struct VramOverflow {
     tile: [u32; 2],
     grid: [u32; 2],
+    #[serde(with = "tile_pixels_wire")]
     pixels: BTreeMap<u32, Vec<u8>>,
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
     #[serde(skip)]
@@ -71,6 +72,33 @@ pub(super) struct VramOverflow {
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
     #[serde(skip)]
     texture_updates: std::cell::RefCell<AtlasUpdates>,
+}
+
+mod tile_pixels_wire {
+    use std::collections::BTreeMap;
+    use cs2_runtime::{graph_serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap},
+        object_graph::wire_bytes};
+
+    #[derive(Serialize)]
+    #[serde(crate = "cs2_runtime::graph_serde")]
+    struct TileBytesRef<'a>(#[serde(serialize_with = "wire_bytes::serialize")] &'a [u8]);
+
+    #[derive(Deserialize)]
+    #[serde(crate = "cs2_runtime::graph_serde")]
+    struct TileBytes(#[serde(with = "wire_bytes")] Vec<u8>);
+
+    pub(super) fn serialize<S: Serializer>(pixels: &BTreeMap<u32, Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(pixels.len()))?;
+        for (index, bytes) in pixels {
+            map.serialize_entry(index, &TileBytesRef(bytes))?;
+        }
+        map.end()
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<u32, Vec<u8>>, D::Error> {
+        let tiles = BTreeMap::<u32, TileBytes>::deserialize(deserializer)?;
+        Ok(tiles.into_iter().map(|(index, bytes)| (index, bytes.0)).collect())
+    }
 }
 
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
@@ -231,7 +259,7 @@ impl VramOverflow {
     }
 
     fn max_resident_tiles(&self, memory: ImageListMemory) -> usize {
-        (memory.limit() / self.tile_bytes()) as usize
+        (memory.offscreen_limit() / self.tile_bytes()) as usize
     }
 
     fn tile_pixels_mut(&mut self, index: u32, memory: ImageListMemory) -> Result<&mut [u8]> {
@@ -241,7 +269,7 @@ impl VramOverflow {
             self.pixels.retain(|_, bytes| list_span_occupies_tile(bytes, 32));
             if self.pixels.len() >= limit {
                 bail!("offscreen canvas tile [{}, {}] needs {tile_bytes} bytes with {} resident tiles (budget {} bytes)",
-                    index % self.grid[0], index / self.grid[0], self.pixels.len(), memory.limit());
+                    index % self.grid[0], index / self.grid[0], self.pixels.len(), memory.offscreen_limit());
             }
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
             self.reset_gpu_atlas();
@@ -1352,6 +1380,23 @@ mod tests {
         assert!(!atlas.pixels.contains_key(&0));
         assert_eq!(atlas.pixel(4096, 0), Some(color));
         assert_eq!(atlas.pixel(8192, 0), Some(color));
+        Ok(())
+    }
+
+    #[test]
+    fn offscreen_fallback_holds_all_576_tiles_with_pixels() -> Result<()> {
+        let tile = [256, 256];
+        let grid = [24, 24];
+        let memory = ImageListMemory::default();
+        let mut atlas = VramOverflow::new(tile, grid);
+        let color = Color::rgb(91, 127, 231);
+        for index in 0..576 {
+            atlas.tile_pixels_mut(index, memory)?.as_chunks_mut::<4>().0.fill([color.r, color.g, color.b, color.a]);
+        }
+        assert_eq!(atlas.pixels.len(), 576);
+        assert!(atlas.pixels.values().all(|bytes| bytes.as_chunks::<4>().0
+            .iter().all(|pixel| *pixel == [color.r, color.g, color.b, color.a])));
+        assert_eq!(atlas.pixel(6143, 6143), Some(color));
         Ok(())
     }
 

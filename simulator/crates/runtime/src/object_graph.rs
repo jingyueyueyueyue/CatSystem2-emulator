@@ -13,11 +13,13 @@ use crate::scene_tools::SceneMessageMemorySnapshot;
 // Desktop additionally proves the actual consumers: 41/42 must be the live
 // FES SCROLL2/SLIDER lower tasks, never an unrelated legacy model kind42.
 pub const SUPPORTED_TASK_KINDS: &[u32] = &[0, 1, 2, 6, 11, 12, 13, 15, 16, 18, 25, 26, 27, 34, 41, 42];
-pub const MAX_GRAPH_BYTES: usize = 64 * 1024 * 1024;
+pub use cs2_formats::save::MAX_HOST_GRAPH_BYTES as MAX_GRAPH_BYTES;
+pub use cs2_script::data_snapshot::wire_bytes;
+const MAX_COMPONENT_BYTES: usize = 64 * 1024 * 1024;
 // Version 4 includes standalone data objects, record stacks and parsed XML.
 // Old unpublished simulator
 // wire layouts are rejected before decoding; native game CSS is unaffected.
-const MAGIC: &[u8; 12] = b"CS2HOSTGRPH4";
+const MAGIC: &[u8] = cs2_formats::save::HOST_GRAPH_MAGIC;
 #[path = "graph_codec.rs"]
 mod codec;
 
@@ -47,7 +49,10 @@ pub struct SceneNodeSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageFrameSnapshot {
-    pub size: [u32; 2], pub rgba: Vec<u8>, pub container: u32,
+    pub size: [u32; 2],
+    #[serde(with = "wire_bytes")]
+    pub rgba: Vec<u8>,
+    pub container: u32,
     pub frame_id: Option<u32>, pub bit_depth: u8, pub offset: [i32; 2],
     pub canvas_size: [u32; 2], pub base: [i32; 2], pub alpha_flag: u32,
     pub attributes: BTreeMap<u16, [u32; 5]>,
@@ -110,6 +115,7 @@ pub struct ObjectGraphSnapshot {
     pub image_export: ImageExportStateSnapshot, pub back_buffer: ImageFrameSnapshot,
     pub image_resources: BTreeMap<u32, ImageResourceSnapshot>,
     /// Desktop image-list component: shared entries, frame tables and cursors.
+    #[serde(with = "wire_bytes")]
     pub image_lists: Vec<u8>,
     pub message_defaults: Option<crate::message_object::MessageDefaults>,
     pub graphics_canvas: ImageFrameSnapshot,
@@ -126,10 +132,18 @@ pub struct ObjectGraphSnapshot {
 
 /// Component wire shares the enclosing graph's version and resource bounds.
 pub fn encode_component<T: Serialize>(value: &T) -> RuntimeResult<Vec<u8>> {
-    codec::encode(value).map_err(|error| invalid(&error.to_string()))
+    codec::encode(value, &[], MAX_COMPONENT_BYTES).map_err(|error| invalid(&error.to_string()))
 }
 pub fn decode_component<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> RuntimeResult<T> {
-    codec::decode(bytes).map_err(|error| invalid(&error.to_string()))
+    codec::decode(bytes, MAX_COMPONENT_BYTES).map_err(|error| invalid(&error.to_string()))
+}
+
+pub fn encode_image_component<T: Serialize>(value: &T, prefix: &[u8]) -> RuntimeResult<Vec<u8>> {
+    codec::encode(value, prefix, MAX_GRAPH_BYTES).map_err(|error| invalid(&error.to_string()))
+}
+
+pub fn decode_image_component<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> RuntimeResult<T> {
+    codec::decode(bytes, MAX_GRAPH_BYTES).map_err(|error| invalid(&error.to_string()))
 }
 
 impl ObjectGraphSnapshot {
@@ -144,7 +158,7 @@ impl ObjectGraphSnapshot {
             || self.pending_messages.len() > 1_000_000 || self.pending_fes_events.len() > 1_000_000
             || self.detached_external.len() > 1_000_000 || self.emocon.len() > 65_536
             || self.image_pixels.len() > 1_000_000 || self.image_resources.len() > 1_000_000
-            || self.host_continuation.len() > MAX_GRAPH_BYTES
+            || self.host_continuation.len() > MAX_COMPONENT_BYTES
             || self.image_lists.len() > MAX_GRAPH_BYTES
         { return Err(invalid("host graph has invalid version, identity sets or fixed-size state")); }
         for (&id, record) in &self.records {
@@ -191,7 +205,7 @@ impl ObjectGraphSnapshot {
         }
         let mut external_bytes = 0usize;
         for bytes in &self.detached_external {
-            external_bytes = external_bytes.checked_add(bytes.len()).filter(|&total| total <= MAX_GRAPH_BYTES)
+            external_bytes = external_bytes.checked_add(bytes.len()).filter(|&total| total <= MAX_COMPONENT_BYTES)
                 .ok_or_else(|| invalid("detached external group exceeds 64 MiB"))?;
         }
         self.numeric.validate()?;
@@ -211,18 +225,14 @@ impl ObjectGraphSnapshot {
 
     pub fn encode(&self) -> RuntimeResult<Vec<u8>> {
         self.validate_structure()?;
-        let body = codec::encode(self).map_err(|error| RuntimeError::InvalidSave(error.to_string()))?;
-        if body.len() > MAX_GRAPH_BYTES - MAGIC.len() { return Err(invalid("host graph exceeds 64 MiB")); }
-        let mut output = MAGIC.to_vec();
-        output.extend_from_slice(&body);
-        Ok(output)
+        codec::encode(self, MAGIC, MAX_GRAPH_BYTES).map_err(|error| RuntimeError::InvalidSave(error.to_string()))
     }
 
     pub fn decode(bytes: &[u8]) -> RuntimeResult<Self> {
         if bytes.len() > MAX_GRAPH_BYTES || !bytes.starts_with(MAGIC) {
             return Err(invalid("CSS record is not a supported versioned host graph"));
         }
-        let saved: Self = codec::decode(&bytes[MAGIC.len()..])
+        let saved: Self = codec::decode(&bytes[MAGIC.len()..], MAX_GRAPH_BYTES - MAGIC.len())
             .map_err(|error| RuntimeError::InvalidSave(error.to_string()))?;
         saved.validate_structure()?;
         Ok(saved)

@@ -34,7 +34,7 @@ libc = "0.2"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "27", default-features = false, features = ["std", "dx12", "wgsl"], optional = true }
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ash = { version = "0.38", default-features = false, optional = true }

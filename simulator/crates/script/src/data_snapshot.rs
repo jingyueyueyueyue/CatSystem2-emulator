@@ -19,7 +19,50 @@ pub struct CssObjectSnapshot {
     pub tag: u32,
     pub logical_capacity: u32,
     pub used_length: u32,
+    #[serde(with = "wire_bytes")]
     pub allocation: Vec<u8>,
+}
+
+/// A byte sequence encoded as its length and bytes by the host graph codec.
+pub mod wire_bytes {
+    use serde::{Deserializer, Serializer, de};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct BytesVisitor;
+
+        impl<'de> de::Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte sequence")
+            }
+
+            fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+                let mut output = Vec::new();
+                output.try_reserve_exact(bytes.len()).map_err(E::custom)?;
+                output.extend_from_slice(bytes);
+                Ok(output)
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(bytes)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut output = Vec::new();
+                while let Some(byte) = seq.next_element()? {
+                    output.push(byte);
+                }
+                Ok(output)
+            }
+        }
+
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
 }
 
 impl CssObjectSnapshot {
@@ -30,7 +73,7 @@ impl CssObjectSnapshot {
 
     pub fn restore(&self) -> Result<CssFile> {
         if self.handle == 0 { return Err(invalid("CSS object snapshot has a zero handle")); }
-        if self.allocation.len() > 64 * 1024 * 1024
+        if self.allocation.len() > cs2_formats::save::MAX_HOST_GRAPH_CSS_BYTES
             || self.logical_capacity as usize > self.allocation.len()
         {
             return Err(invalid("CSS object snapshot allocation/capacity is invalid"));
@@ -322,11 +365,14 @@ impl ScriptDataObjectsSnapshot {
                 return Err(invalid("script data snapshot repeats an object identity"));
             }
             if container.logical_capacity as usize > container.allocation.len()
-                || container.allocation.len() > 64 * 1024 * 1024
+                || container.allocation.len() > cs2_formats::save::MAX_HOST_GRAPH_CSS_BYTES
             {
                 return Err(invalid("CSS object snapshot allocation/capacity is invalid"));
             }
-            total = total.checked_add(container.allocation.len())
+            // Extended portable CSS is bounded separately by the enclosing graph
+            // and revalidated as a tagged container before it becomes live.
+            let ordinary_bytes = container.allocation.len().min(64 * 1024 * 1024);
+            total = total.checked_add(ordinary_bytes)
                 .filter(|&total| total <= MAX_BYTES)
                 .ok_or_else(|| invalid("script data object storage exceeds 256 MiB"))?;
         }

@@ -59,7 +59,7 @@ impl ListSurface {
         }
     }
 
-    pub(super) fn from_snapshot(s: &SurfaceSnapshot) -> Result<Self> {
+    pub(super) fn from_snapshot(s: &SurfaceSnapshot, memory: crate::fes_task_platform::ImageListMemory) -> Result<Self> {
         if s.tiles.len() > 1_000_000 || s.history.len() > 1_000_000
             || s.intermediate.len() > 1_000_000 {
             bail!("saved image-list tile/history count exceeds limit");
@@ -79,7 +79,7 @@ impl ListSurface {
         }).collect::<Result<_>>()?;
         let history = s.history.iter().map(|(key, h)| Ok((key.clone(), History {
             bounds: h.bounds.as_ref().map(unrect),
-            frame: crate::image_manager::restore_frame(&h.frame)?,
+            frame: crate::image_manager::restore_list_frame(&h.frame, memory)?,
             options: unoptions(&h.options)?, priority: h.priority, affine: h.options.affine,
         }))).collect::<Result<_>>()?;
         Ok(Self { size: s.size, tiles, history, intermediate: s.intermediate.iter()
@@ -701,6 +701,29 @@ mod tests {
             assert_eq!(host.data_services.tasks.fes.platform.lists[&id].output, handle);
             Ok(())
         })
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_open_samples_memory_for_lists_over_128_mib() -> Result<()> {
+        use crate::fes_task_platform::ImageListMemory;
+
+        let root = crate::tests::TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&root.0, root.0.join("profile"))?;
+        let bytes = 136 * 1024 * 1024;
+        if ImageListMemory::for_windows_host().limit() >= bytes {
+            player.with_host(|host| {
+                let id = host.create_task_object(15, host.current_task_id, b"windows", b"")?;
+                host.list_contract_native(256, &[id, 8192, 4352].map(u32::to_le_bytes).concat())?;
+                compose(host, id, true, None)?;
+                let handle = host.data_services.tasks.fes.platform.lists[&id].output;
+                assert_eq!(host.image_handles[&handle].pixels().len() as u64, bytes);
+                Ok(())
+            })?;
+        } else {
+            assert!(player.data_services.image_list_memory.limit() < bytes);
+        }
+        Ok(())
     }
 
     #[test]

@@ -505,6 +505,8 @@ impl super::fes_tasks::FesTaskStore {
 
 const BASE_IMAGE_LIST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_IMAGE_LIST_BYTES: u64 = 512 * 1024 * 1024;
+// A 24x24 grid of 256x256 RGBA8 tiles can be entirely offscreen.
+const BASE_OFFSCREEN_BYTES: u64 = 144 * 1024 * 1024;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct ImageListMemory {
@@ -520,6 +522,22 @@ impl ImageListMemory {
 
     pub(super) fn limit(&self) -> u64 {
         (self.available_bytes / 8).clamp(BASE_IMAGE_LIST_BYTES, MAX_IMAGE_LIST_BYTES)
+    }
+
+    pub(super) fn offscreen_limit(&self) -> u64 {
+        self.limit().max(BASE_OFFSCREEN_BYTES)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn for_windows_host() -> Self {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return Self::default();
+        }
+        Self::new(status.ullAvailPhys)
     }
 }
 

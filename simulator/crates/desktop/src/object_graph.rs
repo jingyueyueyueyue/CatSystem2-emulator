@@ -246,8 +246,8 @@ impl HeadlessPlayer {
         };
         // Capture validates the same full replacement which restore accepts,
         // including pointer-domain collisions and saved scheduler cursors.
-        self.prepare_object_graph(saved.clone()).context("validate captured host graph")?;
-        Ok(saved)
+        let prepared = self.prepare_object_graph(saved).context("validate captured host graph")?;
+        Ok(prepared.saved)
     }
 
     fn graph_pe_sha(&self) -> &str {
@@ -261,17 +261,18 @@ impl HeadlessPlayer {
     }
 
     fn append_graph_record(&mut self, handle: u32, record: u32, bytes: &[u8]) -> anyhow::Result<()> {
-        let file = self.css_handles.get(&handle).ok_or_else(|| anyhow::anyhow!("graph destination CSS handle is absent"))?;
-        let mut replacement = file.clone();
-        replacement.append(record, bytes)?;
-        self.css_handles.insert(handle, replacement);
+        let file = self.css_handles.get_mut(&handle).ok_or_else(|| anyhow::anyhow!("graph destination CSS handle is absent"))?;
+        file.append_host_graph(record, bytes)?;
         Ok(())
     }
 
     pub fn restore_object_graph_from_container(&mut self, handle: u32, record: u32) -> anyhow::Result<()> {
+        self.check_object_graph_boundary()?;
         let bytes = self.css_handles.get(&handle).ok_or_else(|| anyhow::anyhow!("graph source CSS handle is absent"))?
-            .try_record(record)?.ok_or_else(|| anyhow::anyhow!("graph source CSS record is absent"))?.to_vec();
-        self.restore_object_graph_bytes(&bytes)
+            .try_record(record)?.ok_or_else(|| anyhow::anyhow!("graph source CSS record is absent"))?;
+        let prepared = self.prepare_object_graph(ObjectGraphSnapshot::decode(bytes)?)?;
+        self.commit_object_graph(prepared);
+        Ok(())
     }
 
     pub fn restore_object_graph_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -346,7 +347,10 @@ impl HeadlessPlayer {
         tasks.restore_shared_numeric_state(&mut values, saved.numeric.clone())?;
         tasks.commit_scene_message_memory_restore(scene);
         let mut nodes = saved.nodes.iter().map(|(&id, node)| Ok((id, restore_node(node)?))).collect::<anyhow::Result<_>>()?;
-        let pixels = saved.image_pixels.iter().map(|(&id, frame)| Ok((id, restore_frame(frame)?))).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let pixels = saved.image_pixels.iter().map(|(&id, frame)| {
+            let image = crate::image_manager::restore_list_frame(frame, self.data_services.image_list_memory)?;
+            Ok((id, image))
+        }).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let images = saved.wrapper_pixels.iter().map(|(&wrapper, &pixel)| {
             let image = pixels.get(&pixel).ok_or_else(|| anyhow::anyhow!("wrapper alias refers to absent image pixels"))?;
             Ok((wrapper, image.clone()))
@@ -552,6 +556,74 @@ mod tests {
     use cs2_formats::CssFile;
     use cs2_script::KcsProgram;
     use std::path::Path;
+
+    #[test]
+    #[ignore = "requires the installed V401 engine and exercises a 288 MiB image checkpoint"]
+    fn dense_canvas_and_large_list_survive_css_file_rollback() -> anyhow::Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let scratch = TempDir::new();
+        std::fs::copy(workspace.join("games/cs2_full_v401/system/cs2_open.exe"), scratch.0.join("cs2_open.exe"))?;
+        std::fs::write(scratch.0.join("startup.xml"), br#"<?xml version="1.0" encoding="UTF-8"?>
+            <document><SCREEN><width>128</width><height>128</height></SCREEN>
+            <TEXTURE><size><x>256</x><y>256</y></size><vt><x>24</x><y>24</y></vt></TEXTURE></document>"#)?;
+        let save = scratch.0.join("profile");
+        let mut player = HeadlessPlayer::open_with_android_memory(
+            &scratch.0, &save, cs2_runtime::resource_router::GameLanguage::Automatic, 2 << 30,
+        )?;
+        player.vm = Some(Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 8], 0)?)?);
+        let edge = 6144;
+        let base_color = 0xff28_567c;
+        let corner_color = 0xff80_4020;
+        let (file, wrapper) = player.with_host(|host| {
+            let root = host.current_task_id;
+            host.ensure_task_record(root)?;
+            let id = host.create_task_object(15, root, b"imglist", b"")?;
+            host.list_contract_native(256, &[id, edge, edge].map(u32::to_le_bytes).concat())?;
+            assert!(host.update_ordinary_children(root, 1, 1, 16_384)?);
+            let wrapper = host.data_services.tasks.fes.platform.lists[&id].output;
+            let mut vm = Vm::new();
+            for [x, y, width, height, color] in [[0, 0, edge, edge, base_color], [edge - 1, 0, 1, 1, corner_color]] {
+                let args = [wrapper, x, y, width, height, color].map(u32::to_le_bytes).concat();
+                host.image_pixels_native(117, &args, &mut vm)?;
+            }
+            host.list_contract_native(262, &[id, 1].map(u32::to_le_bytes).concat())?;
+            assert!(host.update_ordinary_children(root, 1, 1, 16_384)?);
+            let file = host.allocate_handle();
+            host.css_handles.insert(file, CssFile::new(1000));
+            Ok((file, wrapper))
+        })?;
+
+        let assert_pixels = |p: &HeadlessPlayer| -> anyhow::Result<()> {
+            let image = &p.image_handles[&wrapper];
+            let atlas = p.data_services.planes.vram_overflow.as_ref().context("missing dense atlas")?;
+            for row in 0..24 {
+                for column in 0..24 {
+                    let x = column * 256 + 192;
+                    let y = row * 256 + 192;
+                    assert_eq!(atlas.pixel(x, y), Some(crate::packed_color(base_color)));
+                    assert_eq!(image.pixel(x as i32, y as i32)?, crate::packed_color(base_color));
+                }
+            }
+            assert_eq!(atlas.pixel(edge - 1, edge - 1), Some(crate::packed_color(corner_color)));
+            assert_eq!(image.pixel(edge as i32 - 1, edge as i32 - 1)?, crate::packed_color(corner_color));
+            Ok(())
+        };
+        assert_pixels(&player)?;
+        player.save_object_graph_to_container(file, 42)?;
+        let css = player.css_handles.remove(&file).unwrap();
+        assert!(css.try_record(42)?.unwrap().len() > 288 * 1024 * 1024);
+        let disk = css.to_css()?;
+        drop(css);
+        assert_eq!(&disk[..4], b"CSG\0");
+        crate::write_save_css(&save, "dense.dat", &disk)?;
+        let loaded = CssFile::parse(&crate::read_save_css(&save, "dense.dat")?)?;
+        player.css_handles.insert(file, loaded);
+        player.data_services.planes.vram_overflow = None;
+        player.current_parameter = 112;
+        player.restore_object_graph_from_container(file, 42)?;
+        assert_ne!(player.current_parameter, 112);
+        assert_pixels(&player)
+    }
 
     #[test]
     #[ignore = "requires the installed V401 engine"]

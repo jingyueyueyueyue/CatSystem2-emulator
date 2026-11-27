@@ -7350,6 +7350,10 @@ impl HeadlessPlayer {
             player.enable_host_fast_forward(available);
             player.data_services.image_list_memory = fes_task_platform::ImageListMemory::new(available);
         }
+        #[cfg(windows)]
+        if available_memory_bytes.is_none() {
+            player.data_services.image_list_memory = fes_task_platform::ImageListMemory::for_windows_host();
+        }
         let executable_table = cs2_runtime::native_table::OrdinaryNativeTable::from_game_executable(&player.scan);
         player.data_services.ordinary_native_table_from_executable = executable_table.is_some();
         player.data_services.ordinary_native_table = executable_table.or_else(|| {
@@ -10510,8 +10514,17 @@ fn save_path(root: &Path, name: &str) -> Result<PathBuf> {
 }
 
 fn read_save_css(root: &Path, name: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+
     let path = save_path(root, name)?;
-    fs::read(&path).with_context(|| format!("read save file {}", path.display()))
+    let mut file = fs::File::open(&path).with_context(|| format!("open save file {}", path.display()))?;
+    let mut header = Vec::with_capacity(4);
+    (&mut file).take(4).read_to_end(&mut header)?;
+    let limit = CssFile::file_size_limit(&header);
+    if file.metadata()?.len() > limit as u64 { bail!("save file exceeds its CSS size limit"); }
+    file.take((limit + 1 - header.len()) as u64).read_to_end(&mut header)?;
+    if header.len() > limit { bail!("save file exceeds its CSS size limit"); }
+    Ok(header)
 }
 
 fn write_save_css(root: &Path, name: &str, data: &[u8]) -> Result<()> {

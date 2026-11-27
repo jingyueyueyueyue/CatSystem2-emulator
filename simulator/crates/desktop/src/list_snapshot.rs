@@ -2,7 +2,7 @@
 use super::*;
 use cs2_runtime::graph_serde::{Deserialize, Serialize};
 use cs2_runtime::object_graph::{self as wire, ImageFrameSnapshot, ObjectGraphSnapshot};
-use crate::image_manager::{capture_frame, restore_frame};
+use crate::image_manager::{capture_frame, restore_list_frame};
 use crate::fes_task_platform::ImageList;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -120,7 +120,9 @@ struct Snapshot {
     offsets: BTreeMap<u32, [i32; 2]>, switches: BTreeMap<u32, [bool; 3]>,
     lists: BTreeMap<u32, ListState>,
     resource_geometry: BTreeMap<u32, crate::image_manager::ResourceGeometry>,
-    planes: Vec<u8>, canvas: Vec<u8>,
+    planes: Vec<u8>,
+    #[serde(with = "wire::wire_bytes")]
+    canvas: Vec<u8>,
     cache: crate::image_manager::ImageCacheSnapshot,
 }
 
@@ -225,13 +227,13 @@ impl crate::HeadlessPlayer {
                 .graph_snapshot(self.data_services.planes.vram_overflow.as_ref())?,
             cache: self.data_services.image_manager.cache_snapshot(),
         };
-        Ok(wire::encode_component(&snapshot)?)
+        Ok(wire::encode_image_component(&snapshot, &[])?)
     }
 
     pub(crate) fn prepare_image_list_state_restore(&self, saved: &ObjectGraphSnapshot,
         images: &BTreeMap<u32, RgbaFrame>, resources: &mut BTreeMap<u32, crate::DesktopImageResource>,
     ) -> Result<PreparedImageLists> {
-        let s: Snapshot = wire::decode_component(&saved.image_lists)?;
+        let s: Snapshot = wire::decode_image_component(&saved.image_lists)?;
         if s.version != 4 {
             bail!("unsupported saved image component revision {}; expected 4", s.version);
         }
@@ -250,8 +252,9 @@ impl crate::HeadlessPlayer {
             resources.get_mut(&id).unwrap().geometry = *geometry;
         }
         let planes = Self::prepare_plane_visuals_restore(&s.planes, saved)?;
+        let memory = self.data_services.image_list_memory;
         let (canvas, vram_overflow) = crate::canvas_native::CanvasNativeState::prepare_graph_restore(&s.canvas,
-            saved.back_buffer.size, self.data_services.image_list_memory)?;
+            saved.back_buffer.size, memory)?;
         let cache = crate::image_manager::ImageManager::prepare_cache_restore(s.cache)?;
         let list = |id: &u32| s.lists.contains_key(id)
             && saved.records.get(id).is_some_and(|r| r.kind == 15);
@@ -298,7 +301,7 @@ impl crate::HeadlessPlayer {
                 let bytes = frame.rgba.len().checked_add(image.pixels().len())
                     .context("saved list frame cache allocation size overflow")?;
                 frame_charges.insert(id, frame_cache.reserve(bytes)?);
-                frames.insert(id, restore_frame(frame)?);
+                frames.insert(id, restore_list_frame(frame, memory)?);
             }
             shared.push(Rc::new(RefCell::new(Entry {
                 key: e.key, source, position: e.position.map(f32::from_bits), base: e.base.map(f32::from_bits),
@@ -326,7 +329,7 @@ impl crate::HeadlessPlayer {
                 bail!("saved image-list output or base plane is absent");
             }
             let layers = l.layers.iter().map(|(key, layer)| Ok((key.clone(), Layer {
-                frame: restore_frame(&layer.frame)?, options: unoptions(&layer.options)?, priority: layer.priority,
+                frame: restore_list_frame(&layer.frame, memory)?, options: unoptions(&layer.options)?, priority: layer.priority,
                 affine: layer.options.affine,
             }))).collect::<Result<_>>()?;
             lists.insert(id, ImageList { output: l.output, size: l.size, offset: l.offset,
@@ -349,7 +352,7 @@ impl crate::HeadlessPlayer {
         }
         let surfaces = s.surfaces.iter().map(|(&id, surface)| {
             if surface.size != lists[&id].size { bail!("saved list tile surface has the wrong size"); }
-            Ok((id, tiles::ListSurface::from_snapshot(surface)?))
+            Ok((id, tiles::ListSurface::from_snapshot(surface, memory)?))
         }).collect::<Result<_>>()?;
         if s.backgrounds.values().any(|(wrapper, _)| !images.contains_key(wrapper)) {
             bail!("saved list background wrapper is absent");
