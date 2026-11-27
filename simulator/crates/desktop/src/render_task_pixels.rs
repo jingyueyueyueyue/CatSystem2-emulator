@@ -136,8 +136,7 @@ pub(super) fn shade(target: &mut Canvas, source: &RgbaFrame, radius: Option<i32>
     let texture = texture_size(source)?;
     let taps = shade_taps(radius);
     if exact_unit_quad(source) {
-        draw_unit_spans(target, source, &taps);
-        return Ok(());
+        return draw_unit_spans(target, source, &taps);
     }
     shade_quads(target, source, texture, &taps)
 }
@@ -221,9 +220,9 @@ fn exact_unit_quad(source: &RgbaFrame) -> bool {
 
 /// Integer-aligned translations of the logical source rectangle. Each row
 /// sees the original draw order and stays hot across all Shade taps.
-fn draw_unit_spans(target: &mut Canvas, source: &RgbaFrame, taps: &[([i32; 2], u8)]) {
+fn draw_unit_spans(target: &mut Canvas, source: &RgbaFrame, taps: &[([i32; 2], u8)]) -> Result<()> {
     if taps.is_empty() || target.width() == 0 || target.height() == 0 {
-        return;
+        return Ok(());
     }
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
     {
@@ -248,7 +247,7 @@ fn draw_unit_spans(target: &mut Canvas, source: &RgbaFrame, taps: &[([i32; 2], u
             },
             Draw::EffectSpans { taps },
         ) {
-            return;
+            return Ok(());
         }
     }
     let width = target.width() as usize;
@@ -275,6 +274,7 @@ fn draw_unit_spans(target: &mut Canvas, source: &RgbaFrame, taps: &[([i32; 2], u
         source_height,
         u64::from(source_width) * u64::from(source_height) * spans.len() as u64,
     );
+    target.try_pixels()?;
     cs2_renderer::draw_pixel_rows(target.pixels_mut(), width * 4, 0, workers, |row, y| {
         for (range, start, offset_y, alpha) in &spans {
             let sy = (y as i64 - i64::from(*offset_y)) as usize;
@@ -289,6 +289,7 @@ fn draw_unit_spans(target: &mut Canvas, source: &RgbaFrame, taps: &[([i32; 2], u
             );
         }
     });
+    Ok(())
 }
 
 pub(super) fn effect_workers(width: u32, height: u32, pixels: u64) -> usize {
@@ -335,7 +336,7 @@ pub(super) fn composite(
     let size = texture_size(source)?;
     if !diffuse_alpha_only && exact_unit_quad(source) {
         if alpha != 0 {
-            draw_unit_spans(target, source, &[([0; 2], alpha)]);
+            draw_unit_spans(target, source, &[([0; 2], alpha)])?;
         }
         return Ok(());
     }
@@ -358,8 +359,7 @@ pub(super) fn composite(
                 return Ok(());
             }
         }
-        composite_unit_diffuse(target, source, alpha);
-        return Ok(());
+        return composite_unit_diffuse(target, source, alpha);
     }
     draw_quad(
         target,
@@ -371,16 +371,21 @@ pub(super) fn composite(
     )
 }
 
-fn composite_unit_diffuse(target: &mut Canvas, source: &RgbaFrame, alpha: u8) {
+fn composite_unit_diffuse(target: &mut Canvas, source: &RgbaFrame, alpha: u8) -> Result<()> {
     match alpha {
         0 => {}
         255 => {
-            target.pixels_mut().copy_from_slice(source.pixels());
-            for pixel in target.pixels_mut().chunks_exact_mut(4) {
+            if target.device_pixels().is_some() {
+                target.clear(cs2_renderer::Color::rgba(0, 0, 0, 255));
+            }
+            let pixels = target.pixels_mut();
+            pixels.copy_from_slice(source.pixels());
+            for pixel in pixels.chunks_exact_mut(4) {
                 pixel[3] = 255;
             }
         }
         _ => {
+            target.try_pixels()?;
             let factor = u16::from(alpha);
             let inverse = 255 - factor;
             for (destination, sample) in target
@@ -399,6 +404,7 @@ fn composite_unit_diffuse(target: &mut Canvas, source: &RgbaFrame, alpha: u8) {
             }
         }
     }
+    Ok(())
 }
 
 const fn ring_index(x: i32, y: i32) -> i32 {
@@ -562,6 +568,7 @@ fn triangle(
         (a, [b[0] - a[0], b[1] - a[1]], top_left(a, b))
     });
     let stride = target.width() as usize * 4;
+    target.try_pixels()?;
     let pixels = target.pixels_mut();
     for y in top..=bottom {
         let row = &mut pixels[y as usize * stride..][..stride];

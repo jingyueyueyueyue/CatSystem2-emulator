@@ -122,11 +122,6 @@ impl ImageManager {
 
     pub(super) fn set_fast_forward(&mut self, active: bool) {
         self.fast_forward = active;
-        if active { self.trim_resident(0); }
-    }
-
-    fn resident_limit(&self) -> usize {
-        if self.fast_forward { self.capacity.min(32 * 1024 * 1024) } else { self.capacity }
     }
 
     fn evict_oldest(&mut self) -> bool {
@@ -138,7 +133,7 @@ impl ImageManager {
     }
 
     fn trim_resident(&mut self, incoming: usize) {
-        while self.rgba_bytes.saturating_add(incoming) > self.resident_limit() {
+        while self.rgba_bytes.saturating_add(incoming) > self.capacity {
             if !self.evict_oldest() { break; }
         }
     }
@@ -204,7 +199,12 @@ impl ImageManager {
         let cost = cache_cost(frame)?;
         if self.resident_byte_budget {
             let rgba = frame.pixels().len();
-            if rgba > self.resident_limit() || cost > MAX_CACHE { return Ok(()); }
+            if rgba > self.capacity || cost > MAX_CACHE { return Ok(()); }
+            // Keep the pre-skip working set. Explicit cache requests may
+            // still populate unused space without evicting a resident image.
+            if self.fast_forward && self.rgba_bytes.saturating_add(rgba) > self.capacity {
+                return Ok(());
+            }
             self.trim_resident(rgba);
         } else {
             // The original manager allows a sole entry larger than its native budget.
@@ -732,7 +732,7 @@ impl LoggingHost<'_> {
             self.ensure_image_manager()?;
         }
         let manager = &self.data_services.image_manager;
-        let cache = request_cache || manager.force_cache != 0 || manager.fast_forward;
+        let cache = request_cache || manager.force_cache != 0;
         let cached = {
             let _detail = scope("image_frame_cache_lookup");
             let _stage = ImageSourceStep::new(ImageSourceStage::CacheLookup);
@@ -1158,38 +1158,35 @@ mod fast_forward_tests {
         manager.force_cache = 0;
         manager.capacity = 4 * 1024 * 1024;
         let ctrl = cs2_runtime::InputKey::Keyboard(17);
-        let mut peak = 0;
-        let mut evictions = 0;
+        for index in 0..4 {
+            let name = format!("bg/1-{index}.jpg");
+            player.with_host(|host| Ok(host.load_managed_image(&name, 0, true)?))?;
+        }
         for round in 1..=20 {
             player.apply_host_input(cs2_runtime::InputEvent::KeyDown(ctrl))?;
             assert!(player.advance_host_frame(1000)?);
             assert!(player.data_services.fast_forward);
             for index in 0..8 {
-                let before = player.data_services.image_manager.frames.len();
-                if index == 4 {
-                    let name = format!("bg/{round}-0.jpg");
-                    player.with_host(|host| Ok(host.load_managed_image_projection(&name, 0)?))?;
-                }
                 let name = format!("bg/{round}-{index}.jpg");
                 let frame = player.with_host(|host| Ok(host.load_managed_image_projection(&name, 0)?))?
                     .expect("mock background should decode");
                 assert_eq!(frame.metadata().bit_depth, 24);
-                let manager = &player.data_services.image_manager;
                 if index == 4 {
-                    assert!(manager.shared_frame(&format!("bg/{round}-0.jpg"), 0).is_some());
-                    assert!(manager.shared_frame(&format!("bg/{round}-1.jpg"), 0).is_none());
+                    player.with_host(|host| Ok(host.load_managed_image(&name, 0, true)?))?;
                 }
-                peak = peak.max(manager.rgba_bytes);
-                evictions += before + 1 - manager.frames.len();
+                let manager = &player.data_services.image_manager;
+                assert_eq!(manager.frames.len(), 4);
+                assert_eq!(manager.rgba_bytes, 4 * 1024 * 1024);
+                assert!(manager.shared_frame("bg/1-0.jpg", 0).is_some());
                 player.advance_host_frame(1000)?;
             }
             player.apply_host_input(cs2_runtime::InputEvent::KeyUp(ctrl))?;
             assert!(player.advance_host_frame(1000)?);
             assert!(!player.data_services.fast_forward);
         }
-        println!("fast_forward cycles=20 decoded_backgrounds=160 lru_hits_checked=20 peak_decoded_bytes={peak} evictions={evictions}");
-        assert_eq!(peak, 4 * 1024 * 1024);
-        assert_eq!(evictions, 156);
+        let name = "bg/20-7.jpg";
+        player.with_host(|host| Ok(host.load_managed_image(name, 0, true)?))?;
+        assert!(player.data_services.image_manager.shared_frame(name, 0).is_some());
         Ok(())
     }
 }

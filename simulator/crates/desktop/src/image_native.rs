@@ -35,10 +35,19 @@ impl LoggingHost<'_> {
                 let Some(canvas) = self.canvas.as_ref() else {
                     return Ok(NativeReturn::Value(0));
                 };
-                let snapshot = canvas.snapshot();
-                let frame = RgbaFrame::from_rgba8(
-                    snapshot.width(), snapshot.height(), snapshot.rgba().to_vec(),
-                ).map_err(|_| native_state_error("native 113 frame capture failed"))?;
+                let pixels = match canvas.try_pixels() {
+                    Ok(pixels) => pixels,
+                    Err(cause) => {
+                        self.events.push(super::LogicEvent {
+                            frame: self.frame,
+                            kind: "image-capture-error".into(),
+                            detail: format!("native=113 {cause}"),
+                        });
+                        return Ok(NativeReturn::Value(0));
+                    }
+                };
+                let frame = RgbaFrame::from_rgba8(canvas.width(), canvas.height(), pixels.to_vec())
+                    .map_err(|_| native_state_error("native 113 frame capture failed"))?;
                 Ok(NativeReturn::Value(self.register_image_wrapper(frame, true)?))
             }
             118 => {
@@ -663,6 +672,38 @@ fn blur_pixel(
 mod tests {
     use super::*;
     use cs2_renderer::FrameMetadata;
+
+    #[test]
+    fn capture_readback_failure_returns_no_handle_and_can_retry() -> anyhow::Result<()> {
+        #[derive(Debug)]
+        struct RetryReadback(std::sync::atomic::AtomicBool);
+
+        impl cs2_renderer::CanvasReadback for RetryReadback {
+            fn read_rgba(&self, output: &mut [u8]) -> bool {
+                let succeeds = self.0.swap(true, std::sync::atomic::Ordering::Relaxed);
+                output.fill(if succeeds { 77 } else { 99 });
+                succeeds
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+
+        let root = crate::tests::TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&root.0, root.0.join("profile"))?;
+        player.graphics_canvas = cs2_renderer::Canvas::new(1, 1)?;
+        player.graphics_canvas.set_deferred_device_pixels(std::sync::Arc::new(RetryReadback(false.into())));
+        player.with_host(|host| {
+            let mut vm = Vm::new();
+            assert_eq!(host.image_wrapper_native(113, &[], &mut vm)?, NativeReturn::Value(0));
+            assert!(host.image_handles.is_empty());
+            assert_eq!(host.events.last().map(|event| event.kind.as_str()), Some("image-capture-error"));
+            let NativeReturn::Value(handle) = host.image_wrapper_native(113, &[], &mut vm)? else {
+                anyhow::bail!("native 113 did not return an image handle");
+            };
+            assert_eq!(host.image_handles[&handle].pixels(), &[77; 4]);
+            Ok(())
+        })
+    }
 
     #[test]
     fn bgr24_blur_filters_rgb_with_replicated_edges() {

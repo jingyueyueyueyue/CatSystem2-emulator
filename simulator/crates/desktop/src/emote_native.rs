@@ -81,7 +81,8 @@ pub(super) fn receive(
             .ok_or_else(|| unsupported(906, "M2 command524 requires owned load-spec bytes"))?;
         let result = host.data_services
             .emote
-            .load_m2(host.resources, &mut host.data_services.ordinary, host.current_task_id, target, spec, addressed.data[0])?;
+            .load_m2(host.resources, &mut host.data_services.ordinary, host.current_task_id,
+                target, spec, addressed.data[0], host.data_services.fast_forward)?;
         if result == NativeReturn::Retry {
             return Ok(Some(cs2_runtime::TaskCommandOutcome { done: false, propagate: false }));
         }
@@ -758,7 +759,8 @@ impl LoggingHost<'_> {
             let result = self
                 .data_services
                 .emote
-                .load_m2(self.resources, &mut self.data_services.ordinary, self.current_task_id, target, &spec, mode)?;
+                .load_m2(self.resources, &mut self.data_services.ordinary, self.current_task_id,
+                    target, &spec, mode, self.data_services.fast_forward)?;
             if result != NativeReturn::Retry {
                 if let Some(node) = self.scene_nodes.get_mut(&target) { node.initialized = true; }
             }
@@ -950,11 +952,13 @@ impl EmoteNativeServices {
         task: u32,
         spec: &[u8],
         mode: u32,
+        fast_forward: bool,
     ) -> Result<NativeReturn> {
         self.loads.check_cancelled(owner).map_err(error)?;
         let filter = self.state.m2_texture_filter(task)
             .ok_or_else(|| unsupported(906, "M2 target has no CPU texture configuration"))?;
-        let Some(prepared) = self.loads.poll(resources, owner, task, spec, mode, filter, self.state.state(task).map_or(0, |state| state.successful_resource_imports), |plan, version| {
+        let imports = self.state.state(task).map_or(0, |state| state.successful_resource_imports);
+        let Some(prepared) = self.loads.poll(resources, owner, task, spec, mode, filter, imports, fast_forward, |plan, version| {
             self.state.cached_m2_model(task, &plan.resource_name, version).map(load_async::CachedModel::Current).or_else(|| {
                 self.state.uses_unfiltered_m2_texture(task)
                     .then(|| ordinary.subscribe_preloaded_model(version))
@@ -966,6 +970,7 @@ impl EmoteNativeServices {
         let commit_started = std::time::Instant::now();
         let phases_us = prepared.phases_us;
         let preload_wait_us = prepared.preload_wait_us;
+        let atlas_wait_us = prepared.atlas_wait_us;
         let load_async::Prepared { plan, model, version, .. } = prepared;
         let source = CpuM2ModelSource::Shared(model, version);
         let mut secondary_variables = plan.secondary_config.default_variables().map_err(error)?;
@@ -1025,7 +1030,7 @@ impl EmoteNativeServices {
         placement.profile_scale = scale[0];
         placement.scale_offset = scale_offset.map(|value| value as f32);
         self.apply_placement(task).map_err(error)?;
-        super::perf_detail::resource_warmup_note(&format!("m2_async native=906 target={task} name={} config_us={} read_us={} decode_us={} model_us={} preload_hit={} preload_wait_us={} commit_us={}",
+        super::perf_detail::resource_warmup_note(&format!("m2_async native=906 target={task} name={} config_us={} read_us={} decode_us={} model_us={} preload_hit={} preload_wait_us={} atlas_wait_us={atlas_wait_us} commit_us={}",
             String::from_utf8_lossy(&plan.resource_name), phases_us[0], phases_us[1], phases_us[2], phases_us[3],
             preload_wait_us.is_some(), preload_wait_us.unwrap_or_default(), commit_started.elapsed().as_micros()));
         Ok(NativeReturn::Continue)
@@ -1373,7 +1378,14 @@ impl EmoteNativeServices {
         let blend = self.placements.get(&resolved_target).ok_or(EmoteError::UnknownTask(resolved_target))?.blend;
         let submitted = {
             let _timing = SlowTask::new(resolved_target, || 54, "emote_blend");
-            submit_rgba(canvas, &frame, blend)?
+            match submit_rgba(canvas, &frame, blend) {
+                Err(EmoteError::DeviceReadback) => {
+                    #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+                    self.cancel_pose_job(resolved_target);
+                    return Ok(0);
+                }
+                result => result?,
+            }
         };
         if submitted != 0 {
             self.state.record_pixel_submission(resolved_target)?;
@@ -1583,13 +1595,21 @@ fn submit_rgba_with_workers(
     let submitted = ((right - left) * (bottom - top)) as usize;
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
     if crate::gpu_raster::blend_emote(canvas, frame, blend)
-        .map_err(|error| EmoteError::Backend(error.to_string()))?
+        .map_err(|error| {
+            if matches!(error.downcast_ref::<cs2_renderer::RendererError>(),
+                Some(cs2_renderer::RendererError::DeviceReadbackFailed))
+            {
+                EmoteError::CanvasReadback
+            } else {
+                EmoteError::Backend(error.to_string())
+            }
+        })?
     {
         return Ok(submitted);
     }
     let source_over = blend == BlendMode::SourceOver;
     let (left, top, right, bottom) = if source_over {
-        let Some([first_x, first_y, end_x, end_y]) = frame.alpha_bounds() else {
+        let Some([first_x, first_y, end_x, end_y]) = frame.alpha_bounds()? else {
             return Ok(submitted);
         };
         (left.max(i64::from(origin_x) + i64::from(first_x)),
@@ -1621,7 +1641,8 @@ fn submit_rgba_with_workers(
     } else {
         1
     };
-    canvas.blend_rgba_rows_with_workers(target, &frame.rgba()[offset..], stride, blend, workers)
+    canvas.try_pixels().map_err(|_| EmoteError::CanvasReadback)?;
+    canvas.blend_rgba_rows_with_workers(target, &frame.rgba()?[offset..], stride, blend, workers)
         .map_err(|error| EmoteError::Backend(error.to_string()))?;
     Ok(submitted)
 }
@@ -1702,7 +1723,7 @@ mod tests {
         let pixels = [transparent, transparent, transparent, transparent,
             transparent, opaque, transparent, half, transparent, transparent, transparent, transparent];
         let frame = EmoteRasterFrame::new(4, 3, [-1, -1], pixels.concat()).unwrap();
-        assert_eq!(frame.alpha_bounds(), Some([1, 1, 4, 2]));
+        assert_eq!(frame.alpha_bounds().unwrap(), Some([1, 1, 4, 2]));
         for blend in [
             BlendMode::SourceOver, BlendMode::AddSource, BlendMode::AddDestination,
             BlendMode::Multiply, BlendMode::InvertDestination, BlendMode::AddMultiply,
@@ -1759,7 +1780,7 @@ mod tests {
         for y in 0..CANVAS_HEIGHT {
             for x in 0..CANVAS_WIDTH {
                 let source = ((y + 1) * FRAME_WIDTH + x + 1) * 4;
-                let [red, green, blue, alpha] = frame.rgba()[source..source + 4] else {
+                let [red, green, blue, alpha] = frame.rgba().unwrap()[source..source + 4] else {
                     unreachable!()
                 };
                 reference

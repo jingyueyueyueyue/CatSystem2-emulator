@@ -33,6 +33,10 @@ pub struct HostPerfDetails {
     gpu_output: GpuOutputSample,
     emote_gpu: EmoteGpuSample,
     emote_scene: EmoteSceneSample,
+    emote_fallbacks: BTreeMap<&'static str, usize>,
+    fast_forward_state: Option<bool>,
+    #[cfg(windows)]
+    movie_scale: Option<(bool, Duration)>,
     warmup_notes: Vec<String>,
     audio_async_notes: Vec<String>,
     visual_notes: Vec<(&'static str, String)>,
@@ -77,6 +81,20 @@ impl HostPerfDetails {
         }
         if let Some(row) = self.gpu_output.row(session, frame, call) {
             let _ = append_row_reserving(&mut rows, &row, text_reserve);
+        }
+        for (reason, count) in self.emote_fallbacks {
+            let row = format!("emote_fallback session={session} frame={frame} call={call} reason={reason} count={count}");
+            append_row_reserving(&mut rows, &row, text_reserve);
+        }
+        if let Some(active) = self.fast_forward_state {
+            let row = format!("fast_forward_state session={session} frame={frame} call={call} active={active}");
+            append_row_reserving(&mut rows, &row, text_reserve);
+        }
+        #[cfg(windows)]
+        if let Some((reused, elapsed)) = self.movie_scale {
+            let row = format!("movie_scale session={session} frame={frame} call={call} reused={} elapsed_us={}",
+                u8::from(reused), elapsed.as_micros());
+            append_row_reserving(&mut rows, &row, text_reserve);
         }
         let scene = self.emote_scene;
         if scene.updated + scene.held + scene.static_held != 0 {
@@ -291,6 +309,28 @@ struct EmoteSceneSample {
     stale: usize,
     max_lag: u64,
     max_age: Duration,
+}
+
+#[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+pub(super) fn emote_fallback(reason: &'static str) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot { *detail.emote_fallbacks.entry(reason).or_default() += 1; }
+    });
+}
+
+pub(super) fn fast_forward_state(active: bool) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot { detail.fast_forward_state = Some(active); }
+    });
+}
+
+#[cfg(windows)]
+pub(super) fn movie_scale(reused: bool, elapsed: Duration) {
+    DETAIL.with_borrow_mut(|slot| {
+        if let Some(detail) = slot {
+            detail.movie_scale = Some((reused, elapsed));
+        }
+    });
 }
 
 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]

@@ -261,14 +261,13 @@ impl Raster {
         self.prepare_scene_triangles("demand")?;
         let source_view = self.source_texture(source);
         self.full_target = None;
-        self.previous_planes = None;
         let previous = device_frame(canvas).map(|frame| frame.buffer.clone());
         self.ensure_target_size(target_bytes);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         if let Some(previous) = previous {
             encoder.copy_buffer_to_buffer(&previous, 0, &self.target, 0, target_bytes);
         } else {
-            self.queue.write_buffer(&self.target, 0, canvas.pixels());
+            self.queue.write_buffer(&self.target, 0, canvas.try_pixels()?);
         }
         let scene = self.scene_triangles.as_mut().and_then(|result| result.as_mut().ok())
             .context("scene raster missing after initialization")?;

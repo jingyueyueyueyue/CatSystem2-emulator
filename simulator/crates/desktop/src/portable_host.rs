@@ -24,6 +24,8 @@ impl HostPresentationFrame {
         self.canvas.pixels()
     }
 
+    pub fn try_rgba(&self) -> cs2_renderer::Result<&[u8]> { self.canvas.try_pixels() }
+
     pub fn acknowledge_submission(&self) -> Result<()> {
         for receipt in &self.movies {
             receipt.surface.mark_submitted(receipt.playback, receipt.sequence, receipt.time)?;
@@ -201,6 +203,8 @@ impl HeadlessPlayer {
         if reset || self.data_services.host_pause.paused { pacer.reset(now); }
         pacer.delay_ms(now)
     }
+
+    pub fn fast_forward_preview_skipped(&self) -> bool { self.fast_forward_preview_skipped }
 
     /// Enable the hardware raster backend on this interactive host thread.
     pub fn enable_host_gpu_raster() {
@@ -475,16 +479,18 @@ impl HeadlessPlayer {
 
     pub const FAST_FORWARD_KEY: u32 = 0x11;
 
-    /// Opt into the resource policy for hosts that drive held Ctrl. A host may
-    /// pass zero to avoid reserving an optional E-mote model cache.
+    /// Opt into the resource policy for hosts that drive held Ctrl. A zero
+    /// memory reading uses the conservative E-mote working-set budget.
     pub fn enable_host_fast_forward(&mut self, available_memory_bytes: u64) -> usize {
         const GIB: u64 = 1024 * 1024 * 1024;
         self.data_services.fast_forward_enabled = true;
         self.data_services.image_manager.enable_resident_byte_budget();
         let model_budget = if available_memory_bytes >= 4 * GIB {
             (available_memory_bytes / 8).min(GIB) as usize
+        } else if available_memory_bytes == 0 {
+            96 * 1024 * 1024
         } else {
-            0
+            (available_memory_bytes / 16).min(96 * 1024 * 1024) as usize
         };
         self.data_services.emote.set_model_cache_budget(model_budget);
         self.log.push(format!(
@@ -501,6 +507,8 @@ impl HeadlessPlayer {
                 self.with_host(|host| Ok(host.release_fast_forward_sounds()?))?;
             }
             self.data_services.fast_forward = active;
+            self.fast_forward_presented_at = None;
+            super::perf_detail::fast_forward_state(active);
             self.data_services.image_manager.set_fast_forward(active);
             self.data_services.ordinary.set_fast_forward(active);
             self.log.push(format!(
@@ -539,6 +547,10 @@ impl HeadlessPlayer {
     }
 
     fn advance_host_frame_in_slice(&mut self, instruction_budget: usize) -> Result<bool> {
+        #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
+        super::gpu_raster::maintain_device(!self.frame_in_progress());
+        #[cfg(target_os = "android")]
+        self.maintain_host_gpu_memory();
         let instruction_budget = if self.host_work_budget.is_some() {
             instruction_budget.min(super::host_work_budget::INTERACTIVE_INSTRUCTION_SLICE)
         } else {

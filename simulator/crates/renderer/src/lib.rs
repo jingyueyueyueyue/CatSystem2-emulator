@@ -1228,15 +1228,21 @@ impl DevicePixels {
 
     #[track_caller]
     fn pixels(&self) -> &[u8] {
+        self.try_pixels().expect("device pixel readback failed; rebuild the frame instead of using stale pixels")
+    }
+
+    #[track_caller]
+    fn try_pixels(&self) -> Result<&[u8]> {
         let location = std::panic::Location::caller();
-        self.pixels.get_or_init(|| {
+        if self.pixels.get().is_none() {
             let mut pixels = self.take_recycled();
             pixels.resize(self.bytes, 0);
             if !self.source.read_rgba_at(&mut pixels, location) {
-                panic!("device pixel readback failed; rebuild the frame instead of using stale pixels");
+                return self.pixels.get().map(Vec::as_slice).ok_or(RendererError::DeviceReadbackFailed);
             }
-            pixels
-        })
+            let _ = self.pixels.set(pixels);
+        }
+        self.pixels.get().map(Vec::as_slice).ok_or(RendererError::DeviceReadbackFailed)
     }
 
     #[track_caller]
@@ -1410,6 +1416,15 @@ impl Canvas {
         }
     }
 
+    #[track_caller]
+    pub fn try_pixels(&self) -> Result<&[u8]> {
+        match &self.pixels {
+            CanvasPixels::Cpu(pixels) => Ok(pixels),
+            CanvasPixels::SharedCpu(pixels) => Ok(pixels),
+            CanvasPixels::Device(pixels) => pixels.try_pixels(),
+        }
+    }
+
     /// Retain an immutable frame without copying CPU pixels or reading back a device frame.
     /// A later CPU write detaches the canvas only if the snapshot still holds its data.
     pub fn share_snapshot(&mut self) -> Self {
@@ -1427,11 +1442,21 @@ impl Canvas {
     /// Commit only a recoverable frame. On failure the caller can redraw the
     /// same operations on the complete input, including any earlier GPU layers.
     pub fn set_device_pixels(&mut self, source: Arc<dyn CanvasReadback>) -> Result<()> {
-        let bytes = self.pixels.len();
+        let readback = source.clone();
+        self.set_device_pixels_with(source, |pixels| readback.read_rgba(pixels))
+    }
+
+    /// Commit verified pixels from a readback already encoded by the caller.
+    pub fn set_device_pixels_with(
+        &mut self,
+        source: Arc<dyn CanvasReadback>,
+        readback: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<()> {
+        let bytes = rgba_len(self.width, self.height)?;
         let mut pixels = Vec::new();
         pixels.try_reserve_exact(bytes).map_err(|_| RendererError::AllocationFailed { bytes })?;
         pixels.resize(bytes, 0);
-        if !source.read_rgba(&mut pixels) {
+        if !readback(&mut pixels) {
             return Err(RendererError::DeviceReadbackFailed);
         }
         self.pixels = CanvasPixels::Device(Arc::new(DevicePixels::new(source, Some(pixels), bytes)));
@@ -1444,7 +1469,7 @@ impl Canvas {
         source: Arc<dyn CanvasReadback>,
         pixels: &[u8],
     ) -> Result<()> {
-        let bytes = self.pixels.len();
+        let bytes = rgba_len(self.width, self.height)?;
         if pixels.len() != bytes {
             return Err(RendererError::BufferLength { expected: bytes, actual: pixels.len() });
         }
@@ -1469,6 +1494,14 @@ impl Canvas {
             CanvasPixels::Device(pixels) => Some(&*pixels.source),
             CanvasPixels::Cpu(_) | CanvasPixels::SharedCpu(_) => None,
         }
+    }
+
+    /// Borrow the deferred device source only when this canvas can replace it
+    /// without changing a published snapshot or an already materialized image.
+    pub fn exclusive_deferred_pixels(&self) -> Option<&dyn CanvasReadback> {
+        let CanvasPixels::Device(pixels) = &self.pixels else { return None; };
+        (Arc::strong_count(pixels) == 1 && Arc::strong_count(&pixels.source) == 1
+            && pixels.pixels.get().is_none()).then_some(&*pixels.source)
     }
 
     /// Publish the rendered pixels without copying the backing allocation.
@@ -1659,7 +1692,7 @@ impl Canvas {
     }
 
     /// Draws a frame with an optional worker budget for large, uncached linear
-    /// affine transforms. The budget includes the caller and is capped at four.
+    /// scaling and affine transforms. The budget includes the caller and is capped at four.
     /// Other paths, including cache hits, draw serially in layer order.
     pub fn draw_frame_with_workers(
         &mut self,
@@ -1728,7 +1761,7 @@ impl Canvas {
             return Ok(());
         }
 
-        raster::draw_axis_aligned(self, frame, options, (left, top, right, bottom));
+        raster::draw_axis_aligned(self, frame, options, (left, top, right, bottom), workers);
         Ok(())
     }
 
@@ -6628,27 +6661,46 @@ fn sample_frame(frame: &RgbaFrame, x: f64, y: f64, filter: ScaleFilter) -> Color
     }
 }
 
+#[derive(Clone, Copy)]
+struct LinearTaps {
+    first: usize,
+    second: usize,
+    fraction: f64,
+}
+
+impl LinearTaps {
+    fn new(position: f64, size: u32) -> Self {
+        let first = (position as u32).min(size - 1);
+        Self {
+            first: first as usize,
+            second: first.saturating_add(1).min(size - 1) as usize,
+            fraction: (position - f64::from(first)).clamp(0.0, 1.0),
+        }
+    }
+}
+
 fn sample_linear(frame: &RgbaFrame, x: f64, y: f64) -> Color {
-    let x0 = (x as u32).min(frame.width - 1);
-    let y0 = (y as u32).min(frame.height - 1);
-    let x1 = x0.saturating_add(1).min(frame.width - 1);
-    let y1 = y0.saturating_add(1).min(frame.height - 1);
-    let tx = (x - f64::from(x0)).clamp(0.0, 1.0);
-    let ty = (y - f64::from(y0)).clamp(0.0, 1.0);
-    let top_left = frame.pixel_unchecked(x0, y0);
-    let top_right = frame.pixel_unchecked(x1, y0);
-    let bottom_left = frame.pixel_unchecked(x0, y1);
-    let bottom_right = frame.pixel_unchecked(x1, y1);
+    sample_linear_taps(frame.pixels.as_chunks::<4>().0, frame.width as usize,
+        LinearTaps::new(x, frame.width), LinearTaps::new(y, frame.height))
+}
+
+fn sample_linear_taps(pixels: &[[u8; 4]], width: usize, x: LinearTaps, y: LinearTaps) -> Color {
+    let tx = x.fraction;
+    let ty = y.fraction;
+    let top_left = pixels[y.first * width + x.first];
+    let top_right = pixels[y.first * width + x.second];
+    let bottom_left = pixels[y.second * width + x.first];
+    let bottom_right = pixels[y.second * width + x.second];
     let interpolate = |a: u8, b: u8, c: u8, d: u8| {
         let top = f64::from(a) * (1.0 - tx) + f64::from(b) * tx;
         let bottom = f64::from(c) * (1.0 - tx) + f64::from(d) * tx;
         (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
     };
     Color::rgba(
-        interpolate(top_left.r, top_right.r, bottom_left.r, bottom_right.r),
-        interpolate(top_left.g, top_right.g, bottom_left.g, bottom_right.g),
-        interpolate(top_left.b, top_right.b, bottom_left.b, bottom_right.b),
-        interpolate(top_left.a, top_right.a, bottom_left.a, bottom_right.a),
+        interpolate(top_left[0], top_right[0], bottom_left[0], bottom_right[0]),
+        interpolate(top_left[1], top_right[1], bottom_left[1], bottom_right[1]),
+        interpolate(top_left[2], top_right[2], bottom_left[2], bottom_right[2]),
+        interpolate(top_left[3], top_right[3], bottom_left[3], bottom_right[3]),
     )
 }
 

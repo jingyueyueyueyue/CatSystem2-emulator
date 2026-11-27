@@ -455,8 +455,31 @@ pub struct CpuVariableTimelines {
     active: Vec<Instance>,
     immediate_writes: BTreeMap<String, f32>,
     controller_targets: Vec<CpuEmoteControllerTarget>,
+    additive_variables: Arc<[AdditiveVariable]>,
 }
+
+#[derive(Debug)]
+struct AdditiveVariable {
+    name: String,
+    tracks: Vec<(usize, usize)>,
+}
+
 impl CpuVariableTimelines {
+    fn index_additive_variables(&mut self) {
+        let mut variables = BTreeMap::<&str, Vec<(usize, usize)>>::new();
+        for (instance_index, instance) in self.active.iter().enumerate() {
+            for (track_index, track) in instance.definition.tracks.iter().enumerate() {
+                if track.immediate_target.is_none() {
+                    variables.entry(&track.name).or_default().push((instance_index, track_index));
+                }
+            }
+        }
+        self.additive_variables = variables.into_iter().map(|(name, tracks)| AdditiveVariable {
+            name: name.to_owned(),
+            tracks,
+        }).collect();
+    }
+
     ///1fbf0 submits nonloop timelines through lastTime and removes them.
     ///Looping labels remain selected, with their current scalar targets ended.
     pub(super) fn finish_all(&mut self) -> Result<()> {
@@ -475,6 +498,9 @@ impl CpuVariableTimelines {
             if looping { retained.push(instance); }
         }
         next.active = retained;
+        if self.active.len() != next.active.len() {
+            next.index_additive_variables();
+        }
         *self = next;
         Ok(())
     }
@@ -555,14 +581,19 @@ impl CpuVariableTimelines {
         } else {
             self.active.push(instance);
         }
+        self.index_additive_variables();
         Ok(())
     }
     /// Empty label stops all; stopping leaves the owner's base variables intact.
     pub fn stop(&mut self, name: &str) {
+        let count = self.active.len();
         if name.is_empty() {
             self.active.clear();
         } else {
             self.active.retain(|t| t.definition.label != name);
+        }
+        if count != self.active.len() {
+            self.index_additive_variables();
         }
     }
     /// Actual immediate controller commands modify the owner store once.
@@ -575,21 +606,32 @@ impl CpuVariableTimelines {
     }
     /// Whole update commits atomically; no half-advanced model on a diagnostic.
     pub fn advance(&mut self, delta: f32) -> Result<()> {
+        if delta == 0.0 || self.active.is_empty() {
+            return self.advance_in_place(delta);
+        }
+        let mut next = self.clone();
+        next.advance_in_place(delta)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// The player already updates a private copy and commits it after all steps succeed.
+    pub(super) fn advance_in_place(&mut self, delta: f32) -> Result<()> {
         if !delta.is_finite() || delta < 0.0 {
             return Err(invalid("timelineControl nonnegative delta"));
         }
-        if delta == 0.0 {
+        if delta == 0.0 || self.active.is_empty() {
             return Ok(());
         }
-        let mut next = self.clone();
-        let mut retained = Vec::with_capacity(next.active.len());
-        for mut instance in next.active.drain(..) {
+        let count = self.active.len();
+        let mut retained = Vec::with_capacity(count);
+        for mut instance in self.active.drain(..) {
             let retained_instance = instance.advance(delta)?;
-            next.immediate_writes
+            self.immediate_writes
                 .extend(std::mem::take(&mut instance.immediate_writes));
-            next.controller_targets
+            self.controller_targets
                 .append(&mut instance.controller_targets);
-            if next.controller_targets.len() > MAX_FRAMES {
+            if self.controller_targets.len() > MAX_FRAMES {
                 return Err(EmoteError::Capacity);
             }
             if retained_instance {
@@ -597,8 +639,9 @@ impl CpuVariableTimelines {
             }
         }
         self.active = retained;
-        self.immediate_writes = next.immediate_writes;
-        self.controller_targets = next.controller_targets;
+        if self.active.len() != count {
+            self.index_additive_variables();
+        }
         Ok(())
     }
     /// Actual additive values in active-label order, in f32 like20170/13530.
@@ -610,15 +653,12 @@ impl CpuVariableTimelines {
     }
 
     pub(super) fn apply(&self, values: &mut BTreeMap<String, f64>) -> Result<()> {
-        let mut sums = BTreeMap::<&str, f32>::new();
-        for instance in &self.active {
-            for (track, tween) in instance.definition.tracks.iter().zip(&instance.tweens) {
-                if track.immediate_target.is_none() {
-                    *sums.entry(&track.name).or_default() += tween.current;
-                }
+        for variable in self.additive_variables.iter() {
+            let mut offset = 0.0f32;
+            for &(instance, track) in &variable.tracks {
+                offset += self.active[instance].tweens[track].current;
             }
-        }
-        for (name, offset) in sums {
+            let name = variable.name.as_str();
             let value = *values.get(name).unwrap_or(&0.0) as f32 + offset;
             if !value.is_finite() {
                 return Err(invalid("timelineControl additive overflow"));

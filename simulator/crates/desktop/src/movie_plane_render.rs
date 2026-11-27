@@ -8,6 +8,13 @@ use cs2_renderer::{
 };
 use std::collections::BTreeMap;
 
+#[cfg(windows)]
+pub(super) struct ExclusiveMoviePixels {
+    source: std::sync::Weak<crate::movie::MovieFrame>,
+    rectangle: [i32; 4],
+    canvas: Canvas,
+}
+
 #[derive(Clone, Debug)]
 pub struct MoviePlaneProjection {
     pub center: [f32; 2],
@@ -39,11 +46,15 @@ impl MpegMovieHost {
     pub(super) fn draw_exclusive_movie(&mut self, canvas: &mut Canvas) -> Result<bool> {
         let surface = self.frame_surface();
         if !surface.displaying_movie() {
+            #[cfg(windows)]
+            { self.planes.exclusive_pixels = None; }
             return Ok(false);
         }
-        canvas.clear(Color::rgb(0, 0, 0));
         self.planes.presentations.clear();
         let Some(snapshot) = self.exclusive_draw_snapshot()? else {
+            #[cfg(windows)]
+            { self.planes.exclusive_pixels = None; }
+            canvas.clear(Color::BLACK);
             return Ok(true);
         };
         let crate::movie_plane::MovieDrawSnapshot {
@@ -53,24 +64,73 @@ impl MpegMovieHost {
             frame,
             rectangle,
         } = snapshot;
-        let [x, y, width, height] =
-            rectangle.unwrap_or([0, 0, canvas.width() as i32, canvas.height() as i32]);
-        if width > 0 && height > 0 {
+        let rectangle = rectangle.unwrap_or([0, 0, canvas.width() as i32, canvas.height() as i32]);
+        let [x, y, width, height] = rectangle;
+        if width <= 0 || height <= 0 {
+            #[cfg(windows)]
+            { self.planes.exclusive_pixels = None; }
+            canvas.clear(Color::BLACK);
+            return Ok(true);
+        }
+
+        #[cfg(windows)]
+        let timing = crate::perf_detail::enabled().then(std::time::Instant::now);
+        #[cfg(windows)]
+        let cached = self.planes.exclusive_pixels.as_ref().filter(|pixels| {
+            pixels.source.as_ptr() == std::sync::Arc::as_ptr(&frame)
+                && pixels.rectangle == rectangle
+                && pixels.canvas.dimensions() == canvas.dimensions()
+        });
+        #[cfg(windows)]
+        let reused = cached.is_some();
+        #[cfg(not(windows))]
+        let reused = false;
+        #[cfg(windows)]
+        if let Some(pixels) = cached {
+            *canvas = pixels.canvas.clone();
+        }
+        if !reused {
+            #[cfg(windows)]
+            { self.planes.exclusive_pixels = None; }
+            canvas.clear(Color::BLACK);
             let source = RgbaFrame::from_shared_rgba8(frame.width, frame.height, frame.rgba.clone())?;
             let mut options = ImageDrawOptions::new(Point::new(x, y));
             options.scale_x = width as f32 / frame.width as f32;
             options.scale_y = height as f32 / frame.height as f32;
             options.filter = ScaleFilter::Linear;
+            #[cfg(windows)]
+            let workers = {
+                static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                *WORKERS.get_or_init(|| {
+                    std::env::var("CS2_MOVIE_SCALE_WORKERS").ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(4).clamp(1, 4)
+                })
+            };
+            #[cfg(not(windows))]
+            let workers = 1;
             canvas
-                .draw_frame(&source, &options)
+                .draw_frame_with_workers(&source, &options, workers)
                 .context("compose native788 movie rectangle")?;
-            self.record_movie_presentation(MoviePresentation {
-                surface,
-                playback,
-                sequence,
-                time: frame.presentation_time,
-            });
+            #[cfg(windows)]
+            {
+                self.planes.exclusive_pixels = Some(ExclusiveMoviePixels {
+                    source: std::sync::Arc::downgrade(&frame),
+                    rectangle,
+                    canvas: canvas.share_snapshot(),
+                });
+            }
         }
+        #[cfg(windows)]
+        if let Some(start) = timing {
+            crate::perf_detail::movie_scale(reused, start.elapsed());
+        }
+        self.record_movie_presentation(MoviePresentation {
+            surface,
+            playback,
+            sequence,
+            time: frame.presentation_time,
+        });
         Ok(true)
     }
 
@@ -799,4 +859,57 @@ fn sample(frame: &RgbaFrame, uv: [f64; 2]) -> [f64; 4] {
         (pixel(x0, y0, axis) * (1. - wx) + pixel(x1, y0, axis) * wx) * (1. - wy)
             + (pixel(x0, y1, axis) * (1. - wx) + pixel(x1, y1, axis) * wx) * wy
     })
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn exclusive_movie_reuses_pixels_and_preserves_presentation() -> Result<()> {
+    use crate::movie::{MovieFrame, MovieFramePresenter};
+    use std::sync::Arc;
+
+    let mut host = MpegMovieHost::new(|_| unreachable!());
+    let surface = host.frame_surface();
+    let frame = Arc::new(MovieFrame {
+        width: 2,
+        height: 2,
+        presentation_time: 0.5,
+        rgba: Arc::from([16, 32, 64, 255, 32, 64, 128, 127, 64, 128, 192, 0, 128, 192, 255, 255]),
+    });
+    host.show_on_window();
+    surface.present(42, frame.clone())?;
+    host.set_display_rectangle([-1, 1, 6, 4])?;
+    let mut canvas = Canvas::new(8, 6)?;
+    assert!(host.draw_exclusive_movie(&mut canvas)?);
+    let first = canvas.share_snapshot();
+    let first_receipt = host.scene_movie_presentations().remove(0);
+    assert_eq!(first.pixel(7, 5)?, Color::BLACK);
+
+    canvas.clear(Color::WHITE);
+    assert!(host.draw_exclusive_movie(&mut canvas)?);
+    assert!(std::ptr::eq(canvas.pixels(), first.pixels()));
+    let repeated = host.scene_movie_presentations().remove(0);
+    assert_eq!((repeated.playback, repeated.sequence, repeated.time),
+        (first_receipt.playback, first_receipt.sequence, first_receipt.time));
+
+    host.set_display_rectangle([2, 0, 6, 4])?;
+    assert!(host.draw_exclusive_movie(&mut canvas)?);
+    assert_ne!(canvas, first);
+    assert_eq!(canvas.pixel(0, 1)?, Color::BLACK);
+
+    let next = Arc::new(MovieFrame {
+        presentation_time: 1.0,
+        rgba: Arc::from([255; 16]),
+        ..(*frame).clone()
+    });
+    surface.present(42, next)?;
+    assert!(host.draw_exclusive_movie(&mut canvas)?);
+    assert_eq!(canvas.pixel(2, 0)?, Color::WHITE);
+    let updated = host.scene_movie_presentations().remove(0);
+    assert!(updated.sequence > first_receipt.sequence);
+    assert_eq!(updated.time, 1.0);
+
+    host.release(42)?;
+    assert!(host.planes.exclusive_pixels.is_none());
+    assert!(!host.draw_exclusive_movie(&mut canvas)?);
+    Ok(())
 }

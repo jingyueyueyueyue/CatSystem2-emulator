@@ -38,7 +38,7 @@ impl Blend {
         // 19c8f0 runs at fraction zero. Fill only fully transparent RGB;
         // neither source's alpha changes. The OR uses the incoming alpha.
         let mut incoming_alpha = 0_u8;
-        for (a, b) in old.rgba_mut().chunks_exact_mut(4).zip(new.rgba_mut().chunks_exact_mut(4)) {
+        for (a, b) in old.rgba_mut()?.chunks_exact_mut(4).zip(new.rgba_mut()?.chunks_exact_mut(4)) {
             incoming_alpha |= b[3];
             if a[3] == 0 && b[3] != 0 {
                 a[..3].copy_from_slice(&b[..3]);
@@ -75,21 +75,19 @@ impl Blend {
             self.shown = shown;
             return true;
         }
-        if self.shown.device().is_some() {
-            self.shown = self.old.clone();
-        }
-        if *self.new_is_transparent.get_or_insert_with(||
-            !self.new.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0))
-        {
+        let (Ok(old_pixels), Ok(new_pixels)) = (self.old.rgba(), self.new.rgba()) else {
+            return true;
+        };
+        if self.shown.device().is_some() { self.shown = self.old.clone(); }
+        let Ok(shown_pixels) = self.shown.rgba_mut() else { return true; };
+        if *self.new_is_transparent.get_or_insert_with(|| !new_pixels.chunks_exact(4).any(|pixel| pixel[3] != 0)) {
             // 19c7f0 preserves RGB rather than lerping toward black.
-            for (out, old) in self.shown.rgba_mut().chunks_exact_mut(4)
-                .zip(self.old.rgba().chunks_exact(4)) {
+            for (out, old) in shown_pixels.chunks_exact_mut(4).zip(old_pixels.chunks_exact(4)) {
                 out[..3].copy_from_slice(&old[..3]);
                 out[3] = ((u32::from(old[3]) * old_weight) >> 8) as u8;
             }
         } else {
-            for ((out, old), new) in self.shown.rgba_mut().iter_mut()
-                .zip(self.old.rgba()).zip(self.new.rgba()) {
+            for ((out, old), new) in shown_pixels.iter_mut().zip(old_pixels).zip(new_pixels) {
                 *out = ((u32::from(*old) * old_weight
                     + u32::from(*new) * new_weight) >> 8) as u8;
             }
@@ -224,7 +222,11 @@ impl CpuM2SurfaceOwner {
         }
         let Some(previous) = self.pending.as_ref() else { return Ok(()); };
         let blend = if enabled && self.duration != 0 {
-            Some(Blend::new(previous.clone(), next.clone(), self.duration, prepare)?)
+            match Blend::new(previous.clone(), next.clone(), self.duration, prepare) {
+                Ok(blend) => Some(blend),
+                Err(EmoteError::DeviceReadback) => None,
+                Err(error) => return Err(error),
+            }
         } else { None };
         self.pending = None;
         self.deferred_capture = false;

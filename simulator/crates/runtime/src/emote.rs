@@ -145,11 +145,15 @@ pub enum EmoteError {
     Backend(String),
     InvalidReply { native: u32 },
     InvalidFrame,
+    DeviceReadback,
+    CanvasReadback,
 }
 
 impl fmt::Display for EmoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DeviceReadback => write!(f, "E-mote device pixels are temporarily unavailable"),
+            Self::CanvasReadback => write!(f, "scene canvas pixels are temporarily unavailable"),
             Self::UnknownProfile => write!(f, "E-mote requires an identified M2 task registration"),
             Self::UnknownTask(id) => write!(f, "E-mote task {id} is not registered"),
             Self::WrongTaskType(kind) => write!(f, "E-mote requires task type54, received {kind}"),
@@ -477,17 +481,19 @@ impl EmoteRasterFrame {
         EmoteFrameIdentity(Arc::downgrade(&self.pixels))
     }
     pub fn is_valid(&self) -> bool {
-        self.pixels.device.as_ref().is_none_or(|device| device.is_valid())
+        self.pixels.rgba.get().is_some() || self.pixels.device.as_ref().is_some_and(|device| device.is_valid())
     }
-    pub fn rgba(&self) -> &[u8] {
-        self.pixels.rgba.get_or_init(|| {
-            let size = Self::frame_bytes(self.width, self.height).unwrap();
+    pub fn rgba(&self) -> Result<&[u8]> {
+        if self.pixels.rgba.get().is_none() {
+            let device = self.device().filter(|device| device.is_valid()).ok_or(EmoteError::DeviceReadback)?;
+            let size = Self::frame_bytes(self.width, self.height)?;
             let mut rgba = vec![0; size];
-            if !self.pixels.device.as_ref().is_some_and(|device| device.read_rgba(&mut rgba)) {
-                panic!("E-mote device readback failed; rebuild the pose instead of using stale pixels");
+            if !device.read_rgba(&mut rgba) {
+                return Err(EmoteError::DeviceReadback);
             }
-            rgba
-        })
+            let _ = self.pixels.rgba.set(rgba);
+        }
+        Ok(self.pixels.rgba.get().ok_or(EmoteError::DeviceReadback)?)
     }
 
     /// Return the original frame when possible, otherwise clip and pad it to a full viewport.
@@ -510,6 +516,7 @@ impl EmoteRasterFrame {
         let bottom = (origin[1] + i64::from(self.height)).min(i64::from(size[1]));
         let mut rgba = vec![0; byte_count];
         if right > left && bottom > top {
+            let pixels = self.rgba()?;
             let source_x = (left - origin[0]) as usize;
             let source_y = (top - origin[1]) as usize;
             let source_stride = self.width as usize;
@@ -519,18 +526,18 @@ impl EmoteRasterFrame {
                 let source = ((source_y + row) * source_stride + source_x) * 4;
                 let target = ((top as usize + row) * target_stride + left as usize) * 4;
                 rgba[target..target + row_bytes]
-                    .copy_from_slice(&self.rgba()[source..source + row_bytes]);
+                    .copy_from_slice(&pixels[source..source + row_bytes]);
             }
         }
         Self::new(size[0], size[1], [0, 0], rgba)
     }
 
-    fn rgba_mut(&mut self) -> &mut [u8] {
-        self.rgba();
+    fn rgba_mut(&mut self) -> Result<&mut [u8]> {
+        self.rgba()?;
         let pixels = Arc::make_mut(&mut self.pixels);
         pixels.device = None;
         pixels.alpha_bounds.take();
-        pixels.rgba.get_mut().unwrap()
+        pixels.rgba.get_mut().map(Vec::as_mut_slice).ok_or(EmoteError::InvalidFrame)
     }
 
     fn try_recycle(self) -> Option<Vec<u8>> {
@@ -538,10 +545,11 @@ impl EmoteRasterFrame {
     }
 
     /// Nonzero-alpha bounds in local pixels, with exclusive right and bottom.
-    pub fn alpha_bounds(&self) -> Option<[u32; 4]> {
-        *self.pixels.alpha_bounds.get_or_init(|| {
+    pub fn alpha_bounds(&self) -> Result<Option<[u32; 4]>> {
+        let rgba = self.rgba()?;
+        Ok(*self.pixels.alpha_bounds.get_or_init(|| {
             let mut bounds = [self.width, self.height, 0, 0];
-            for (row, pixels) in self.rgba().chunks_exact(self.width as usize * 4).enumerate() {
+            for (row, pixels) in rgba.chunks_exact(self.width as usize * 4).enumerate() {
                 let mut pixels = pixels.chunks_exact(4);
                 if let Some(first) = pixels.position(|pixel| pixel[3] != 0) {
                     let last = pixels.rposition(|pixel| pixel[3] != 0)
@@ -553,7 +561,7 @@ impl EmoteRasterFrame {
                 }
             }
             (bounds[0] < bounds[2]).then_some(bounds)
-        })
+        }))
     }
 }
 
@@ -1228,6 +1236,33 @@ impl EmoteServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_pixels_can_be_retried_after_a_temporary_readback_failure() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct DelayedReadback(AtomicUsize);
+
+        impl EmoteDeviceReadback for DelayedReadback {
+            fn read_rgba(&self, output: &mut [u8]) -> bool {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 { return false; }
+                output.copy_from_slice(&[10, 20, 30, 255]);
+                true
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+
+        let device = Arc::new(DelayedReadback::default());
+        let frame = EmoteRasterFrame::from_device(1, 1, [0, 0], device.clone())?;
+        assert_eq!(frame.alpha_bounds(), Err(EmoteError::DeviceReadback));
+        assert!(frame.is_valid());
+        assert_eq!(frame.alpha_bounds()?, Some([0, 0, 1, 1]));
+        assert_eq!(frame.rgba()?, [10, 20, 30, 255]);
+        assert_eq!(device.0.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
     use std::io::Write;
 
     #[test]
@@ -1310,9 +1345,9 @@ mod tests {
     #[test]
     fn raster_frame_viewport_materialization_clips_and_reuses_matching_frames() -> Result<()> {
         let matching = EmoteRasterFrame::new(1, 1, [0, 0], vec![1, 2, 3, 4])?;
-        let address = matching.rgba().as_ptr();
+        let address = matching.rgba().unwrap().as_ptr();
         let matching = matching.into_viewport([1, 1])?;
-        assert_eq!(matching.rgba().as_ptr(), address);
+        assert_eq!(matching.rgba().unwrap().as_ptr(), address);
 
         let cropped = EmoteRasterFrame::new(2, 2, [1, 1], vec![
             1, 2, 3, 255, 4, 5, 6, 255,
@@ -1320,20 +1355,20 @@ mod tests {
         ])?;
         let expanded = cropped.clone().into_viewport([3, 2])?;
         assert_eq!(expanded.origin(), [0, 0]);
-        assert_eq!(expanded.rgba(), [
+        assert_eq!(expanded.rgba().unwrap(), [
             [0u8, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
             [0, 0, 0, 0], [1, 2, 3, 255], [4, 5, 6, 255],
         ].concat().as_slice());
 
-        let clipped = EmoteRasterFrame::new(2, 2, [-1, 0], cropped.rgba().to_vec())?
+        let clipped = EmoteRasterFrame::new(2, 2, [-1, 0], cropped.rgba().unwrap().to_vec())?
             .into_viewport([2, 2])?;
-        assert_eq!(clipped.rgba(), [
+        assert_eq!(clipped.rgba().unwrap(), [
             [4u8, 5, 6, 255], [0, 0, 0, 0],
             [10, 11, 12, 255], [0, 0, 0, 0],
         ].concat().as_slice());
         let outside = EmoteRasterFrame::new(1, 1, [5, 5], vec![255; 4])?
             .into_viewport([2, 2])?;
-        assert!(outside.rgba().iter().all(|&byte| byte == 0));
+        assert!(outside.rgba().unwrap().iter().all(|&byte| byte == 0));
         assert!(outside.into_viewport([0, 2]).is_err());
         assert!(cropped.into_viewport([u32::MAX, u32::MAX]).is_err());
         Ok(())

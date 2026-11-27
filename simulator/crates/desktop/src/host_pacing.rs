@@ -16,7 +16,9 @@ impl TickPacer {
     pub(super) fn reset(&mut self, now: Instant) { self.next = now; }
     pub(super) fn completed(&mut self, now: Instant) { self.next = completed_deadline(self.next, now); }
     pub(super) fn delay_ms(&self, now: Instant) -> u32 {
-        self.next.saturating_duration_since(now).as_nanos().div_ceil(1_000_000).min(100) as u32
+        // Handler can only schedule at whole uptime milliseconds. Wake up
+        // before the deadline while keeping tick debt in nanoseconds.
+        self.next.saturating_duration_since(now).as_millis().min(100) as u32
     }
 }
 
@@ -25,7 +27,7 @@ fn fixed_step_clock_catches_up_without_skipping_a_game_tick_or_counting_retries(
     let start = Instant::now();
     let mut clock = TickPacer::new(start);
     clock.completed(start);
-    assert_eq!(clock.delay_ms(start), 17);
+    assert_eq!(clock.delay_ms(start), 16);
     let late = start + TICK * 3;
     assert_eq!(clock.delay_ms(late), 0);
     // Querying/retrying does not consume a scheduled game tick.
@@ -34,11 +36,11 @@ fn fixed_step_clock_catches_up_without_skipping_a_game_tick_or_counting_retries(
     assert_eq!(clock.delay_ms(late), 0);
     clock.completed(late);
     clock.completed(late);
-    assert_eq!(clock.delay_ms(late), 17);
+    assert_eq!(clock.delay_ms(late), 16);
     let resumed = start + Duration::from_secs(120);
     clock.reset(resumed);
     clock.completed(resumed);
-    assert_eq!(clock.delay_ms(resumed), 17, "pause time cannot become game-time debt");
+    assert_eq!(clock.delay_ms(resumed), 16, "pause time cannot become game-time debt");
 }
 
 #[test]

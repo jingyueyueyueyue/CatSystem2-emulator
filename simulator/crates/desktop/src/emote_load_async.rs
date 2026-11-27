@@ -10,6 +10,8 @@ const MAX_PACKED: usize = 64 * 1024 * 1024;
 const MAX_MODEL: usize = 256 * 1024 * 1024;
 const MAX_POOL: usize = 512 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(all(windows, feature = "gpu-raster"))]
+const ATLAS_WAIT: Duration = Duration::from_millis(50);
 type PreparedResult = std::result::Result<Prepared, EmoteError>;
 
 pub(super) struct Prepared {
@@ -19,6 +21,7 @@ pub(super) struct Prepared {
     identities: Vec<(ResourceCandidate, EmoteArchiveVersion)>,
     pub(super) phases_us: [u128; 4],
     pub(super) preload_wait_us: Option<u128>,
+    pub(super) atlas_wait_us: u128,
     _charge: Option<Charge>,
 }
 pub(super) enum CachedModel {
@@ -36,7 +39,7 @@ impl PlanWork {
     fn reuse(self, model: Arc<CpuMotionModel>, preload_wait_us: Option<u128>) -> Prepared {
         Prepared {
             plan: self.plan, model, version: self.version, identities: self.identities,
-            phases_us: [self.config_us, 0, 0, 0], preload_wait_us, _charge: None,
+            phases_us: [self.config_us, 0, 0, 0], preload_wait_us, atlas_wait_us: 0, _charge: None,
         }
     }
 }
@@ -79,6 +82,8 @@ struct Pending {
     result: Arc<Mutex<Option<StageResult>>>,
     next: Option<Work>,
     waiting: Option<WaitingPreload>,
+    #[cfg(all(windows, feature = "gpu-raster"))]
+    staging_atlas: Option<(Prepared, Instant)>,
 }
 struct Job {
     resources: Arc<ResourceIndex>,
@@ -129,18 +134,28 @@ impl Loads {
         });
     }
     pub(super) fn poll(&mut self, resources: &ResourceIndex, owner: u32, target: u32,
-        spec: &[u8], mode: u32, filter: u32, imports: u32,
+        spec: &[u8], mode: u32, filter: u32, imports: u32, fast_forward: bool,
         mut cached: impl FnMut(&EmoteM2ResourcePlan, &EmoteArchiveVersion) -> Option<CachedModel>,
     ) -> std::result::Result<Option<Prepared>, EmoteError> {
+        #[cfg(not(all(windows, feature = "gpu-raster")))]
+        let _ = fast_forward;
         self.check_cancelled(owner)?;
         if !self.pending.contains_key(&owner) {
             if spec.len() > MAX_FORMAT_BYTES + 1 { return Err(EmoteError::Capacity); }
             if self.pending.len() >= MAX_PENDING { return Err(EmoteError::Capacity); }
             self.pending.insert(owner, Pending { target, spec: spec.to_vec(), mode, filter, imports,
-                started: Instant::now(), result: Arc::new(Mutex::new(None)), next: Some(Work::Plan(spec.to_vec())), waiting: None });
+                started: Instant::now(), result: Arc::new(Mutex::new(None)), next: Some(Work::Plan(spec.to_vec())), waiting: None,
+                #[cfg(all(windows, feature = "gpu-raster"))]
+                staging_atlas: None,
+            });
         }
         let pending = self.pending.get_mut(&owner).unwrap();
         let mut result = pending.result.try_lock().ok().and_then(|mut slot| slot.take());
+        #[cfg(all(windows, feature = "gpu-raster"))]
+        let atlas_started = pending.staging_atlas.take().map(|(prepared, started)| {
+            result = Some(Ok(Stage::Ready(prepared)));
+            started
+        });
         if let Some(status) = pending.waiting.as_ref().and_then(|waiting| waiting.subscription.poll_model()) {
             let WaitingPreload { work, started, .. } = pending.waiting.take().unwrap();
             match status {
@@ -209,6 +224,19 @@ impl Loads {
                 }
             }
             Stage::Ready(prepared) => prepared,
+        };
+        #[cfg(all(windows, feature = "gpu-raster"))]
+        let prepared = {
+            let mut prepared = prepared;
+            if (fast_forward && pending.imports != 0) || atlas_started.is_some() {
+                let started = atlas_started.unwrap_or_else(Instant::now);
+                if started.elapsed() < ATLAS_WAIT && !crate::gpu_raster::loading_emote_atlas_ready(&prepared.model) {
+                    pending.staging_atlas = Some((prepared, started));
+                    return Ok(None);
+                }
+                prepared.atlas_wait_us = atlas_started.map_or(0, |started| started.elapsed().as_micros());
+            }
+            prepared
         };
         self.pending.remove(&owner);
         if prepared.identities.iter().any(|(candidate, version)|
@@ -285,7 +313,7 @@ fn prepare(resources: &ResourceIndex, work: PlanWork, filter: u32, budget: Arc<A
         return Err(rejected("M2 resource changed during preparation"));
     }
     Ok(Prepared { plan, model, version, identities, phases_us: [config_us, read_us, decode_us, load_us],
-        preload_wait_us: None, _charge: Some(charge) })
+        preload_wait_us: None, atlas_wait_us: 0, _charge: Some(charge) })
 }
 
 #[cfg(test)]
@@ -436,18 +464,18 @@ mod tests {
         std::fs::create_dir(&root)?;
         let resources = ResourceIndex::scan(&root)?;
         let mut loads = Loads::default();
-        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, |_, _| None)?.is_none());
+        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, false, |_, _| None)?.is_none());
         assert_eq!(loads.saved(1), Some((2, b"actor".to_vec(), 7)));
-        assert!(loads.poll(&resources, 1, 2, b"changed", 0, 1, 0, |_, _| None).is_err());
+        assert!(loads.poll(&resources, 1, 2, b"changed", 0, 1, 0, false, |_, _| None).is_err());
         assert!(!loads.has_pending());
-        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, |_, _| None)?.is_none());
+        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, false, |_, _| None)?.is_none());
         loads.pending.get_mut(&1).unwrap().started = Instant::now() - TIMEOUT;
-        assert!(loads.poll(&resources, 1, 2, b"changed", 0, 0, 0, |_, _| None).err().unwrap().to_string().contains("timed out"));
+        assert!(loads.poll(&resources, 1, 2, b"changed", 0, 0, 0, false, |_, _| None).err().unwrap().to_string().contains("timed out"));
         assert!(!loads.has_pending());
-        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, |_, _| None)?.is_none());
+        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, false, |_, _| None)?.is_none());
         loads.cancel_target(2);
         assert!(loads.has_pending(), "a surviving caller must consume its cancelled native before graph capture");
-        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, |_, _| None).is_err());
+        assert!(loads.poll(&resources, 1, 2, b"actor", 7, 0, 0, false, |_, _| None).is_err());
         assert!(!loads.has_pending());
         drop(loads); std::fs::remove_dir_all(root)?;
         Ok(())
@@ -460,10 +488,10 @@ mod tests {
         std::fs::create_dir(&root)?;
         let resources = ResourceIndex::scan(&root)?;
         let mut loads = Loads::default();
-        assert!(loads.poll(&resources, 1, 2, b"actor", 0, 0, 0, |_, _| None)?.is_none());
+        assert!(loads.poll(&resources, 1, 2, b"actor", 0, 0, 0, false, |_, _| None)?.is_none());
         let started = Instant::now();
         loop {
-            match loads.poll(&resources, 1, 2, b"actor", 0, 0, 0, |_, _| None) {
+            match loads.poll(&resources, 1, 2, b"actor", 0, 0, 0, false, |_, _| None) {
                 Err(_) => break,
                 Ok(None) => std::thread::yield_now(),
                 Ok(Some(_)) => panic!("an absent configuration cannot report a committed model"),

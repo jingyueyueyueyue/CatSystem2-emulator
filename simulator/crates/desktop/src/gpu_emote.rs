@@ -71,9 +71,10 @@ impl EmoteBatch {
         PREPARED.with_borrow_mut(Vec::clear);
         RASTER.with_borrow(|slot| {
             if let Some(raster) = slot.as_ref()
-                && let Some(mesh) = raster.emote.as_ref().and_then(|emote| emote.mesh.as_ref())
+                && let Some(emote) = raster.emote.as_ref()
+                && let Some(mesh) = emote.mesh.as_ref()
             {
-                mesh.submission.flush(&raster.queue);
+                mesh.submission.seal(&raster.queue, !emote.atlas_transfers.staging());
             }
         });
     }
@@ -129,6 +130,7 @@ pub(in crate) fn stage_emote_model(model: &Arc<CpuMotionModel>) {
     RASTER.with_borrow_mut(|slot| {
         let Some(raster) = slot.as_mut() else { return };
         let Some(emote) = raster.emote.as_mut() else { return };
+        emote.poll_atlas_upload();
         let started = Instant::now();
         emote.atlas_upload_window.refresh(started);
         let budget = emote.atlas_transfers.allowance(&raster.device,
@@ -284,19 +286,22 @@ pub(in crate) fn expand_emote_surface(
     })
 }
 
-pub(in crate) fn draw_emote_surface(
-    player: &CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>,
-) -> Option<EmoteRasterFrame> {
+fn device_endpoint_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
+    *ENABLED.get_or_init(|| {
         #[cfg(windows)]
         let enabled = !std::env::var("CS2_EMOTE_DEVICE_ENDPOINT").is_ok_and(|value| value == "0");
         #[cfg(target_os = "android")]
         let enabled = !super::android_property(c"debug.cs2.emote_device_endpoint", |value| value == b"0")
             .unwrap_or(false);
         enabled
-    });
-    if !enabled || !super::emote_device_blend_requested() { return None; }
+    })
+}
+
+pub(in crate) fn draw_emote_surface(
+    player: &CpuPlayer, viewport: CpuViewport, variables: &BTreeMap<String, f64>,
+) -> Option<EmoteRasterFrame> {
+    if !device_endpoint_enabled() || !super::emote_device_blend_requested() { return None; }
     if !RASTER.with_borrow(|slot| slot.as_ref().is_some_and(|raster|
         raster.direct_output_enabled() && !raster.failed.load(Ordering::Relaxed))) { return None; }
     // Endpoint capture chooses the pure GPU shaders without changing batch
@@ -305,6 +310,35 @@ pub(in crate) fn draw_emote_surface(
     let _capture = EndpointCapture(CAPTURING.with(|capture| capture.replace(true)));
     let frame = draw_emote(player, viewport, variables)?;
     expand_emote_surface(&frame, [viewport.width, viewport.height])
+}
+
+/// Returns false while a single known atlas can make progress on the submit worker.
+#[cfg(windows)]
+pub(in crate) fn loading_emote_atlas_ready(model: &Arc<CpuMotionModel>) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if model.textures.len() != 1 || !device_endpoint_enabled() || !super::emote_device_blend_requested()
+        || !*ENABLED.get_or_init(|| std::env::var_os("CS2_EMOTE_LOAD_ATLAS").is_some_and(|value| value == "1"))
+        || !mesh::atlas_upload_enabled()
+    {
+        return true;
+    }
+    let (name, texture) = model.textures.first_key_value().unwrap();
+    RASTER.with_borrow_mut(|slot| {
+        let Some(raster) = slot.as_mut() else { return true };
+        if !raster.direct_output_enabled() || raster.failed.load(Ordering::Relaxed) { return true; }
+        let Some(emote) = raster.emote.as_mut() else { return true };
+        emote.poll_atlas_upload();
+        if emote.scene_atlas_tail(model, texture) == 0 { return true; }
+        if emote.atlas_transfers.staging() { return false; }
+        let limit = 2 * ATLAS_TRANSFER_BYTES;
+        let budget = emote.atlas_transfers.allowance(&raster.device, limit, Duration::ZERO);
+        if budget < ATLAS_TRANSFER_BYTES.min(emote.scene_atlas_tail(model, texture)) { return false; }
+        match emote.enqueue_loading_atlas(&raster.device, &raster.queue, model, name, budget) {
+            Ok(0) | Err(_) => return true,
+            Ok(bytes) => report(&format!("emote_atlas_load_reserved_bytes={bytes}")),
+        }
+        false
+    })
 }
 
 pub(in crate) fn prepare_emote_surfaces(
@@ -320,7 +354,9 @@ pub(in crate) fn prepare_emote_surfaces(
         }
         let [width, height] = size;
         let bytes = fade_extent(&raster.device, size)?;
-        let cpu_transparent = new.device().is_none().then(|| !new.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0));
+        let cpu_transparent = if new.device().is_none() {
+            Some(!new.rgba().ok()?.chunks_exact(4).any(|pixel| pixel[3] != 0))
+        } else { None };
         let emote = raster.emote.as_mut()?;
         let prior = emote.fade_source(&raster.device, &raster.queue, &raster.failed, old)?;
         let next = emote.fade_source(&raster.device, &raster.queue, &raster.failed, new)?;
@@ -340,7 +376,8 @@ pub(in crate) fn prepare_emote_surfaces(
                 wgpu::BindGroupEntry { binding: 4, resource: adjusted_new.as_entire_binding() },
             ],
         });
-        dispatch_fade(&raster.device, &raster.queue, &emote.fade_prepare, &bindings, size);
+        let mut encoder = raster.device.create_command_encoder(&Default::default());
+        encode_fade(&mut encoder, &emote.fade_prepare, &bindings, size);
         if let Some(alpha) = &alpha {
             let bindings = raster.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("CS2 E-mote capture alpha"), layout: &emote.fade_alpha_layout,
@@ -350,8 +387,9 @@ pub(in crate) fn prepare_emote_surfaces(
                     wgpu::BindGroupEntry { binding: 5, resource: alpha.as_entire_binding() },
                 ],
             });
-            dispatch_fade(&raster.device, &raster.queue, &emote.fade_alpha, &bindings, size);
+            encode_fade(&mut encoder, &emote.fade_alpha, &bindings, size);
         }
+        super::submit_gpu_commands(&raster.queue, Some(encoder.finish()));
         Some((
             raster.bind_fade_output(size, old.origin(), adjusted_old, bytes, None)?,
             raster.bind_fade_output(size, new.origin(), adjusted_new, bytes, alpha)?,
@@ -372,16 +410,21 @@ fn fade_extent(device: &wgpu::Device, [width, height]: [u32; 2]) -> Option<u64> 
 
 fn dispatch_fade(
     device: &wgpu::Device, queue: &wgpu::Queue, pipeline: &wgpu::ComputePipeline,
-    bindings: &wgpu::BindGroup, [width, height]: [u32; 2],
+    bindings: &wgpu::BindGroup, size: [u32; 2],
 ) {
     let mut encoder = device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bindings, &[]);
-        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
-    }
+    encode_fade(&mut encoder, pipeline, bindings, size);
     super::submit_gpu_commands(queue, Some(encoder.finish()));
+}
+
+fn encode_fade(
+    encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline,
+    bindings: &wgpu::BindGroup, [width, height]: [u32; 2],
+) {
+    let mut pass = encoder.begin_compute_pass(&Default::default());
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bindings, &[]);
+    pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
 }
 
 impl Raster {
@@ -399,7 +442,8 @@ impl Raster {
     ) -> Option<EmoteRasterFrame> {
         EmoteRasterFrame::from_device(size[0], size[1], origin, Arc::new(DevicePose {
             buffer, device: self.device.clone(), queue: self.queue.clone(), bytes,
-            failed: self.failed.clone(), fade_alpha, mesh_submission: None,
+            failed: self.failed.clone(), readback_buffers: self.readback_buffers.clone(),
+            fade_alpha, mesh_submission: None,
         })).ok()
     }
 }
@@ -899,6 +943,7 @@ struct CachedAtlas {
     identity: usize,
     bytes: usize,
     view: wgpu::TextureView,
+    mesh_binding: Option<wgpu::BindGroup>,
     texture: wgpu::Texture,
     uploaded_rows: u32,
     used_by_draw: bool,
@@ -915,24 +960,153 @@ struct AtlasUploadWindow {
 struct AtlasTransfers {
     pending: VecDeque<(wgpu::SubmissionIndex, usize)>,
     bytes: usize,
+    #[cfg(windows)]
+    background: Option<PendingAtlasUpload>,
 }
 
 impl AtlasTransfers {
     fn allowance(&mut self, device: &wgpu::Device, requested: usize, timeout: Duration) -> usize {
-        while requested > ATLAS_IN_FLIGHT_BYTES - self.bytes {
+        let limit = ATLAS_IN_FLIGHT_BYTES - self.staging_bytes();
+        while requested > limit - self.bytes {
             let Some((submission, bytes)) = self.pending.front() else { break };
             if !gpu_submission_finished(device, submission, timeout) { break; }
             self.bytes -= *bytes;
             self.pending.pop_front();
         }
-        requested.min(ATLAS_IN_FLIGHT_BYTES - self.bytes)
+        requested.min(limit - self.bytes)
     }
 
     fn submitted(&mut self, submission: wgpu::SubmissionIndex, bytes: usize) {
-        debug_assert!(bytes <= ATLAS_IN_FLIGHT_BYTES - self.bytes);
+        debug_assert!(bytes <= ATLAS_IN_FLIGHT_BYTES - self.staging_bytes() - self.bytes);
         self.pending.push_back((submission, bytes));
         self.bytes += bytes;
     }
+
+    fn staging_bytes(&self) -> usize {
+        #[cfg(windows)]
+        if let Some(upload) = &self.background {
+            return upload.bytes;
+        }
+        0
+    }
+
+    fn staging(&self) -> bool { self.staging_bytes() != 0 }
+
+    fn uploading(&self, texture: &wgpu::Texture) -> bool {
+        #[cfg(windows)]
+        if let Some(upload) = &self.background {
+            return matches!(&upload.target, AtlasUploadTarget::Existing(current) if current == texture);
+        }
+        let _ = texture;
+        false
+    }
+
+    fn reserved_texture_bytes(&self) -> usize {
+        #[cfg(windows)]
+        if let Some(upload) = &self.background
+            && let AtlasUploadTarget::New { bytes, .. } = &upload.target
+        {
+            return *bytes;
+        }
+        0
+    }
+}
+
+#[cfg(windows)]
+enum AtlasUploadTarget {
+    Existing(wgpu::Texture),
+    New { owner: Weak<CpuMotionModel>, identity: usize, bytes: usize },
+}
+
+#[cfg(windows)]
+struct PendingAtlasUpload {
+    target: AtlasUploadTarget,
+    bytes: usize,
+    receipt: mpsc::Receiver<AtlasUploadReceipt>,
+}
+
+#[cfg(windows)]
+struct SubmittedAtlasUpload {
+    submission: wgpu::SubmissionIndex,
+    end_row: u32,
+    bytes: usize,
+}
+
+#[cfg(windows)]
+struct AtlasUploadReceipt {
+    submitted: SubmittedAtlasUpload,
+    allocation: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+
+#[cfg(windows)]
+struct AtlasUploadWork {
+    queue: wgpu::Queue,
+    texture: Option<wgpu::Texture>,
+    model: Arc<CpuMotionModel>,
+    name: String,
+    rows: std::ops::Range<u32>,
+    rows_per_submission: u32,
+    stream_device: Option<wgpu::Device>,
+    queued_at: Instant,
+    receipt: mpsc::Sender<AtlasUploadReceipt>,
+}
+
+#[cfg(windows)]
+impl AtlasUploadWork {
+    fn submit(self) {
+        let started = Instant::now();
+        let source = &self.model.textures[&self.name];
+        let allocation = if self.texture.is_none() {
+            // The retained load is the consumer. Cancellation before dispatch
+            // leaves only this job's reference to a cold model.
+            if Arc::strong_count(&self.model) == 1 { return; }
+            let device = self.stream_device.as_ref().unwrap();
+            let allocation = create_atlas_texture(device, source);
+            report(&format!("emote_atlas_load_worker_allocate_bytes={} allocate_us={}",
+                source.width * source.height * 4, started.elapsed().as_micros()));
+            Some(allocation)
+        } else {
+            None
+        };
+        let texture = self.texture.as_ref().or_else(|| allocation.as_ref().map(|(texture, _)| texture)).unwrap();
+        let pixels = source.upload_pixels().0;
+        let upload_started = Instant::now();
+        let deadline = upload_started + ATLAS_UPLOAD_WINDOW;
+        let mut last: Option<SubmittedAtlasUpload> = None;
+        for start in self.rows.clone().step_by(self.rows_per_submission as usize) {
+            if let Some(upload) = &last {
+                // Retire each chunk before reusing its share of the transfer budget.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let device = self.stream_device.as_ref().unwrap();
+                if remaining.is_zero() || !gpu_submission_finished(device, &upload.submission, remaining) { break; }
+            }
+            let end_row = (start + self.rows_per_submission).min(self.rows.end);
+            write_atlas_rows(&self.queue, texture, pixels, start..end_row);
+            let submission = super::submit_gpu_commands(&self.queue, []);
+            let bytes = (end_row - start) as usize * source.width * 4;
+            last = Some(SubmittedAtlasUpload { submission, end_row, bytes });
+        }
+        let Some(submitted) = last else { return; };
+        let bytes = (submitted.end_row - self.rows.start) as usize * source.width * 4;
+        let _ = self.receipt.send(AtlasUploadReceipt { submitted, allocation });
+        let scope = if self.stream_device.is_some() { "load" } else { "scene" };
+        report(&format!("emote_atlas_{scope}_worker_bytes={bytes} queue_us={} submit_us={}",
+            started.duration_since(self.queued_at).as_micros(), upload_started.elapsed().as_micros()));
+    }
+}
+
+fn create_atlas_texture(device: &wgpu::Device, source: &CpuTexture) -> (wgpu::Texture, wgpu::TextureView) {
+    let size = wgpu::Extent3d {
+        width: source.width as u32, height: source.height as u32, depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("CS2 E-mote atlas"), size, mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 fn gpu_submission_finished(device: &wgpu::Device, submission: &wgpu::SubmissionIndex, timeout: Duration) -> bool {
@@ -964,20 +1138,29 @@ impl CachedAtlas {
         if rows == 0 {
             return 0;
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                origin: wgpu::Origin3d { x: 0, y: start, z: 0 },
-                ..self.texture.as_image_copy()
-            },
-            &pixels[start as usize * stride..(start + rows) as usize * stride],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0, bytes_per_row: Some(size.width * 4), rows_per_image: Some(rows),
-            },
-            wgpu::Extent3d { height: rows, ..size },
-        );
+        write_atlas_rows(queue, &self.texture, pixels, start..start + rows);
         self.uploaded_rows += rows;
         rows as usize * stride
     }
+}
+
+fn write_atlas_rows(
+    queue: &wgpu::Queue, texture: &wgpu::Texture, pixels: &[u8], rows: std::ops::Range<u32>,
+) {
+    let size = texture.size();
+    let stride = size.width * 4;
+    let height = rows.end - rows.start;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            origin: wgpu::Origin3d { x: 0, y: rows.start, z: 0 },
+            ..texture.as_image_copy()
+        },
+        &pixels[rows.start as usize * stride as usize..rows.end as usize * stride as usize],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(height),
+        },
+        wgpu::Extent3d { height, ..size },
+    );
 }
 
 #[derive(Clone)]
@@ -1330,6 +1513,7 @@ pub(super) struct DevicePose {
     queue: wgpu::Queue,
     bytes: u64,
     failed: Arc<AtomicBool>,
+    readback_buffers: Arc<super::ReadbackBuffers>,
     fade_alpha: Option<Arc<wgpu::Buffer>>,
     mesh_submission: Option<Arc<mesh::MeshSubmission>>,
 }
@@ -1348,26 +1532,7 @@ impl EmoteDeviceReadback for DevicePose {
     fn read_rgba(&self, output: &mut [u8]) -> bool {
         if self.failed.load(Ordering::Relaxed) || output.len() as u64 != self.bytes { return false; }
         self.flush_mesh();
-        let measurement = ReadbackTimer::start(ReadbackKind::Emote, self.bytes);
-        let readback = buffer(&self.device, self.bytes, DOWNLOAD);
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(&self.buffer, 0, &readback, 0, self.bytes);
-        let submitted = super::submit_gpu_commands(&self.queue, Some(encoder.finish()));
-        let slice = readback.slice(..);
-        let (send, receive) = mpsc::sync_channel(1);
-        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = send.send(result); });
-        let ready = self.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submitted), timeout: Some(Duration::from_millis(250)),
-        });
-        if ready.is_err() || !matches!(receive.try_recv(), Ok(Ok(()))) || self.failed.load(Ordering::Relaxed) {
-            self.failed.store(true, Ordering::Relaxed);
-            report("emote_device_readback_failed");
-            return false;
-        }
-        output.copy_from_slice(&slice.get_mapped_range());
-        readback.unmap();
-        if let Some(measurement) = measurement { measurement.complete(); }
-        true
+        self.readback_buffers.read(&self.device, &self.queue, &self.buffer, &self.failed, ReadbackKind::Emote, output)
     }
 
     fn as_any(&self) -> &dyn std::any::Any { self }
@@ -1414,6 +1579,7 @@ impl<T> OutputPool<T> {
 }
 
 pub(super) struct EmoteRaster {
+    readback_buffers: Arc<super::ReadbackBuffers>,
     mesh: Option<mesh::MeshRaster>,
     sprite: wgpu::ComputePipeline,
     sprite_layout: wgpu::BindGroupLayout,
@@ -1459,15 +1625,14 @@ pub(super) struct EmoteRaster {
 impl EmoteRaster {
     #[cfg(target_os = "android")]
     pub(super) fn trim_android_caches(&mut self) {
-        self.atlases.retain(|atlas| atlas.used_by_draw);
+        self.atlases.retain(|atlas| atlas.owner.strong_count() != 0);
         self.atlas_bytes = self.atlases.iter().map(|atlas| atlas.bytes).sum();
-        self.fade_sources.clear();
-        self.fade_outputs = OutputPool::new();
-        self.rgba_spares.clear();
-        self.readback_spares.clear();
+        self.fade_sources.truncate(2);
+        self.rgba_spares.truncate(2);
+        self.readback_spares.truncate(2);
     }
 
-    pub(super) fn new(device: &wgpu::Device) -> Result<Self> {
+    fn new(device: &wgpu::Device, readback_buffers: Arc<super::ReadbackBuffers>) -> Result<Self> {
         #[cfg(target_os = "android")]
         let validation = crate::gpu_raster::lock_validation_scope();
         device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -1564,7 +1729,7 @@ impl EmoteRaster {
             pixels: source(8, UPLOAD), rgba: Arc::new(source(4, TARGET)),
             rgba_spares: Vec::new(), repairs: source(8, UPLOAD),
             size: source(16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
-            readback: source(4, DOWNLOAD), readback_spares: Vec::new(), pending: Vec::new(),
+            readback: source(4, DOWNLOAD), readback_buffers, readback_spares: Vec::new(), pending: Vec::new(),
             repair_scratch: EmoteRepairScratch::default(), batches: Default::default(), words: Vec::new(),
         })
     }
@@ -1583,7 +1748,7 @@ impl EmoteRaster {
         } else {
             let bytes = u64::from(frame.width()) * u64::from(frame.height()) * 4;
             let source = buffer(device, bytes, UPLOAD);
-            queue.write_buffer(&source, 0, frame.rgba());
+            queue.write_buffer(&source, 0, frame.rgba().ok()?);
             (frame.clone(), source)
         };
         let source = entry.1.clone();
@@ -1604,7 +1769,8 @@ impl EmoteRaster {
     fn atlas(
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
         owner: &Arc<CpuMotionModel>, source: &CpuTexture,
-    ) -> Result<wgpu::TextureView> {
+    ) -> Result<&mut CachedAtlas> {
+        self.poll_atlas_upload();
         if REQUIRE_RESIDENT_ATLASES.with(Cell::get) {
             let owner = Arc::downgrade(owner);
             let identity = std::ptr::from_ref(source) as usize;
@@ -1612,11 +1778,14 @@ impl EmoteRaster {
                 entry.identity == identity && Weak::ptr_eq(&entry.owner, &owner) && entry.resident()
             }).context("E-mote scene atlas is not fully resident")?;
             atlas.used_by_draw = true;
-            return Ok(atlas.view.clone());
+            return Ok(atlas);
         }
         let index = self.atlas_storage(device, owner, source, false)?
             .context("E-mote atlas allocation was declined")?;
         if !self.atlases[index].resident() {
+            if self.atlas_transfers.uploading(&self.atlases[index].texture) {
+                bail!("E-mote atlas upload is awaiting submission");
+            }
             let started = Instant::now();
             let pixels = source.upload_pixels().0;
             let stride = source.width * 4;
@@ -1632,21 +1801,105 @@ impl EmoteRaster {
             }
             report(&format!("emote_atlas_demand_bytes={bytes} write_us={}", started.elapsed().as_micros()));
         }
-        Ok(self.atlases[index].view.clone())
+        Ok(&mut self.atlases[index])
     }
 
     fn stage_scene_atlas(
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
-        model: &Arc<CpuMotionModel>, texture: &CpuTexture, budget: &mut usize,
+        model: &Arc<CpuMotionModel>, name: &str, budget: &mut usize, background: bool,
     ) -> Result<Option<bool>> {
+        let texture = &model.textures[name];
         let stride = texture.width * 4;
-        if *budget < stride {
+        if *budget < stride || (background && self.atlas_transfers.staging()) {
             return Ok(Some(self.scene_atlas_tail(model, texture) == 0));
         }
         let Some(index) = self.atlas_storage(device, model, texture, false)? else { return Ok(None) };
+        #[cfg(windows)]
+        if background && !self.atlases[index].resident() {
+            *budget -= self.enqueue_atlas_rows(queue, model, name, Some(index), *budget, None);
+            return Ok(Some(false));
+        }
         let atlas = &mut self.atlases[index];
         *budget -= atlas.upload(queue, texture.upload_pixels().0, *budget);
         Ok(Some(atlas.resident()))
+    }
+
+    #[cfg(windows)]
+    fn enqueue_loading_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        model: &Arc<CpuMotionModel>, name: &str, budget: usize,
+    ) -> Result<usize> {
+        let source = &model.textures[name];
+        let identity = std::ptr::from_ref(source) as usize;
+        let owner = Arc::downgrade(model);
+        let index = self.atlases.iter().position(|atlas|
+            atlas.identity == identity && Weak::ptr_eq(&atlas.owner, &owner));
+        // Speculation must keep the current scene live until native 906 commits.
+        if index.is_none() && self.reserve_atlas_space(device, source, true)?.is_none() {
+            return Ok(0);
+        }
+        Ok(self.enqueue_atlas_rows(queue, model, name, index, budget, Some(device)))
+    }
+
+    #[cfg(windows)]
+    fn enqueue_atlas_rows(&mut self, queue: &wgpu::Queue, model: &Arc<CpuMotionModel>,
+        name: &str, index: Option<usize>, budget: usize, stream_device: Option<&wgpu::Device>,
+    ) -> usize {
+        let source = &model.textures[name];
+        let stride = source.width * 4;
+        let height = source.height as u32;
+        let atlas = index.map(|index| &self.atlases[index]);
+        let start = atlas.map_or(0, |atlas| atlas.uploaded_rows);
+        let rows_per_submission = (height - start).min((budget / stride) as u32);
+        if rows_per_submission == 0 { return 0; }
+        let bytes = rows_per_submission as usize * stride;
+        let end = if stream_device.is_some() { height } else { start + rows_per_submission };
+        let (send, receipt) = mpsc::channel();
+        let work = AtlasUploadWork {
+            queue: queue.clone(), texture: atlas.map(|atlas| atlas.texture.clone()), model: Arc::clone(model),
+            name: name.to_owned(), rows: start..end, rows_per_submission,
+            stream_device: stream_device.cloned(), queued_at: Instant::now(), receipt: send,
+        };
+        if !mesh::enqueue_atlas_upload(work) { return 0; }
+        let target = atlas.map_or_else(|| AtlasUploadTarget::New {
+            owner: Arc::downgrade(model),
+            identity: std::ptr::from_ref(source) as usize,
+            bytes: source.upload_pixels().0.len(),
+        }, |atlas| AtlasUploadTarget::Existing(atlas.texture.clone()));
+        self.atlas_transfers.background = Some(PendingAtlasUpload { target, bytes, receipt });
+        bytes
+    }
+
+    fn poll_atlas_upload(&mut self) {
+        #[cfg(windows)]
+        if let Some(upload) = &self.atlas_transfers.background {
+            let receipt = upload.receipt.try_recv();
+            if matches!(receipt, Err(mpsc::TryRecvError::Empty)) { return; }
+            let upload = self.atlas_transfers.background.take().unwrap();
+            if let Ok(AtlasUploadReceipt { submitted, allocation }) = receipt {
+                self.atlas_transfers.submitted(submitted.submission, submitted.bytes);
+                match upload.target {
+                    AtlasUploadTarget::Existing(texture) => {
+                        if let Some(atlas) = self.atlases.iter_mut().find(|atlas| atlas.texture == texture) {
+                            atlas.uploaded_rows = submitted.end_row;
+                        }
+                    }
+                    AtlasUploadTarget::New { owner, identity, bytes } => {
+                        let Some((texture, view)) = allocation else { return; };
+                        // Exact demand can create its own atlas after the load
+                        // deadline. Leave that entry and its submitted rows intact.
+                        if owner.strong_count() != 0 && !self.atlases.iter().any(|atlas|
+                            atlas.identity == identity && Weak::ptr_eq(&atlas.owner, &owner))
+                        {
+                            self.atlas_bytes += bytes;
+                            self.atlases.push_front(CachedAtlas {
+                                owner, identity, bytes, view, texture, mesh_binding: None,
+                                uploaded_rows: submitted.end_row, used_by_draw: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn scene_atlas_tail(&self, model: &Arc<CpuMotionModel>, texture: &CpuTexture) -> usize {
@@ -1671,6 +1924,7 @@ impl EmoteRaster {
         for texture in model.textures.values() {
             let Some(index) = self.atlas_storage(device, model, texture, true)? else { return Ok(0) };
             let atlas = &mut self.atlases[index];
+            if self.atlas_transfers.uploading(&atlas.texture) { continue; }
             let bytes = atlas.upload(queue, texture.upload_pixels().0, budget);
             if bytes != 0 {
                 return Ok(bytes);
@@ -1703,9 +1957,27 @@ impl EmoteRaster {
             self.atlases.push_back(entry);
             return Ok(Some(self.atlases.len() - 1));
         }
+        let Some(bytes) = self.reserve_atlas_space(device, source, preloading)? else { return Ok(None) };
+        let (texture, view) = create_atlas_texture(device, source);
+        self.atlas_bytes += bytes;
+        let atlas = CachedAtlas {
+            owner: owner_id, identity, bytes, view, texture, mesh_binding: None, uploaded_rows: 0,
+            used_by_draw: !preloading,
+        };
+        if preloading {
+            self.atlases.push_front(atlas);
+            Ok(Some(0))
+        } else {
+            self.atlases.push_back(atlas);
+            Ok(Some(self.atlases.len() - 1))
+        }
+    }
+
+    fn reserve_atlas_space(&mut self, device: &wgpu::Device, source: &CpuTexture,
+        preloading: bool,
+    ) -> Result<Option<usize>> {
         let limit = device.limits().max_texture_dimension_2d as usize;
-        let (pixels, _) = source.upload_pixels();
-        let bytes = pixels.len();
+        let bytes = source.upload_pixels().0.len();
         if source.width.max(source.height) > limit || source.width.min(source.height) == 0
             || source.width * source.height * 4 != bytes || bytes > MAX_ATLAS_BYTES
         {
@@ -1719,16 +1991,17 @@ impl EmoteRaster {
         // Speculation may replace inactive entries, but must leave every draw
         // and current scene model resident. Both budgets have explicit bounds.
         let budget = if preloading { ATLAS_STAGE_LIMIT } else { ATLAS_DRAW_LIMIT };
+        let reserved = self.atlas_transfers.reserved_texture_bytes();
         let mut evicted = 0;
         let mut evicted_bytes = 0;
-        while self.atlas_bytes + bytes > budget {
+        while self.atlas_bytes + reserved + bytes > budget {
             let Some(index) = atlas_eviction_candidate(self.atlases.iter().map(|atlas| {
-                atlas.used_by_draw || self.atlas_batch_models.iter()
+                atlas.used_by_draw || self.atlas_transfers.uploading(&atlas.texture) || self.atlas_batch_models.iter()
                     .any(|owner| Weak::ptr_eq(owner, &atlas.owner))
             })) else {
                 static REPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 if REPORTS.fetch_add(1, Ordering::Relaxed) < 16 {
-                    report(&format!("emote_atlas_declined reason=active_budget speculative={preloading} resident_bytes={} requested_bytes={bytes} limit={budget}", self.atlas_bytes));
+                    report(&format!("emote_atlas_declined reason=active_budget speculative={preloading} resident_bytes={} reserved_bytes={reserved} requested_bytes={bytes} limit={budget}", self.atlas_bytes));
                 }
                 return Ok(None);
             };
@@ -1737,34 +2010,13 @@ impl EmoteRaster {
             evicted += 1;
             evicted_bytes += atlas.bytes;
         }
-        let size = wgpu::Extent3d {
-            width: source.width as u32, height: source.height as u32, depth_or_array_layers: 1,
-        };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("CS2 E-mote atlas"), size, mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&Default::default());
-        self.atlas_bytes += bytes;
         if evicted != 0 {
             report(&format!(
                 "emote_atlas_evictions={evicted} evicted_bytes={evicted_bytes} resident_bytes={}",
-                self.atlas_bytes,
+                self.atlas_bytes + bytes,
             ));
         }
-        let atlas = CachedAtlas {
-            owner: owner_id, identity, bytes, view, texture, uploaded_rows: 0,
-            used_by_draw: !preloading,
-        };
-        if preloading {
-            self.atlases.push_front(atlas);
-            Ok(Some(0))
-        } else {
-            self.atlases.push_back(atlas);
-            Ok(Some(self.atlases.len() - 1))
-        }
+        Ok(Some(bytes))
     }
 
     fn finish_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
@@ -2051,7 +2303,7 @@ impl EmoteRaster {
                 let group = match atlas_groups.entry(std::ptr::from_ref(texture)) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        let atlas = self.atlas(device, queue, model, texture)?;
+                        let atlas = self.atlas(device, queue, model, texture)?.view.clone();
                         entry.insert(device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("CS2 E-mote sprite"),
                             layout: &self.sprite_layout,
@@ -2099,7 +2351,8 @@ impl EmoteRaster {
                 width, bottom - y, [x as i32, y as i32],
                 Arc::new(DevicePose {
                     buffer: self.rgba.clone(), device: device.clone(), queue: queue.clone(),
-                    bytes: color_bytes, failed: failed.clone(), fade_alpha: None, mesh_submission: None,
+                    bytes: color_bytes, failed: failed.clone(), readback_buffers: self.readback_buffers.clone(),
+                    fade_alpha: None, mesh_submission: None,
                 }),
             )?);
         }
@@ -2115,7 +2368,8 @@ impl EmoteRaster {
                 width, bottom - y, [x as i32, y as i32],
                 Arc::new(DevicePose {
                     buffer: self.rgba.clone(), device: device.clone(), queue: queue.clone(),
-                    bytes: color_bytes, failed: failed.clone(), fade_alpha: None, mesh_submission: None,
+                    bytes: color_bytes, failed: failed.clone(), readback_buffers: self.readback_buffers.clone(),
+                    fade_alpha: None, mesh_submission: None,
                 }),
             )?;
             let draws = own_draws(draws);
@@ -2225,7 +2479,8 @@ impl EmoteRaster {
             [x as i32, y as i32],
             Arc::new(DevicePose {
                 buffer: self.rgba.clone(), device: device.clone(), queue: queue.clone(),
-                bytes: color_bytes, failed: failed.clone(), fade_alpha: None, mesh_submission: None,
+                bytes: color_bytes, failed: failed.clone(), readback_buffers: self.readback_buffers.clone(),
+                fade_alpha: None, mesh_submission: None,
             }),
         )?)
     }
@@ -2236,7 +2491,7 @@ impl Raster {
         &mut self, canvas: &mut Canvas, frame: &EmoteRasterFrame, pose: &DevicePose, blend: BlendMode,
     ) -> Result<bool> {
         if self.failed.load(Ordering::Relaxed) || !Arc::ptr_eq(&self.failed, &pose.failed) {
-            bail!("E-mote pose belongs to an unavailable device");
+            return Ok(false);
         }
         pose.flush_mesh();
         let bounds = super::RasterRect { origin: [0; 2], size: [canvas.width(), canvas.height()] };
@@ -2262,16 +2517,21 @@ impl Raster {
             return Ok(false);
         }
         self.full_target = None;
-        self.previous_planes = None;
-        self.ensure_target_size(target_bytes);
+        let in_place = blend == BlendMode::SourceOver && self.direct_output_enabled()
+            && Arc::strong_count(&self.target) == 2
+            && canvas.exclusive_deferred_pixels().and_then(|source| source.as_any().downcast_ref::<super::DeviceFrame>())
+                .is_some_and(|frame| Arc::ptr_eq(&frame.buffer, &self.target));
+        if !in_place { self.ensure_target_size(target_bytes); }
         let previous = device_frame(canvas)
             .filter(|frame| Arc::ptr_eq(&frame.failed, &self.failed) && !frame.failed.load(Ordering::Relaxed))
             .map(|frame| frame.buffer.clone());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        if let Some(previous) = previous {
-            encoder.copy_buffer_to_buffer(&previous, 0, &self.target, 0, target_bytes);
-        } else {
-            self.queue.write_buffer(&self.target, 0, canvas.pixels());
+        if !in_place {
+            if let Some(previous) = previous {
+                encoder.copy_buffer_to_buffer(&previous, 0, &self.target, 0, target_bytes);
+            } else {
+                self.queue.write_buffer(&self.target, 0, canvas.try_pixels()?);
+            }
         }
         let params = [
             target.origin[0], target.origin[1], target.size[0], target.size[1],
@@ -2301,7 +2561,7 @@ impl Raster {
         } else {
             let mut pixels = vec![0; target_bytes as usize];
             if !cs2_renderer::CanvasReadback::read_rgba(output.as_ref(), &mut pixels) {
-                bail!("read device-composited E-mote frame");
+                return Ok(false);
             }
             canvas.set_verified_device_pixels(output, &pixels)?;
         }
@@ -2312,11 +2572,17 @@ impl Raster {
         Ok(true)
     }
 
+    pub(super) fn prewarm_pose_jobs(&mut self) {
+        if super::emote_batch_configured() {
+            let _ = self.ensure_emote();
+        }
+    }
+
     fn ensure_emote(&mut self) -> Result<()> {
         if self.failed.load(Ordering::Relaxed) { bail!("E-mote device unavailable"); }
         if self.emote_initialization_failed { bail!("E-mote shader initialization failed"); }
         if self.emote.is_none() {
-            let renderer = EmoteRaster::new(&self.device).inspect_err(|_| {
+            let renderer = EmoteRaster::new(&self.device, self.readback_buffers.clone()).inspect_err(|_| {
                 self.emote_initialization_failed = true;
             })?;
             self.emote = Some(renderer);
@@ -2333,7 +2599,7 @@ impl Raster {
         if self.failed.load(Ordering::Relaxed) { bail!("E-mote device failed during draw"); }
         if !super::emote_device_blend_requested() {
             frame = EmoteRasterFrame::new(
-                frame.width(), frame.height(), frame.origin(), frame.rgba().to_vec(),
+                frame.width(), frame.height(), frame.origin(), frame.rgba()?.to_vec(),
             )?;
         }
         Ok(frame)
@@ -2408,7 +2674,7 @@ mod tests {
         let first_scene_start = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut preflight_retries = 0;
-        while !host.preflight_scene_emote_poses()? {
+        while !host.preflight_scene_emote_poses(false)? {
             assert!(Instant::now() < deadline, "cold actor failed to prepare");
             preflight_retries += 1;
             std::thread::sleep(Duration::from_millis(1));
@@ -2424,7 +2690,7 @@ mod tests {
         let gate = Arc::new(PoseTestGate::default());
         host.data_services.emote.set_pose_test_gate(slow, gate.clone());
         advance(&mut host, 2)?;
-        assert!(host.preflight_scene_emote_poses()?, "prior valid samples allow immediate composition");
+        assert!(host.preflight_scene_emote_poses(false)?, "prior valid samples allow immediate composition");
         host.render_scene()?;
         let deadline = Instant::now() + Duration::from_secs(2);
         while !gate.started.load(Ordering::Acquire) {
@@ -2433,7 +2699,7 @@ mod tests {
         }
         let held = Instant::now();
         while held.elapsed() < Duration::from_millis(200) {
-            assert!(host.preflight_scene_emote_poses()?, "slow actor cannot gate ordinary composition");
+            assert!(host.preflight_scene_emote_poses(false)?, "slow actor cannot gate ordinary composition");
             host.render_scene()?;
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2443,7 +2709,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         while host.data_services.emote.displayed_pose_tick(slow) != Some(2) {
             assert!(Instant::now() < deadline, "delayed actor failed to resume");
-            assert!(host.preflight_scene_emote_poses()?);
+            assert!(host.preflight_scene_emote_poses(false)?);
             host.render_scene()?;
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2455,16 +2721,16 @@ mod tests {
         gate.started.store(false, Ordering::Release);
         gate.released.store(false, Ordering::Release);
         advance(&mut host, 3)?;
-        assert!(!host.preflight_scene_emote_poses()?);
+        assert!(!host.preflight_scene_emote_poses(true)?);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !gate.started.load(Ordering::Acquire) {
             assert!(Instant::now() < deadline, "capture pose failed to reach its gate");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!host.preflight_scene_emote_poses()?);
+        assert!(!host.preflight_scene_emote_poses(true)?);
         assert_eq!(host.frame_rgba(), previous);
         gate.released.store(true, Ordering::Release);
-        while !host.preflight_scene_emote_poses()? {
+        while !host.preflight_scene_emote_poses(true)? {
             assert!(Instant::now() < deadline, "capture pose failed to prepare");
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2506,10 +2772,10 @@ mod tests {
             assert_eq!(actual.origin(), frame.origin());
             let tint = [argb >> 16 & 255, argb >> 8 & 255, argb & 255, argb >> 24];
             let expected: Vec<_> = pixels.iter().enumerate().map(|(i, &v)| ((u32::from(v) * tint[i % 4] + 127) / 255) as u8).collect();
-            assert_eq!(actual.rgba(), expected);
+            assert_eq!(actual.rgba().unwrap(), expected);
         }
         // Tinting is a final operation and never modifies a held endpoint.
-        assert_eq!(frame.rgba(), pixels);
+        assert_eq!(frame.rgba().unwrap(), pixels);
         let cpu = EmoteRasterFrame::new(1, 1, [0, 0], vec![1, 2, 3, 0])?;
         assert!(tint_emote_surface(&cpu, 0x80808080).is_none());
         RASTER.with_borrow_mut(Option::take);
@@ -2591,7 +2857,7 @@ mod tests {
         raster.ensure_emote()?;
         let emote = raster.emote.as_mut().unwrap();
         let mut remaining = SCENE_ATLAS_STAGE_BYTES;
-        assert_eq!(emote.stage_scene_atlas(&raster.device, &raster.queue, &model, texture, &mut remaining)?, Some(false));
+        assert_eq!(emote.stage_scene_atlas(&raster.device, &raster.queue, &model, "test", &mut remaining, false)?, Some(false));
         assert_eq!(remaining, 0);
         super::super::submit_gpu_commands(&raster.queue, []);
 
@@ -2603,19 +2869,61 @@ mod tests {
         });
         assert_eq!(emote.atlases[0].uploaded_rows, 768);
         assert_eq!(emote.atlas_bytes, atlas_bytes);
-        assert_eq!(emote.stage_scene_atlas(&raster.device, &raster.queue, &model, texture, &mut remaining)?, Some(false));
+        assert_eq!(emote.stage_scene_atlas(&raster.device, &raster.queue, &model, "test", &mut remaining, false)?, Some(false));
 
         // Exact consumers can complete the remaining rows in order.
-        let exact = emote.atlas(&raster.device, &raster.queue, &model, texture)?;
+        let exact_texture = emote.atlas(&raster.device, &raster.queue, &model, texture)?.texture.clone();
         super::super::submit_gpu_commands(&raster.queue, []);
         assert_eq!(emote.atlases[0].uploaded_rows, 1024);
         REQUIRE_RESIDENT_ATLASES.with(|resident| -> Result<()> {
             resident.set(true);
             let result = emote.atlas(&raster.device, &raster.queue, &model, texture);
             resident.set(false);
-            assert_eq!(result?, exact);
+            assert_eq!(result?.texture, exact_texture);
             Ok(())
         })?;
+
+        #[cfg(windows)]
+        {
+            let mut emote = EmoteRaster::new(&raster.device, Arc::clone(&raster.readback_buffers))?;
+            let mut remaining = SCENE_ATLAS_STAGE_BYTES;
+            assert_eq!(emote.stage_scene_atlas(
+                &raster.device, &raster.queue, &model, "test", &mut remaining, true,
+            )?, Some(false));
+            assert_eq!(remaining, 0);
+            assert_eq!(emote.atlases[0].uploaded_rows, 0);
+            assert_eq!(emote.atlas_transfers.allowance(&raster.device, ATLAS_IN_FLIGHT_BYTES, Duration::ZERO),
+                ATLAS_IN_FLIGHT_BYTES - SCENE_ATLAS_STAGE_BYTES);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while emote.atlas_transfers.staging() && Instant::now() < deadline {
+                emote.poll_atlas_upload();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(emote.atlases[0].uploaded_rows, 768);
+            assert_eq!(emote.atlas_transfers.bytes, SCENE_ATLAS_STAGE_BYTES);
+            assert!(emote.atlas(&raster.device, &raster.queue, &model, texture)?.resident());
+
+            // A fresh load reserves texture bytes before the worker allocates.
+            // An exact draw can still finish using its own texture on deadline.
+            let mut emote = EmoteRaster::new(&raster.device, Arc::clone(&raster.readback_buffers))?;
+            assert_eq!(emote.enqueue_loading_atlas(&raster.device, &raster.queue, &model,
+                "test", ATLAS_TRANSFER_BYTES)?, atlas_bytes);
+            assert!(emote.atlases.is_empty());
+            assert_eq!(emote.atlas_transfers.reserved_texture_bytes(), atlas_bytes);
+            let index = emote.atlas_storage(&raster.device, &model, texture, false)?.unwrap();
+            let exact_texture = emote.atlases[index].texture.clone();
+            assert!(emote.atlas(&raster.device, &raster.queue, &model, texture)?.resident());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while emote.atlas_transfers.staging() && Instant::now() < deadline {
+                emote.poll_atlas_upload();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(emote.atlas_transfers.reserved_texture_bytes(), 0);
+            assert_eq!(emote.atlas_bytes, atlas_bytes);
+            assert_eq!(emote.atlases.len(), 1);
+            assert_eq!(emote.atlases[0].texture, exact_texture);
+            assert!(emote.atlases[0].resident());
+        }
         Ok(())
     }
 
@@ -2833,8 +3141,8 @@ mod tests {
             let frame = RASTER.with_borrow_mut(|slot| slot.as_mut().unwrap()
                 .render_emote(player, viewport, &variables, true))?;
             assert!(frame.device().is_some());
-            assert!(frame.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0));
-            if i == 0 { first_rgba.extend_from_slice(frame.rgba()); }
+            assert!(frame.rgba().unwrap().chunks_exact(4).any(|pixel| pixel[3] != 0));
+            if i == 0 { first_rgba.extend_from_slice(frame.rgba().unwrap()); }
             assert_eq!(PREPARED.with_borrow(Vec::len), 1 - i, "prepared geometry must be consumed");
         }
         batch.finish()?;
@@ -2842,7 +3150,7 @@ mod tests {
         let batch = begin_emote_batch()?;
         let replay = RASTER.with_borrow_mut(|slot| slot.as_mut().unwrap().render_emote(
             &players[0], viewport, &players[0].effective_variables()?, true))?;
-        assert_eq!(replay.rgba(), first_rgba, "switching back to a cached earlier pose restores its GPU geometry");
+        assert_eq!(replay.rgba().unwrap(), first_rgba, "switching back to a cached earlier pose restores its GPU geometry");
         assert!(RASTER.with_borrow(|slot| slot.as_ref().unwrap().emote.as_ref().unwrap()
             .mesh.as_ref().unwrap().geometry_upload_bytes > 0), "an older cached pose must replace the last resident pose");
         batch.finish()?;
@@ -2906,7 +3214,7 @@ mod tests {
         let mut expected = Vec::new();
         for player in &players {
             let frame = render(player)?;
-            let rgba = frame.rgba().to_vec();
+            let rgba = frame.rgba().unwrap().to_vec();
             assert!(rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
             assert_eq!(submission.pending_poses(), 0, "CPU readback must submit the pose");
             let mut checksum = DefaultHasher::new();
@@ -2916,7 +3224,7 @@ mod tests {
         }
         let tinted_expected = tint_emote_surface(&render(&players[1])?, 0xff80ff40).context("reference tint")?;
         assert_eq!(submission.pending_poses(), 0, "tint must submit the source pose");
-        let tinted_expected = tinted_expected.rgba().to_vec();
+        let tinted_expected = tinted_expected.rgba().unwrap().to_vec();
         batch.finish()?;
         assert!(expected.windows(2).all(|pair| pair[0] != pair[1]));
 
@@ -2929,15 +3237,23 @@ mod tests {
         let batch = begin_emote_batch()?;
         prepare_emote_poses(&references);
         let mut frames = Vec::new();
+        #[cfg(windows)]
+        let queue_full_batch = mesh::mesh_async_encode_enabled();
+        #[cfg(not(windows))]
+        let queue_full_batch = false;
         for (index, player) in players.iter().enumerate() {
             frames.push(render(player)?);
-            let pending = if index < 3 && mesh::batch_submissions_enabled() { index + 1 } else { 0 };
+            let pending = if (index < 3 || queue_full_batch) && mesh::batch_submissions_enabled() {
+                index + 1
+            } else {
+                0
+            };
             assert_eq!(submission.pending_poses(), pending);
         }
         batch.seal();
         for (frame, (origin, rgba)) in frames.iter().zip(&expected) {
             assert_eq!(frame.origin(), *origin);
-            assert_eq!(frame.rgba(), rgba.as_slice());
+            assert_eq!(frame.rgba().unwrap(), rgba.as_slice());
         }
         batch.finish()?;
 
@@ -2948,10 +3264,11 @@ mod tests {
         if mesh::batch_submissions_enabled() {
             assert_eq!(submission.pending_poses(), 2);
         }
+        batch.seal();
         let second = tint_emote_surface(&second, 0xff80ff40).context("batched tint")?;
         assert_eq!(submission.pending_poses(), 0);
-        assert_eq!(first.rgba(), expected[0].1.as_slice());
-        assert_eq!(second.rgba(), tinted_expected.as_slice());
+        assert_eq!(first.rgba().unwrap(), expected[0].1.as_slice());
+        assert_eq!(second.rgba().unwrap(), tinted_expected.as_slice());
         batch.finish()?;
         RASTER.with_borrow_mut(Option::take);
         Ok(())
@@ -3031,7 +3348,7 @@ mod tests {
             assert_eq!(bindings, 2, "each unique atlas has one binding regardless of masks, alpha, or ordered runs");
             if pose == 0 { assert!(uploaded > 0, "the first pose uploads actual indexed geometry"); }
             else { assert_eq!(uploaded, 0, "unchanged cached geometry remains on the GPU, including generation wrap"); }
-            let max = frame.rgba().iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            let max = frame.rgba().unwrap().iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
             assert!(max <= 2, "hardware integer-sample coverage/mask/overlap diverged: max={max} wrap={wrap}");
         }
         Ok(())
@@ -3066,7 +3383,7 @@ mod tests {
                     frames.push(player.render_preview(viewport)?.frame);
                     cpu_us += start.elapsed().as_micros();
                     let mut hasher = DefaultHasher::new();
-                    frames.last().unwrap().rgba().hash(&mut hasher);
+                    frames.last().unwrap().rgba().unwrap().hash(&mut hasher);
                     let hash = hasher.finish();
                     changed[i] |= prior_hashes[i].is_some_and(|prior| prior != hash);
                     prior_hashes[i] = Some(hash);
@@ -3091,13 +3408,13 @@ mod tests {
                     let mut alpha_differences = 0u64;
                     let mut transparent_rgb = 0u64;
                     let mut squared = 0u64;
-                    for (j, (&a, &b)) in frames[i].rgba().iter().zip(rgba.rgba()).enumerate() {
+                    for (j, (&a, &b)) in frames[i].rgba().unwrap().iter().zip(rgba.rgba().unwrap()).enumerate() {
                         let delta = a.abs_diff(b);
                         max = max.max(delta);
                         squared += u64::from(delta) * u64::from(delta);
                         for (n, threshold) in [1, 3, 8].into_iter().enumerate() { above[n] += u64::from(delta > threshold); }
                         if j % 4 == 3 { alpha_differences += u64::from(delta != 0); }
-                        else if frames[i].rgba()[j / 4 * 4 + 3] == 0 && delta != 0 { transparent_rgb += 1; }
+                        else if frames[i].rgba().unwrap()[j / 4 * 4 + 3] == 0 && delta != 0 { transparent_rgb += 1; }
                     }
                     let psnr = if squared == 0 { f64::INFINITY } else {
                         10. * (255. * 255. * (1280 * 720 * 4) as f64 / squared as f64).log10()
@@ -3108,9 +3425,9 @@ mod tests {
                     {
                         let output = PathBuf::from(output);
                         std::fs::create_dir_all(&output)?;
-                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-cpu.png")), frames[i].rgba(), 1280, 720, image::ColorType::Rgba8)?;
-                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-gpu.png")), rgba.rgba(), 1280, 720, image::ColorType::Rgba8)?;
-                        let diff: Vec<_> = frames[i].rgba().chunks_exact(4).zip(rgba.rgba().chunks_exact(4)).flat_map(|(a, b)|
+                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-cpu.png")), frames[i].rgba().unwrap(), 1280, 720, image::ColorType::Rgba8)?;
+                        image::save_buffer(output.join(format!("mesh-preview-instance{i}-gpu.png")), rgba.rgba().unwrap(), 1280, 720, image::ColorType::Rgba8)?;
+                        let diff: Vec<_> = frames[i].rgba().unwrap().chunks_exact(4).zip(rgba.rgba().unwrap().chunks_exact(4)).flat_map(|(a, b)|
                             [a[0].abs_diff(b[0]).saturating_mul(16), a[1].abs_diff(b[1]).saturating_mul(16), a[2].abs_diff(b[2]).saturating_mul(16), 255]).collect();
                         image::save_buffer(output.join(format!("mesh-preview-instance{i}-difference-x16.png")), &diff, 1280, 720, image::ColorType::Rgba8)?;
                     }
@@ -3140,7 +3457,7 @@ mod tests {
     fn gpu_surface_fade_matches_padded_source_and_transparent_rgb() -> Result<()> {
         let mut raster = Raster::new()?;
         raster.test_direct_output = true;
-        raster.emote = Some(EmoteRaster::new(&raster.device)?);
+        raster.emote = Some(EmoteRaster::new(&raster.device, raster.readback_buffers.clone())?);
         let old_rgba = vec![30, 40, 50, 255, 60, 70, 80, 127, 90, 100, 110, 0];
         let crop = Arc::new(buffer(&raster.device, old_rgba.len() as u64, TARGET));
         raster.queue.write_buffer(&crop, 0, &old_rgba);
@@ -3165,7 +3482,7 @@ mod tests {
                 prepare_emote_surfaces(&expanded, &device_next).context("device fade endpoint preparation")?;
             assert_eq!(alpha_class, None);
             assert!(old_adjusted.device().is_some() && new_adjusted.device().is_some());
-            let mut expected_old = cpu_old.rgba().to_vec();
+            let mut expected_old = cpu_old.rgba().unwrap().to_vec();
             for (prior, next) in expected_old.chunks_exact_mut(4).zip(new_rgba.chunks_exact_mut(4)) {
                 if prior[3] == 0 && next[3] != 0 {
                     prior[..3].copy_from_slice(&next[..3]);
@@ -3185,12 +3502,12 @@ mod tests {
                             ((u32::from(old) * (256 - weight) + u32::from(new) * weight) >> 8) as u8
                         }
                     }).collect();
-                assert_eq!(mixed.rgba(), expected);
+                assert_eq!(mixed.rgba().unwrap(), expected);
             }
-            assert_eq!(old_adjusted.rgba(), expected_old);
-            assert_eq!(new_adjusted.rgba(), new_rgba);
+            assert_eq!(old_adjusted.rgba().unwrap(), expected_old);
+            assert_eq!(new_adjusted.rgba().unwrap(), new_rgba);
         }
-        assert_eq!(expanded.rgba(), cpu_old.rgba());
+        assert_eq!(expanded.rgba().unwrap(), cpu_old.rgba().unwrap());
         RASTER.with_borrow_mut(Option::take);
         Ok(())
     }
@@ -3239,9 +3556,9 @@ mod tests {
             let width = gpu.width() as usize;
             let height = gpu.height();
             let origin = gpu.origin().map(|n| n as usize);
-            let rgba = gpu.rgba();
+            let rgba = gpu.rgba().unwrap();
             let [mut different, mut interior, mut max, mut interior_max, mut squared] = [0u64; 5];
-            for (i, a) in cpu.frame.rgba().chunks_exact(4).enumerate() {
+            for (i, a) in cpu.frame.rgba().unwrap().chunks_exact(4).enumerate() {
                 let y = i / 1280;
                 let x = i % 1280;
                 let b: &[u8] = if x >= origin[0] && y >= origin[1]
@@ -3256,7 +3573,7 @@ mod tests {
                 let alpha = a[3];
                 let near_edge = (y.saturating_sub(1)..=(y+1).min(719)).any(|py|
                     (x.saturating_sub(1)..=(x+1).min(1279)).any(|px|
-                        (cpu.frame.rgba()[(py * 1280 + px) * 4 + 3] == 0) != (alpha == 0)));
+                        (cpu.frame.rgba().unwrap()[(py * 1280 + px) * 4 + 3] == 0) != (alpha == 0)));
                 different += 1;
                 interior += u64::from(!near_edge);
                 for (&a, &b) in a.iter().zip(b) {
@@ -3267,7 +3584,7 @@ mod tests {
                 }
             }
             let psnr = if squared == 0 { f64::INFINITY } else {
-                10.0 * (255.0 * 255.0 * cpu.frame.rgba().len() as f64 / squared as f64).log10()
+                10.0 * (255.0 * 255.0 * cpu.frame.rgba().unwrap().len() as f64 / squared as f64).log10()
             };
             println!("tick={tick} layers={} triangles={} warnings={} cpu_us={cpu_us} gpu_us={gpu_us} gpu_width={width} gpu_height={} different={different} interior={interior} max={max} interior_max={interior_max} psnr={psnr:.2}",
                 cpu.layers, cpu.triangles, cpu.warnings.len(), height);

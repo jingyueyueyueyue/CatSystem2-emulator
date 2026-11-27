@@ -334,7 +334,7 @@ impl RenderTaskStore {
             1_000_000.,
             &mut bounded_draw,
             0,
-        );
+        ).and_then(|()| verify_deferred_output(canvas));
         let [first, second] = surfaces.finish();
         if result.is_err() {
             self.tasks.insert(owner, previous);
@@ -344,6 +344,15 @@ impl RenderTaskStore {
         }
         result
     }
+}
+
+fn verify_deferred_output(canvas: &Canvas) -> Result<()> {
+    #[cfg(all(windows, feature = "gpu-raster"))]
+    if crate::gpu_raster::DeferredSceneReadback::active() {
+        canvas.try_pixels()?;
+    }
+    let _ = canvas;
+    Ok(())
 }
 
 impl RenderTask {
@@ -1157,6 +1166,7 @@ fn render_sampled_range(
         middle.clear(Color::rgba(0, 0, 0, 255));
     }
     render_chain(tasks, surfaces, preceding, &mut middle, from, to, draw, depth + 1)?;
+    middle.try_pixels()?;
     let source = middle.into_frame();
     match task.kind {
         35 => {
@@ -1380,6 +1390,78 @@ fn wipe_configuration(args: &[u8], duration_first: bool) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, feature = "gpu-raster"))]
+    #[test]
+    fn deferred_sampled_effect_rejects_lost_source_and_preserves_feedback() -> Result<()> {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        #[derive(Debug)]
+        struct Readback {
+            calls: Arc<AtomicUsize>,
+            succeeds: bool,
+        }
+
+        impl cs2_renderer::CanvasReadback for Readback {
+            fn read_rgba(&self, output: &mut [u8]) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                for pixel in output.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[10, 20, 30, 255]);
+                }
+                self.succeeds
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+
+        let _deferred = crate::gpu_raster::DeferredSceneReadback::begin();
+        let mut render = RenderTaskStore::default();
+        let mut canvas = Canvas::new(2, 1)?;
+        render.register(1, 35, Some(&canvas), None)?;
+        let blur = render.tasks.get_mut(&1).unwrap();
+        blur.active = 1;
+        blur.raw_configuration[20] = 10f32.to_bits();
+        blur.raw_configuration[21] = 20f32.to_bits();
+        blur.configured = true;
+        let previous = render.auxiliary.as_ref().unwrap().clone();
+
+        for (source_succeeds, output_succeeds) in [(false, false), (true, false), (true, true)] {
+            canvas.clear(Color::rgb(0, 0, 0));
+            let source = Arc::new(AtomicUsize::new(0));
+            let output = Arc::new(AtomicUsize::new(0));
+            let result = render.compose(&mut canvas, &mut |target, lower, _| {
+                let (calls, succeeds) = if lower == 10. {
+                    (&source, source_succeeds)
+                } else if lower == 20. {
+                    (&output, output_succeeds)
+                } else {
+                    return Ok(());
+                };
+                target.set_deferred_device_pixels(Arc::new(Readback { calls: calls.clone(), succeeds }));
+                Ok(())
+            });
+            assert_eq!(source.load(Ordering::Relaxed), 1);
+            assert_eq!(output.load(Ordering::Relaxed), usize::from(source_succeeds));
+            let blur = &render.tasks[&1];
+            if output_succeeds {
+                result?;
+                assert_eq!(canvas.pixel(0, 0)?, Color::rgb(10, 20, 30));
+                assert!(!blur.fresh_feedback);
+                assert_eq!(blur.auxiliary_slot, 1);
+                assert!(blur.work.is_some());
+            } else {
+                assert!(matches!(
+                    result.unwrap_err().downcast_ref::<cs2_renderer::RendererError>(),
+                    Some(cs2_renderer::RendererError::DeviceReadbackFailed)
+                ));
+                assert!(blur.fresh_feedback);
+                assert_eq!(blur.auxiliary_slot, 0);
+                assert!(blur.work.is_none());
+                assert_eq!(render.auxiliary.as_ref().unwrap().pixels(), previous.pixels());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn ordinary_568_captures_previous_pixels_for_draw() -> Result<()> {

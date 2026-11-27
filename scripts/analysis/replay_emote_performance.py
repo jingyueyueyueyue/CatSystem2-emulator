@@ -17,8 +17,33 @@ from run_playthrough_batch import file_sha256, identify_player
 def summarize(prefix: Path, frames: range, expected_poses: int | None = None, *,
               interactive: bool = False) -> dict:
     samples = {}
+    fallbacks_by_frame = {}
+    transitions = []
+    previews = {}
     for line in prefix.with_suffix(".host.log").read_text(encoding="utf-8-sig").splitlines():
         kind = line.split(maxsplit=1)[0] if line else ""
+        if kind in ("emote_fallback", "fast_forward_state", "replay_preview"):
+            fields = dict(re.findall(r"(\w+)=([\w-]+)", line))
+            frame = int(fields["frame"])
+            if frame not in frames:
+                continue
+            if kind == "emote_fallback":
+                reason = fields["reason"]
+                counts = fallbacks_by_frame.setdefault(frame, {})
+                counts[reason] = counts.get(reason, 0) + int(fields["count"])
+            elif kind == "fast_forward_state":
+                transitions.append({"frame": frame, "active": fields["active"] == "true"})
+            else:
+                previews[frame] = (int(fields["monotonic_us"]), not int(fields["skipped"]))
+            continue
+        if kind == "movie_scale":
+            fields = dict(re.findall(r"(\w+)=(\d+)", line))
+            frame = int(fields["frame"])
+            if frame in frames and (interactive or int(fields["call"]) == 0):
+                name = "movie_scale.reused_us" if int(fields["reused"]) else "movie_scale.draw_us"
+                values = samples.setdefault(name, {})
+                values[frame] = values.get(frame, 0) + float(fields["elapsed_us"])
+            continue
         if kind not in ("replay_perf", "replay_tick", "plane_detail", "gpu_output", "emote_gpu", "emote_scene"):
             continue
         data = dict(re.findall(r"(\w+)=(\d+)", line))
@@ -27,7 +52,15 @@ def summarize(prefix: Path, frames: range, expected_poses: int | None = None, *,
             continue
         if kind == "replay_perf":
             phases = json.loads(line.split("phase_ns=", 1)[1])
-            data.update(compose_emote_us=phases[20] / 1000, compose_plane_us=phases[22] / 1000)
+            data.update(
+                script_children_us=phases[7] / 1000,
+                script_list_raster_us=phases[10] / 1000,
+                compose_unattributed_us=phases[4] / 1000,
+                compose_total_us=(phases[4] + sum(phases[18:25])) / 1000,
+                compose_text_us=phases[19] / 1000,
+                compose_emote_us=phases[20] / 1000,
+                compose_plane_us=phases[22] / 1000,
+            )
         for field, value in data.items():
             if field == "session":
                 continue
@@ -35,12 +68,19 @@ def summarize(prefix: Path, frames: range, expected_poses: int | None = None, *,
             number = float(value)
             if kind == "emote_scene" and field.startswith("max_"):
                 number = max(number, values.get(key[0], 0))
-            elif interactive and (kind == "emote_scene" or field.endswith("_us") or field in ("sync_waits", "sync_poses")):
+            elif interactive and (
+                kind in ("emote_scene", "gpu_output")
+                or field.endswith("_us")
+                or field in ("sync_waits", "sync_poses")
+            ):
                 number += values.get(key[0], 0)
             values[key[0]] = number
     result = {}
     for name, values in samples.items():
-        if (not interactive or name.startswith(("replay_perf.", "replay_tick."))) and tuple(sorted(values)) != tuple(frames):
+        require_all_frames = name.startswith(("replay_perf.", "replay_tick.")) or (
+            not interactive and not name.startswith("movie_scale.")
+        )
+        if require_all_frames and tuple(sorted(values)) != tuple(frames):
             raise RuntimeError(f"{name} did not cover every requested frame")
         ordered = sorted(values.values())
         middle = len(ordered) // 2
@@ -57,6 +97,47 @@ def summarize(prefix: Path, frames: range, expected_poses: int | None = None, *,
             result[name]["total"] = int(sum(ordered))
     if not result:
         raise RuntimeError("No performance samples")
+    def fallback_counts(first, stop):
+        counts = {}
+        for frame, reasons in fallbacks_by_frame.items():
+            if first <= frame < stop:
+                for reason, count in reasons.items():
+                    counts[reason] = counts.get(reason, 0) + count
+        return counts
+
+    def preview_period(first, stop):
+        start_us, end_us = previews[first][0], previews[stop - 1][0]
+        duration = (end_us - start_us) / 1e6
+        intervals = sum(previews[frame][1] for frame in range(first + 1, stop) if frame in previews)
+        return {"first": first, "last": stop - 1, "seconds": duration, "preview_intervals": intervals,
+                "preview_hz": intervals / duration if duration > 0 else None,
+                "emote_fallbacks": fallback_counts(first, stop),
+                "readback_failures": {
+                    field: int(sum(value for frame, value in
+                                   samples.get(f"gpu_output.{field}", {}).items() if first <= frame < stop))
+                    for field in ("device_failed", "packed_failed", "emote_failed")
+                }}
+
+    result["emote_fallbacks"] = fallback_counts(frames.start, frames.stop)
+    result["fast_forward_transitions"] = transitions
+    if previews:
+        periods = []
+        boundaries = sorted({frames.start, frames.stop, *(event["frame"] for event in transitions)})
+        for first, stop in zip(boundaries, boundaries[1:]):
+            if first >= stop or first not in previews or stop - 1 not in previews:
+                continue
+            periods.append(preview_period(first, stop))
+        result["preview_periods"] = periods
+        result["preview_recovery"] = []
+        for event in transitions:
+            first = event["frame"]
+            if event["active"] or first not in previews:
+                continue
+            cutoff_us = previews[first][0] + 2_000_000
+            next_boundary = boundaries[boundaries.index(first) + 1]
+            stop = next((frame for frame in range(first + 1, next_boundary)
+                         if frame not in previews or previews[frame][0] > cutoff_us), next_boundary)
+            result["preview_recovery"].append(preview_period(first, stop))
     if expected_poses is not None:
         poses = samples.get("emote_gpu.poses", {})
         for frame in frames:
@@ -126,9 +207,11 @@ def run(args: argparse.Namespace) -> dict:
         "argv": [str(player), *route], "emote_gpu": args.emote_gpu, "prepare_workers": workers,
         "gpu_options": {name: env.get(name) for name in (
             "CS2_REPLAY_DEVICE_OUTPUT", "CS2_GPU_TEXTURED_PLANES", "CS2_EMOTE_MESH_BATCH",
-            "CS2_EMOTE_MESH_LAYERED",
+            "CS2_EMOTE_MESH_LAYERED", "CS2_EMOTE_ASYNC_SUBMIT", "CS2_EMOTE_ASYNC_ENCODE", "CS2_EMOTE_ASYNC_ATLAS",
+            "CS2_EMOTE_LOAD_ATLAS", "CS2_SCENE_DEFER_READBACK",
         )},
-        "row_pool": args.row_pool, "frames": {"first": frames.start, "last": frames.stop - 1},
+        "row_pool": args.row_pool, "movie_scale_workers": env.get("CS2_MOVIE_SCALE_WORKERS"),
+        "frames": {"first": frames.start, "last": frames.stop - 1},
         "expected_poses": args.expected_poses, "interactive": args.interactive,
         "retry_sleep": args.retry_sleep if args.interactive else None,
         "metrics": metrics,

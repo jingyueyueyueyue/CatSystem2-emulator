@@ -383,7 +383,8 @@ impl Presenter {
             if self.logical_buffer.size() < size {
                 self.logical_buffer = buffer(&raster.device, size, super::UPLOAD);
             }
-            raster.queue.write_buffer(&self.logical_buffer, 0, canvas.pixels());
+            let Ok(pixels) = canvas.try_pixels() else { return Ok(false); };
+            raster.queue.write_buffer(&self.logical_buffer, 0, pixels);
             &self.logical_buffer
         };
         let params = [canvas.width(), canvas.height(), width, height, u32::from(self.config.format.is_srgb()), 0, 0, 0];

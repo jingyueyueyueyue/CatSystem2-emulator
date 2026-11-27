@@ -18,6 +18,7 @@ fn mesh_fragment(vertex: MeshVertex) -> @location(0) vec4f {
 @group(0) @binding(4) var mesh_coverage: texture_2d<f32>;
 @group(0) @binding(5) var<storage, read_write> mesh_rgba: array<u32>;
 @group(0) @binding(6) var<storage, read_write> mesh_stencil: array<u32>;
+@group(1) @binding(0) var mesh_atlas: texture_2d<u32>;
 
 // Keep the existing integer straight-RGBA and serial stencil representation.
 // Each ordered mesh is rasterized then composited before the next mesh starts.
@@ -39,7 +40,7 @@ fn mesh_sprite(@builtin(global_invocation_id) id: vec3u) {
         if stencil != reference { return; }
     }
     let base = vec2i(bitcast<i32>(command(12u)), bitcast<i32>(command(13u)));
-    var sample = sample_atlas(base, coverage.xy, vec2f(0.0));
+    var sample = sample_atlas(mesh_atlas, base, coverage.xy, vec2f(0.0));
     if (command(10u) & 256u) != 0u { sample = Sample(sample.color.bgra, sample.error.bgra); }
     let alpha = clamp(sample.color.a / 255.0 * bitcast<f32>(command(11u)), 0.0, 1.0);
     if operation == 0u {

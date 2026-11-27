@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    Canvas, Color, FramePixels, ImageDrawOptions, Point, RgbaFrame, ScaleFilter, blend_into,
-    modulate_alpha, sample_frame,
+    Canvas, Color, FramePixels, ImageDrawOptions, LinearTaps, Point, RgbaFrame, ScaleFilter,
+    blend_into, modulate_alpha, sample_linear_taps,
 };
 
 type Bounds = (u32, u32, u32, u32);
@@ -16,18 +16,18 @@ pub(super) fn draw_axis_aligned(
     frame: &RgbaFrame,
     options: &ImageDrawOptions,
     bounds: Bounds,
+    workers: usize,
 ) {
     let (left, top, right, bottom) = bounds;
     let source_x = |x| (f64::from(x) - f64::from(options.position.x)) / f64::from(options.scale_x);
     let source_y = |y| (f64::from(y) - f64::from(options.position.y)) / f64::from(options.scale_y);
     if options.filter == ScaleFilter::Linear {
-        draw_sampled(canvas, frame, options, bounds, false, 1, |x, y| {
-            Some(sample_frame(
-                frame,
-                source_x(x),
-                source_y(y),
-                ScaleFilter::Linear,
-            ))
+        let columns: Vec<_> = (left..right).map(|x| LinearTaps::new(source_x(x) - 0.5, frame.width)).collect();
+        let rows: Vec<_> = (top..bottom).map(|y| LinearTaps::new(source_y(y) - 0.5, frame.height)).collect();
+        let pixels = frame.pixels.as_chunks::<4>().0;
+        draw_sampled(canvas, frame, options, bounds, false, workers, |x, y| {
+            Some(sample_linear_taps(pixels, frame.width as usize,
+                columns[(x - left) as usize], rows[(y - top) as usize]))
         });
         return;
     }
@@ -401,6 +401,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn axis_aligned_linear_workers_match_serial_pixels() {
+        let rgba: Vec<_> = (0..640 * 360)
+            .flat_map(|index| {
+                let value = index as u8;
+                [value, value.wrapping_add(47), value.wrapping_sub(13), value.rotate_left(2)]
+            })
+            .collect();
+        let mut options = ImageDrawOptions::new(Point::new(-7, 4));
+        options.scale_x = 2.;
+        options.scale_y = 2.;
+        options.filter = ScaleFilter::Linear;
+        options.clip = Some(Rect::new(9, 11, 1250, 700));
+        let mut serial = Canvas::new(1280, 720).unwrap();
+        serial.clear(Color::rgb(23, 78, 152));
+        let mut parallel = serial.clone();
+        let mut reference = serial.clone();
+        // Separate image identities exercise the uncached path in both runs.
+        let first = RgbaFrame::from_rgba8(640, 360, rgba.clone()).unwrap();
+        let second = RgbaFrame::from_rgba8(640, 360, rgba).unwrap();
+        serial.draw_frame_with_workers(&first, &options, 1).unwrap();
+        parallel.draw_frame_with_workers(&second, &options, 4).unwrap();
+        for y in 11..711 {
+            for x in 9..1259 {
+                let source_x = f64::from(x - options.position.x) / f64::from(options.scale_x) - 0.5;
+                let source_y = f64::from(y - options.position.y) / f64::from(options.scale_y) - 0.5;
+                let sample = sample_linear(&first, source_x, source_y);
+                reference.blend_pixel_unchecked_with_mode(x as u32, y as u32, sample, options.blend_mode);
+            }
+        }
+        assert_eq!(serial.pixels(), reference.pixels());
+        assert_eq!(parallel.pixels(), reference.pixels());
     }
 
     #[test]

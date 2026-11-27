@@ -8,7 +8,7 @@ use cs2_renderer::{BlendMode, Canvas, CanvasReadback, FrameAsset, FramePixelIden
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use super::perf_detail::{GpuDecision, ReadbackKind, ReadbackTimer, list_gpu_decision};
 use super::canvas_native::VramOverflow;
 use super::native_tasks::WipeStep;
@@ -103,12 +103,14 @@ enum RasterStatus {
     NotCreated,
     Ready,
     Disabled,
+    Recovering,
     InitializationFailed,
 }
 
 thread_local! {
     static RASTER: RefCell<Option<Raster>> = const { RefCell::new(None) };
     static RASTER_STATUS: Cell<RasterStatus> = const { Cell::new(RasterStatus::NotCreated) };
+    static DEVICE_RETRY_AT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 fn set_raster_status(status: RasterStatus) {
@@ -120,6 +122,7 @@ fn missing_emote_raster_reason(status: RasterStatus) -> &'static str {
         RasterStatus::NotCreated => "Raster has not been created",
         RasterStatus::Ready => "Raster slot is empty despite ready status",
         RasterStatus::Disabled => "Raster is disabled or was discarded after a device error",
+        RasterStatus::Recovering => "Raster is waiting to rebuild a lost device",
         RasterStatus::InitializationFailed => "Raster initialization failed",
     }
 }
@@ -129,37 +132,106 @@ pub(super) fn emote_missing_raster_reason() -> &'static str {
 }
 
 pub(super) fn enable() -> bool {
+    DEVICE_RETRY_AT.set(None);
     #[cfg(target_os = "android")]
     memory::clear_recovery();
-    RASTER.with_borrow_mut(|slot| {
-        *slot = match Raster::new() {
-            Ok(mut raster) => {
-                if raster.direct_output_enabled() {
-                    // Device startup is outside the first particle or movie frame.
-                    let _ = raster.prepare_scene_triangles("prewarm");
-                }
-                set_raster_status(RasterStatus::Ready);
-                Some(raster)
+    let raster = match Raster::new() {
+        Ok(mut raster) => {
+            if raster.direct_output_enabled() {
+                // Device startup is outside the first particle or movie frame.
+                let _ = raster.prepare_scene_triangles("prewarm");
+                raster.prewarm_pose_jobs();
             }
-            Err(error) => {
-                set_raster_status(RasterStatus::InitializationFailed);
-                report(&format!("backend=cpu reason={error:#}"));
-                None
-            }
-        };
-        slot.is_some()
-    })
+            set_raster_status(RasterStatus::Ready);
+            Some(raster)
+        }
+        Err(error) => {
+            set_raster_status(RasterStatus::InitializationFailed);
+            report(&format!("backend=cpu reason={error:#}"));
+            None
+        }
+    };
+    let ready = raster.is_some();
+    drop(RASTER.replace(raster));
+    ready
 }
 
 #[cfg(windows)]
 pub(super) fn disable() {
+    DEVICE_RETRY_AT.set(None);
     let raster = RASTER.with_borrow_mut(Option::take);
     set_raster_status(RasterStatus::Disabled);
     drop(raster);
 }
 
+pub(super) fn maintain_device(at_frame_boundary: bool) {
+    const RETRY: Duration = Duration::from_millis(500);
+    let now = Instant::now();
+    let lost = RASTER.with_borrow_mut(|slot| {
+        if slot.as_ref().is_some_and(|raster| raster.failed.load(Ordering::Relaxed)) {
+            return slot.take();
+        }
+        None
+    });
+    if lost.is_some() {
+        set_raster_status(RasterStatus::Recovering);
+        DEVICE_RETRY_AT.set(Some(now + RETRY));
+        report("gpu_raster_recovery reason=device_lost state=scheduled");
+    }
+    drop(lost);
+    if at_frame_boundary && DEVICE_RETRY_AT.get().is_some_and(|deadline| now >= deadline) {
+        if enable() {
+            report("gpu_raster_recovery reason=device_lost state=ready");
+        } else {
+            set_raster_status(RasterStatus::Recovering);
+            DEVICE_RETRY_AT.set(Some(Instant::now() + Duration::from_secs(2)));
+        }
+    }
+}
+
 pub(super) fn available() -> bool {
-    RASTER.with_borrow(|slot| slot.is_some())
+    RASTER.with_borrow(|slot| slot.as_ref().is_some_and(|raster| !raster.failed.load(Ordering::Relaxed)))
+}
+
+#[cfg(windows)]
+thread_local! {
+    static DEFER_SCENE_READBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(windows)]
+pub(super) fn windows_device_output_requested() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CS2_REPLAY_DEVICE_OUTPUT").is_some_and(|value| value == "1"))
+}
+
+#[cfg(windows)]
+pub(super) fn deferred_scene_readback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var_os("CS2_SCENE_DEFER_READBACK").is_some_and(|value| value == "0"))
+        && available()
+}
+
+#[cfg(windows)]
+pub(super) fn discard_scene_plane_output() {
+    RASTER.with_borrow_mut(|slot| {
+        if let Some(raster) = slot.as_mut() {
+            raster.previous_planes = None;
+        }
+    });
+}
+
+#[cfg(windows)]
+pub(super) struct DeferredSceneReadback(bool);
+
+#[cfg(windows)]
+impl DeferredSceneReadback {
+    pub(super) fn begin() -> Self { Self(DEFER_SCENE_READBACK.replace(true)) }
+    pub(super) fn active() -> bool { DEFER_SCENE_READBACK.get() }
+}
+
+#[cfg(windows)]
+impl Drop for DeferredSceneReadback {
+    fn drop(&mut self) { DEFER_SCENE_READBACK.set(self.0); }
 }
 
 pub(super) use emote_raster::{
@@ -168,6 +240,8 @@ pub(super) use emote_raster::{
     tint_emote_surface, PoseScheduler, ScenePose, ScenePoseContext, pose_jobs_available,
     protect_emote_models,
 };
+#[cfg(windows)]
+pub(super) use emote_raster::loading_emote_atlas_ready;
 #[cfg(test)]
 pub(super) use emote_raster::PoseTestGate;
 
@@ -202,15 +276,19 @@ fn emote_device_blend_requested() -> bool {
     !android_property(c"debug.cs2.emote_device_blend", |value| value == b"0").unwrap_or(false)
 }
 
-#[cfg(windows)]
 pub(super) fn emote_batch_requested() -> bool {
-    available() && emote_device_blend_requested()
+    available() && emote_batch_configured()
+}
+
+#[cfg(windows)]
+fn emote_batch_configured() -> bool {
+    emote_device_blend_requested()
         && !std::env::var_os("CS2_EMOTE_BATCH").is_some_and(|value| value == "0")
 }
 
 #[cfg(target_os = "android")]
-pub(super) fn emote_batch_requested() -> bool {
-    available() && emote_device_blend_requested()
+fn emote_batch_configured() -> bool {
+    emote_device_blend_requested()
         && !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false)
 }
 
@@ -479,8 +557,6 @@ pub(super) fn draw_job(target: &mut Canvas, job: RasterJob<'_>) -> bool {
             Err(error) => {
                 note(GpuDecision::DispatchFailed);
                 report(&format!("draw={label} backend=cpu reason={error:#}"));
-                set_raster_status(RasterStatus::Disabled);
-                *slot = None;
                 false
             }
         }
@@ -563,8 +639,6 @@ pub(super) fn draw_list_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> b
             Ok(false) => false,
             Err(error) => {
                 report(&format!("draw=list_span_batch backend=cpu reason={error:#}"));
-                set_raster_status(RasterStatus::Disabled);
-                *slot = None;
                 false
             }
         }
@@ -630,8 +704,6 @@ pub(super) fn draw_plane_group(canvas: &mut Canvas, draws: &[RasterJob<'_>]) -> 
             Ok(false) => false,
             Err(error) => {
                 report(&format!("draw=plane_group backend=cpu reason={error:#}"));
-                set_raster_status(RasterStatus::Disabled);
-                *slot = None;
                 false
             }
         }
@@ -658,6 +730,8 @@ struct Raster {
     sources: VecDeque<CachedTexture>,
     atlas: Option<AtlasTexture>,
     source_bytes: usize,
+    packed_readback_retry_at: Option<Instant>,
+    readback_buffers: Arc<ReadbackBuffers>,
     full_target: Option<([u32; 2], usize)>,
     target: Arc<wgpu::Buffer>,
     spares: Vec<Arc<wgpu::Buffer>>,
@@ -725,7 +799,6 @@ struct CompletedPlanes {
     parameters: Vec<u8>,
     inputs: Vec<(Option<RgbaFrame>, Option<(u64, u64)>)>,
     before: Vec<u8>,
-    before_revision: Option<u64>,
     after: CompletedOutput,
     seed: Option<wgpu::Buffer>,
 }
@@ -743,6 +816,7 @@ struct DeviceFrame {
     device: wgpu::Device,
     queue: wgpu::Queue,
     failed: Arc<AtomicBool>,
+    readback_buffers: Arc<ReadbackBuffers>,
 }
 
 impl CanvasReadback for DeviceFrame {
@@ -760,28 +834,70 @@ impl CanvasReadback for DeviceFrame {
         if self.failed.load(Ordering::Relaxed) { return false; }
         let size = self.size.into_iter().map(u64::from).product::<u64>() * 4;
         if output.len() as u64 != size { return false; }
-        let measurement = ReadbackTimer::start(ReadbackKind::Device, size);
-        let readback = buffer(&self.device, size, DOWNLOAD);
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(&self.buffer, 0, &readback, 0, size);
-        let submitted = submit_gpu_commands(&self.queue, Some(encoder.finish()));
-        let slice = readback.slice(..);
+        self.readback_buffers.read(&self.device, &self.queue, &self.buffer, &self.failed, ReadbackKind::Device, output)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+#[derive(Debug, Default)]
+struct ReadbackBuffers(std::sync::Mutex<Vec<wgpu::Buffer>>);
+
+impl ReadbackBuffers {
+    fn read(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer,
+        failed: &AtomicBool, kind: ReadbackKind, output: &mut [u8],
+    ) -> bool {
+        let size = output.len() as u64;
+        let readback = self.acquire(device, size);
+        let measurement = ReadbackTimer::start(kind, size);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(source, 0, &readback, 0, size);
+        let submitted = submit_gpu_commands(queue, Some(encoder.finish()));
+        let copied = self.finish(device, readback, submitted, failed, kind, output);
+        if copied && let Some(measurement) = measurement { measurement.complete(); }
+        copied
+    }
+
+    fn acquire(&self, device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        let mut spares = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let spare = spares.iter().enumerate().filter(|(_, entry)| entry.size() >= size)
+            .min_by_key(|(_, entry)| entry.size()).map(|(index, _)| index);
+        let spare = spare.map(|index| spares.swap_remove(index));
+        drop(spares);
+        spare.unwrap_or_else(|| buffer(device, size, DOWNLOAD))
+    }
+
+    fn finish(
+        &self, device: &wgpu::Device, readback: wgpu::Buffer, submitted: wgpu::SubmissionIndex,
+        failed: &AtomicBool, kind: ReadbackKind, output: &mut [u8],
+    ) -> bool {
+        let slice = readback.slice(..output.len() as u64);
         let (send, receive) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |value| { let _ = send.send(value); });
-        if self.device.poll(wgpu::PollType::Wait {
+        let ready = device.poll(wgpu::PollType::Wait {
             submission_index: Some(submitted), timeout: Some(Duration::from_millis(250)),
-        }).is_err() || !matches!(receive.try_recv(), Ok(Ok(()))) || self.failed.load(Ordering::Relaxed) {
-            self.failed.store(true, Ordering::Relaxed);
-            report("device_frame_readback_failed");
+        });
+        if ready.is_err() || !matches!(receive.try_recv(), Ok(Ok(()))) || failed.load(Ordering::Relaxed) {
+            readback.unmap();
+            let label = match kind { ReadbackKind::Device => "canvas", ReadbackKind::Packed => "packed", ReadbackKind::Emote => "emote" };
+            report_readback_failure(label, &ready);
             return false;
         }
         output.copy_from_slice(&slice.get_mapped_range());
         readback.unmap();
-        if let Some(measurement) = measurement { measurement.complete(); }
+        let mut spares = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if spares.len() < 3 && readback.size() + spares.iter().map(wgpu::Buffer::size).sum::<u64>() <= 16 * 1024 * 1024 {
+            spares.push(readback);
+        }
         true
     }
+}
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+fn report_readback_failure(kind: &str, poll: &Result<wgpu::PollStatus, wgpu::PollError>) {
+    let reason = if matches!(poll, Err(wgpu::PollError::Timeout)) { "readback_timeout" } else { "readback_failed" };
+    crate::perf_detail::emote_fallback(reason);
+    report(&format!("gpu_readback kind={kind} reason={reason}"));
 }
 
 fn buffer(device: &wgpu::Device, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -845,7 +961,9 @@ impl Raster {
         let error_flag = Arc::clone(&failed);
         device.on_uncaptured_error(Arc::new(move |error| {
             report(&format!("device_error={error}"));
-            error_flag.store(true, Ordering::Relaxed);
+            if matches!(error, wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }) {
+                error_flag.store(true, Ordering::Relaxed);
+            }
         }));
         let lost_flag = Arc::clone(&failed);
         device.set_device_lost_callback(move |reason, _| {
@@ -900,7 +1018,8 @@ impl Raster {
         Ok(Self {
             device, queue, pipeline, layout, device_blend, device_blend_layout, device_blend_params,
             empty_source: source, empty_atlas, empty_page_table,
-            sources: VecDeque::new(), source_bytes: 0,
+            sources: VecDeque::new(), source_bytes: 0, packed_readback_retry_at: None,
+            readback_buffers: Arc::default(),
             target, args_buffer, readback, timing, atlas: None, full_target: None,
             emote: None, scene_triangles: None, reported_emote_result: None, emote_initialization_failed: false,
             scratch: Vec::new(), previous_planes: None, failed, backend: info.backend, reported: [false; 9],
@@ -921,10 +1040,7 @@ impl Raster {
         #[cfg(all(test, windows))]
         if self.test_direct_output { return true; }
         #[cfg(windows)]
-        {
-            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED.get_or_init(|| std::env::var_os("CS2_REPLAY_DEVICE_OUTPUT").is_some_and(|value| value == "1"))
-        }
+        return windows_device_output_requested();
         #[cfg(target_os = "android")]
         return !android_property(c"debug.cs2.single_barrier", |value| value == b"0").unwrap_or(false);
     }
@@ -1104,6 +1220,9 @@ impl Raster {
         }
         let bounds = RasterRect { origin: [0; 2], size: [canvas.width(), canvas.height()] };
         let direct = matches!(output, RasterOutput::Canvas) && self.direct_output_enabled();
+        if !direct && self.packed_readback_retry_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(false);
+        }
         let full_region = [bounds];
         let regions = if direct { full_region.as_slice() } else { regions };
         let mut target_size = 0u64;
@@ -1172,45 +1291,67 @@ impl Raster {
         let stride = canvas.width() as usize * 4;
         let target_rect = regions[0];
         let [first, row_size] = byte_range(target_rect, stride);
-        let retain_result = retain_result && regions.len() == 1 && target_size <= 16 * 1024 * 1024;
         let previous_device = direct.then(|| device_frame(canvas))
             .flatten().filter(|frame| Arc::ptr_eq(&frame.failed, &self.failed))
-            .map(|frame| (frame.revision, frame.buffer.clone()));
-        let before_revision = previous_device.as_ref().map(|(revision, _)| *revision);
-        self.ensure_target_size(target_size);
-        let input = if previous_device.is_some() {
-            &[][..]
-        } else if regions.len() == 1 && row_size == stride {
-            &canvas.pixels()[first..first + target_size as usize]
-        } else {
-            self.scratch.clear();
-            for region in regions {
-                let [first, row_size] = byte_range(*region, stride);
-                for row in 0..region.size[1] as usize {
-                    let start = first + row * stride;
-                    self.scratch.extend_from_slice(&canvas.pixels()[start..start + row_size]);
+            .map(|frame| frame.buffer.clone());
+        #[cfg(windows)]
+        let in_place = DeferredSceneReadback::active()
+            && previous_device.as_ref().is_some_and(|previous| Arc::ptr_eq(previous, &self.target))
+            && Arc::strong_count(&self.target) == 3
+            && canvas.exclusive_deferred_pixels().is_some();
+        #[cfg(target_os = "android")]
+        let in_place = false;
+        // Keep the reusable CPU-seeded prefix across groups layered over a
+        // changing GPU frame. Its cached canvas owns an immutable buffer.
+        let retain_result = retain_result && previous_device.is_none()
+            && regions.len() == 1 && target_size <= 16 * 1024 * 1024;
+        if !in_place {
+            self.ensure_target_size(target_size);
+        }
+        let input = if previous_device.is_none() {
+            let pixels = canvas.try_pixels()?;
+            if regions.len() == 1 && row_size == stride {
+                &pixels[first..first + target_size as usize]
+            } else {
+                self.scratch.clear();
+                for region in regions {
+                    let [first, row_size] = byte_range(*region, stride);
+                    for row in 0..region.size[1] as usize {
+                        let start = first + row * stride;
+                        self.scratch.extend_from_slice(&pixels[start..start + row_size]);
+                    }
                 }
+                &self.scratch
             }
-            &self.scratch
+        } else {
+            &[][..]
         };
         if retain_result && let Some(previous) = &self.previous_planes
             && previous.area == target_rect && previous.parameters == parameters
-            && previous.before_revision == before_revision && previous.before == input
+            && previous.before == input
             && previous.inputs.iter().zip(draws.iter().zip(&atlas_versions)).all(|((old, version), (new, next_version))| {
                 version == next_version && equal_pixels(old.as_ref(), new.source)
             })
         {
             match &previous.after {
                 CompletedOutput::Cpu(pixels) => replace_rows(canvas, first, stride, row_size, pixels),
-                CompletedOutput::Device(verified) if direct => *canvas = verified.clone(),
-                CompletedOutput::Device(verified) => replace_rows(canvas, first, stride, row_size, verified.pixels()),
+                CompletedOutput::Device(output) if direct => {
+                    #[cfg(windows)]
+                    if !DeferredSceneReadback::active() {
+                        output.try_pixels()?;
+                    }
+                    *canvas = output.clone();
+                }
+                CompletedOutput::Device(verified) => replace_rows(canvas, first, stride, row_size, verified.try_pixels()?),
             }
             return Ok(true);
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let seed = if let Some((_, previous)) = previous_device {
-            encoder.copy_buffer_to_buffer(&previous, 0, &self.target, 0, target_size);
-            retain_result.then_some((Vec::new(), None))
+        let seed = if let Some(previous) = previous_device {
+            if !in_place {
+                encoder.copy_buffer_to_buffer(&previous, 0, &self.target, 0, target_size);
+            }
+            None
         } else if retain_result {
             let previous = self.previous_planes.take();
             let reuse = previous.as_ref().is_some_and(|old| old.area == target_rect && old.seed.is_some()
@@ -1296,12 +1437,34 @@ impl Raster {
             first_job = end_job;
         }
         if direct {
-            submit_gpu_commands(&self.queue, Some(encoder.finish()));
             let frame = self.publish_device_frame(bounds.size);
-            canvas.set_deferred_device_pixels(frame);
+            #[cfg(windows)]
+            if DeferredSceneReadback::active() {
+                submit_gpu_commands(&self.queue, Some(encoder.finish()));
+                canvas.set_deferred_device_pixels(frame);
+            } else {
+                // Verify fallback pixels in the same submission as the draw.
+                // The previous canvas remains usable if that readback fails.
+                canvas.set_device_pixels_with(frame, |pixels| {
+                    let measurement = ReadbackTimer::start(ReadbackKind::Device, target_size);
+                    let readback = self.readback_buffers.acquire(&self.device, target_size);
+                    encoder.copy_buffer_to_buffer(&self.target, 0, &readback, 0, target_size);
+                    let submitted = submit_gpu_commands(&self.queue, Some(encoder.finish()));
+                    let copied = self.readback_buffers.finish(
+                        &self.device, readback, submitted, &self.failed, ReadbackKind::Device, pixels,
+                    );
+                    if copied && let Some(measurement) = measurement { measurement.complete(); }
+                    copied
+                })?;
+            }
+            #[cfg(target_os = "android")]
+            {
+                submit_gpu_commands(&self.queue, Some(encoder.finish()));
+                canvas.set_deferred_device_pixels(frame);
+            }
             if let Some((before, seed)) = seed {
                 self.previous_planes = Some(CompletedPlanes {
-                    area: target_rect, before, before_revision, seed, parameters,
+                    area: target_rect, before, seed, parameters,
                     after: CompletedOutput::Device(canvas.clone()),
                     inputs: draws.iter().zip(atlas_versions).map(|(job, version)| (job.source.cloned(), version)).collect(),
                 });
@@ -1321,10 +1484,12 @@ impl Raster {
         let slice = self.readback.slice(..map_size);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
-        let ready = self.device.poll(wgpu::PollType::Wait {
+        let poll = self.device.poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
             timeout: Some(Duration::from_millis(250)),
-        }).context("wait for raster readback")
+        });
+        if poll.is_err() { report_readback_failure("packed", &poll); }
+        let ready = poll.context("wait for raster readback")
             .and_then(|_| receiver.try_recv().context("receive raster readback")?.context("map raster readback"))
             .and_then(|_| {
                 if self.failed.load(Ordering::Relaxed) {
@@ -1334,6 +1499,7 @@ impl Raster {
             });
         if let Err(error) = ready {
             self.readback.unmap();
+            self.packed_readback_retry_at = Some(Instant::now() + Duration::from_millis(100));
             return Err(error);
         }
         {
@@ -1354,7 +1520,7 @@ impl Raster {
             }
             if let Some((before, seed)) = seed {
                 self.previous_planes = Some(CompletedPlanes {
-                    area: target_rect, parameters, before, before_revision, seed,
+                    area: target_rect, parameters, before, seed,
                     after: CompletedOutput::Cpu(output[..target_size as usize].to_vec()),
                     inputs: draws.iter().zip(atlas_versions).map(|(job, version)| (job.source.cloned(), version)).collect(),
                 });
@@ -1374,6 +1540,7 @@ impl Raster {
             revision: NEXT_FRAME.fetch_add(1, Ordering::Relaxed), size,
             buffer: self.target.clone(), device: self.device.clone(), queue: self.queue.clone(),
             failed: self.failed.clone(),
+            readback_buffers: self.readback_buffers.clone(),
         })
     }
 
@@ -1526,6 +1693,33 @@ fn replace_rows(canvas: &mut Canvas, first: usize, stride: usize, row_size: usiz
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn plane_prefix_survives_device_continuation() -> Result<()> {
+        let mut raster = Raster::new()?;
+        raster.test_direct_output = true;
+        let full = RasterRect { origin: [0; 2], size: [64, 64] };
+        let patch = RasterRect { origin: [8, 8], size: [16, 16] };
+        let background = RgbaFrame::from_rgba8(64, 64, [13, 23, 43, 255].repeat(64 * 64))?;
+        let foreground = RgbaFrame::from_rgba8(16, 16, [77, 55, 33, 255].repeat(16 * 16))?;
+        let copy = Draw::Copy { source_origin: [0; 2] };
+        let prefix = [RasterJob { rect: full, source: Some(&background), atlas: None, operation: copy }];
+        let continuation = [RasterJob { rect: patch, source: Some(&foreground), atlas: None, operation: copy }];
+        let mut canvas = Canvas::new(64, 64)?;
+
+        assert!(raster.draw_jobs(&mut canvas, &[full], &prefix, RasterOutput::Canvas, true)?);
+        let prefix_revision = frame_revision(&canvas).context("missing device prefix")?;
+        assert!(raster.draw_jobs(&mut canvas, &[patch], &continuation, RasterOutput::Canvas, true)?);
+        assert_ne!(frame_revision(&canvas), Some(prefix_revision));
+        assert_eq!(canvas.pixel(8, 8)?, cs2_renderer::Color::rgb(77, 55, 33));
+
+        let mut next = Canvas::new(64, 64)?;
+        assert!(raster.draw_jobs(&mut next, &[full], &prefix, RasterOutput::Canvas, true)?);
+        assert_eq!(frame_revision(&next), Some(prefix_revision));
+        assert_eq!(next.pixels(), background.pixels());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires a DX12 adapter"]

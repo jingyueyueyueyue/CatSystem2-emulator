@@ -290,6 +290,7 @@ impl FrameEffects {
         }
         draw(&mut frame, far, 1_000_000.)?;
         task.check_capacity()?;
+        super::verify_deferred_output(&frame)?;
         if task.now >= task.end {
             task.active = 0;
         }

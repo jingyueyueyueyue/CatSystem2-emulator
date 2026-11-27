@@ -255,7 +255,6 @@ pub(super) struct ResourcePreloads {
 impl ResourcePreloads {
     pub(super) fn set_fast_forward(&mut self, active: bool) {
         self.fast_forward = active;
-        if active { self.images.clear(); }
     }
 
     pub(crate) fn graph_request_count(&self) -> usize { self.requests.len() }
@@ -321,7 +320,7 @@ impl ResourcePreloads {
             || self.ahead.resources().any(|resource| resource.version.as_ref() == Some(&model.version)));
         // Each source version generates one warm event. Never compare/copy HG3
         // sources again just because another logical frame elapsed.
-        for resource in self.ahead.newly_ready() {
+        for resource in self.ahead.newly_ready().take(2) {
             self.images.submit(&resource.bytes);
             if let Some(version) = resource.version.clone() {
                 if self.models.len() >= MAX_MODELS || self.models.iter().any(|model| model.version == version) { continue; }

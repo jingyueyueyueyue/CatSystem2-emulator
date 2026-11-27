@@ -292,6 +292,7 @@ impl CpuStencilBuffer {
     ) -> Result<usize> {
         let mut written = 0usize;
         let [ox, oy] = mask.origin();
+        let pixels = mask.rgba()?;
         for sy in 0..mask.height() {
             let y = i64::from(oy) + i64::from(sy);
             if y < 0 || y >= i64::from(self.height) {
@@ -303,7 +304,7 @@ impl CpuStencilBuffer {
                     continue;
                 }
                 let source = (sy as usize * mask.width() as usize + sx as usize) * 4;
-                if mask.rgba()[source + 3] <= 64 {
+                if pixels[source + 3] <= 64 {
                     continue;
                 }
                 if self.get(x as u32, y as u32) != Some(reference) {
@@ -359,6 +360,8 @@ impl CpuStencilBuffer {
         }
         let mut submitted = 0usize;
         let [ox, oy] = source.origin();
+        let source_pixels = source.rgba()?;
+        let destination_pixels = destination.rgba_mut()?;
         for sy in 0..source.height() {
             let y = i64::from(oy) + i64::from(sy);
             if y < 0 || y >= i64::from(self.height) {
@@ -375,21 +378,20 @@ impl CpuStencilBuffer {
                 let index = y as usize * self.width as usize + x as usize;
                 let src = (sy as usize * source.width() as usize + sx as usize) * 4;
                 let dst = index * 4;
-                let alpha = f64::from(source.rgba()[src + 3]) / 255.0;
-                let old_alpha = f64::from(destination.rgba()[dst + 3]) / 255.0;
+                let alpha = f64::from(source_pixels[src + 3]) / 255.0;
+                let old_alpha = f64::from(destination_pixels[dst + 3]) / 255.0;
                 let combined = alpha + old_alpha * (1.0 - alpha);
                 if combined == 0.0 {
                     continue;
                 }
-                let pixels = destination.rgba_mut();
                 for c in 0..3 {
-                    pixels[dst + c] = ((f64::from(source.rgba()[src + c]) * alpha
-                        + f64::from(pixels[dst + c]) * old_alpha * (1.0 - alpha))
+                    destination_pixels[dst + c] = ((f64::from(source_pixels[src + c]) * alpha
+                        + f64::from(destination_pixels[dst + c]) * old_alpha * (1.0 - alpha))
                         / combined)
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }
-                pixels[dst + 3] = (combined * 255.0).round().clamp(0.0, 255.0) as u8;
+                destination_pixels[dst + 3] = (combined * 255.0).round().clamp(0.0, 255.0) as u8;
                 submitted += 1;
             }
         }

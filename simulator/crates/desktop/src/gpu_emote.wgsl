@@ -20,7 +20,7 @@ struct Sample {
     error: vec4<f32>,
 }
 
-fn sample_atlas(base: vec2<i32>, offset: vec2<f32>, uncertainty: vec2<f32>) -> Sample {
+fn sample_atlas(atlas: texture_2d<u32>, base: vec2<i32>, offset: vec2<f32>, uncertainty: vec2<f32>) -> Sample {
     let last = vec2<i32>(textureDimensions(atlas)) - 1;
     let position = offset - 0.5;
     let integral = floor(position);
@@ -102,7 +102,7 @@ fn sprite(@builtin(global_invocation_id) id: vec3<u32>) {
         let offset = start + advance;
         let base = vec2<i32>(bitcast<i32>(command(i + 6u)), bitcast<i32>(command(i + 7u)));
         let uncertainty = (abs(start) + abs(advance) + abs(offset)) * 0.00000013 + 0.0000002;
-        var sample = sample_atlas(base, offset, uncertainty);
+        var sample = sample_atlas(atlas, base, offset, uncertainty);
         if bgra {
             sample = Sample(sample.color.bgra, sample.error.bgra);
         }

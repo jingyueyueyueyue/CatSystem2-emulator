@@ -653,6 +653,7 @@ fn replay(
     let live_path = output.with_extension("inputs.txt");
     let mut live_commands = Vec::new();
     let mut live_next = 0;
+    let replay_started = std::time::Instant::now();
     for completed in 0..frames {
         let tick_started = std::time::Instant::now();
         if release_ctrl_at == Some(completed) {
@@ -1173,6 +1174,8 @@ fn replay(
                 "replay_tick frame={completed} call=0 ready_us={} retry_sleep_us={} retries={retries}",
                 tick_started.elapsed().as_micros(), retry_sleep.as_micros(),
             );
+            eprintln!("replay_preview frame={completed} monotonic_us={} skipped={}",
+                replay_started.elapsed().as_micros(), u8::from(player.fast_forward_preview_skipped()));
         }
         if let Some(controller) = route.as_deref_mut() {
             controller.observe_frame(&player);

@@ -7,10 +7,9 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const TRIM_INTERVAL: Duration = Duration::from_secs(2);
 const TRIM_AT: usize = 16_384;
 const RETIRE_AT: usize = 32_768;
-const RESUME_BELOW: usize = 12_288;
-const RECOVERY_DELAY: Duration = Duration::from_secs(2);
-const FAILED_RETRY_DELAY: Duration = Duration::from_secs(10);
-const DRAIN_TIMEOUT: Duration = Duration::from_millis(40);
+const RESUME_BELOW: usize = RETIRE_AT - 4_096;
+const RECOVERY_DELAY: Duration = Duration::from_secs(1);
+const FAILED_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 thread_local! {
     static RECOVER_AT: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -41,7 +40,7 @@ pub(in crate::gpu_raster) fn map_count(mut maps: impl Read) -> io::Result<usize>
 pub(crate) fn maintain(at_frame_boundary: bool) {
     let retired = RASTER.with_borrow_mut(|slot| {
         if slot.as_mut().is_some_and(Raster::maintain_android_memory) {
-            set_raster_status(RasterStatus::Disabled);
+            set_raster_status(RasterStatus::Recovering);
             slot.take();
             return true;
         }
@@ -52,6 +51,7 @@ pub(crate) fn maintain(at_frame_boundary: bool) {
     } else if at_frame_boundary {
         recover();
     }
+    if RECOVER_AT.get().is_some() { crate::perf_detail::emote_fallback("vma_retired"); }
 }
 
 pub(super) fn clear_recovery() {
@@ -103,24 +103,18 @@ impl Raster {
         }
         self.memory.trimmed_at = Some(now);
 
-        // Drop only derived GPU data. In-flight commands and published frames
-        // retain their own references until the queue releases them.
-        self.sources.clear();
-        self.source_bytes = 0;
-        self.atlas = None;
-        self.previous_planes = None;
-        self.spares.clear();
-        self.full_target = None;
+        // Reclaim cold textures and excess spare capacity in bounded steps.
+        // The active scene and frames held by the presenter keep their owners.
+        for _ in 0..(self.sources.len() / 2).min(16) {
+            if let Some(source) = self.sources.pop_front() { self.source_bytes -= source.bytes; }
+        }
+        self.spares.truncate(2);
         if let Some(emote) = &mut self.emote {
             emote.trim_android_caches();
         }
-        let drained = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(DRAIN_TIMEOUT),
-        }).is_ok();
-        purge_unused_heap_pages();
+        let _ = self.device.poll(wgpu::PollType::Poll);
         let remaining = current_map_count().unwrap_or(maps);
-        report(&format!("memory_reclaim maps_before={maps} maps_after={remaining} drained={drained}"));
+        report(&format!("memory_reclaim maps_before={maps} maps_after={remaining}"));
         if remaining < RETIRE_AT {
             return false;
         }
@@ -129,16 +123,7 @@ impl Raster {
         // without returning a Vulkan error. Stop allocating on this device
         // while there is still room to finish and display the current scene.
         self.memory.retired = true;
-        report(&format!("memory_reclaim maps={remaining} backend=cpu reason=mapping_pressure"));
+        report(&format!("memory_reclaim maps={remaining} backend=cpu reason=vma_retired"));
         true
     }
-}
-
-fn purge_unused_heap_pages() {
-    unsafe extern "C" {
-        fn mallopt(option: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
-    }
-    // Bionic M_PURGE is available from API 28. Older versions reject the
-    // request, which is independent of the GPU cache eviction above.
-    unsafe { mallopt(-101, 0); }
 }

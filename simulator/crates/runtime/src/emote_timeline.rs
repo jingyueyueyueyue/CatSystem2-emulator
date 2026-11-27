@@ -8,7 +8,7 @@
 
 use super::{EmoteError, PsbValue, Result, cpu::PriorityTimeline};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Debug, Clone, Default)]
 pub(super) struct CpuReferenceTimelines {
     root: Option<(String, String)>,
-    owners: BTreeMap<Vec<usize>, ReferenceClock>,
-    seen: BTreeSet<Vec<usize>>,
+    owners: Arc<BTreeMap<Vec<usize>, ReferenceClock>>,
     updated_tick: Option<f32>,
     updated_variables: Arc<BTreeMap<String, f64>>,
     visible_layers: Option<Arc<Vec<usize>>>,
@@ -32,6 +31,7 @@ struct ReferenceClock {
     sample: f32,
     observed_tick: f32,
     playing: bool,
+    seen: bool,
 }
 
 pub(super) fn same_variable_bits(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>) -> bool {
@@ -42,25 +42,19 @@ pub(super) fn same_variable_bits(left: &BTreeMap<String, f64>, right: &BTreeMap<
 #[derive(Debug, Clone)]
 pub(super) struct CpuReferenceSample {
     pub path: Vec<usize>,
-    pub object: String,
-    pub motion: String,
     pub frame: f64,
     pub raw_frame: f64,
 }
 
 impl CpuReferenceTimelines {
     pub(super) fn estimated_snapshot_bytes(&self) -> usize {
-        // The updated variable map is shared by Arc. Allow headroom for tree
-        // nodes in both the owned path map and the transient seen set.
+        // The updated variable map is shared by Arc. Allow headroom for tree nodes.
         const TREE_ENTRY_OVERHEAD: usize = 8 * size_of::<usize>();
         let labels = |(owner, motion): &(String, String)| owner.len() + motion.len();
         self.root.as_ref().map_or(0, labels)
             + self.owners.iter().map(|(path, state)| {
                 size_of::<(Vec<usize>, ReferenceClock)>() + TREE_ENTRY_OVERHEAD
                     + path.len() * size_of::<usize>() + state.selected.as_ref().map_or(0, labels)
-            }).sum::<usize>()
-            + self.seen.iter().map(|path| {
-                size_of::<Vec<usize>>() + TREE_ENTRY_OVERHEAD + path.len() * size_of::<usize>()
             }).sum::<usize>()
             + self.updated_variables.iter().map(|(name, _)| {
                 size_of::<(String, f64)>() + TREE_ENTRY_OVERHEAD + name.len()
@@ -88,22 +82,26 @@ impl CpuReferenceTimelines {
         self.root == other.root
             && self.updated_tick.map(f32::to_bits) == other.updated_tick.map(f32::to_bits)
             && same_variable_bits(&self.updated_variables, &other.updated_variables)
-            && self.owners.len() == other.owners.len()
-            && self.owners.iter().zip(&other.owners).all(|((left_path, left), (right_path, right))|
+            && (Arc::ptr_eq(&self.owners, &other.owners) || self.owners.len() == other.owners.len()
+            && self.owners.iter().zip(other.owners.iter()).all(|((left_path, left), (right_path, right))|
                 left_path == right_path && left.selected == right.selected && left.playing == right.playing
                     && [left.raw, left.sample, left.observed_tick].map(f32::to_bits)
-                        == [right.raw, right.sample, right.observed_tick].map(f32::to_bits))
+                        == [right.raw, right.sample, right.observed_tick].map(f32::to_bits)))
     }
 
-    pub fn begin(&mut self, object: &str, motion: &str) {
+    pub fn begin(&mut self, object: &str, motion: &str, update: bool) {
         if self.root.as_ref().is_none_or(|(owner, name)| owner != object || name != motion) {
-            self.owners.clear();
+            self.owners = Arc::default();
             self.root = Some((object.to_owned(), motion.to_owned()));
             self.updated_tick = None;
             self.updated_variables = Arc::default();
             self.visible_layers = None;
         }
-        self.seen.clear();
+        if update {
+            for owner in Arc::make_mut(&mut self.owners).values_mut() {
+                owner.seen = false;
+            }
+        }
     }
 
     pub fn mark_tick(&mut self, tick: f32, variables: BTreeMap<String, f64>) {
@@ -127,22 +125,39 @@ impl CpuReferenceTimelines {
         end: f32,
         tick: f32,
         parameter_frame: Option<f32>,
+        reuse_tick: bool,
     ) -> Result<CpuReferenceSample> {
         if ![initial, end, tick].into_iter().all(f32::is_finite)
             || parameter_frame.is_some_and(|v| !v.is_finite()) || end < 0.0
         {
             return Err(invalid("reference clock outside recovered finite domain"));
         }
-        let identity = (object.to_owned(), motion.to_owned());
         let update_delta = self.updated_tick.map(|before| tick - before).unwrap_or(0.0);
         if !update_delta.is_finite() {
             return Err(invalid("reference update delta overflow"));
         }
-        let changed = self.owners.get(&path).and_then(|v| v.selected.as_ref()) != Some(&identity);
+        let changed = self.owners.get(&path).and_then(|owner| owner.selected.as_ref())
+            .is_none_or(|(selected_object, selected_motion)| selected_object != object || selected_motion != motion);
+        if reuse_tick && !changed
+            && let Some(owner) = self.owners.get(&path)
+            && owner.observed_tick.to_bits() == tick.to_bits()
+        {
+            // A completed clock can be read without cloning the holder tree
+            // when selection would only set the update pass's visibility bit.
+            let unchanged = match parameter_frame {
+                Some(frame) => [owner.raw, owner.sample].map(f32::to_bits) == [frame.to_bits(); 2],
+                None => !owner.playing || (owner.raw < end && owner.raw.to_bits() != (-0.0f32).to_bits()
+                    && owner.sample.to_bits() == owner.raw.min(end).to_bits()),
+            };
+            if unchanged {
+                return Ok(CpuReferenceSample { path, frame: f64::from(owner.sample), raw_frame: f64::from(owner.raw) });
+            }
+        }
+        let owners = Arc::make_mut(&mut self.owners);
         if changed {
             //Replacing a motion destroys its physical layer subtree; sibling
             //holders and this reference's own parser-created holder survive.
-            self.owners.retain(|key, _| key.len() <= path.len() || !key.starts_with(&path));
+            owners.retain(|key, _| key.len() <= path.len() || !key.starts_with(&path));
             let mut raw = initial.max(0.0);
             //3acc0..3acf8: a newly selected ordinary motion beginning at
             //zero starts at lastTime on a negative parent update. f9 then
@@ -150,14 +165,15 @@ impl CpuReferenceTimelines {
             if parameter_frame.is_none() && update_delta < 0.0 && raw == 0.0 {
                 raw = end;
             }
-            self.owners.insert(path.clone(), ReferenceClock {
-                selected: Some(identity), raw, sample: raw.min(end),
+            owners.insert(path.clone(), ReferenceClock {
+                selected: Some((object.to_owned(), motion.to_owned())), raw, sample: raw.min(end),
                 observed_tick: tick,
                 playing: if update_delta < 0.0 { raw >= 0.0 } else { raw < end },
+                seen: false,
             });
         }
-        self.seen.insert(path.clone());
-        let owner = self.owners.get_mut(&path).unwrap();
+        let owner = owners.get_mut(&path).unwrap();
+        owner.seen = true;
         if let Some(frame) = parameter_frame {
             //3ac12/3ac1a and3ac38/3ac40 do not clamp to lastTime.
             owner.raw = frame;
@@ -189,26 +205,27 @@ impl CpuReferenceTimelines {
             }
         }
         owner.observed_tick = tick;
-        Ok(CpuReferenceSample { path, object: object.to_owned(), motion: motion.to_owned(),
-                                frame: f64::from(owner.sample), raw_frame: f64::from(owner.raw) })
+        Ok(CpuReferenceSample { path, frame: f64::from(owner.sample), raw_frame: f64::from(owner.raw) })
     }
 
     pub fn finish(&mut self) {
         //A hidden physical layer has no visited reference;41b83 clears the
         //motion name/state but does not delete its holder. Drop its descendants
         //because they belonged to the released selected motion's layer tree.
-        let hidden: Vec<_> = self.owners.keys().filter(|path| !self.seen.contains(*path)).cloned().collect();
-        self.owners.retain(|path, _| !hidden.iter().any(|parent|
+        let owners = Arc::make_mut(&mut self.owners);
+        let hidden: Vec<_> = owners.iter()
+            .filter(|(_, owner)| !owner.seen)
+            .map(|(path, _)| path.clone()).collect();
+        owners.retain(|path, _| !hidden.iter().any(|parent|
             path.len() > parent.len() && path.starts_with(parent)));
         for path in hidden {
-            if let Some(owner) = self.owners.get_mut(&path) {
+            if let Some(owner) = owners.get_mut(&path) {
                 owner.selected = None;
                 owner.raw = 0.0;
                 owner.sample = 0.0;
                 owner.playing = false;
             }
         }
-        self.seen.clear();
     }
 }
 
@@ -263,6 +280,30 @@ fn vector(value: Option<&PsbValue>) -> Result<Vec<f32>> {
         return Err(invalid("non-finite frame vector"));
     }
     Ok(values)
+}
+
+fn vector_prefix<const N: usize>(value: Option<&PsbValue>) -> Result<(usize, [f32; N])> {
+    let mut output = [0.0; N];
+    let mut store = |index: usize, number: f32| {
+        if !number.is_finite() { return Err(invalid("non-finite frame vector")); }
+        if let Some(slot) = output.get_mut(index) { *slot = number; }
+        Ok(())
+    };
+    let len = match value {
+        None | Some(PsbValue::Null) => 0,
+        Some(PsbValue::List(values)) => {
+            for (index, value) in values.iter().enumerate() {
+                store(index, value.number().ok_or_else(|| invalid("non-numeric frame vector"))? as f32)?;
+            }
+            values.len()
+        }
+        Some(PsbValue::Integers(values)) => {
+            for (index, &value) in values.iter().enumerate() { store(index, value as f32)?; }
+            values.len()
+        }
+        _ => return Err(invalid("frame vector type")),
+    };
+    Ok((len, output))
 }
 
 fn linear(a: f32, b: f32, t: f32) -> Result<f32> {
@@ -760,26 +801,50 @@ pub fn sample_emote_layer(layer: &PsbValue, time: f64) -> Result<CpuTimelineSamp
 /// A sampled key keeps its original fields and owns only the interpolated values.
 pub(super) struct FrameContent<'a> {
     base: Cow<'a, PsbValue>,
-    overrides: Vec<(&'static str, PsbValue)>,
+    evaluated: EvaluatedLayerContent<'a>,
+}
+
+#[derive(Default)]
+struct EvaluatedLayerContent<'a> {
+    scalars: [Option<(&'static str, PsbValue)>; 7],
+    coord: Option<[f32; 3]>,
+    mesh: Option<(&'a PsbValue, [f32; 32])>,
 }
 
 impl<'a> FrameContent<'a> {
     pub(super) fn is_unmodified(&self) -> bool {
-        self.overrides.is_empty() && self.borrowed_base().is_some()
+        self.borrowed_base().is_some() && self.evaluated.scalars[0].is_none()
+            && self.evaluated.coord.is_none() && self.evaluated.mesh.is_none()
     }
 
     pub(super) fn borrowed_base(&self) -> Option<&PsbValue> {
         match &self.base { Cow::Borrowed(value) => Some(value), Cow::Owned(_) => None }
     }
 
-    pub(super) fn overrides(&self) -> &[(&'static str, PsbValue)] { &self.overrides }
+    pub(super) fn overrides(&self) -> impl Iterator<Item = &(&'static str, PsbValue)> {
+        self.evaluated.scalars.iter().flatten()
+    }
+
+    pub(super) fn interpolated_coord(&self) -> Option<[f32; 3]> { self.evaluated.coord }
+
+    pub(super) fn coord(&self) -> Result<[f32; 3]> {
+        if let Some(coord) = self.evaluated.coord { return Ok(coord); }
+        let (len, coord) = vector_prefix(self.base.get("coord"))?;
+        if len != 0 && len != 3 { return Err(invalid("frame coord must have three components")); }
+        Ok(coord)
+    }
+
+    pub(super) fn mesh(&self) -> Option<(&PsbValue, Option<&[f32; 32]>)> {
+        if let Some((source, points)) = &self.evaluated.mesh { return Some((source, Some(points))); }
+        self.base.get("mesh").map(|source| (source, None))
+    }
 
     pub(super) fn borrowed(base: &'a PsbValue) -> Self {
-        Self { base: Cow::Borrowed(base), overrides: Vec::new() }
+        Self { base: Cow::Borrowed(base), evaluated: EvaluatedLayerContent::default() }
     }
 
     pub(super) fn get(&self, key: &str) -> Option<&PsbValue> {
-        self.overrides.iter().find(|(name, _)| *name == key)
+        self.overrides().find(|(name, _)| *name == key)
             .map(|(_, value)| value)
             .or_else(|| self.base.get(key))
     }
@@ -790,21 +855,29 @@ impl<'a> FrameContent<'a> {
 
     pub(super) fn to_mut(&mut self) -> &mut PsbValue {
         let base = self.base.to_mut();
+        let evaluated = std::mem::take(&mut self.evaluated);
         if let PsbValue::Object(fields) = base {
-            fields.extend(self.overrides.drain(..).map(|(name, value)| (name.to_owned(), value)));
+            fields.extend(evaluated.scalars.into_iter().flatten().map(|(name, value)| (name.to_owned(), value)));
+            let list = |values: &[f32]| PsbValue::List(values.iter().map(|n| PsbValue::Number(f64::from(*n))).collect());
+            if let Some(coord) = evaluated.coord { fields.insert("coord".into(), list(&coord)); }
+            if let Some((source, points)) = evaluated.mesh {
+                let mut mesh = source.object().expect("interpolated mesh source").clone();
+                mesh.insert("bp".into(), list(&points));
+                fields.insert("mesh".into(), PsbValue::Object(mesh));
+            }
         }
         base
     }
 
     fn into_value(mut self) -> PsbValue {
-        if !self.overrides.is_empty() {
+        if !self.is_unmodified() {
             self.to_mut();
         }
         self.base.into_owned()
     }
 
     fn insert(&mut self, key: &'static str, value: PsbValue) {
-        self.overrides.push((key, value));
+        *self.evaluated.scalars.iter_mut().find(|slot| slot.is_none()).expect("interpolated scalar slot") = Some((key, value));
     }
 }
 
@@ -900,22 +973,12 @@ pub(super) fn sample_emote_keys<'a>(
         );
     }
     if start.get("coord").is_some() || end.get("coord").is_some() {
-        let a = vector(start.get("coord"))?;
-        let b = vector(end.get("coord"))?;
-        if (!a.is_empty() && a.len() != 3) || (!b.is_empty() && b.len() != 3) {
+        let (a_len, a) = vector_prefix::<3>(start.get("coord"))?;
+        let (b_len, b) = vector_prefix::<3>(end.get("coord"))?;
+        if ![a_len, b_len].iter().all(|len| matches!(len, 0 | 3)) {
             return Err(invalid("frame coord must have three components"));
         }
-        let values = (0..3)
-            .map(|i| {
-                linear(
-                    a.get(i).copied().unwrap_or(0.0),
-                    b.get(i).copied().unwrap_or(0.0),
-                    ratio,
-                )
-                .map(|n| PsbValue::Number(f64::from(n)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        content.insert("coord", PsbValue::List(values));
+        content.evaluated.coord = Some([linear(a[0], b[0], ratio)?, linear(a[1], b[1], ratio)?, linear(a[2], b[2], ratio)?]);
     }
     //3db7d/3dba4 substitute global97df8 when exactly one BP endpoint is
     //empty. Initializer296d0 supplies16 row-major(x/3,y/3) pairs. An empty
@@ -926,32 +989,27 @@ pub(super) fn sample_emote_keys<'a>(
         if am.is_some_and(|m| m.object().is_none()) || bm.is_some_and(|m| m.object().is_none()) {
             return Err(invalid("frame mesh must be an object"));
         }
-        let mut a = vector(am.and_then(|m| m.get("bp")))?;
-        let mut b = vector(bm.and_then(|m| m.get("bp")))?;
-        if !vector(am.and_then(|m| m.get("cc")))?.is_empty()
-            || !vector(bm.and_then(|m| m.get("cc")))?.is_empty()
+        let (a_len, mut a) = vector_prefix::<32>(am.and_then(|m| m.get("bp")))?;
+        let (b_len, mut b) = vector_prefix::<32>(bm.and_then(|m| m.get("bp")))?;
+        if vector_prefix::<0>(am.and_then(|m| m.get("cc")))?.0 != 0
+            || vector_prefix::<0>(bm.and_then(|m| m.get("cc")))?.0 != 0
         {
             sample.warnings.push("timeline mesh BP interpolation curve cc is not recovered".into());
         }
-        if !a.is_empty() || !b.is_empty() {
-            let identity = || super::CpuBezierPatch::identity().points().iter()
-                .flat_map(|point| point.iter().copied()).collect::<Vec<_>>();
-            if a.is_empty() {
+        if a_len != 0 || b_len != 0 {
+            let identity = || {
+                let patch = super::CpuBezierPatch::identity();
+                std::array::from_fn(|index| patch.points()[index / 2][index % 2])
+            };
+            if a_len == 0 {
                 a = identity();
             }
-            if b.is_empty() {
+            if b_len == 0 {
                 b = identity();
             }
-            if a.len() == 32 && b.len() == 32 {
-                let mut mesh = am.or(bm).and_then(PsbValue::object)
-                    .ok_or_else(|| invalid("mesh object"))?.clone();
-                let values = a
-                    .into_iter()
-                    .zip(b)
-                    .map(|(a, b)| linear(a, b, ratio).map(|n| PsbValue::Number(f64::from(n))))
-                    .collect::<Result<Vec<_>>>()?;
-                mesh.insert("bp".into(), PsbValue::List(values));
-                content.insert("mesh", PsbValue::Object(mesh));
+            if [a_len, b_len].iter().all(|len| matches!(len, 0 | 32)) {
+                for (value, end) in a.iter_mut().zip(b) { *value = linear(*value, end, ratio)?; }
+                content.evaluated.mesh = Some((am.or(bm).ok_or_else(|| invalid("mesh object"))?, a));
             } else {
                 sample
                     .warnings
@@ -1082,7 +1140,7 @@ pub(super) fn apply_transition_outputs(
 /// order:0 mirror,1 rotate,2 zoom,3 shear. Translation comes from coord.
 /// Column-vector output is[a,b,c,d,tx,ty], i.e. x'=a*x+c*y+tx.
 pub fn emote_layer_affine(layer: &PsbValue, content: &PsbValue) -> Result<[f64; 6]> {
-    layer_affine(transform_order(layer)?, |key| content.get(key))
+    layer_affine(transform_order(layer)?, &FrameContent::borrowed(content))
 }
 
 pub(super) fn transform_order(layer: &PsbValue) -> Result<[u8; 4]> {
@@ -1099,9 +1157,8 @@ pub(super) fn transform_order(layer: &PsbValue) -> Result<[u8; 4]> {
     Ok([order[0] as u8, order[1] as u8, order[2] as u8, order[3] as u8])
 }
 
-pub(super) fn layer_affine<'a>(
-    order: [u8; 4], get: impl Fn(&str) -> Option<&'a PsbValue>,
-) -> Result<[f64; 6]> {
+pub(super) fn layer_affine(order: [u8; 4], content: &FrameContent<'_>) -> Result<[f64; 6]> {
+    let get = |name| content.get(name);
     let mut a = 1.0f32;
     let mut b = 0.0f32;
     let mut c = 0.0f32;
@@ -1157,17 +1214,14 @@ pub(super) fn layer_affine<'a>(
             _ => unreachable!(),
         }
     }
-    let coord = vector(get("coord"))?;
-    if !coord.is_empty() && coord.len() != 3 {
-        return Err(invalid("frame coord must have three components"));
-    }
+    let coord = content.coord()?;
     let result = [
         a,
         b,
         c,
         d,
-        coord.first().copied().unwrap_or(0.0),
-        coord.get(1).copied().unwrap_or(0.0),
+        coord[0],
+        coord[1],
     ];
     if result.iter().any(|n| !n.is_finite()) {
         return Err(invalid("layer affine overflow"));

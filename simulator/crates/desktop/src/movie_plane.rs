@@ -123,6 +123,8 @@ pub(super) struct MoviePlanes {
     pub projection: crate::movie_plane_render::MoviePlaneProjection,
     pub frame_snapshots: BTreeMap<u32, MovieDrawSnapshot>,
     pub exclusive_snapshot: Option<MovieDrawSnapshot>,
+    #[cfg(windows)]
+    pub exclusive_pixels: Option<crate::movie_plane_render::ExclusiveMoviePixels>,
     pub snapshot_active: bool,
     pub(super) next_sequence: u64,
 }

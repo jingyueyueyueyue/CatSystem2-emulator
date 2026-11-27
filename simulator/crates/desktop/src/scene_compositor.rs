@@ -45,6 +45,8 @@ pub(super) struct SceneCompositor {
     prefix: Option<ImagePrefix>,
     pub(super) graphics_frame: Option<RgbaFrame>,
     pub(super) revision: Option<u64>,
+    #[cfg(all(windows, feature = "gpu-raster"))]
+    pub(super) back_buffer: Option<Canvas>,
     revision_counter: u64,
 }
 

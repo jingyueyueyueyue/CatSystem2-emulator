@@ -7092,6 +7092,8 @@ pub struct HeadlessPlayer {
     host_work_budget: Option<std::time::Duration>,
     host_frame_budget_yielded: bool,
     host_tick_pacer: Option<host_pacing::TickPacer>,
+    fast_forward_presented_at: Option<std::time::Instant>,
+    fast_forward_preview_skipped: bool,
     particle_frame_cursor: Option<i32>,
     external_size: usize,
     configured_shared_slots: usize,
@@ -7237,6 +7239,8 @@ impl HeadlessPlayer {
             host_work_budget: None,
             host_frame_budget_yielded: false,
             host_tick_pacer: None,
+            fast_forward_presented_at: None,
+            fast_forward_preview_skipped: false,
             particle_frame_cursor: None,
             external_size: 0,
             configured_shared_slots: 512,
@@ -7781,6 +7785,7 @@ impl HeadlessPlayer {
             return Ok(());
         }
         let mut completed_frames = 0;
+        self.fast_forward_preview_skipped = false;
         for _ in 0..frames {
             // A graph native yields with its VM/task/frame continuation intact.
             // All LoggingHost and VM borrows have returned at this safe point.
@@ -8149,15 +8154,35 @@ impl HeadlessPlayer {
             }
             let retain_scene = !self.data_services.tasks.new_visible_list_sources.is_empty()
                 && self.with_host(|host| Ok(host.retain_scene_during_list_setup()))?;
-            if !retain_scene {
+            let exact_scene = self.data_services.frame_capture.enabled != 0
+                || self.data_services.tasks.render.has_composition();
+            let fast_forward_preview = self.data_services.fast_forward && !exact_scene
+                && self.movie_playbacks.is_empty();
+            let preview_due = !fast_forward_preview || self.fast_forward_presented_at
+                .is_none_or(|presented| presented.elapsed() >= host_pacing::TICK * 2);
+            if !retain_scene && preview_due {
                 #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-                if !self.preflight_scene_emote_poses()? {
+                let pose_ready = self.preflight_scene_emote_poses(exact_scene)?;
+                #[cfg(not(all(feature = "gpu-raster", any(windows, target_os = "android"))))]
+                let pose_ready = true;
+                if pose_ready {
+                    if self.render_scene().context("render logical scene")? {
+                        self.capture_completed_frame();
+                        if self.data_services.fast_forward {
+                            self.fast_forward_presented_at = Some(std::time::Instant::now());
+                        }
+                    } else {
+                        self.fast_forward_preview_skipped = true;
+                    }
+                } else if !fast_forward_preview {
                     // Keep the last complete canvas until a new or incompatible
                     // actor's first pose arrives. All earlier phases ran already.
                     break;
+                } else {
+                    self.fast_forward_preview_skipped = true;
                 }
-                self.render_scene().context("render logical scene")?;
-                self.capture_completed_frame();
+            } else if fast_forward_preview {
+                self.fast_forward_preview_skipped = true;
             }
             self.commit_host_device_keys_frame();
             self.data_services.top_clock.sampled = self.data_services.top_clock.requested;
@@ -8321,21 +8346,77 @@ impl HeadlessPlayer {
     }
 
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-    fn preflight_scene_emote_poses(&mut self) -> Result<bool> {
+    fn preflight_scene_emote_poses(&mut self, exact: bool) -> Result<bool> {
         let _timing = measure_host_phase(HostPhase::ComposeEmote);
-        let exact = self.data_services.frame_capture.enabled != 0
-            || self.data_services.tasks.render.has_composition();
         self.data_services.emote.preflight_scene_pose_jobs(
             &self.scene_nodes, self.state.clock.frame, exact,
         )
             .context("check interactive E-mote scene dependencies")
     }
 
-    fn render_scene(&mut self) -> Result<()> {
-        let result = self.compose_scene();
+    fn render_scene(&mut self) -> Result<bool> {
+        #[cfg(all(windows, feature = "gpu-raster"))]
+        let result = if gpu_raster::windows_device_output_requested() {
+            let defer = self.data_services.frame_capture.enabled == 0
+                && self.movie_playbacks.is_empty()
+                && !self.movie_host.frame_surface().displaying_movie()
+                && gpu_raster::deferred_scene_readback_enabled();
+            let _readback = defer.then(gpu_raster::DeferredSceneReadback::begin);
+            self.compose_scene_with_readback_recovery(Self::compose_scene)
+        } else {
+            self.compose_scene().map(|()| true)
+        };
+        #[cfg(not(all(windows, feature = "gpu-raster")))]
+        let result = self.compose_scene().map(|()| true);
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         self.data_services.emote.finish_scene_pose_jobs();
         result
+    }
+
+    #[cfg(all(windows, feature = "gpu-raster"))]
+    fn compose_scene_with_readback_recovery(
+        &mut self, compose: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<bool> {
+        let (width, height) = self.canvas.dimensions();
+        let mut previous = match self.scene_compositor.back_buffer.take()
+            .filter(|canvas| canvas.dimensions() == (width, height))
+        {
+            Some(canvas) => canvas,
+            None => Canvas::new(width, height)?,
+        };
+        if previous.device_pixels().is_some() {
+            previous.clear(Color::rgba(0, 0, 0, 255));
+        }
+        std::mem::swap(&mut self.canvas, &mut previous);
+        let revision = self.scene_compositor.revision;
+        let result = compose(self).and_then(|()| {
+            let _timing = measure_host_phase(HostPhase::Compose);
+            self.canvas.try_pixels()?;
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.scene_compositor.back_buffer = Some(previous);
+                Ok(true)
+            }
+            Err(error) => {
+                std::mem::swap(&mut self.canvas, &mut previous);
+                self.scene_compositor.back_buffer = Some(previous);
+                self.scene_compositor.revision = revision;
+                self.movie_host.planes.presentations.clear();
+                if matches!(error.downcast_ref::<cs2_renderer::RendererError>(),
+                    Some(cs2_renderer::RendererError::DeviceReadbackFailed))
+                    || matches!(error.downcast_ref::<cs2_runtime::emote::EmoteError>(),
+                        Some(cs2_runtime::emote::EmoteError::CanvasReadback))
+                {
+                    gpu_raster::discard_scene_plane_output();
+                    perf_detail::emote_fallback("scene_readback_failed");
+                    gpu_raster::report("scene_preview state=retained reason=readback_failed");
+                    return Ok(false);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn compose_scene(&mut self) -> Result<()> {
@@ -8372,7 +8453,14 @@ impl HeadlessPlayer {
                 }
                 let snapshot = snapshot.as_ref().unwrap();
                 std::mem::swap(&mut self.canvas, target);
-                let result = self.render_scene_depth_range(snapshot, lower..upper, &mut graphics_snapshot);
+                let result = self.render_scene_depth_range(snapshot, lower..upper, &mut graphics_snapshot)
+                    .and_then(|()| {
+                        #[cfg(all(windows, feature = "gpu-raster"))]
+                        if !gpu_raster::DeferredSceneReadback::active() {
+                            self.canvas.try_pixels()?;
+                        }
+                        Ok(())
+                    });
                 std::mem::swap(&mut self.canvas, target);
                 result
             });
@@ -8433,7 +8521,6 @@ impl HeadlessPlayer {
         range: std::ops::Range<f32>,
         graphics_snapshot: &mut Option<RgbaFrame>,
     ) -> Result<()> {
-        snapshot.draw_legacy_layers(&mut self.canvas)?;
         let nodes = snapshot.drawables(&range);
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         let mut emote_batch = if gpu_raster::emote_batch_requested() {
@@ -8453,9 +8540,14 @@ impl HeadlessPlayer {
                 Some(batch)
             }
         } else { None };
+        snapshot.draw_legacy_layers(&mut self.canvas)?;
         let mut scene_text = snapshot.text(&range).peekable();
         #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
         let (gpu_planes, mut pending_planes) = (gpu_raster::available(), Vec::new());
+        #[cfg(all(windows, feature = "gpu-raster"))]
+        let verify_cpu_input = gpu_raster::windows_device_output_requested();
+        #[cfg(all(target_os = "android", feature = "gpu-raster"))]
+        let verify_cpu_input = false;
         for drawable in nodes {
             let id = drawable.id;
             let depth = drawable.depth;
@@ -8470,7 +8562,7 @@ impl HeadlessPlayer {
                 }
             }
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
-            if gpu_planes {
+            if gpu_planes || verify_cpu_input {
                 let independent = !drawable.foreign_depth
                     && !self.particles.contains_key(&id)
                     && !self.data_services.css_models.owners.contains_key(&id)
@@ -8478,7 +8570,7 @@ impl HeadlessPlayer {
                     && !self.data_services.particle_external.canvases.contains_key(&id)
                     && !self.data_services.tasks.javascript.owns_plane(id)
                     && self.kx_geometry(id).is_none();
-                if independent {
+                if independent && gpu_planes {
                     if drawable.kind == 2 {
                         pending_planes.push(id);
                         continue;
@@ -8488,6 +8580,9 @@ impl HeadlessPlayer {
                     }
                 }
                 self.flush_plane_group(&mut pending_planes, graphics_snapshot)?;
+                if verify_cpu_input && (!independent || drawable.kind == 61) {
+                    self.canvas.try_pixels()?;
+                }
             }
             #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
             let _scene_draw = gpu_raster::scene_draw_scope(id, drawable.kind);
@@ -8729,7 +8824,7 @@ pub fn run() -> Result<()> {
 fn open_window_player(path: &Path) -> Result<HeadlessPlayer> {
     HeadlessPlayer::enable_host_gpu_raster();
     let mut player = HeadlessPlayer::open_internal(
-        path, None, cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::for_session(), None,
+        path, None, cs2_runtime::resource_router::GameLanguage::Automatic, ScriptRandom::for_session(), Some(0),
     ).with_context(|| format!("open game directory `{}`", path.display()))?;
     player.capture_script_evidence = false;
     player.enable_host_window_requests();
@@ -9421,7 +9516,8 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                 if [size.width, size.height] != [gpu.config.width, gpu.config.height] {
                     gpu.resize(size.width, size.height);
                 }
-                gpu.draw(frame.rgba())
+                let Ok(pixels) = frame.try_rgba() else { return Ok(false); };
+                gpu.draw(pixels)
             }) {
                 Ok(presenter) => presenter,
                 Err(error) => {
@@ -9505,7 +9601,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                         let presentation = (|| -> Result<()> {
                             apply_window_control_requests(player, window, &mut self.fullscreen)?;
                             apply_window_pointer_request(player, window, &mut self.input, event_loop)?;
-                            if let Some(presenter) = &self.presenter {
+                            if let Some(presenter) = &self.presenter && !player.fast_forward_preview_skipped() {
                                 presenter.publish(window_media::prepare(player))?;
                             }
                             Ok(())
@@ -9614,7 +9710,8 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                     let target = Arc::clone(&window);
                     let mut bgra = Vec::new();
                     let presenter = match window_media::WindowPresenter::start(move |frame| {
-                        blit_rgba_to_window(&target, frame.rgba(), frame.size(), &mut bgra)
+                        let Ok(pixels) = frame.try_rgba() else { return Ok(false); };
+                        blit_rgba_to_window(&target, pixels, frame.size(), &mut bgra)
                     }) {
                         Ok(presenter) => presenter,
                         Err(error) => {
@@ -9704,7 +9801,7 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
                         let presentation = (|| -> Result<()> {
                             apply_window_control_requests(player, window, &mut self.fullscreen)?;
                             apply_window_pointer_request(player, window, &mut self.input, event_loop)?;
-                            if let Some(presenter) = &self.presenter {
+                            if let Some(presenter) = &self.presenter && !player.fast_forward_preview_skipped() {
                                 presenter.publish(window_media::prepare(player))?;
                             }
                             Ok(())
@@ -12921,6 +13018,47 @@ mod tests {
     }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(all(windows, feature = "gpu-raster"))]
+    #[test]
+    fn scene_readback_failure_retains_completed_canvas_and_allows_next_frame() -> Result<()> {
+        #[derive(Debug)]
+        struct FailingReadback;
+
+        impl cs2_renderer::CanvasReadback for FailingReadback {
+            fn read_rgba(&self, output: &mut [u8]) -> bool {
+                output.fill(99);
+                false
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+
+        let temp = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("profile"))?;
+        player.canvas = Canvas::new(2, 1)?;
+        let completed = Color::rgb(10, 20, 30);
+        player.canvas.clear(completed);
+        player.scene_compositor.record_static(None, false);
+        let revision = player.stable_frame_revision();
+
+        let published = player.compose_scene_with_readback_recovery(|player| {
+            player.canvas.set_deferred_device_pixels(std::sync::Arc::new(FailingReadback));
+            player.scene_compositor.revision = None;
+            Ok(())
+        })?;
+        assert!(!published);
+        assert_eq!(player.canvas.pixel(0, 0)?, completed);
+        assert_eq!(player.stable_frame_revision(), revision);
+
+        let next = Color::rgb(40, 50, 60);
+        assert!(player.compose_scene_with_readback_recovery(|player| {
+            player.canvas.clear(next);
+            Ok(())
+        })?);
+        assert_eq!(player.canvas.pixel(0, 0)?, next);
+        Ok(())
+    }
 
     #[test]
     fn scene_snapshot_preserves_feedback_depth_and_completed_capture() -> Result<()> {

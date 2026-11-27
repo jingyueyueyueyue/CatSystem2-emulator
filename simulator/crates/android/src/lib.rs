@@ -715,8 +715,6 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
         drain_pending_input(id, player)?;
-        #[cfg(target_os = "android")]
-        player.maintain_host_gpu_memory();
         let step = if let Some(timing) = unsafe { timing.as_mut() } {
             let mut advance = || HostFrameTiming::capture(|| player.advance_host_frame_with_retries(budget as usize));
             let (result, sample) = if let Some(output) = detail_rows {
@@ -756,7 +754,8 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
             0
         } else if player.has_unsubmitted_movie_frame().map_err(|cause| cause.to_string())? {
             FRAME_MOVIE
-        } else if sessions.published_frames.get(&id).is_some_and(|frame| frame.matches_player(player)) {
+        } else if player.fast_forward_preview_skipped()
+            || sessions.published_frames.get(&id).is_some_and(|frame| frame.matches_player(player)) {
             FRAME_UNCHANGED
         } else {
             FRAME_CHANGED
@@ -1109,7 +1108,7 @@ pub unsafe extern "C" fn cs2_android_copy_frame(
         let length = stride_bytes.checked_mul(height as usize).filter(|&n| n <= 512 * 1024 * 1024)
             .ok_or("Android surface exceeds its size limit")?;
         let destination = unsafe { std::slice::from_raw_parts_mut(buffer, length) };
-        let pixels = frame.frame.rgba();
+        let Ok(pixels) = frame.frame.try_rgba() else { return Ok(-2); };
         let row_bytes = logical_width as usize * 4;
         for row in 0..logical_height as usize {
             destination[row * stride_bytes..row * stride_bytes + row_bytes]

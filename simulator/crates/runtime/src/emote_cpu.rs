@@ -19,11 +19,14 @@ use super::{
     emote_native_descriptor, m2plane_tint_argb,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 #[path = "emote_node_cache.rs"]
 mod node_cache;
 use node_cache::BoundedMemo;
+
+const NODE_CACHE_SHARDS: usize = 4;
 
 #[derive(Debug)]
 struct DerivedNodeCache {
@@ -33,7 +36,10 @@ struct DerivedNodeCache {
 
 impl Default for DerivedNodeCache {
     fn default() -> Self {
-        Self { affine: BoundedMemo::new(256 * 1024), meshes: BoundedMemo::new(8 * 1024 * 1024) }
+        Self {
+            affine: BoundedMemo::new(256 * 1024 / NODE_CACHE_SHARDS),
+            meshes: BoundedMemo::new(8 * 1024 * 1024 / NODE_CACHE_SHARDS),
+        }
     }
 }
 
@@ -101,24 +107,40 @@ fn numbers(value: Option<&PsbValue>) -> Result<Vec<f64>> {
 /// Driver3279d..32839 initializes the parameter cursor;33140..331ee
 /// recomputes it after a variable write. Discretization truncates the raw
 /// variable before clamping, and descending ranges preserve their direction.
-fn parameter_cursor(parameter: &PsbValue, value: f64) -> Result<f64> {
+#[derive(Debug, Clone, Copy)]
+struct ParameterRange {
+    begin: f32,
+    end: f32,
+    division: f32,
+    discretization: bool,
+}
+
+fn parameter_range(parameter: &PsbValue) -> Result<ParameterRange> {
     let begin = num(parameter, "rangeBegin", 0.0)? as f32;
     let end = num(parameter, "rangeEnd", 0.0)? as f32;
     let division = num(parameter, "division", 0.0)? as f32;
-    let mut value = value as f32;
-    if ![begin, end, division, value].into_iter().all(f32::is_finite) {
+    if ![begin, end, division].into_iter().all(f32::is_finite) {
         return Err(unsupported("parameter cursor outside original finite f32 domain"));
     }
-    if begin == end || division <= 0.0 {
-        return Ok(0.0);
-    }
-    let discrete = match parameter.get("discretization") {
+    let discretization = begin != end && division > 0.0 && match parameter.get("discretization") {
         None | Some(PsbValue::Null) | Some(PsbValue::Bool(false)) => false,
         Some(PsbValue::Bool(true)) => true,
         Some(v) => v.number().filter(|v| v.is_finite())
             .ok_or_else(|| unsupported("parameter discretization flag"))? != 0.0,
     };
-    if discrete {
+    Ok(ParameterRange { begin, end, division, discretization })
+}
+
+fn parameter_cursor(range: ParameterRange, value: f64) -> Result<f64> {
+    let ParameterRange { begin, end, division, discretization } = range;
+    let mut value = value as f32;
+    if !value.is_finite() {
+        return Err(unsupported("parameter cursor outside original finite f32 domain"));
+    }
+    if begin == end || division <= 0.0 {
+        return Ok(0.0);
+    }
+    if discretization {
         // CVTTSS2SI produces i32::MIN on finite out-of-range operands.
         let integer = if (-2147483648.0..2147483648.0).contains(&value) {
             value.trunc() as i32
@@ -133,6 +155,47 @@ fn parameter_cursor(parameter: &PsbValue, value: f64) -> Result<f64> {
         return Err(unsupported("nonfinite original parameter cursor"));
     }
     Ok(cursor as f64)
+}
+
+#[derive(Debug, Default)]
+struct ParameterSlots {
+    names: Vec<String>,
+    parameters: HashMap<usize, usize>,
+    ranges: Vec<Result<(usize, ParameterRange)>>,
+}
+
+impl ParameterSlots {
+    fn prepare(root: &PsbValue) -> Self {
+        const MAX_INDEXED_PARAMETERS: usize = 4096;
+        let mut result = Self::default();
+        let mut names = HashMap::new();
+        let Some(objects) = root.get("object").and_then(PsbValue::object) else { return result };
+        for motion in objects.values().filter_map(|object| object.get("motion").and_then(PsbValue::object))
+            .flat_map(|motions| motions.values())
+        {
+            let Some(parameters) = motion.get("parameter").and_then(PsbValue::list) else { continue };
+            for parameter in parameters {
+                if result.ranges.len() >= MAX_INDEXED_PARAMETERS { return result; }
+                let range = (|| {
+                    let id = string(parameter, "id").ok_or_else(|| unsupported("parameter id"))?;
+                    let slot = *names.entry(id).or_insert_with(|| {
+                        result.names.push(id.to_owned());
+                        result.names.len() - 1
+                    });
+                    Ok((slot, parameter_range(parameter)?))
+                })();
+                result.parameters.insert(std::ptr::from_ref(parameter) as usize, result.ranges.len());
+                result.ranges.push(range);
+            }
+        }
+        result
+    }
+
+    fn estimated_storage_bytes(&self) -> usize {
+        self.names.capacity() * size_of::<String>() + self.names.iter().map(String::capacity).sum::<usize>()
+            + self.parameters.capacity() * size_of::<(usize, usize)>()
+            + self.ranges.capacity() * size_of::<Result<(usize, ParameterRange)>>()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,9 +295,10 @@ pub struct CpuMotionModel {
     // The index uses addresses of nodes in the immutable, shared PSB tree.
     document: Arc<PsbDocument>,
     layer_timelines: Option<Arc<LayerTimelines>>,
+    parameter_slots: Arc<ParameterSlots>,
     // Exact resolved inputs, independent of instance clocks/controllers. Shared
     // by transactional player clones without deep-copying cached mesh buffers.
-    node_cache: Arc<Mutex<DerivedNodeCache>>,
+    node_cache: Arc<[Mutex<DerivedNodeCache>; NODE_CACHE_SHARDS]>,
     pub textures: BTreeMap<String, CpuTexture>,
     pub base_object: String,
     pub base_motion: String,
@@ -323,7 +387,8 @@ impl CpuMotionModel {
         let mut model = Self {
             document: Arc::new(document),
             layer_timelines: None,
-            node_cache: Arc::new(Mutex::new(DerivedNodeCache::default())),
+            parameter_slots: Arc::default(),
+            node_cache: Arc::default(),
             textures,
             base_object,
             base_motion,
@@ -345,37 +410,43 @@ impl CpuMotionModel {
     /// Dynamic affine hits/misses, mesh hits/misses, and their retained payload+key bytes.
     /// Counters are model-wide CPU work, not per-instance GPU timings.
     pub fn node_cache_counters(&self) -> [u64; 5] {
-        let cache = self.node_cache.lock().unwrap_or_else(|error| error.into_inner());
-        [cache.affine.hits, cache.affine.misses, cache.meshes.hits, cache.meshes.misses,
-            (cache.affine.bytes() + cache.meshes.bytes()) as u64]
+        let mut total = [0; 5];
+        for shard in self.node_cache.iter() {
+            let cache = shard.lock().unwrap_or_else(|error| error.into_inner());
+            for (sum, value) in total.iter_mut().zip([cache.affine.hits, cache.affine.misses,
+                cache.meshes.hits, cache.meshes.misses, (cache.affine.bytes() + cache.meshes.bytes()) as u64])
+            {
+                *sum += value;
+            }
+        }
+        total
     }
 
-    fn try_node_cache(&self) -> Option<MutexGuard<'_, DerivedNodeCache>> {
-        match self.node_cache.try_lock() {
-            Ok(cache) => Some(cache),
-            Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
+    fn node_cache(&self, key: &[u64]) -> MutexGuard<'_, DerivedNodeCache> {
+        let mut hash = DefaultHasher::new();
+        key.hash(&mut hash);
+        let shard = hash.finish() as usize % NODE_CACHE_SHARDS;
+        self.node_cache[shard].lock().unwrap_or_else(|error| error.into_inner())
     }
 
     fn layer_affine(&self, order: [u8; 4], content: &FrameContent<'_>) -> Result<[f64; 6]> {
-        if !use_node_cache() { return timeline::layer_affine(order, |name| content.get(name)); }
+        if !use_node_cache() { return timeline::layer_affine(order, content); }
         let key = affine_cache_key(order, content);
         if let Some(key) = key.as_ref()
-            && let Some(value) = self.try_node_cache().and_then(|mut cache| cache.affine.get(key.as_slice()).copied())
+            && let Some(value) = self.node_cache(key.as_slice()).affine.get(key.as_slice()).copied()
         {
             return Ok(value);
         }
-        let value = timeline::layer_affine(order, |name| content.get(name))?;
-        if let Some(key) = key
-            && let Some(mut cache) = self.try_node_cache()
-        {
+        let value = timeline::layer_affine(order, content)?;
+        if let Some(key) = key {
+            let mut cache = self.node_cache(key.as_slice());
             cache.affine.insert(key.into_vec(), value, size_of::<[f64; 6]>());
         }
         Ok(value)
     }
 
     fn prepare_layer_timelines(&mut self) {
+        self.parameter_slots = Arc::new(ParameterSlots::prepare(&self.document.root));
         if use_layer_timeline_index() {
             self.layer_timelines = Some(Arc::new(LayerTimelines::prepare(&self.document.root)));
         }
@@ -388,16 +459,16 @@ impl CpuMotionModel {
     /// Estimated retained payload, counting the shared PSB backing only once.
     /// This is a cache accounting estimate, not allocator RSS or GPU residency.
     pub fn estimated_storage_bytes(&self) -> usize {
-        let cache = self.node_cache.lock().unwrap_or_else(|error| error.into_inner());
         self.estimated_document_bytes()
             .saturating_add(self.textures.iter().map(|(name, texture)|
                 name.capacity() + size_of::<CpuTexture>() + texture.extra_storage_bytes()).sum::<usize>())
-            .saturating_add(cache.affine.bytes()).saturating_add(cache.meshes.bytes())
+            .saturating_add(self.node_cache_counters()[4] as usize)
             .saturating_add(size_of::<Self>())
     }
 
     fn estimated_index_bytes(&self) -> usize {
-        self.layer_timelines.as_deref().map_or(0, LayerTimelines::estimated_storage_bytes)
+        self.parameter_slots.estimated_storage_bytes()
+            + self.layer_timelines.as_deref().map_or(0, LayerTimelines::estimated_storage_bytes)
     }
 
     pub fn motions(&self) -> Result<Vec<(String, String)>> {
@@ -514,7 +585,7 @@ pub struct CpuPlayer {
     variable_timelines: CpuVariableTimelines,
     m2_timed_variables: CpuM2TimedVariables,
     ///Parser-created reference clock owners, separate from M2 controllers.
-    ///Deep Clone preserves the player's existing transactional update model.
+    ///Copy-on-write snapshots preserve the player's transactional updates.
     reference_timelines: super::timeline::CpuReferenceTimelines,
 }
 
@@ -606,10 +677,16 @@ impl CpuPlayer {
     /// driver overrides and independent reference clocks. Prepared geometry may
     /// only be consumed while this snapshot still matches.
     pub fn render_state_snapshot(&self, viewport: CpuViewport, variables: &BTreeMap<String, f64>) -> CpuPlayerRenderState {
+        self.render_state_snapshot_shared(viewport, Arc::new(variables.clone()))
+    }
+
+    pub fn render_state_snapshot_shared(
+        &self, viewport: CpuViewport, variables: Arc<BTreeMap<String, f64>>,
+    ) -> CpuPlayerRenderState {
         CpuPlayerRenderState {
             model: Arc::downgrade(&self.model), object: self.object.clone(), motion: self.motion.clone(),
             pose: RasterPose::new(self, viewport), time_units: viewport.time_units_per_frame.to_bits(),
-            variables: variables.clone(), references: self.reference_timelines.clone(),
+            variables, references: self.reference_timelines.clone(),
             controllers: [self.controller_a_raw, self.controller_b_raw],
         }
     }
@@ -721,7 +798,7 @@ impl CpuPlayer {
         if !frame.is_finite() {
             return Err(unsupported("motion time overflow"));
         }
-        self.variable_timelines.advance(delta)?;
+        self.variable_timelines.advance_in_place(delta)?;
         self.consume_controller_targets()?;
         self.m2_timed_variables.advance(delta, &mut self.variables)?;
         self.frame = f64::from(frame);
@@ -781,7 +858,7 @@ impl CpuPlayer {
         &mut self, mut references: super::timeline::CpuReferenceTimelines,
     ) -> Result<()> {
         let variables = self.effective_variables()?;
-        references.begin(&self.object, &self.motion);
+        references.begin(&self.object, &self.motion, true);
         let mut target = CpuDrawTarget::default();
         let mut context = RenderContext {
             player: self, variables: &variables,
@@ -791,7 +868,7 @@ impl CpuPlayer {
             active: BTreeSet::new(), references,
             reference_path: Vec::new(), reference_update: true, reference_tick_current: false,
             visible_layers: Vec::new(),
-            parameter_values: HashMap::new(),
+            parameter_values: Vec::new(), parameter_cursors: Vec::new(),
             reference_raw_time: self.frame,
         };
         if self.enabled {
@@ -861,7 +938,7 @@ impl CpuPlayer {
         target: &mut T,
     ) -> Result<EmoteDrawDiagnostics> {
         let mut references = self.reference_timelines.clone();
-        references.begin(&self.object, &self.motion);
+        references.begin(&self.object, &self.motion, false);
         let reference_tick_current = references.has_tick(self.frame as f32, variables);
         let mut context = RenderContext {
             player: self,
@@ -877,7 +954,8 @@ impl CpuPlayer {
             reference_update: false,
             reference_tick_current,
             visible_layers: Vec::new(),
-            parameter_values: HashMap::new(),
+            parameter_values: Vec::new(),
+            parameter_cursors: Vec::new(),
             reference_raw_time: self.frame,
         };
         // A static initial pose cannot stand in for an enabled controller,
@@ -923,7 +1001,7 @@ impl CpuPlayer {
                 0,
             )?;
         }
-        //Draws sample a private copy. Only the explicit per-tick update hook
+        //Draws share a clock snapshot. Only the explicit per-tick update hook
         //commits visibility/release, so a second color/mask/render pass cannot
         //consume time or destroy holders absent from its primitive schedule.
         Ok(EmoteDrawDiagnostics {
@@ -1020,10 +1098,11 @@ fn affine_cache_key(order: [u8; 4], content: &FrameContent<'_>) -> Option<Affine
         // The owning model retains this immutable tree. Only interpolated
         // transform overrides can change this node's local matrix.
         let held = [order, 0, std::ptr::from_ref(base) as usize as u64];
-        let mut overrides = content.overrides().iter().filter_map(|(name, value)| {
+        let mut overrides = content.overrides().filter_map(|(name, value)| {
             FIELDS.iter().position(|field| field == name).map(|index| (index, value))
         }).peekable();
-        if overrides.peek().is_none() {
+        let coord = content.interpolated_coord();
+        if overrides.peek().is_none() && coord.is_none() {
             return Some(AffineMemoKey::Held(held));
         }
         let mut key = Vec::with_capacity(16);
@@ -1031,6 +1110,10 @@ fn affine_cache_key(order: [u8; 4], content: &FrameContent<'_>) -> Option<Affine
         for (index, value) in overrides {
             key.push(index as u64);
             append_numeric_key(Some(value), &mut key)?;
+        }
+        if let Some(coord) = coord {
+            key.push(7);
+            key.extend(coord.map(|value| u64::from(value.to_bits())));
         }
         Some(AffineMemoKey::Interpolated(key))
     } else {
@@ -1208,9 +1291,9 @@ struct RenderContext<'a, T> {
     reference_update: bool,
     reference_tick_current: bool,
     visible_layers: Vec<usize>,
-    /// The variables and all parameter definitions stay immutable for this
-    /// evaluation. Other poses and reference updates start with a fresh map.
-    parameter_values: HashMap<usize, f64>,
+    // Resolve each variable once, then cache each motion-specific cursor.
+    parameter_values: Vec<Option<f64>>,
+    parameter_cursors: Vec<Option<f64>>,
     ///Caller player+100, distinct from sampled+104.41087 uses the raw
     ///clock when selecting a new reference on an unparameterized layer.
     reference_raw_time: f64,
@@ -1300,12 +1383,24 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         }
         let parameter = &params[index as usize];
         let identity = std::ptr::from_ref(parameter) as usize;
-        if let Some(cursor) = self.parameter_values.get(&identity) {
-            return Ok(Some(*cursor));
+        let slots = &self.player.model.parameter_slots;
+        let Some(&parameter_slot) = slots.parameters.get(&identity) else {
+            let id = string(parameter, "id").ok_or_else(|| unsupported("parameter id"))?;
+            return parameter_cursor(parameter_range(parameter)?, self.variables.get(id).copied().unwrap_or(0.0)).map(Some);
+        };
+        if let Some(&Some(cursor)) = self.parameter_cursors.get(parameter_slot) {
+            return Ok(Some(cursor));
         }
-        let id = string(parameter, "id").ok_or_else(|| unsupported("parameter id"))?;
-        let cursor = parameter_cursor(parameter, *self.variables.get(id).unwrap_or(&0.0))?;
-        self.parameter_values.insert(identity, cursor);
+        let &(variable_slot, range) = slots.ranges[parameter_slot].as_ref().map_err(Clone::clone)?;
+        if self.parameter_values.is_empty() {
+            self.parameter_values.resize(slots.names.len(), None);
+            self.parameter_cursors.resize(slots.ranges.len(), None);
+        }
+        let value = *self.parameter_values[variable_slot].get_or_insert_with(|| {
+            self.variables.get(&slots.names[variable_slot]).copied().unwrap_or(0.0)
+        });
+        let cursor = parameter_cursor(range, value)?;
+        self.parameter_cursors[parameter_slot] = Some(cursor);
         Ok(Some(cursor))
     }
 
@@ -1341,7 +1436,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             path.push(index);
             let initial = (draw.time as f32 - draw.frame_begin) + offset;
             draw.reference = Some(self.references.select(path, object, name, initial, end,
-                self.player.frame as f32, parameter)?);
+                self.player.frame as f32, parameter, self.reference_tick_current)?);
         }
         Ok(())
     }
@@ -1600,10 +1695,12 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         capture: bool,
     ) -> Result<Vec<Arc<DrawLayer<'a>>>> {
         let Some(reference) = &draw.reference else { return Ok(Vec::new()); };
+        let object = draw.content.text("src").expect("selected reference has an object");
+        let motion = draw.content.text("icon").expect("selected reference has a motion");
         let previous = std::mem::replace(&mut self.reference_path, reference.path.clone());
         let caller_raw = std::mem::replace(&mut self.reference_raw_time, reference.raw_frame);
         let result = self.collect_motion(
-            &reference.object, &reference.motion, reference.frame, draw.transform,
+            object, motion, reference.frame, draw.transform,
             &draw.motion_parent_warps, draw.depth + 1, stencils, primitives, capture,
         );
         self.reference_path = previous;
@@ -1716,7 +1813,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
         let resolved = if let Some(resolved) = local_slot.and_then(|slot| slot.get()) {
             resolved
         } else {
-            let coord = numbers(content.get("coord"))?;
+            let coord = content.coord()?;
             let opacity = timeline::opacity(content.get("opa"))?;
             let order = match indexed {
                 Some(indexed) => indexed.transform_order()?,
@@ -1725,12 +1822,12 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             // Immutable key slots have their own exact transform. Other
             // samples retain the exact-input cache for interpolated values.
             let matrix = if local_slot.is_some() {
-                timeline::layer_affine(order, |name| content.get(name))?
+                timeline::layer_affine(order, &content)?
             } else {
                 self.player.model.layer_affine(order, &content)?
             };
             let resolved = LocalLayerTransform {
-                matrix, opacity, depth: coord.get(2).copied().unwrap_or(0.0) as f32,
+                matrix, opacity, depth: coord[2],
             };
             if let Some(slot) = local_slot {
                 slot.publish(resolved);
@@ -1775,8 +1872,16 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             number(LayerField::MeshTransform)? != 0.0 && number(LayerField::MeshCombine)? != 0.0;
         let inherited_mesh = inherit_mask as u32 & 0x02000000 != 0;
         let stops_geometry = !inherited_mesh && !warps.is_empty();
-        if let Some(mesh) = content.get("mesh") {
-            let points = numbers(mesh.get("bp"))?;
+        if let Some((mesh, interpolated)) = content.mesh() {
+            let points;
+            let sampled_points;
+            let points: &[f64] = if let Some(sampled) = interpolated {
+                sampled_points = sampled.map(f64::from);
+                &sampled_points
+            } else {
+                points = numbers(mesh.get("bp"))?;
+                &points
+            };
             let coefficients = numbers(mesh.get("cc"))?;
             if !coefficients.is_empty() {
                 self.warnings
@@ -1788,7 +1893,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
                         .insert(format!("mesh bp length{} unsupported", points.len()));
                 } else {
                     let dims = self.mesh_dimensions(&content)?;
-                    let raw = CpuBezierPatch::from_interleaved(&points)?;
+                    let raw = CpuBezierPatch::from_interleaved(points)?;
                     let mut patch = raw.clone();
                     if mesh_combine {
                         //3f876 copies own raw BP;3f880..3f8ca adds each
@@ -2200,7 +2305,7 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             [left, top, width, height, ox, oy], warps, mesh_owner));
         let model = &self.player.model;
         let cached = cache_key.as_ref().and_then(|key| {
-            model.try_node_cache().and_then(|mut cache| cache.meshes.get(key).cloned())
+            model.node_cache(key).meshes.get(key).cloned()
         });
         let vertices = if let Some(vertices) = cached {
             vertices.as_ref().clone()
@@ -2228,9 +2333,8 @@ impl<'a, T: EmoteDrawTarget> RenderContext<'a, T> {
             if let Some(key) = cache_key {
                 let value_bytes = vertices.capacity() * size_of::<[f64; 4]>();
                 let cached = Arc::new(vertices.clone());
-                if let Some(mut cache) = model.try_node_cache() {
-                    cache.meshes.insert(key, cached, value_bytes);
-                }
+                let mut cache = model.node_cache(&key);
+                cache.meshes.insert(key, cached, value_bytes);
             }
             vertices
         };
@@ -3065,7 +3169,7 @@ pub struct CpuPlayerRenderState {
     motion: String,
     pose: RasterPose,
     time_units: u64,
-    variables: BTreeMap<String, f64>,
+    variables: Arc<BTreeMap<String, f64>>,
     references: super::timeline::CpuReferenceTimelines,
     controllers: [u32; 2],
 }
@@ -3539,17 +3643,17 @@ impl CpuEmoteBackend {
 
     pub fn render_preview(&self, task: u32) -> Result<DiagnosticFrame> {
         let mut preview = self.model_preview(task)?;
-        Self::tint_surface(self.surface_tinter, self.tint_argb(task)?, &mut preview.frame);
+        Self::tint_surface(self.surface_tinter, self.tint_argb(task)?, &mut preview.frame)?;
         Ok(preview)
     }
 
-    fn tint_surface(tinter: Option<HostSurfaceTinter>, argb: u32, frame: &mut EmoteRasterFrame) {
+    fn tint_surface(tinter: Option<HostSurfaceTinter>, argb: u32, frame: &mut EmoteRasterFrame) -> Result<()> {
         if argb == 0xffff_ffff {
-            return;
+            return Ok(());
         }
         if let Some(tinted) = tinter.and_then(|tinter| tinter(frame, argb)) {
             *frame = tinted;
-            return;
+            return Ok(());
         }
         let tint = [
             ((argb >> 16) & 255) as u8,
@@ -3559,11 +3663,12 @@ impl CpuEmoteBackend {
         ];
         // M2Plane draws the driver's already-composited texture on a quad;
         // its uniform vertex color is applied after internal model rendering.
-        for pixel in frame.rgba_mut().chunks_exact_mut(4) {
+        for pixel in frame.rgba_mut()?.chunks_exact_mut(4) {
             for c in 0..4 {
                 pixel[c] = ((u32::from(pixel[c]) * u32::from(tint[c]) + 127) / 255) as u8;
             }
         }
+        Ok(())
     }
 }
 impl EmoteBackend for CpuEmoteBackend {
@@ -4556,7 +4661,7 @@ impl EmoteBackend for CpuEmoteBackend {
                 self.raster_scratch = bytes;
             }
         }
-        Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut captured);
+        Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut captured)?;
         Ok(captured)
     }
     fn render_sampled_scene_rgba(
@@ -4585,7 +4690,7 @@ impl EmoteBackend for CpuEmoteBackend {
         {
             self.raster_scratch = bytes;
         }
-        Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut frame);
+        Self::tint_surface(self.surface_tinter, state.tint_argb(), &mut frame)?;
         Ok(frame)
     }
     fn playback_info(&self, task: u32) -> Result<EmotePlaybackInfo> {
@@ -4793,7 +4898,8 @@ mod tests {
         let mut model = CpuMotionModel {
             document: Arc::new(PsbDocument::from_test_root(root)),
             layer_timelines: None,
-            node_cache: Arc::new(Mutex::new(DerivedNodeCache::default())),
+            parameter_slots: Arc::default(),
+            node_cache: Arc::default(),
             textures: [("atlas".into(), CpuTexture::from_rgba(1, 1, vec![200, 100, 50, 255]).unwrap())].into(),
             base_object: "actor".into(), base_motion: "idle".into(),
         };
@@ -4823,10 +4929,10 @@ mod tests {
         assert_eq!(resolved.matrix, Transform::identity().m);
         player.frame = 1.0;
         let repeated = player.render_strict(backend.viewport)?;
-        assert_eq!(original.rgba(), repeated.rgba());
+        assert_eq!(original.rgba().unwrap(), repeated.rgba().unwrap());
         player.set_root_affine([1.0, 0.0, 0.0, 1.0, 1.0, 0.0])?;
         let moved = player.render_strict(backend.viewport)?;
-        assert_ne!(original.rgba(), moved.rgba());
+        assert_ne!(original.rgba().unwrap(), moved.rgba().unwrap());
         assert_eq!(slot.get().unwrap().matrix, resolved.matrix);
         assert_eq!(model.node_cache_counters()[..2], [0, 0]);
         Ok(())
@@ -4898,9 +5004,9 @@ mod tests {
         });
         backend.set_base_argb(1, 0xff80_ffff)?;
         let tinted = backend.render_rgba(1)?;
-        assert_eq!(&tinted.rgba()[..4], &[17, 18, 19, 20]);
+        assert_eq!(&tinted.rgba().unwrap()[..4], &[17, 18, 19, 20]);
         let remembered = backend.players[&1].surface.capture().unwrap();
-        assert_ne!(&remembered.rgba()[..4], &[17, 18, 19, 20]);
+        assert_ne!(&remembered.rgba().unwrap()[..4], &[17, 18, 19, 20]);
         Ok(())
     }
 
@@ -5084,32 +5190,32 @@ mod tests {
     fn sidecar_emote_exact_hit_and_live_input_invalidation() -> Result<()> {
         let mut backend = backend()?;
         let first = backend.render_rgba(1)?;
-        assert_eq!(first.alpha_bounds(), Some([0, 0, 1, 1]));
+        assert_eq!(first.alpha_bounds().unwrap(), Some([0, 0, 1, 1]));
         assert!(Arc::ptr_eq(&first.pixels, &backend.render_rgba(1)?.pixels));
         backend.set_base_argb(1, 0x00ff_ffff)?;
-        assert_eq!(backend.render_rgba(1)?.alpha_bounds(), None);
-        assert_eq!(first.alpha_bounds(), Some([0, 0, 1, 1]));
+        assert_eq!(backend.render_rgba(1)?.alpha_bounds().unwrap(), None);
+        assert_eq!(first.alpha_bounds().unwrap(), Some([0, 0, 1, 1]));
         backend.set_base_argb(1, 0xffff_ffff)?;
         assert!(Arc::ptr_eq(&first.pixels, &backend.render_rgba(1)?.pixels));
 
         backend.player_mut(1)?.set_variable("mouth", 1.0)?;
-        assert_eq!(backend.render_rgba(1)?.alpha_bounds(), None);
+        assert_eq!(backend.render_rgba(1)?.alpha_bounds().unwrap(), None);
         backend.player_mut(1)?.set_variable("mouth", 0.0)?;
         backend.viewport.origin_x = 1.0;
         let moved = backend.render_rgba(1)?;
-        assert_eq!(moved.alpha_bounds(), Some([1, 0, 2, 1]));
-        assert_eq!(moved.rgba(), backend.render_preview(1)?.frame.rgba());
+        assert_eq!(moved.alpha_bounds().unwrap(), Some([1, 0, 2, 1]));
+        assert_eq!(moved.rgba().unwrap(), backend.render_preview(1)?.frame.rgba().unwrap());
         backend.player_mut(1)?.reference_timelines.mark_tick(1.0, BTreeMap::new());
         let refreshed = backend.render_rgba(1)?;
         assert!(!Arc::ptr_eq(&moved.pixels, &refreshed.pixels));
-        assert_eq!(moved.rgba(), refreshed.rgba());
+        assert_eq!(moved.rgba().unwrap(), refreshed.rgba().unwrap());
 
         let mut model = (*backend.player(1)?.model).clone();
         model.textures.insert("atlas".into(), CpuTexture::from_rgba(1, 1, vec![60, 100, 50, 255])?);
         backend.player_mut(1)?.model = Arc::new(model);
         let replacement = backend.render_rgba(1)?;
-        assert_ne!(replacement.rgba(), refreshed.rgba());
-        assert_eq!(replacement.rgba(), backend.render_preview(1)?.frame.rgba());
+        assert_ne!(replacement.rgba().unwrap(), refreshed.rgba().unwrap());
+        assert_eq!(replacement.rgba().unwrap(), backend.render_preview(1)?.frame.rgba().unwrap());
 
         let mut owner = CpuM2LiveOwner::new(Default::default(), &[], &mut BTreeMap::new(), &BTreeMap::new())?;
         owner.pending_effects.push("live test warning".into());
@@ -5124,7 +5230,7 @@ mod tests {
         let expected = backend.render_preview(1)?.frame;
         backend.set_rasterizer(|_, _, _| None);
         let fallback = backend.render_rgba(1)?;
-        assert_eq!(fallback.rgba(), expected.rgba());
+        assert_eq!(fallback.rgba().unwrap(), expected.rgba().unwrap());
         assert_eq!(fallback.origin(), [0, 0]);
 
         let mut owner = CpuM2LiveOwner::new(Default::default(), &[], &mut BTreeMap::new(), &BTreeMap::new())?;
@@ -5145,9 +5251,9 @@ mod tests {
         assert_eq!(presented.origin(), [1, 0]);
         let captured = backend.capture_surface(1)?;
         assert_eq!((captured.width(), captured.height(), captured.origin()), (3, 2, [0, 0]));
-        for (index, pixel) in captured.rgba().chunks_exact(4).enumerate() {
+        for (index, pixel) in captured.rgba().unwrap().chunks_exact(4).enumerate() {
             if index == 1 {
-                assert_eq!(pixel, presented.rgba());
+                assert_eq!(pixel, presented.rgba().unwrap());
             } else {
                 assert_eq!(pixel, &[0u8; 4]);
             }
@@ -5169,14 +5275,14 @@ mod tests {
     #[test]
     fn sidecar_emote_recycles_cleared_pixels_without_overriding_held_surface() -> Result<()> {
         let mut backend = backend()?;
-        let first = backend.render_rgba(1)?.rgba().as_ptr();
+        let first = backend.render_rgba(1)?.rgba().unwrap().as_ptr();
         backend.viewport.origin_x = 1.0;
         backend.render_rgba(1)?;
         assert_eq!(backend.raster_scratch.as_ptr(), first);
         backend.viewport.origin_x = 2.0;
         let rendered = backend.render_rgba(1)?;
-        assert_eq!(rendered.rgba().as_ptr(), first);
-        assert_eq!(rendered.alpha_bounds(), Some([2, 0, 3, 1]));
+        assert_eq!(rendered.rgba().unwrap().as_ptr(), first);
+        assert_eq!(rendered.alpha_bounds().unwrap(), Some([2, 0, 3, 1]));
 
         let held = EmoteRasterFrame::new(3, 2, [0, 0], vec![0; 24])?;
         backend.players.get_mut(&1).unwrap().surface.request(Some(30), held.clone(), false);

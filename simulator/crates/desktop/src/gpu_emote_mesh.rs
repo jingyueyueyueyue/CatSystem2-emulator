@@ -8,6 +8,7 @@ const OVERLAP_BINS: usize = 32;
 const MAX_BATCH_RUNS: usize = 128;
 const MAX_BATCHED_POSES: usize = 4;
 const MAX_IN_FLIGHT_MESH_BATCHES: usize = 4;
+const MAX_UPLOAD_SLOTS: usize = MAX_BATCHED_POSES * MAX_IN_FLIGHT_MESH_BATCHES;
 const MAX_BATCHED_POSE_UPLOAD: usize = 2 * 1024 * 1024;
 const SLOW_MESH_BATCH_PHASE: Duration = Duration::from_millis(8);
 
@@ -187,6 +188,7 @@ fn coverage_overlap(a: &[u32; 4], b: &[u32; 4]) -> bool {
     a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
 }
 
+#[derive(Debug)]
 struct CoverageSchedule {
     ranges: Vec<std::ops::Range<usize>>,
     order: Vec<usize>,
@@ -262,7 +264,7 @@ pub(super) struct IndexedGeometry {
     vertices: Vec<u32>,
     indices: Arc<Vec<u32>>,
     draws: Vec<IndexedDraw>,
-    coverage: CoverageSchedule,
+    coverage: Arc<CoverageSchedule>,
 }
 
 impl IndexedGeometry {
@@ -304,6 +306,7 @@ impl GeometryCache {
                 + frame.vertices.capacity() * size_of::<u32>()
                 + frame.draws.capacity() * size_of::<IndexedDraw>()
                 + frame.draws.iter().map(|draw| draw.runs.capacity() * size_of::<IndexedRun>()).sum::<usize>()
+                + size_of::<CoverageSchedule>() + 2 * size_of::<usize>()
                 + frame.coverage.ranges.capacity() * size_of::<std::ops::Range<usize>>()
                 + frame.coverage.order.capacity() * size_of::<usize>()
                 + shared_vec(&frame.indices, &mut seen);
@@ -453,7 +456,7 @@ impl GeometryCache {
         }
         let indices = reused_indices.unwrap_or_else(|| Arc::new(indices));
         let run_bounds: Vec<_> = prepared.iter().flat_map(|draw| draw.runs.iter().map(|run| run.bounds)).collect();
-        let coverage = CoverageSchedule::new(&run_bounds, layered_coverage_enabled());
+        let coverage = Arc::new(CoverageSchedule::new(&run_bounds, layered_coverage_enabled()));
         self.meshes = keys.clone();
         let frame = Arc::new(IndexedGeometry { viewport: size, keys, bounds, vertices, indices, draws: prepared, coverage });
         self.frame = Some(frame.clone());
@@ -465,6 +468,7 @@ pub(super) struct MeshRaster {
     raster: wgpu::RenderPipeline,
     composite: wgpu::ComputePipeline,
     composite_layout: wgpu::BindGroupLayout,
+    atlas_layout: wgpu::BindGroupLayout,
     stencil: wgpu::Buffer,
     uploads: Vec<MeshUpload>,
     pub(super) submission: Arc<MeshSubmission>,
@@ -496,13 +500,188 @@ pub(super) struct MeshSubmission {
 #[derive(Debug, Default)]
 struct MeshSubmissions {
     batch: Option<MeshCommandBatch>,
-    in_flight: VecDeque<wgpu::SubmissionIndex>,
+    in_flight: VecDeque<(wgpu::SubmissionIndex, u32)>,
+    #[cfg(windows)]
+    submitting: Option<PendingMeshSubmit>,
+}
+
+impl MeshSubmissions {
+    fn finish_submit(&mut self) {
+        #[cfg(windows)]
+        if let Some(pending) = self.submitting.take() {
+            let wait_started = Instant::now();
+            let submission = pending.receipt.recv().expect("E-mote submission worker stopped during a batch");
+            emote_gpu_encode_elapsed(wait_started.elapsed());
+            self.in_flight.push_back((submission, pending.uploads));
+        }
+    }
+
+    fn retire(&mut self, device: &wgpu::Device, wait: Duration) {
+        let mut wait = wait;
+        while let Some((submission, _)) = self.in_flight.front() {
+            if !gpu_submission_finished(device, submission, wait) { break; }
+            self.in_flight.pop_front();
+            wait = Duration::ZERO;
+        }
+    }
+
+    fn next_slot(&self) -> usize {
+        let reserved = self.batch.as_ref().map_or(0, |batch| batch.uploads);
+        self.in_flight.iter().fold(reserved, |used, (_, slots)| used | slots).trailing_ones() as usize
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct PendingMeshSubmit {
+    receipt: mpsc::Receiver<wgpu::SubmissionIndex>,
+    uploads: u32,
+}
+
+#[cfg(windows)]
+enum GpuSubmitWork {
+    Mesh {
+        batch: MeshCommandBatch,
+        queue: wgpu::Queue,
+        receipt: mpsc::Sender<wgpu::SubmissionIndex>,
+    },
+    Atlas(super::AtlasUploadWork),
+}
+
+#[cfg(windows)]
+fn mesh_submit_worker() -> Option<&'static mpsc::SyncSender<GpuSubmitWork>> {
+    static WORKER: OnceLock<Option<mpsc::SyncSender<GpuSubmitWork>>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        if std::env::var_os("CS2_EMOTE_ASYNC_SUBMIT").is_some_and(|value| value == "0") {
+            return None;
+        }
+        let (send, receive) = mpsc::sync_channel::<GpuSubmitWork>(1);
+        std::thread::Builder::new().name("CS2 E-mote GPU submit".into()).spawn(move || {
+            while let Ok(work) = receive.recv() {
+                match work {
+                    GpuSubmitWork::Mesh { batch, queue, receipt } => {
+                        let (submission, _, _) = batch.submit(&queue);
+                        let _ = receipt.send(submission);
+                    }
+                    GpuSubmitWork::Atlas(upload) => {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| upload.submit())).is_err() {
+                            report("emote_atlas_scene_worker_failed");
+                        }
+                    }
+                }
+            }
+        }).ok().map(|_| send)
+    }).as_ref()
+}
+
+#[cfg(windows)]
+pub(super) fn atlas_upload_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var_os("CS2_EMOTE_ASYNC_ATLAS").is_some_and(|value| value == "0"))
+        && mesh_submit_worker().is_some()
+}
+
+#[cfg(windows)]
+pub(super) fn enqueue_atlas_upload(work: super::AtlasUploadWork) -> bool {
+    mesh_submit_worker().is_some_and(|worker| worker.try_send(GpuSubmitWork::Atlas(work)).is_ok())
+}
+
+#[cfg(windows)]
+pub(super) fn mesh_async_encode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CS2_EMOTE_ASYNC_ENCODE").is_some_and(|value| value == "1"))
+        && mesh_submit_worker().is_some()
+}
+
+#[derive(Debug)]
+struct MeshRunCommand {
+    indices: std::ops::Range<u32>,
+    scissor: [u32; 4],
+    stamp: u32,
+    atlas: usize,
+    command_offset: u32,
+}
+
+#[derive(Debug)]
+struct MeshPoseCommands {
+    raster: wgpu::RenderPipeline,
+    composite: wgpu::ComputePipeline,
+    coverage_view: wgpu::TextureView,
+    coverage: Arc<CoverageSchedule>,
+    clear_coverage: bool,
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    output: Arc<wgpu::Buffer>,
+    stencil: Option<wgpu::Buffer>,
+    bytes: u64,
+    size: [u32; 2],
+    composite_binding: wgpu::BindGroup,
+    atlases: Vec<wgpu::BindGroup>,
+    runs: Vec<MeshRunCommand>,
+}
+
+impl MeshPoseCommands {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.output, 0, Some(self.bytes));
+        if let Some(stencil) = &self.stencil {
+            encoder.clear_buffer(stencil, 0, Some(self.bytes));
+        }
+        for batch in &self.coverage.ranges {
+            // Intersecting writes keep their coverage/composition barriers.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("CS2 ordered indexed E-mote meshes"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.coverage_view, depth_slice: None, resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if self.clear_coverage && batch.start == 0 {
+                                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })], ..Default::default()
+                });
+                pass.set_pipeline(&self.raster);
+                pass.set_viewport(0., 0., self.size[0] as f32, self.size[1] as f32, 0., 1.);
+                pass.set_vertex_buffer(0, self.vertices.slice(..));
+                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                for index in self.coverage.runs(batch) {
+                    let run = &self.runs[index];
+                    let [x, y, width, height] = run.scissor;
+                    pass.set_scissor_rect(x, y, width, height);
+                    pass.draw_indexed(run.indices.clone(), 0, run.stamp..run.stamp + 1);
+                }
+            }
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.composite);
+            let mut current_atlas = None;
+            for index in self.coverage.runs(batch) {
+                let run = &self.runs[index];
+                if current_atlas != Some(run.atlas) {
+                    pass.set_bind_group(1, &self.atlases[run.atlas], &[]);
+                    current_atlas = Some(run.atlas);
+                }
+                pass.set_bind_group(0, &self.composite_binding, &[run.command_offset]);
+                pass.dispatch_workgroups(run.scissor[2].div_ceil(8), run.scissor[3].div_ceil(8), 1);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MeshBatchCommands {
+    Recording(wgpu::CommandEncoder),
+    #[cfg(windows)]
+    Deferred { device: wgpu::Device, poses: Vec<MeshPoseCommands> },
 }
 
 #[derive(Debug)]
 struct MeshCommandBatch {
-    encoder: wgpu::CommandEncoder,
+    commands: MeshBatchCommands,
     outputs: Vec<Arc<wgpu::Buffer>>,
+    uploads: u32,
     poses: usize,
     coverage_passes: usize,
     encode_time: Duration,
@@ -510,10 +689,22 @@ struct MeshCommandBatch {
 }
 
 impl MeshCommandBatch {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, defer_recording: bool) -> Self {
+        #[cfg(windows)]
+        let commands = if defer_recording {
+            MeshBatchCommands::Deferred { device: device.clone(), poses: Vec::new() }
+        } else {
+            MeshBatchCommands::Recording(device.create_command_encoder(&Default::default()))
+        };
+        #[cfg(not(windows))]
+        let commands = {
+            let _ = defer_recording;
+            MeshBatchCommands::Recording(device.create_command_encoder(&Default::default()))
+        };
         Self {
-            encoder: device.create_command_encoder(&Default::default()),
+            commands,
             outputs: Vec::new(),
+            uploads: 0,
             poses: 0,
             coverage_passes: 0,
             encode_time: Duration::ZERO,
@@ -521,18 +712,53 @@ impl MeshCommandBatch {
         }
     }
 
+    fn defer_recording(&self) -> bool {
+        match &self.commands {
+            MeshBatchCommands::Recording(_) => false,
+            #[cfg(windows)]
+            MeshBatchCommands::Deferred { .. } => true,
+        }
+    }
+
+    fn record(&mut self, pose: MeshPoseCommands) -> Duration {
+        match &mut self.commands {
+            MeshBatchCommands::Recording(encoder) => {
+                let started = Instant::now();
+                pose.record(encoder);
+                started.elapsed()
+            }
+            #[cfg(windows)]
+            MeshBatchCommands::Deferred { poses, .. } => {
+                poses.push(pose);
+                Duration::ZERO
+            }
+        }
+    }
+
     fn submit(self, queue: &wgpu::Queue) -> (wgpu::SubmissionIndex, Duration, Duration) {
+        let deferred = self.defer_recording();
+        let (encoder, record_time) = match self.commands {
+            MeshBatchCommands::Recording(encoder) => (encoder, Duration::ZERO),
+            #[cfg(windows)]
+            MeshBatchCommands::Deferred { device, poses } => {
+                let started = Instant::now();
+                let mut encoder = device.create_command_encoder(&Default::default());
+                for pose in poses { pose.record(&mut encoder); }
+                (encoder, started.elapsed())
+            }
+        };
         #[cfg(windows)]
         let thread_before_finish = mesh_thread_cpu_time();
         let finish_started = Instant::now();
-        let commands = self.encoder.finish();
+        let commands = encoder.finish();
         let finish_time = finish_started.elapsed();
         #[cfg(windows)]
         let thread_before_submit = thread_before_finish.and_then(|_| mesh_thread_cpu_time());
         let submit_started = Instant::now();
         let submission = crate::gpu_raster::submit_gpu_commands(queue, Some(commands));
         let submit_time = submit_started.elapsed();
-        let slow = [self.encode_time, finish_time, submit_time].into_iter()
+        let record_time_total = self.encode_time + record_time;
+        let slow = [record_time_total, finish_time, submit_time].into_iter()
             .any(|time| time > SLOW_MESH_BATCH_PHASE);
         #[cfg(windows)]
         let thread_cpu = thread_before_finish.zip(thread_before_submit)
@@ -543,9 +769,10 @@ impl MeshCommandBatch {
             )));
         if self.sample_log || slow {
             report(&format!(
-                "emote_mesh_batch poses={} cpu_encode_us={} cpu_submit_us={} submits=1 cpu_record_us={} cpu_finish_us={} slow={} coverage_passes={}",
-                self.poses, (self.encode_time + finish_time).as_micros(), submit_time.as_micros(),
-                self.encode_time.as_micros(), finish_time.as_micros(), u32::from(slow), self.coverage_passes,
+                "emote_mesh_batch poses={} cpu_encode_us={} cpu_submit_us={} submits=1 cpu_record_us={} cpu_finish_us={} slow={} coverage_passes={} deferred_recording={}",
+                self.poses, (record_time_total + finish_time).as_micros(), submit_time.as_micros(),
+                record_time_total.as_micros(), finish_time.as_micros(), u32::from(slow), self.coverage_passes,
+                u32::from(deferred),
             ));
         }
         #[cfg(windows)]
@@ -553,7 +780,7 @@ impl MeshCommandBatch {
             report(&format!("emote_mesh_thread_cpu poses={} finish_thread_us={} submit_thread_us={}",
                 self.poses, finish_us, submit_us));
         }
-        (submission, finish_time, submit_time)
+        (submission, record_time + finish_time, submit_time)
     }
 
     fn submit_deferred(self, queue: &wgpu::Queue) -> wgpu::SubmissionIndex {
@@ -598,11 +825,47 @@ fn mesh_thread_cpu_time() -> Option<u64> {
 }
 
 impl MeshSubmission {
+    /// The scene prefix can compose while an independent set of pose outputs
+    /// is finalized. A pose consumer flushes before reading those outputs.
+    pub(super) fn seal(&self, queue: &wgpu::Queue, allow_background: bool) {
+        #[cfg(windows)]
+        if allow_background && let Some(worker) = mesh_submit_worker() {
+            let mut pending = self.pending.lock().unwrap();
+            pending.finish_submit();
+            if let Some(batch) = pending.batch.take() {
+                let uploads = batch.uploads;
+                let (send, receipt) = mpsc::channel();
+                let work = GpuSubmitWork::Mesh { batch, queue: queue.clone(), receipt: send };
+                match worker.try_send(work) {
+                    Ok(()) => pending.submitting = Some(PendingMeshSubmit { receipt, uploads }),
+                    Err(mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work)) => {
+                        let GpuSubmitWork::Mesh { batch, .. } = work else { unreachable!() };
+                        pending.in_flight.push_back((batch.submit_deferred(queue), uploads));
+                    }
+                }
+            }
+            return;
+        }
+        let _ = allow_background;
+        self.flush(queue);
+    }
+
     pub(super) fn flush(&self, queue: &wgpu::Queue) {
         let mut pending = self.pending.lock().unwrap();
+        pending.finish_submit();
         if let Some(batch) = pending.batch.take() {
-            pending.in_flight.push_back(batch.submit_deferred(queue));
+            let uploads = batch.uploads;
+            pending.in_flight.push_back((batch.submit_deferred(queue), uploads));
         }
+    }
+
+    pub(super) fn can_start_batch(&self, device: &wgpu::Device) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retire(device, Duration::ZERO);
+        let reserved = pending.in_flight.len() + usize::from(pending.batch.is_some());
+        #[cfg(windows)]
+        let reserved = reserved + usize::from(pending.submitting.is_some());
+        reserved < MAX_IN_FLIGHT_MESH_BATCHES
     }
 
     #[cfg(test)]
@@ -667,13 +930,16 @@ impl MeshRaster {
             label: Some("CS2 E-mote indexed composition"),
             entries: &[
                 storage(0, true),
-                texture(2, wgpu::TextureSampleType::Uint),
                 texture(4, wgpu::TextureSampleType::Float { filterable: false }),
                 storage(5, false), storage(6, false),
             ],
         });
+        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CS2 E-mote indexed atlas"),
+            entries: &[texture(0, wgpu::TextureSampleType::Uint)],
+        });
         let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&bindings], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[&bindings, &atlas_layout], push_constant_ranges: &[],
         });
         let composite = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("CS2 E-mote ordered mesh composite"), module: &module,
@@ -686,7 +952,7 @@ impl MeshRaster {
         #[cfg(target_os = "android")]
         drop(validation);
         Ok(Self {
-            raster, composite, composite_layout: bindings,
+            raster, composite, composite_layout: bindings, atlas_layout,
             stencil: buffer(device, 4, UPLOAD),
             uploads: vec![MeshUpload::new(device)], submission: Arc::default(),
             geometry: GeometryCache::default(), geometry_upload_bytes: 0, encoding_counts: [0; 3],
@@ -811,7 +1077,23 @@ impl EmoteRaster {
             bail!("mesh_output_limit");
         }
         // Resolve every atlas before encoding: failure leaves no partial pose.
-        let atlases: Vec<_> = active.iter().map(|(draw, _)| self.atlas(device, queue, model, draw.texture)).collect::<Result<_>>()?;
+        let atlas_layout = self.mesh.as_ref().context("mesh_pipeline_unavailable")?.atlas_layout.clone();
+        let mut atlas_bindings = Vec::new();
+        let binding_indices: Vec<_> = active.iter().map(|(draw, _)| -> Result<usize> {
+            if let Some(index) = atlas_bindings.iter().position(|(texture, _)| std::ptr::eq(*texture, draw.texture)) {
+                return Ok(index);
+            }
+            let atlas = self.atlas(device, queue, model, draw.texture)?;
+            let binding = atlas.mesh_binding.get_or_insert_with(|| device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("CS2 E-mote mesh atlas"), layout: &atlas_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0, resource: wgpu::BindingResource::TextureView(&atlas.view),
+                }],
+            }));
+            let index = atlas_bindings.len();
+            atlas_bindings.push((draw.texture, binding.clone()));
+            Ok(index)
+        }).collect::<Result<_>>()?;
         let alignment = limits.min_storage_buffer_offset_alignment as usize / 4;
         let stride = 16usize.next_multiple_of(alignment);
         let runs: Vec<_> = active.iter().enumerate().flat_map(|(draw, (_, info))|
@@ -822,7 +1104,7 @@ impl EmoteRaster {
         // Float32 stores these generations exactly. On wrap a single clear
         // retires all old generations before numbering restarts at one.
         let clear_coverage = u64::from(mesh.coverage_stamp) + run_count as u64 > 16_777_215;
-        if clear_coverage { mesh.coverage_stamp = 0; }
+        let mut coverage_stamp = if clear_coverage { 0 } else { mesh.coverage_stamp };
         let mut headers = vec![0u32; run_count * stride];
         for (index, (draw, run)) in runs.iter().enumerate() {
             let (draw, info) = active[*draw];
@@ -831,8 +1113,8 @@ impl EmoteRaster {
                 draw.stencil, draw.reference, draw.operation, draw.texture, draw.opacity));
             headers[offset + 4..offset + 7].copy_from_slice(&[width, x, y]);
             headers[offset + 12..offset + 14].copy_from_slice(&info.base.map(|v| v as i32 as u32));
-            mesh.coverage_stamp += 1;
-            headers[offset + 14] = mesh.coverage_stamp;
+            coverage_stamp += 1;
+            headers[offset + 14] = coverage_stamp;
         }
         let header_bytes = (headers.len() * 4) as u64;
         let output_started = started.map(|_| Instant::now());
@@ -841,23 +1123,33 @@ impl EmoteRaster {
         let mesh = self.mesh.as_mut().context("mesh_pipeline_unavailable")?;
         let submission = mesh.submission.clone();
         let mut pending = submission.pending.lock().unwrap();
+        pending.finish_submit();
         let upload_words = headers.len() + geometry.vertices.len() + geometry.indices.len();
         let batches = &geometry.coverage.ranges;
         let defer = batching() && !CAPTURING.with(Cell::get) && batch_submissions_enabled()
             && upload_words <= MAX_BATCHED_POSE_UPLOAD / size_of::<u32>();
-        if !defer && let Some(batch) = pending.batch.take() {
-            pending.in_flight.push_back(batch.submit_deferred(queue));
+        #[cfg(windows)]
+        let defer_recording = defer && mesh_async_encode_enabled();
+        #[cfg(not(windows))]
+        let defer_recording = false;
+        let batch_full = pending.batch.as_ref().is_some_and(|batch| batch.poses == MAX_BATCHED_POSES);
+        if (!defer || batch_full) && let Some(batch) = pending.batch.take() {
+            let uploads = batch.uploads;
+            pending.in_flight.push_back((batch.submit_deferred(queue), uploads));
         }
         // Offscreen batches can be produced without a swapchain acquire.
         // Reap old command buffers before the driver allocates another batch.
+        pending.retire(device, Duration::ZERO);
         if pending.in_flight.len() >= MAX_IN_FLIGHT_MESH_BATCHES {
-            let earliest = pending.in_flight.front().unwrap();
-            if !gpu_submission_finished(device, earliest, ATLAS_UPLOAD_WINDOW) {
-                bail!("E-mote command queue is busy");
+            pending.retire(device, ATLAS_UPLOAD_WINDOW);
+            if pending.in_flight.len() >= MAX_IN_FLIGHT_MESH_BATCHES {
+                crate::perf_detail::emote_fallback("queue_busy");
+                bail!("mesh_gpu_backpressure");
             }
-            pending.in_flight.pop_front();
         }
-        let slot = pending.batch.as_ref().map_or(0, |batch| batch.poses);
+        let slot = pending.next_slot();
+        debug_assert!(slot < MAX_UPLOAD_SLOTS);
+        mesh.coverage_stamp = coverage_stamp;
         if slot == mesh.uploads.len() {
             mesh.uploads.push(MeshUpload::new(device));
         }
@@ -874,102 +1166,72 @@ impl EmoteRaster {
         queue.write_buffer(&upload.commands, 0, data);
         mesh.geometry_upload_bytes = upload.upload_geometry(device, queue, &geometry);
         let (coverage_texture, coverage) = mesh.coverage.as_ref().unwrap();
-        let composite = &mesh.composite;
         let triangle_count = geometry.indices.len() / 3;
         mesh.poses += 1;
         let sample_log = mesh.poses <= 3 || mesh.poses % 120 == 0;
         let prepared = started.map(|_| Instant::now());
-        let commands_started = Instant::now();
-        let command_batch = pending.batch.get_or_insert_with(|| MeshCommandBatch::new(device));
-        command_batch.outputs.push(output.clone());
-        let encoder = &mut command_batch.encoder;
-        // Each ordered draw writes the final packed RGBA directly. Mask-only
-        // state has its own scratch buffer and is untouched for unmasked poses.
-        encoder.clear_buffer(&output, 0, Some(bytes));
-        if stencil_needed { encoder.clear_buffer(&mesh.stencil, 0, Some(bytes)); }
-        // Header offsets carry alpha/mask state, so every draw using the same
-        // actual atlas view can share one immutable resource binding.
-        let mut composite_bindings: Vec<(wgpu::TextureView, wgpu::BindGroup)> = Vec::new();
-        let binding_indices: Vec<_> = atlases.iter().map(|atlas| {
-            if let Some(index) = composite_bindings.iter().position(|(view, _)| view == atlas) { return index; }
-            let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        // The canvas and upload slot may vary per pose. Atlas groups stay with
+        // their cached texture and can be reused across slots and poses.
+        let composite_binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("CS2 E-mote mesh composite"), layout: &mesh.composite_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &upload.commands, offset: 0, size: NonZeroU64::new(64),
                     }) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(atlas) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(coverage) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &output, offset: 0, size: NonZeroU64::new(bytes),
                     }) },
                     wgpu::BindGroupEntry { binding: 6, resource: mesh.stencil.as_entire_binding() },
                 ],
-            });
-            let index = composite_bindings.len();
-            composite_bindings.push((atlas.clone(), binding));
-            index
-        }).collect();
-        for batch in batches {
-            // Coverage and integer composition can be grouped only when their
-            // entire pixel-write rectangles are disjoint. Overlapping runs,
-            // including folded meshes and serial masks, retain their barriers.
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("CS2 ordered indexed E-mote meshes"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: coverage, depth_slice: None, resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: if clear_coverage && batch.start == 0 { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) }
-                                else { wgpu::LoadOp::Load },
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })], ..Default::default()
-                });
-                pass.set_pipeline(&mesh.raster);
-                pass.set_viewport(0., 0., width as f32, height as f32, 0., 1.);
-                pass.set_vertex_buffer(0, upload.vertices.slice(..));
-                pass.set_index_buffer(upload.indices.slice(..), wgpu::IndexFormat::Uint32);
-                for index in geometry.coverage.runs(batch) {
-                    let run = runs[index].1;
-                    let [left, top, right, bottom] = run.bounds;
-                    pass.set_scissor_rect(left - x, top - y, right - left, bottom - top);
-                    let stamp = headers[index * stride + 14];
-                    pass.draw_indexed(run.indices.clone(), 0, stamp..stamp + 1);
+        });
+        let atlas_count = atlas_bindings.len();
+        let pose = MeshPoseCommands {
+            raster: mesh.raster.clone(), composite: mesh.composite.clone(),
+            coverage_view: coverage.clone(), coverage: geometry.coverage.clone(), clear_coverage,
+            vertices: upload.vertices.clone(), indices: upload.indices.clone(),
+            output: output.clone(), stencil: stencil_needed.then(|| mesh.stencil.clone()),
+            bytes, size: [width, height], composite_binding,
+            atlases: atlas_bindings.into_iter().map(|(_, binding)| binding).collect(),
+            runs: runs.iter().enumerate().map(|(index, (draw, run))| {
+                let [left, top, right, bottom] = run.bounds;
+                let offset = index * stride;
+                MeshRunCommand {
+                    indices: run.indices.clone(), scissor: [left - x, top - y, right - left, bottom - top],
+                    stamp: headers[offset + 14], atlas: binding_indices[*draw], command_offset: (offset * 4) as u32,
                 }
-            }
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(composite);
-            for run in geometry.coverage.runs(batch) {
-                let offset = run * stride;
-                let binding = &composite_bindings[binding_indices[runs[run].0]].1;
-                pass.set_bind_group(0, binding, &[(offset * 4) as u32]);
-                pass.dispatch_workgroups(headers[offset].div_ceil(8), headers[offset + 1].div_ceil(8), 1);
-            }
-        }
-        let encode_time = commands_started.elapsed();
+            }).collect(),
+        };
+        let commands_started = Instant::now();
+        let command_batch = pending.batch.get_or_insert_with(|| MeshCommandBatch::new(device, defer_recording));
+        // Keep outputs out of the reusable pool until queue submission.
+        command_batch.outputs.push(output.clone());
+        command_batch.uploads |= 1 << slot;
+        let encode_time = command_batch.record(pose);
         command_batch.poses += 1;
         command_batch.coverage_passes += batches.len();
         command_batch.encode_time += encode_time;
         command_batch.sample_log |= sample_log;
-        let submitted = !defer || command_batch.poses == MAX_BATCHED_POSES;
+        let submitted = !defer || (command_batch.poses == MAX_BATCHED_POSES && !command_batch.defer_recording());
         let (finish_time, submit_time) = if submitted {
-            let (submission, finish_time, submit_time) = pending.batch.take().unwrap().submit(queue);
-            pending.in_flight.push_back(submission);
+            let batch = pending.batch.take().unwrap();
+            let uploads = batch.uploads;
+            let (submission, finish_time, submit_time) = batch.submit(queue);
+            pending.in_flight.push_back((submission, uploads));
             (finish_time, submit_time)
         } else {
             (Duration::ZERO, Duration::ZERO)
         };
         drop(pending);
         let draw_count = active.len();
-        mesh.encoding_counts = [run_count, batches.len(), composite_bindings.len()];
+        mesh.encoding_counts = [run_count, batches.len(), atlas_count];
         if sample_log {
             let coverage_bytes = u64::from(coverage_texture.width()) * u64::from(coverage_texture.height()) * 16;
             let composite_pixels = runs.iter().map(|(_, run)| run.bounds).map(|[left, top, right, bottom]|
                 u64::from(right - left) * u64::from(bottom - top)).sum::<u64>();
             report(&format!("emote_mesh draws={draw_count} triangles={triangle_count} runs={run_count} preview=true cpu_prepare_encode_us={} uv_bytes={} vertex_upload_capacity={} index_upload_capacity={} geometry_upload_bytes={} coverage_clears={} composite_bindings={} coverage_batches={} adjacent_coverage_batches={} ordered_passes_saved={} fallback_geometry_hits={} fallback_geometry_misses={} cpu_prepare_us={} cpu_encode_us={} cpu_submit_us={} coverage_bytes={coverage_bytes} coverage_allocations={} header_upload_bytes={header_bytes} buffer_clear_bytes={} composite_pixels={composite_pixels} pack_passes=0 submits={}",
                 preparation_started.elapsed().as_micros(), u64::from(width) * u64::from(height) * 16, upload.vertices.size(), upload.indices.size(),
-                mesh.geometry_upload_bytes, u32::from(clear_coverage), composite_bindings.len(), batches.len(),
+                mesh.geometry_upload_bytes, u32::from(clear_coverage), atlas_count, batches.len(),
                 geometry.coverage.adjacent_count, (run_count - batches.len()) * 2, mesh.geometry.hits, mesh.geometry.misses,
                 (commands_started - preparation_started).as_micros(), (encode_time + finish_time).as_micros(),
                 submit_time.as_micros(), u32::from(coverage_allocated), bytes * (1 + u64::from(stencil_needed)), u32::from(submitted)));
@@ -990,6 +1252,7 @@ impl EmoteRaster {
         eprintln!("emote_mesh draws={draw_count} triangles={triangle_count} runs={run_count} preview=true");
         Ok(EmoteRasterFrame::from_device(width, height, [x as i32, y as i32], Arc::new(DevicePose {
             buffer: output, device: device.clone(), queue: queue.clone(), bytes, failed: failed.clone(), fade_alpha: None,
+            readback_buffers: self.readback_buffers.clone(),
             mesh_submission: (!submitted).then_some(submission),
         }))?)
     }

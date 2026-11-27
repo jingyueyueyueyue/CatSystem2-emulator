@@ -2185,7 +2185,7 @@ pub(super) fn draw_plane_with_view(
         && draw_unit_canvas_plane(
             canvas, source, services.vram_overflow.as_ref(), vertices, clip, (color >> 24) as u8,
             blend,
-        )
+        )?
     {
         return Ok(true);
     }
@@ -2197,6 +2197,7 @@ pub(super) fn draw_plane_with_view(
     {
         return Ok(true);
     }
+    canvas.try_pixels()?;
     for triangle in triangles() {
         raster_triangle(
             canvas,
@@ -2774,24 +2775,25 @@ fn draw_unit_canvas_plane(
     clip: Option<Rect>,
     opacity: u8,
     blend: BlendMode,
-) -> bool {
+) -> HostResult<bool> {
     let span = match unit_plane_span([canvas.width(), canvas.height()], source, overflow.is_some(), vertices, clip, opacity) {
         Some(Some(span)) => span,
-        Some(None) => return true,
-        None => return false,
+        Some(None) => return Ok(true),
+        None => return Ok(false),
     };
     #[cfg(all(feature = "gpu-raster", any(windows, target_os = "android")))]
     if super::gpu_raster::available()
         && let Some(plane) = GpuPlane::from_span(source, overflow, &span, opacity, blend)
     {
         let job = plane.job();
-        if super::gpu_raster::draw_job(canvas, job) { return true; }
+        if super::gpu_raster::draw_job(canvas, job) { return Ok(true); }
     }
 
     let source_stride = source.width() as usize * 4;
     let canvas_stride = canvas.width() as usize * 4;
     let width = span.size[0];
     let row_bytes = width as usize * 4;
+    canvas.try_pixels()?;
     let pixels = canvas.pixels_mut();
     for row in 0..span.size[1] {
         let sample_y = span.sample[1] + row;
@@ -2822,7 +2824,7 @@ fn draw_unit_canvas_plane(
             consumed += count;
         }
     }
-    true
+    Ok(true)
 }
 
 fn blend_unit_plane_span(input: &[u8], output: &mut [u8], opacity: u8) {
@@ -3213,7 +3215,7 @@ mod unit_canvas_plane_tests {
             draw(&mut serial, Rect::new(4, top as i32, width - 8, rows))?;
             top += rows;
         }
-        assert_ne!(parallel.pixel(20, 20)?, Color::rgba(51, 71, 171, 199));
+        assert!(parallel.pixels().chunks_exact(4).any(|pixel| pixel != [51, 71, 171, 199]));
         assert_eq!(parallel.pixels(), serial.pixels());
         Ok(())
     }
@@ -3407,7 +3409,7 @@ mod unit_canvas_plane_tests {
                             )?;
                         }
                         let mut actual = background.clone();
-                        assert!(draw_unit_canvas_plane(&mut actual, &source, None, vertices, clip, opacity, blend));
+                        assert!(draw_unit_canvas_plane(&mut actual, &source, None, vertices, clip, opacity, blend)?);
                         assert_eq!(actual.pixels(), reference.pixels(), "{blend:?} {opacity} {clip:?}");
                     }
                 }
@@ -3431,11 +3433,11 @@ mod unit_canvas_plane_tests {
         ] {
             let mut malformed = vertices;
             malformed[vertex][field] = value;
-            assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, malformed, None, 255, BlendMode::SourceOver));
+            assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, malformed, None, 255, BlendMode::SourceOver)?);
         }
         let mut outside_source = vertices;
         outside_source.iter_mut().for_each(|vertex| vertex[4] += 2.);
-        assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, outside_source, None, 255, BlendMode::SourceOver));
+        assert!(!draw_unit_canvas_plane(&mut canvas, &source, None, outside_source, None, 255, BlendMode::SourceOver)?);
         assert!(canvas.pixels().iter().all(|&channel| channel == 0));
         Ok(())
     }
