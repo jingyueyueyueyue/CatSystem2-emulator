@@ -228,7 +228,7 @@ impl crate::HeadlessPlayer {
         Ok(wire::encode_component(&snapshot)?)
     }
 
-    pub(crate) fn prepare_image_list_state_restore(saved: &ObjectGraphSnapshot,
+    pub(crate) fn prepare_image_list_state_restore(&self, saved: &ObjectGraphSnapshot,
         images: &BTreeMap<u32, RgbaFrame>, resources: &mut BTreeMap<u32, crate::DesktopImageResource>,
     ) -> Result<PreparedImageLists> {
         let s: Snapshot = wire::decode_component(&saved.image_lists)?;
@@ -251,7 +251,7 @@ impl crate::HeadlessPlayer {
         }
         let planes = Self::prepare_plane_visuals_restore(&s.planes, saved)?;
         let (canvas, vram_overflow) = crate::canvas_native::CanvasNativeState::prepare_graph_restore(&s.canvas,
-            saved.back_buffer.size)?;
+            saved.back_buffer.size, self.data_services.image_list_memory)?;
         let cache = crate::image_manager::ImageManager::prepare_cache_restore(s.cache)?;
         let list = |id: &u32| s.lists.contains_key(id)
             && saved.records.get(id).is_some_and(|r| r.kind == 15);

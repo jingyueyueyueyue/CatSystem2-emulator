@@ -84,7 +84,7 @@ impl CanvasNativeState {
         }
     }
 
-    pub(crate) fn prepare_graph_restore(bytes: &[u8], logical: [u32; 2]) -> Result<(Self, Option<VramOverflow>)> {
+    pub(crate) fn prepare_graph_restore(bytes: &[u8], logical: [u32; 2], memory: ImageListMemory) -> Result<(Self, Option<VramOverflow>)> {
         let (s, overflow): (Snapshot, Option<VramOverflow>) = if let Some(bytes) = bytes.strip_prefix(OVERFLOW_TAG) {
             let (state, overflow) = wire::decode_component(bytes)?;
             (state, Some(overflow))
@@ -107,9 +107,10 @@ impl CanvasNativeState {
         }
         if let Some(overflow) = &overflow {
             if !s.initialized || overflow.tile != s.tile || overflow.grid != s.grid
+                || overflow.pixels.len() > overflow.max_resident_tiles(memory)
                 || overflow.pixels.iter().any(|(&index, bytes)| {
                     s.tiles.get(index as usize).is_none_or(Option::is_none)
-                        || bytes.len() != overflow.tile_bytes()
+                        || bytes.len() as u64 != overflow.tile_bytes()
                 })
             {
                 bail!("saved offscreen VRAM differs from the allocated texture slots");
@@ -121,7 +122,7 @@ impl CanvasNativeState {
             frame.try_into_canvas().map_err(|_| anyhow::anyhow!("saved offscreen canvas is empty"))
         }).transpose()?;
         Ok((Self { initialized: s.initialized, mode: s.mode, enabled: s.enabled, active: s.active,
-            size: s.size, tile: s.tile, grid: s.grid, areas: s.areas, split_row: s.split_row,
+            size: s.size, tile: s.tile, grid: s.grid, memory, areas: s.areas, split_row: s.split_row,
             tiles: s.tiles, view, offscreen }, overflow))
     }
 }
@@ -166,7 +167,7 @@ mod tests {
         let legacy = crate::image_manager::capture_frame(&RgbaFrame::from_rgba8(2, 1, rgba.to_vec())?);
         assert_eq!(wire::encode_component(&saved.offscreen)?, wire::encode_component(&Some(legacy))?);
 
-        let (restored, overflow) = CanvasNativeState::prepare_graph_restore(&bytes, [2, 1])?;
+        let (restored, overflow) = CanvasNativeState::prepare_graph_restore(&bytes, [2, 1], state.memory)?;
         assert!(overflow.is_none());
         assert_eq!(restored.offscreen.as_ref().unwrap().pixels(), rgba);
         assert_eq!(restored.graph_snapshot(None)?, bytes);

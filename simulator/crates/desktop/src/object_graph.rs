@@ -368,7 +368,7 @@ impl HeadlessPlayer {
                 uses_alpha: r.uses_alpha, auxiliary: r.auxiliary, attributes: r.attributes.clone() }))
         }).collect::<anyhow::Result<_>>()?;
         let resource_layers = crate::image_manager::ImageManager::prepare_resource_layers_restore(&saved.image_resources)?;
-        let mut image_lists = Self::prepare_image_list_state_restore(&saved, &images, &mut resources)?;
+        let mut image_lists = self.prepare_image_list_state_restore(&saved, &images, &mut resources)?;
         // Reinsert validated proxy identities before allocator preparation or
         // the first live write; never rebuild their history during commit.
         image_lists.prepare_scene_nodes(&mut nodes)?;

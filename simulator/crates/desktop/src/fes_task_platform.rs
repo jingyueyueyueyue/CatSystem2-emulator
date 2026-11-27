@@ -506,7 +506,7 @@ impl super::fes_tasks::FesTaskStore {
 const BASE_IMAGE_LIST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_IMAGE_LIST_BYTES: u64 = 512 * 1024 * 1024;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct ImageListMemory {
     // The host samples available RAM at game open. A zero sample authorizes
     // only the baseline used when the host has no memory measurement.
