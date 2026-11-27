@@ -8,7 +8,32 @@ const CANONICAL: [u32; 14] = [
 ];
 
 #[derive(Clone, Copy)]
-pub(super) struct FesCommandProfile(&'static [u32], u32);
+struct FesCommandProfile(&'static [u32], u32);
+
+pub(super) fn canonical_command(raw: u32, controls: [Option<u32>; 2], digest: &str) -> Option<u32> {
+    let [entry, locals] = controls;
+    if entry == Some(raw) && entry != locals {
+        return Some(341);
+    }
+    if locals == Some(raw) && entry != locals {
+        return Some(353);
+    }
+    exact_profile(digest).and_then(|profile| profile.canonical(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_command;
+
+    #[test]
+    fn fes_controls_use_registered_wrappers_without_a_known_executable_hash() {
+        let controls = [Some(298), Some(310)];
+        assert_eq!(canonical_command(298, controls, ""), Some(341));
+        assert_eq!(canonical_command(310, controls, ""), Some(353));
+        assert_eq!(canonical_command(341, controls, ""), None);
+        assert_eq!(canonical_command(298, [Some(298); 2], ""), None);
+    }
+}
 
 impl FesCommandProfile {
     pub(super) fn canonical(self, raw: u32) -> Option<u32> {
@@ -18,7 +43,7 @@ impl FesCommandProfile {
     }
 }
 
-pub(super) fn exact_profile(sha256: &str) -> Option<FesCommandProfile> {
+fn exact_profile(sha256: &str) -> Option<FesCommandProfile> {
     let (commands, system): (&'static [u32], u32) = match sha256 {
         "0e1dde51e86e9152d8e1d27b82efb15916cb9f82d23dd30990212fafd96c8b9f" => (&[
             326, 327, 328, 329, 330, 331, 335, 336, 337, 338, 339, 342, 347, 346,

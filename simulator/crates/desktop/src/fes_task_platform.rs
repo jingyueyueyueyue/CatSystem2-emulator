@@ -503,12 +503,55 @@ impl super::fes_tasks::FesTaskStore {
     }
 }
 
+const BASE_IMAGE_LIST_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_IMAGE_LIST_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct ImageListMemory {
+    // The host samples available RAM at game open. A zero sample authorizes
+    // only the baseline used when the host has no memory measurement.
+    available_bytes: u64,
+}
+
+impl ImageListMemory {
+    pub(super) fn new(available_bytes: u64) -> Self {
+        Self { available_bytes }
+    }
+
+    pub(super) fn limit(&self) -> u64 {
+        (self.available_bytes / 8).clamp(BASE_IMAGE_LIST_BYTES, MAX_IMAGE_LIST_BYTES)
+    }
+}
+
 impl LoggingHost<'_> {
+    pub(super) fn allocate_fes_image_list(&self, id: u32, [width, height]: [u32; 2]) -> Result<RgbaFrame> {
+        let limit = self.data_services.image_list_memory.limit();
+        let bytes = (u64::from(width) * u64::from(height))
+            .checked_mul(4)
+            .with_context(|| format!("image-list dimensions {width}×{height} overflow the RGBA8 size"))?;
+        let mut other_bytes = 0u64;
+        let mut uses_extended_budget = bytes > BASE_IMAGE_LIST_BYTES;
+        for (&other, list) in &self.data_services.tasks.fes.platform.lists {
+            if other == id {
+                continue;
+            }
+            let [width, height] = list.size.map(u64::from);
+            let bytes = width.saturating_mul(height).saturating_mul(4);
+            uses_extended_budget |= bytes > BASE_IMAGE_LIST_BYTES;
+            other_bytes = other_bytes.saturating_add(bytes);
+        }
+        if uses_extended_budget && other_bytes.saturating_add(bytes) > limit {
+            bail!("image list {width}×{height} needs {bytes} bytes with {other_bytes} bytes already in use (session budget {limit} bytes)");
+        }
+        RgbaFrame::blank_native_rgba8(width, height, limit as usize)
+            .with_context(|| format!("allocate {width}×{height} FES image list"))
+    }
+
     pub(super) fn initialize_fes_image_list(&mut self, id: u32, width: u32, height: u32) -> Result<()> {
         if self.scene_nodes.get(&id).is_none_or(|node| node.kind != 15) {
             bail!("image-list initialization requires a live type-15 task");
         }
-        let frame = blank(width, height)?;
+        let frame = self.allocate_fes_image_list(id, [width, height])?;
         super::list_native::clear_entries(self, id)?;
         let size = self.canvas.as_ref().map(|canvas| [canvas.width(), canvas.height()])
             .context("type-15 base plane needs a render context")?;
@@ -518,7 +561,7 @@ impl LoggingHost<'_> {
             .map(|old| (old.enabled, old.submit, old.force, old.base_plane))
             .unwrap_or((enabled, submit, force, None));
         if let Some(old) = old { self.release_image_wrapper(old.output)?; }
-        let output = self.register_image_wrapper(frame, false)?;
+        let output = self.register_image_list_wrapper(frame)?;
         self.data_services.tasks.fes.platform.lists.insert(id, ImageList {
             output, size: [width, height], offset: [0; 2], base_plane,
             enabled, submit, force, layers: BTreeMap::new(),
@@ -2249,17 +2292,6 @@ pub(super) fn register_region(
         .regions
         .sort_by_key(|region| std::cmp::Reverse(region.words[1] as i32));
     Ok(())
-}
-
-fn blank(width: u32, height: u32) -> Result<RgbaFrame> {
-    let size = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|size| size.checked_mul(4))
-        .filter(|&size| size <= 64 * 1024 * 1024)
-        .context("FES image-list size exceeds 64 MiB")?;
-    Ok(RgbaFrame::from_native_rgba8(
-        width, height, vec![0; size], cs2_renderer::FrameMetadata::raster([width, height]),
-    )?)
 }
 
 fn blank_layer(name: String, kind: String) -> FesMediaLayer {

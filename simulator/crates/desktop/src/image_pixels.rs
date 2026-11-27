@@ -101,7 +101,17 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn register_image_wrapper(&mut self, frame: RgbaFrame, owned: bool) -> Result<u32> {
-        if self.image_handles.len() >= MAX_WRAPPERS || frame.pixels().len() > MAX_PIXELS {
+        self.register_image_wrapper_with_limit(frame, owned, MAX_PIXELS)
+    }
+
+    pub(super) fn register_image_list_wrapper(&mut self, frame: RgbaFrame) -> Result<u32> {
+        self.register_image_wrapper_with_limit(frame, false, self.data_services.image_list_memory.limit() as usize)
+    }
+
+    fn register_image_wrapper_with_limit(
+        &mut self, frame: RgbaFrame, owned: bool, limit: usize,
+    ) -> Result<u32> {
+        if self.image_handles.len() >= MAX_WRAPPERS || frame.pixels().len() > limit {
             return Err(native_state_error("ordinary image storage limit exceeded"));
         }
         let handle = self.allocate_handle();

@@ -495,10 +495,14 @@ impl LoggingHost<'_> {
             if packet[1] < 256 { return Ok(None); }
             let digest = self.data_services.native_profile.map(|profile| profile.pe_sha256)
                 .or(self.data_services.css_task_pe_sha256).unwrap_or("");
-            // Unknown versions/messages remain unhandled and follow the
-            // existing base-class child traversal with their raw packet.
-            let Some(profile) = fes_command_profile::exact_profile(digest) else { return Ok(None); };
-            let Some(code) = profile.canonical(packet[1]) else { return Ok(None); };
+            let controls = self.data_services.ordinary_native_table.as_ref()
+                .map(|table| table.fes_control_wrappers())
+                .or_else(|| self.data_services.startup_companion_natives.as_ref()
+                    .map(|table| table.fes_control_wrappers))
+                .unwrap_or_default();
+            let Some(code) = fes_command_profile::canonical_command(packet[1], controls, digest) else {
+                return Ok(None);
+            };
             code
         };
         let command = TaskCommand {

@@ -471,7 +471,11 @@ fn compose_inner(
             None => {
                 let old = &host.image_handles[&handle];
                 if same_size {
-                    Canvas::from_rgba8(surface.size[0], surface.size[1], old.pixels().to_vec())?
+                    let source = old.pixels();
+                    let mut pixels = Vec::new();
+                    pixels.try_reserve_exact(source.len()).context("allocate image-list redraw buffer")?;
+                    pixels.extend_from_slice(source);
+                    Canvas::from_rgba8(surface.size[0], surface.size[1], pixels)?
                 } else {
                     let mut canvas = Canvas::new(surface.size[0], surface.size[1])?;
                     canvas.copy_frame(old, &ImageDrawOptions::new(Point::new(0, 0)))?;
@@ -672,6 +676,78 @@ fn draw_list_layers_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remastered_image_list_initializes_and_composes_at_native_size() -> Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-list-large-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let player = crate::HeadlessPlayer::open_with_save_root(&root, root.join("profile"));
+        std::fs::remove_dir(&root)?;
+        let mut player = player?;
+        player.with_host(|host| {
+            let id = host.create_task_object(15, host.current_task_id, b"imglist", b"")?;
+            let (width, height) = (5888, 4864);
+            let args = [id, width, height].map(u32::to_le_bytes).concat();
+            assert!(matches!(host.list_contract_native(256, &args)?, cs2_script::NativeReturn::Continue));
+            compose(host, id, true, None)?;
+
+            let handle = host.data_services.tasks.fes.platform.lists[&id].output;
+            let frame = &host.image_handles[&handle];
+            assert_eq!(frame.dimensions(), (width, height));
+            assert_eq!(frame.pixels().len(), 114_556_928);
+            assert_eq!(frame.pixel(5887, 4863)?, cs2_renderer::Color::TRANSPARENT);
+            assert!(host.initialize_fes_image_list(id, u32::MAX, height).is_err());
+            assert_eq!(host.data_services.tasks.fes.platform.lists[&id].output, handle);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn android_memory_budget_allows_large_list_startup_resize_and_clear() -> Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("cs2-list-budget-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let open = |bytes| crate::HeadlessPlayer::open_with_android_memory(
+            &root, root.join("profile"), cs2_runtime::resource_router::GameLanguage::Automatic, bytes,
+        );
+        let baseline = open(0);
+        let expanded = open(2 * 1024 * 1024 * 1024);
+        std::fs::remove_dir(&root)?;
+        let mut baseline = baseline?;
+        let mut expanded = expanded?;
+        let size = [8192, 4352]; // 136 MiB of RGBA8
+
+        baseline.with_host(|host| {
+            let id = host.create_task_object(15, host.current_task_id, b"baseline", b"")?;
+            let args = [id, size[0], size[1]].map(u32::to_le_bytes).concat();
+            assert!(host.list_contract_native(256, &args).is_err());
+            assert!(!host.data_services.tasks.fes.platform.lists.contains_key(&id));
+            Ok(())
+        })?;
+        expanded.with_host(|host| {
+            let id = host.create_task_object(15, host.current_task_id, b"expanded", b"")?;
+            let args = [id, size[0], size[1]].map(u32::to_le_bytes).concat();
+            host.list_contract_native(256, &args).context("initialize above 128 MiB")?;
+            compose(host, id, true, None).context("compose above 128 MiB")?;
+            let handle = host.data_services.tasks.fes.platform.lists[&id].output;
+            assert_eq!(host.image_handles[&handle].pixels().len(), 136 * 1024 * 1024);
+
+            let args = [id, size[0], size[1] + 128].map(u32::to_le_bytes).concat();
+            host.list_contract_native(663, &args).context("resize above 128 MiB")?;
+            host.list_contract_native(341, &id.to_le_bytes()).context("clear above 128 MiB")?;
+            let handle = host.data_services.tasks.fes.platform.lists[&id].output;
+            assert_eq!(host.image_handles[&handle].pixels().len(), 140 * 1024 * 1024);
+            assert_eq!(host.image_handles[&handle].pixel(8191, 4479)?, cs2_renderer::Color::TRANSPARENT);
+
+            // A failed native call leaves its route in place for the VM.
+            let second = host.create_task_object(15, host.current_task_id, b"second", b"")?;
+            let args = [second, size[0], size[1]].map(u32::to_le_bytes).concat();
+            assert!(host.list_contract_native(256, &args).is_err());
+            assert!(!host.data_services.tasks.fes.platform.lists.contains_key(&second));
+            Ok(())
+        })
+    }
 
     #[test]
     fn empty_list_clear_reuses_only_exclusive_full_storage() -> Result<()> {

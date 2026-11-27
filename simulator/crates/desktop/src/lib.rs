@@ -7348,6 +7348,7 @@ impl HeadlessPlayer {
             .and_then(|binary| cs2_runtime::native_profile::profile_for_pe_sha256(&binary.sha256, None));
         if let Some(available) = available_memory_bytes {
             player.enable_host_fast_forward(available);
+            player.data_services.image_list_memory = fes_task_platform::ImageListMemory::new(available);
         }
         let executable_table = cs2_runtime::native_table::OrdinaryNativeTable::from_game_executable(&player.scan);
         player.data_services.ordinary_native_table_from_executable = executable_table.is_some();

@@ -93,6 +93,7 @@ pub(super) struct DataServices {
     pub(super) sound_media: super::sound_media::SoundMediaStore,
     pub(super) host_clock: super::media_clock::HostClock,
     pub(super) list_native: super::list_native::ListNativeStore,
+    pub(super) image_list_memory: super::fes_task_platform::ImageListMemory,
     pub(super) canvas_native: super::canvas_native::CanvasNativeState,
     pub(super) transitions: super::transition_native::TransitionStore,
     pub(super) files: super::file_native::FileNativeStore,

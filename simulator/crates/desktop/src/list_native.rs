@@ -217,12 +217,8 @@ fn is_legacy_list_pe(sha: Option<&str>) -> bool {
     matches!(sha, Some(super::css_model::UTATE_SHA | super::particle_external::CAMPANELLA_SHA))
 }
 
-fn is_short_registration_pe(sha: Option<&str>) -> bool {
-    is_legacy_list_pe(sha) || sha == Some(super::css_model::SHA)
-}
-
-fn uses_short_registration(sha: Option<&str>, index: u32, bytes: usize) -> bool {
-    matches!(index, 257 | 259) && bytes == 32 && is_short_registration_pe(sha)
+fn uses_short_registration(index: u32, bytes: usize) -> bool {
+    matches!(index, 257 | 259) && bytes == 32
 }
 
 #[derive(Default)]
@@ -652,7 +648,7 @@ pub(super) fn receive(
             host.events.push(super::LogicEvent {
                 frame: host.frame,
                 kind: "image-list-error".into(),
-                detail: error.to_string(),
+                detail: format!("{error:#}"),
             });
             native_state_error("type-15 receiver failed; see image-list-error")
         })
@@ -859,11 +855,15 @@ fn receive_inner(
             }
         }
         297 => {
+            let blank = host.data_services.tasks.fes.platform.lists.get(&id)
+                .map(|list| host.allocate_fes_image_list(id, list.size))
+                .transpose()?;
             clear_entries(host, id)?;
-            if let Some(list) = host.data_services.tasks.fes.platform.lists.get_mut(&id) {
+            if let Some(frame) = blank {
+                let list = host.data_services.tasks.fes.platform.lists.get_mut(&id).unwrap();
                 list.layers.clear();
-                let (handle, size) = (list.output, list.size);
-                host.replace_image_wrapper_pixels(handle, blank(size)?)?;
+                let handle = list.output;
+                host.replace_image_wrapper_pixels(handle, frame)?;
             }
             restore_background(host, id)?;
             if let Some(surface) = host.data_services.list_native.surfaces.get_mut(&id) {
@@ -1053,8 +1053,21 @@ fn receive_inner(
             buffers.write_data1(&handle.to_le_bytes())?;
         }
         314 if initialized => {
-            let frame = blank([command.data[0], command.data[1]])?;
-            let handle = host.register_image_wrapper(frame, false)?;
+            let size = [command.data[0], command.data[1]];
+            let frame = host.allocate_fes_image_list(id, size)?;
+            let tile = if host.data_services.list_native.surfaces.contains_key(&id) {
+                host.ensure_canvas_state()?;
+                Some(host.data_services.canvas_native.tile_size().unwrap_or(size.map(|axis| axis.max(1))))
+            } else {
+                None
+            };
+            let handle = host.register_image_list_wrapper(frame)?;
+            if let Some(tile) = tile
+                && let Err(error) = host.data_services.list_native.surfaces.get_mut(&id).unwrap().resize(size, tile)
+            {
+                host.release_image_wrapper(handle)?;
+                return Err(error);
+            }
             let list = host
                 .data_services
                 .tasks
@@ -1065,23 +1078,9 @@ fn receive_inner(
                 .unwrap();
             let old = list.output;
             list.output = handle;
-            list.size = [command.data[0], command.data[1]];
+            list.size = size;
             if host.image_handles.contains_key(&old) {
                 host.release_image_wrapper(old)?;
-            }
-            if host.data_services.list_native.surfaces.contains_key(&id) {
-                host.ensure_canvas_state()?;
-                let tile = host
-                    .data_services
-                    .canvas_native
-                    .tile_size()
-                    .unwrap_or([command.data[0].max(1), command.data[1].max(1)]);
-                host.data_services
-                    .list_native
-                    .surfaces
-                    .get_mut(&id)
-                    .unwrap()
-                    .resize([command.data[0], command.data[1]], tile)?;
             }
             let keys: Vec<_> = host
                 .data_services
@@ -1167,9 +1166,7 @@ fn register_owned(
     let visible = read_u32(bytes, 48)? != 0;
     let transform = read_u32(bytes, 52)?;
     let no_sources = sources == [0; 4];
-    let legacy_empty = no_sources
-        && bytes.get(60..) == Some(LEGACY_EMPTY_LIST_SOURCE.as_slice())
-        && is_short_registration_pe(host.css_task_sha());
+    let legacy_empty = no_sources && bytes.get(60..) == Some(LEGACY_EMPTY_LIST_SOURCE.as_slice());
     if no_sources && !legacy_empty {
         if command.code == 286 && identity != 0 {
             if let Some(mut entry) = host.data_services.list_native.entries.get_mut(&stamp) {
@@ -1945,10 +1942,10 @@ impl LoggingHost<'_> {
             .iter()
             .find(|spec| spec.native == index)
             .ok_or_else(|| native_state_error("native has no image-list batch contract"))?;
-        if matches!(index, 257 | 259) && args.len() == 32 && self.css_task_sha().is_none() {
+        let short = uses_short_registration(index, args.len());
+        if short && self.css_task_sha().is_none() {
             self.bind_utate_plane_input_profile()?;
         }
-        let short = uses_short_registration(self.css_task_sha(), index, args.len());
         if !short && args.len() < contract.bytes {
             return Err(native_state_error("image-list arguments are truncated"));
         }
@@ -2132,24 +2129,17 @@ mod registration_tests {
     }
 
     #[test]
-    fn story_entry_records_are_short_only_for_verified_executables() {
-        for (sha, target, wrapper) in [
-            (crate::css_model::UTATE_SHA, 11, 40),
-            (crate::particle_external::CAMPANELLA_SHA, 33, 33),
-        ] {
-            let args = words(&[target, 1, wrapper, 0, 0, 255, 1, 1]);
-            let expected = words(&[91, 0, 0, 0, 0, 0, 0, 0, 0, 1f32.to_bits(), 1f32.to_bits(), 255, 1, 0, 0]);
-            for native in [257, 259] {
-                assert!(uses_short_registration(Some(sha), native, args.len()));
-                assert_eq!(list_registration_record(native, &args, 0, 91, true).unwrap(), expected);
-                assert!(!uses_short_registration(None, native, args.len()));
-                assert!(!uses_short_registration(Some("other"), native, args.len()));
-                assert!(!uses_short_registration(Some(sha), native, 31));
-                assert!(!uses_short_registration(Some(sha), native, 33));
-                assert!(!uses_short_registration(Some(sha), native, 52));
-            }
-            assert!(!uses_short_registration(Some(sha), 622, args.len()));
+    fn story_entry_records_use_the_short_argument_layout() {
+        let args = words(&[11, 1, 40, 0, 0, 255, 1, 1]);
+        let expected = words(&[91, 0, 0, 0, 0, 0, 0, 0, 0, 1f32.to_bits(), 1f32.to_bits(), 255, 1, 0, 0]);
+        for native in [257, 259] {
+            assert!(uses_short_registration(native, args.len()));
+            assert_eq!(list_registration_record(native, &args, 0, 91, true).unwrap(), expected);
+            assert!(!uses_short_registration(native, 31));
+            assert!(!uses_short_registration(native, 33));
+            assert!(!uses_short_registration(native, 52));
         }
+        assert!(!uses_short_registration(622, args.len()));
     }
 
     #[test]
@@ -2161,16 +2151,16 @@ mod registration_tests {
             255, 1, 0, 0,
         ]);
         for index in [257, 259] {
-            assert!(uses_short_registration(sha, index, captured.len()));
+            assert!(uses_short_registration(index, captured.len()));
             assert_eq!(list_registration_record(index, &captured, 0, 91, true).unwrap(), expected);
-            assert!(!uses_short_registration(sha, index, 31));
-            assert!(!uses_short_registration(sha, index, 33));
-            assert!(!uses_short_registration(sha, index, 52));
+            assert!(!uses_short_registration(index, 31));
+            assert!(!uses_short_registration(index, 33));
+            assert!(!uses_short_registration(index, 52));
             let empty = list_registration_record(index, &captured, 0, 0, true).unwrap();
             assert_eq!(&empty[60..], LEGACY_EMPTY_LIST_SOURCE);
         }
-        assert!(!uses_short_registration(sha, 622, captured.len()));
-        assert!(!uses_short_registration(sha, 627, captured.len()));
+        assert!(!uses_short_registration(622, captured.len()));
+        assert!(!uses_short_registration(627, captured.len()));
         assert!(!is_legacy_list_pe(sha));
     }
 
@@ -3304,19 +3294,6 @@ fn interpolate15(source: &RgbaFrame, at: [i32; 2], fraction: [i32; 2]) -> Option
             .sum::<i32>()
             >> 15) as u8
     }))
-}
-
-fn blank(size: [u32; 2]) -> Result<RgbaFrame> {
-    let length = (size[0] as usize)
-        .checked_mul(size[1] as usize)
-        .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n <= 128 * 1024 * 1024)
-        .context("image-list output exceeds 128 MiB")?;
-    let mut pixels = Vec::new();
-    pixels.try_reserve_exact(length)?;
-    pixels.resize(length, 0);
-    Ok(RgbaFrame::from_native_rgba8(size[0], size[1], pixels,
-        cs2_renderer::FrameMetadata::raster(size))?)
 }
 
 fn float(args: &[u8], offset: usize) -> Result<f32> {
