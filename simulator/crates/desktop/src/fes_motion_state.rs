@@ -190,7 +190,7 @@ impl FesMotionStore {
                 { bail!("FES motion checkpoint identity/kind/parent differs from its live bank"); }
                 let identity = (id, key.0.clone(), key.1);
                 match node.kind {
-                    Kind::Base if definition.kind_name == b"DRAW" => {
+                    Kind::Base if matches!(definition.kind_name.as_slice(), b"DRAW" | b"WIPE") => {
                         if extensions.draws.get(&identity) != node.parent.as_ref() {
                             bail!("FES DRAW checkpoint motion parent differs from its actual PLANE owner");
                         }

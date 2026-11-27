@@ -12,71 +12,80 @@
   },
   "9": {
     "start": {
-      "before": 379, "click": 382, "after": 650, "region": 14,
-      "inputs": ["move:381:195,357", "require-hit:382:14", "382:195,357"]
+      "before": 1190, "click": 1200, "after": 1580, "region": 14,
+      "inputs": ["move:1195:195,357", "require-hit:1200:14", "1200:195,357"]
     },
     "load-disabled": {
-      "before": 379, "click": 382, "after": 487, "region": 15, "expectation": "disabled",
-      "inputs": ["move:381:195,408", "382:195,408"]
+      "before": 1190, "click": 1200, "after": 1380, "region": 15, "expectation": "disabled",
+      "inputs": ["move:1195:195,408", "1200:195,408"]
     },
     "config": {
-      "before": 379, "click": 382, "after": 630, "region": 16,
-      "inputs": ["move:381:195,459", "require-hit:382:16", "382:195,459"]
+      "before": 1190, "click": 1200, "after": 1580, "region": 16,
+      "inputs": ["move:1195:195,459", "require-hit:1200:16", "1200:195,459"]
     },
     "exit-yes": {
-      "before": 487, "click": 491, "after": 610, "region": 26, "expectation": "exit",
-      "inputs": ["move:381:195,561", "require-hit:382:18", "382:195,561",
-        "move:490:552,366", "require-hit:491:26", "491:552,366"]
+      "before": 2960, "click": 2980, "after": 3050, "region": 26, "expectation": "exit",
+      "inputs": ["move:2325:195,561", "require-hit:2340:18", "2340:195,561",
+        "move:2965:552,366", "require-hit:2980:26", "2980:552,366", "capture:2982"]
     },
     "exit-no": {
-      "before": 487, "click": 491, "after": 608, "region": 27,
-      "inputs": ["move:381:195,561", "require-hit:382:18", "382:195,561",
-        "move:490:729,366", "require-hit:491:27", "491:729,366"]
+      "before": 2960, "click": 2980, "after": 3200, "region": 27,
+      "region_change": [27, true, null],
+      "inputs": ["move:2325:195,561", "require-hit:2340:18", "2340:195,561",
+        "move:2965:729,366", "require-hit:2980:27", "2980:729,366"]
     }
   },
   "11": {
     "start": {
-      "before": 610, "click": 613, "after": 1560, "region": 15,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1153,476", "require-hit:613:15", "613:1153,476",
-        "capture:718", "capture:962", "capture:1330"]
+      "before": 1190, "click": 1200, "after": 2180, "region": 15,
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1153,476", "require-hit:1200:15", "1200:1153,476",
+        "capture:1440", "capture:1680", "capture:1930"]
     },
     "continue-disabled": {
-      "before": 610, "click": 613, "after": 747, "region": 16, "expectation": "disabled",
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1153,527", "613:1153,527"]
+      "before": 1190, "click": 1200, "after": 1380, "region": 16, "expectation": "disabled",
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1153,527", "1200:1153,527"]
     },
     "config": {
-      "before": 610, "click": 613, "after": 950, "region": 17,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1154,581", "require-hit:613:17", "613:1154,581"]
+      "before": 1190, "click": 1200, "after": 1770, "region": 17,
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1154,581", "require-hit:1200:17", "1200:1154,581"]
     },
     "config-back": {
-      "before": 718, "click": 722, "after": 850, "region": 25,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1154,581", "require-hit:613:17", "613:1154,581",
-        "move:721:1210,674", "require-hit:722:25", "722:1210,674"]
+      "before": 1780, "click": 1800, "after": 2220, "region": 25,
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1154,581", "require-hit:1200:17", "1200:1154,581",
+        "move:1790:1210,674", "require-hit:1800:25", "1800:1210,674"]
     },
     "config-text": {
-      "before": 718, "click": 722, "after": 850, "region": 20,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1154,581", "require-hit:613:17", "613:1154,581",
-        "move:721:1113,39", "require-hit:722:20", "722:1113,39"]
+      "before": 1780, "click": 1800, "after": 2220, "region": 20,
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1154,581", "require-hit:1200:17", "1200:1154,581",
+        "move:1790:1113,39", "require-hit:1800:20", "1800:1113,39"]
     },
     "config-sound": {
-      "before": 718, "click": 722, "after": 850, "region": 21,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1154,581", "require-hit:613:17", "613:1154,581",
-        "move:721:1210,39", "require-hit:722:21", "722:1210,39"]
+      "before": 1780, "click": 1800, "after": 2220, "region": 21,
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1154,581", "require-hit:1200:17", "1200:1154,581",
+        "move:1790:1210,39", "require-hit:1800:21", "1800:1210,39"]
     },
     "exit-yes": {
-      "before": 718, "click": 722, "after": 850, "region": 35, "expectation": "exit",
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1153,686", "require-hit:613:19", "613:1153,686",
-        "move:721:583,393", "require-hit:722:35", "722:583,393"]
+      "before": 2280, "click": 2300, "after": 2640, "region": 35, "expectation": "exit",
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1153,686", "require-hit:1200:19",
+        "1200:1153,686", "move:2290:583,393", "require-hit:2300:35", "2300:583,393", "capture:2302"]
     },
     "exit-no": {
-      "before": 718, "click": 722, "after": 850, "region": 36,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1153,686", "require-hit:613:19", "613:1153,686",
-        "move:721:693,393", "require-hit:722:36", "722:693,393"]
+      "before": 2280, "click": 2300, "after": 2890, "region": 36,
+      "region_change": [36, true, null],
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1153,686", "require-hit:1200:19",
+        "1200:1153,686", "move:2290:693,393", "require-hit:2300:36", "2300:693,393"]
     },
     "exit-confirmation-toggle": {
-      "before": 718, "click": 722, "after": 850, "region": 37,
-      "inputs": ["215:13", "385:13", "550:13", "move:612:1153,686", "require-hit:613:19", "613:1153,686",
-        "move:721:639,489", "require-hit:722:37", "722:639,489"]
+      "before": 2280, "click": 2300, "after": 2640, "region": 37,
+      "accept_message_resume": true,
+      "inputs": ["215:13", "385:13", "550:13", "move:1195:1153,686", "require-hit:1200:19", "1200:1153,686",
+        "move:2290:639,489", "require-hit:2300:37", "2300:639,489"]
     }
   }
 }

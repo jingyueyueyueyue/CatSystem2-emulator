@@ -2707,6 +2707,7 @@ impl LoggingHost<'_> {
             drawing_available: self.canvas.is_some(),
             utate_string_receiver,
             legacy_string_receiver_45,
+            legacy_text_decode_offset: None,
         };
         let complete_before_utate_append = data.story_trace && utate_string_receiver && index == 614
             && target.and_then(|id| data.messages.object(id))
@@ -2722,6 +2723,11 @@ impl LoggingHost<'_> {
         {
             let id = u32::from_le_bytes(arguments[..4].try_into().unwrap());
             data.messages.legacy.paint_pending(id, context.device)?;
+        }
+        if let Some(offset) = context.legacy_text_decode_offset {
+            data.note_text_decode(self.events, self.frame, format!(
+                "legacy StringPlane command=104 codec=Cp932 bad_at={offset}",
+            ));
         }
         if data.story_trace && utate_string_receiver
             && self.cst_contexts.values().any(|cst| cst.story.is_scene("00_01"))
@@ -4916,6 +4922,7 @@ impl LoggingHost<'_> {
             drawing_available: self.canvas.is_some(),
             utate_string_receiver: false,
             legacy_string_receiver_45: false,
+            legacy_text_decode_offset: None,
         };
         let Some(route) = context
             .route_message(target)?
@@ -5976,6 +5983,7 @@ impl HeadlessPlayer {
                 drawing_available: true,
                 utate_string_receiver: legacy_kind == Some(UTATE_STRING_KIND),
                 legacy_string_receiver_45: legacy_kind == Some(LEGACY_STRING_KIND_45),
+                legacy_text_decode_offset: None,
             };
             data.messages
                 .frame_update(id, elapsed, &self.scene_nodes, deletion, &mut context)?;
@@ -6169,6 +6177,7 @@ impl HeadlessPlayer {
                 continue;
             }
             if let Some(object) = self.data_services.messages.legacy.object(id) {
+                self.canvas.try_pixels()?;
                 object.draw(&mut self.canvas, node)?;
             }
         }
@@ -6187,6 +6196,7 @@ struct MessagePlatformContext<'a> {
     drawing_available: bool,
     utate_string_receiver: bool,
     legacy_string_receiver_45: bool,
+    legacy_text_decode_offset: Option<usize>,
 }
 
 impl MessageBackend for MessagePlatformContext<'_> {
@@ -6234,6 +6244,10 @@ impl MessageBackend for MessagePlatformContext<'_> {
 }
 
 impl MessageNativeContext for MessagePlatformContext<'_> {
+    fn note_legacy_text_decode(&mut self, offset: usize) {
+        self.legacy_text_decode_offset = Some(offset);
+    }
+
     fn utate_string_receiver(&self) -> bool {
         self.utate_string_receiver
     }

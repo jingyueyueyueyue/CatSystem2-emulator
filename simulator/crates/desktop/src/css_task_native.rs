@@ -175,13 +175,13 @@ impl LoggingHost<'_> {
         };
         let length = record.len();
         let target = read_u32(args, 8)?;
-        if code == 341 && self.data_services.css_models.owners.contains_key(&target)
-        {
-            let body = record.to_vec();
+        if code == 341 && self.data_services.css_models.owners.contains_key(&target) {
             let command = TaskCommand { target: target as i32,
                 sender: self.current_task_id as i32, code, data: [0, 1, 0] };
-            let mut buffers = self.pending_owned_task_buffers(command).unwrap_or(
-                super::native_tasks::OwnedTaskBuffers::new(None, Some(body))?);
+            let mut buffers = match self.pending_owned_task_buffers(command) {
+                Some(pending) => pending,
+                None => super::native_tasks::OwnedTaskBuffers::new(None, Some(record.to_vec()))?,
+            };
             let mut output = 1;
             let outcome = self.route_task_command_buffers(command, &mut buffers, &mut output, 4096)?;
             return Ok(if outcome.is_some_and(|outcome| !outcome.done) {

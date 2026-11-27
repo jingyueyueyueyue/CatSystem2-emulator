@@ -10,42 +10,12 @@ use cs2_script::{NativeReturn, Result, Vm};
 use super::super::{LoggingHost, native_state_error, read_u32};
 use super::{NativeTaskStore, OwnedTaskBuffers};
 
-const LEGACY: &str = "659d5f069f3c97f69a61e12449cf1510b45e48a10649b9ac6977c2b93d6d28ad";
-
-#[derive(Clone, Copy)]
-pub(super) struct OriginalStateTreeAbi {
-    receiver: Option<LegacyReceiver>,
-    commands: StateTreeCommands,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum LegacyReceiver {
-    ParticleCanvas,
-    CssModel,
-}
-
-impl OriginalStateTreeAbi {
-    fn for_sha(sha: &str) -> Option<Self> {
-        match sha {
-            // Wrappers 53a90/54660; factory18d30, view handler1ef20.
-            LEGACY => Some(Self {
-                receiver: Some(LegacyReceiver::ParticleCanvas),
-                commands: StateTreeCommands { capture: 374, restore: 375, release: 376 },
-            }),
-            super::super::css_model::UTATE_SHA => Some(Self {
-                receiver: Some(LegacyReceiver::CssModel),
-                commands: StateTreeCommands { capture: 380, restore: 381, release: 382 },
-            }),
-            _ => None,
-        }
-    }
-}
+const PARTICLE_TREE_COMMANDS: StateTreeCommands =
+    StateTreeCommands { capture: 374, restore: 375, release: 376 };
+const CSS_TREE_COMMANDS: StateTreeCommands =
+    StateTreeCommands { capture: 380, restore: 381, release: 382 };
 
 impl NativeTaskStore {
-    pub(super) fn bind_original_state_tree_profile(&mut self, sha: &str) {
-        self.original_state_tree_abi = OriginalStateTreeAbi::for_sha(sha);
-    }
-
     pub(crate) fn model_state_tree_for_owner(&self, owner: u32, handle: u32) -> Result<StateTree> {
         self.model_state_trees.get(&handle).filter(|(id, _)| *id == owner)
             .map(|(_, tree)| tree.clone()).ok_or_else(|| native_state_error(
@@ -70,17 +40,9 @@ impl LoggingHost<'_> {
                 .and_then(|companion| companion.state_tree_commands))
     }
 
-    fn state_tree_abi(&self) -> Option<OriginalStateTreeAbi> {
-        let legacy = self.data_services.tasks.original_state_tree_abi.or_else(||
-            self.data_services.native_profile.map(|p| p.pe_sha256)
-                .or(self.data_services.css_task_pe_sha256).and_then(OriginalStateTreeAbi::for_sha));
-        legacy.or_else(|| self.registered_state_tree_commands()
-            .map(|commands| OriginalStateTreeAbi { receiver: None, commands }))
-    }
-
     pub(super) fn original_state_tree_native(&mut self, index: u32, args: &[u8]) -> Result<NativeReturn> {
         if !matches!(index, 688 | 689) { return Err(native_state_error("invalid original state-tree native")); }
-        let abi = self.state_tree_abi().ok_or_else(|| native_state_error(
+        let commands = self.registered_state_tree_commands().ok_or_else(|| native_state_error(
             "original 688/689 need a registered state-tree wrapper"))?;
         let css = read_u32(args, 0)?;
         if css == 0 { return Ok(NativeReturn::Value(0)); }
@@ -97,18 +59,15 @@ impl LoggingHost<'_> {
         } else { None };
         let target = read_u32(args, 8)?;
         let kind = self.data_services.tasks.records.get(&target).map(|record| record.kind);
-        let receiver_exists = match abi.receiver {
-            Some(LegacyReceiver::ParticleCanvas) =>
-                self.data_services.particle_external.canvases.contains_key(&target),
-            Some(LegacyReceiver::CssModel) =>
-                self.data_services.css_models.utate_models.contains_key(&target),
-            None => false,
-        };
-        let StateTreeCommands { capture, restore: restore_command, release } = abi.commands;
+        let receiver_exists = (commands == PARTICLE_TREE_COMMANDS
+            && self.legacy_particle_canvas(42)
+            && self.data_services.particle_external.canvases.contains_key(&target))
+            || (commands == CSS_TREE_COMMANDS
+                && self.data_services.css_models.utate_models.contains_key(&target));
+        let StateTreeCommands { capture, restore: restore_command, release } = commands;
         if kind != Some(42) || !receiver_exists {
             return Err(self.task_error(target, cs2_runtime::RuntimeError::Host(format!(
-                "original native{index} has no recovered positive-target state-tree receiver: target={target} kind={kind:?} receiver={:?} commands={capture}/{restore_command}/{release}",
-                abi.receiver,
+                "original native{index} has no recovered positive-target state-tree receiver: target={target} kind={kind:?} commands={capture}/{restore_command}/{release}",
             ))));
         }
         let command = TaskCommand { target: target as i32, sender: self.current_task_id as i32,
@@ -211,7 +170,8 @@ impl LoggingHost<'_> {
                                 _ => None,
                             }
                         } else { None };
-                        let canvas = self.data_services.particle_external.canvases.get_mut(&id).unwrap();
+                        let canvas = self.data_services.particle_external.canvases.get_mut(&id)
+                            .ok_or_else(|| native_state_error("live model canvas disappeared"))?;
                         let (local, saved, base) = match found {
                             Some(index) => {
                                 let node = &mut canvas.nodes[index];
@@ -222,8 +182,10 @@ impl LoggingHost<'_> {
                                 IDENTITY_MODEL_TRANSFORM),
                         };
                         match command.code {
-                            344 | 345 => local.primary = values.unwrap(),
-                            346 | 347 => local.secondary = values.unwrap(),
+                            344 | 345 => local.primary = values.ok_or_else(||
+                                native_state_error("primary model transform was not decoded"))?,
+                            346 | 347 => local.secondary = values.ok_or_else(||
+                                native_state_error("secondary model transform was not decoded"))?,
                             371 => local.freeze_primary(saved, base),
                             372 => local.freeze_secondary(saved),
                             _ => unreachable!(),
@@ -239,7 +201,8 @@ impl LoggingHost<'_> {
                 }
             }
             373 => {
-                let canvas = self.data_services.particle_external.canvases.get_mut(&id).unwrap();
+                let canvas = self.data_services.particle_external.canvases.get_mut(&id)
+                    .ok_or_else(|| native_state_error("live model canvas disappeared"))?;
                 if canvas.loaded {
                     if let Some(found) = canvas.resolve_object(command_path(buffers.data0)?) {
                         match found {
@@ -265,7 +228,8 @@ impl LoggingHost<'_> {
                     let mut prepared = live_state(&self.data_services.particle_external.canvases[&id])?;
                     prepared.restore(tree).map_err(|error| self.task_error(id, error))?;
                     let (root, nodes) = prepared.into_overrides();
-                    let canvas = self.data_services.particle_external.canvases.get_mut(&id).unwrap();
+                    let canvas = self.data_services.particle_external.canvases.get_mut(&id)
+                        .ok_or_else(|| native_state_error("live model canvas disappeared"))?;
                     // All parsing/path validation precedes this single commit.
                     canvas.root_overrides = root;
                     for (node, state) in canvas.nodes.iter_mut().zip(nodes) { node.overrides = state; }
@@ -311,12 +275,14 @@ impl LoggingHost<'_> {
             return Ok(self.queue_task_command_buffers(command, &buffers, output)?
                 .then_some(TaskCommandOutcome { done: true, propagate: false }));
         }
-        let result = self.route_task_command_buffers(command, &mut buffers, output, 4096);
+        let result = self.route_task_command_buffers(command, &mut buffers, output, 4096)?;
         if buffers.data1_write_length() != 0 {
+            let bytes = buffers.data1().and_then(|data| data.get(..buffers.data1_write_length()))
+                .ok_or_else(|| native_state_error("model query lost its written data1 bytes"))?;
             vm.as_deref_mut().ok_or_else(|| native_state_error("model query output requires its caller VM"))?
-                .write(packet[3], &buffers.data1().unwrap()[..buffers.data1_write_length()])?;
+                .write(packet[3], bytes)?;
         }
-        result
+        Ok(result)
     }
 
     // Owned queries explicitly mark equal-byte output too. Missing paths and
@@ -391,6 +357,32 @@ mod tests {
     use crate::{HeadlessPlayer, tests::TempDir};
     use cs2_formats::CssFile;
     use std::path::Path;
+
+    #[test]
+    #[ignore = "requires the installed Campanella engine"]
+    fn native_state_tree_registered_legacy_model_roundtrip() -> anyhow::Result<()> {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../games/\u{795d}\u{798f}\u{306e}\u{30ab}\u{30f3}\u{30d1}\u{30cd}\u{30e9}");
+        let scratch = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(game, &scratch.0)?;
+        player.with_host(|host| {
+            assert_eq!(host.registered_state_tree_commands(), Some(PARTICLE_TREE_COMMANDS));
+            host.data_services.native_profile = None;
+            host.data_services.css_task_pe_sha256 = None;
+            let target = host.create_task_object(42, 0, b"3D View", b"")?;
+            let canvas = host.data_services.particle_external.canvases.get_mut(&target)
+                .ok_or_else(|| anyhow::anyhow!("factory did not install its model canvas"))?;
+            canvas.loaded = true;
+            host.css_handles.insert(1, CssFile::new(1000));
+            let args = [1, 500, target].map(u32::to_le_bytes).concat();
+            assert_eq!(host.portable_object_graph_native(688, &args)?, NativeReturn::Value(1));
+            assert!(host.data_services.tasks.model_state_trees.is_empty());
+            assert!(host.css_handles[&1].try_record(500)?.is_some());
+            assert_eq!(host.portable_object_graph_native(689, &args)?, NativeReturn::Value(1));
+            assert!(host.data_services.tasks.model_state_trees.is_empty());
+            Ok(())
+        })
+    }
 
     #[test]
     #[ignore = "requires the installed V401 and Happiness!2 games"]

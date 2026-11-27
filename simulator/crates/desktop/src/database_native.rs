@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use cs2_formats::database::DatabaseFile;
 use cs2_script::{NativeReturn, Result, Vm};
 use cs2_script::data_snapshot::{DatabaseObjectSnapshot, DatabaseRowSnapshot};
-use super::{LoggingHost, expand_kcs_format, native_state_error, read_u32, trim_nul};
+use super::{LoggingHost, ScriptTextEncoding, expand_kcs_format, native_state_error, read_u32, trim_nul};
 use super::fes_driver::{FesDriverEffect, FesScriptDriver};
 use cs2_script::ExpressionState;
 
@@ -83,7 +83,9 @@ pub(super) fn apply_fes_effect(
     let mut number = |index: usize| driver.evaluate_parameter(&operands[index], command.context.current, shared);
     let handle = number(0)? as u32;
     let loose_gbk = host.data_services.has_loose_gbk_text();
-    let Some(object) = host.data_services.databases.objects.get_mut(&handle) else {
+    let services = &mut host.data_services;
+    let origins = &mut services.cst_text_origins;
+    let Some(object) = services.databases.objects.get_mut(&handle) else {
         return Ok(true);
     };
 
@@ -108,7 +110,7 @@ pub(super) fn apply_fes_effect(
             .skip_while(|key| !(start..=end).contains(&dictionary_head(key)))
             .take_while(|key| dictionary_head(key) <= end)
             .nth(ordinal);
-        write_fes_string(shared, second, found.map_or_else(Vec::new, Vec::clone));
+        write_fes_string(shared, origins, second, found.map_or_else(Vec::new, Vec::clone));
         write_fes_number(shared, first, u32::from(found.is_some()));
         return Ok(true);
     }
@@ -127,8 +129,8 @@ pub(super) fn apply_fes_effect(
             write_fes_number(shared, first, ordinal as u32);
         }
         b"dic_title" => {
-            write_fes_string(shared, first, row.map_or_else(Vec::new, |row| row.title.clone()));
-            write_fes_string(shared, second, row.map_or_else(Vec::new, |row| row.short_title.clone()));
+            write_fes_string(shared, origins, first, row.map_or_else(Vec::new, |row| row.title.clone()));
+            write_fes_string(shared, origins, second, row.map_or_else(Vec::new, |row| row.short_title.clone()));
         }
         b"dic_ind" => {
             let mut output = Vec::new();
@@ -141,7 +143,7 @@ pub(super) fn apply_fes_effect(
                     }
                 }
             }
-            write_fes_string(shared, first, output);
+            write_fes_string(shared, origins, first, output);
         }
         b"dic_update" => {
             let [_, updated_bits, new] = row.map_or([0; 3], |row| row.state);
@@ -173,8 +175,17 @@ fn write_fes_number(shared: &mut ExpressionState, index: i32, value: u32) {
     if let Some(slot) = shared.shared.get_mut(index as usize) { *slot = value as i32; }
 }
 
-fn write_fes_string(shared: &mut ExpressionState, index: i32, value: Vec<u8>) {
-    if index >= 0 { shared.strings.insert(index as u32, value); }
+fn write_fes_string(
+    shared: &mut ExpressionState, origins: &mut super::cst_context_native::CstTextOrigins,
+    index: i32, value: Vec<u8>,
+) {
+    if index >= 0 {
+        // KCDB keys and display fields use the legacy text code page. Keep
+        // their raw bytes for subsequent lookups and carry the source codec
+        // into any FES display running with a localized scene code page.
+        origins.set_shared_encoding(index as u32, &value, ScriptTextEncoding::Cp932);
+        shared.strings.insert(index as u32, value);
+    }
 }
 
 impl LoggingHost<'_> {
@@ -449,6 +460,10 @@ mod tests {
             assert_eq!(host.string_values.get(&31).map(Vec::as_slice), Some(b"\x88\xa4".as_slice()));
             assert_eq!(host.string_values.get(&32).map(Vec::as_slice), Some(b"\x82\xa0\x82\xa2".as_slice()));
             assert!(host.string_values.get(&33).is_some_and(|value| value.starts_with(b"[")));
+            for id in 30..=33 {
+                let value = &host.string_values[&id];
+                assert_eq!(host.data_services.cst_text_origins.shared(id, value), Some(ScriptTextEncoding::Cp932));
+            }
             Ok(())
         })?;
         Ok(())

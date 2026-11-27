@@ -12,7 +12,7 @@ use crate::scene_tools::SceneMessageMemorySnapshot;
 
 // Desktop additionally proves the actual consumers: 41/42 must be the live
 // FES SCROLL2/SLIDER lower tasks, never an unrelated legacy model kind42.
-pub const SUPPORTED_TASK_KINDS: &[u32] = &[0, 1, 2, 6, 11, 12, 13, 15, 16, 18, 25, 27, 34, 41, 42];
+pub const SUPPORTED_TASK_KINDS: &[u32] = &[0, 1, 2, 6, 11, 12, 13, 15, 16, 18, 25, 26, 27, 34, 41, 42];
 pub const MAX_GRAPH_BYTES: usize = 64 * 1024 * 1024;
 // Version 4 includes standalone data objects, record stacks and parsed XML.
 // Old unpublished simulator

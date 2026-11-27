@@ -3323,6 +3323,8 @@ pub(super) fn draw_message_plane(
     registered_size: [u32; 2],
 ) -> Result<()> {
     draw_message_plane_with_tint(target, frame, node, offset, registered_size, message_plane_tint(node))
+        .map_err(|error| error.downcast::<ScriptError>()
+            .unwrap_or_else(|_| invalid("message plane scaled/color pixel composition failed")))
 }
 
 pub(super) fn message_plane_tint(node: &super::SceneNode) -> u32 {
@@ -3336,7 +3338,7 @@ pub(super) fn draw_message_plane_with_tint(
     offset: [i32; 2],
     registered_size: [u32; 2],
     color: u32,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     if !node.visible {
         return Ok(());
     }
@@ -3349,7 +3351,7 @@ pub(super) fn draw_message_plane_with_tint(
     {
         return Err(invalid(
             "message plane transform contains nonfinite coordinates",
-        ));
+        ).into());
     }
     if frame.width() == 0 || frame.height() == 0 || node.scale[0] == 0.0 || node.scale[1] == 0.0 {
         // Degenerate geometry draws no pixels but retains text/reveal state.
@@ -3385,9 +3387,10 @@ pub(super) fn draw_message_plane_with_tint(
     if super::gpu_raster::draw_image(target, &tinted, &options) {
         return Ok(());
     }
+    target.try_pixels()?;
     // Canvas already supports signed/mirrored scales and clips to the viewport.
     // An unscaled registration rectangle would incorrectly cut enlarged text.
     target
         .draw_frame(&tinted, &options)
-        .map_err(|_| invalid("message plane scaled/color pixel composition failed"))
+        .map_err(|_| invalid("message plane scaled/color pixel composition failed").into())
 }

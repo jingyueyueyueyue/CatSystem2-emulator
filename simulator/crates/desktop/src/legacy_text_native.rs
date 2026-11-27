@@ -360,7 +360,10 @@ impl LegacyTextNativeServices {
             .ok_or_else(|| invalid("legacy StringPlane has no command-102 record allocation"))?;
         match command {
             104 => {
-                let ordinary_record_added = object.append(text.as_ref().unwrap())?;
+                let (ordinary_record_added, bad_at) = object.append(text.as_ref().unwrap())?;
+                if let Some(offset) = bad_at {
+                    context.note_legacy_text_decode(offset);
+                }
                 object.immediate_paint_pending |= ordinary_record_added && object.mode != 1;
             }
             105 => object.clear(),
@@ -742,7 +745,7 @@ impl LegacyTextObject {
         Ok(())
     }
 
-    fn append(&mut self, text: &[u8]) -> Result<bool> {
+    fn append(&mut self, text: &[u8]) -> Result<(bool, Option<usize>)> {
         let total: usize = self.raw_appends.iter().map(Vec::len).sum();
         if total.saturating_add(text.len()) > MAX_BYTES {
             return Err(invalid("legacy StringPlane retained source exceeds 64 MiB"));
@@ -753,9 +756,13 @@ impl LegacyTextObject {
         let mut ruby_start = None;
         let mut ruby_codes = Vec::new();
         let mut ordinary_record_added = false;
+        let mut bad_at = None;
         while cursor < text.len() {
             let start = cursor;
-            let (code, character, width) = decode_cp932_unit(text, cursor)?;
+            let (code, character, width) = decode_cp932_unit(text, cursor);
+            if character == char::REPLACEMENT_CHARACTER {
+                bad_at.get_or_insert(start);
+            }
             cursor += width;
             if code == 0xffff {
                 self.separator()?;
@@ -879,7 +886,7 @@ impl LegacyTextObject {
         // The original parser finalizes layout state at every append; unlike
         // the new Page parser, a pending bracket does not join the next call.
         self.align_records();
-        Ok(ordinary_record_added)
+        Ok((ordinary_record_added, bad_at))
     }
 
     fn align_records(&mut self) {
@@ -1248,25 +1255,30 @@ fn cp932_codes(bytes: &[u8]) -> Result<Vec<u16>> {
     }
     Ok(result)
 }
-fn decode_cp932_unit(bytes: &[u8], cursor: usize) -> Result<(u16, char, usize)> {
+fn decode_cp932_unit(bytes: &[u8], cursor: usize) -> (u16, char, usize) {
     let first = bytes[cursor];
     let width = legacy_cp932_width(bytes, cursor);
-    let unit = bytes
-        .get(cursor..cursor + width)
-        .ok_or_else(|| invalid("legacy StringPlane has a truncated CP932 lead byte"))?;
-    let code = if width == 2 {
-        u16::from_be_bytes([unit[0], unit[1]])
+    let unit = &bytes[cursor..cursor + width];
+    let (code, character) = if width == 2 {
+        let decoded = super::ScriptTextEncoding::Cp932.decode_strict(unit);
+        (u16::from_be_bytes([unit[0], unit[1]]),
+            decoded.and_then(|text| text.chars().next()))
+    } else if matches!(first, 0x81..=0x9f | 0xe0..=0xfc) {
+        (u16::from(first), None)
     } else {
-        u16::from(first)
+        let decoded = super::cp932_to_utf8(unit);
+        (u16::from(first), String::from_utf8_lossy(&decoded).chars().next())
     };
-    let converted = super::cp932_to_utf8(unit);
-    let text = std::str::from_utf8(&converted)
-        .map_err(|_| invalid("legacy CP932 conversion produced invalid Unicode"))?;
-    let character = text
-        .chars()
-        .next()
-        .ok_or_else(|| invalid("legacy CP932 character decoded empty"))?;
-    Ok((code, character, width))
+    (code, character.unwrap_or(char::REPLACEMENT_CHARACTER), width)
+}
+
+#[test]
+fn legacy_string_plane_recovers_malformed_units_at_character_boundaries() {
+    assert_eq!(decode_cp932_unit(b"\x82\xa0", 0), (0x82a0, '\u{3042}', 2));
+    assert_eq!(decode_cp932_unit(b"\x82", 0), (0x82, char::REPLACEMENT_CHARACTER, 1));
+    assert_eq!(decode_cp932_unit(b"\x82/", 0), (0x82, char::REPLACEMENT_CHARACTER, 1));
+    assert_eq!(decode_cp932_unit(b"\x82/", 1), (0x2f, '/', 1));
+    assert_eq!(decode_cp932_unit(b"\xff", 0), (0xff, '\u{f8f3}', 1));
 }
 fn legacy_cp932_width(bytes: &[u8], cursor: usize) -> usize {
     if matches!(bytes[cursor], 0x81..=0x9f | 0xe0..=0xef)

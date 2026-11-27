@@ -62,15 +62,21 @@ def source_coverage(root: Path):
     motion_args = argument_table(motion, "native_argument_words", "")
     particle_args = argument_table(particle, "particle_native", r"let\s+words\s*=\s*")
     dispatch = ordinary.mask[ordinary.call_brace:ordinary.call_match]
-    version_guard = next((guard for guard in re.finditer(
-        r"if matches!\(index, ([0-9. |=]+)\)\s*\{\s*return Err\(cs2_script::ScriptError::UnimplementedNativeCall",
+    version_guard = re.search(
+        r"if cs2_runtime::native_table::OrdinaryNativeTable::is_feature_slot\(index\)\s*\{"
+        r"\s*return Err\(cs2_script::ScriptError::UnimplementedNativeCall\s*\{\s*index\s*\}\)",
         dispatch,
-    ) if numbers(guard[1]) == VERSION_CHANGED), None)
-    if version_guard is None:
+    )
+    table_path = "simulator/crates/runtime/src/native_table.rs"
+    native_table = RustSource(blobs[table_path].decode("utf-8-sig"), table_path, require_dispatch=False)
+    feature_slot, _ = native_table.function("is_feature_slot")
+    feature_set = re.fullmatch(r"\{\s*matches!\(index, ([0-9. |=]+)\)\s*\}", rust_mask(feature_slot))
+    if version_guard is None or feature_set is None or numbers(feature_set[1]) != VERSION_CHANGED:
         raise ValueError("ordinary version gate changed; review pre-dispatch coverage")
 
-    def checked_helper(name: str, *markers: str) -> dict:
-        module = helper_sources[name]
+    def checked_helper(name: str, *markers: str, module: RustSource | None = None) -> dict:
+        if module is None:
+            module = helper_sources[name]
         body, line = module.function(name)
         if not all(marker in rust_mask(body) for marker in markers):
             raise ValueError(f"{module.path}:{line}: review special ABI for {name}")
@@ -86,16 +92,19 @@ def source_coverage(root: Path):
                                         "let count = read_u32(args, 16)?")
     legacy_motion = checked_helper("legacy_utate_motion_properties_native",
                                    "!matches!(index, 299..=302)", "LEGACY_MOTION_GROUP_COUNT) * 4",
-                                   "Some(CAMPANELLA_SHA) | Some(TSUNABAN_SHA)")
+                                   "table.has_short_motion_properties(index)")
+    motion_stack = checked_helper("call", "index == 23 && arguments.is_empty()",
+                                  "vm.native_argument_storage(count * 4)?",
+                                  "arguments.len() != count * 4", module=motion)
     compatible = {**{(index, 0): movie_control for index in range(266, 270)},
                   (417, 4): movie_volume,
                   (250, 16): task_restore_inner | {"wrapper": task_restore}}
 
     special = {}
     for index, helper, description in (
-        (576, "restore_css_task_native", "Exact PE wrapper and supported CSS receiver required"),
-        (688, "original_state_tree_native", "Exact PE wrapper and supported original or portable graph receiver required"),
-        (689, "original_state_tree_native", "Exact PE wrapper and supported original or portable graph receiver required"),
+        (576, "restore_css_task_native", "Registered wrapper and supported CSS receiver required"),
+        (688, "original_state_tree_native", "Recognized wrapper and compatible live model or portable graph receiver required"),
+        (689, "original_state_tree_native", "Recognized wrapper and compatible live model or portable graph receiver required"),
     ):
         module = helper_sources[helper]
         _, line = module.function(helper)
@@ -107,9 +116,9 @@ def source_coverage(root: Path):
             return special[index]
         if (index, length) in compatible:
             return {"status": "source-behavior", **compatible[index, length]}
-        if index in {299, 301, 302} and length == 36:
+        if 299 <= index <= 302 and length == 36:
             return {"status": "conditional-version", **legacy_motion,
-                    "condition": "Legacy eight-group argument layout supported for verified Utate, Campanella and Tsunaban profiles"}
+                    "condition": "Registered motion wrapper must copy the legacy eight-group layout"}
         if index in VERSION_CHANGED:
             return {"status": "conditional-version", "source": DESKTOP,
                     "line": ordinary.line(ordinary.call_brace + version_guard.start()),
@@ -147,6 +156,10 @@ def source_coverage(root: Path):
         if table == "ordinary":
             return ordinary_call(index, length)
         if table == "motion":
+            if (index, length) == (23, 0):
+                return {"status": "source-behavior", **motion_stack,
+                        "expected_argument_bytes": motion_args[index],
+                        "argument_storage": "current VM parameter pointer without popping"}
             expected = motion_args.get(index)
             module = motion
             receiver = "native_argument_words"
@@ -204,16 +217,20 @@ def compare(inventory: dict, root: Path) -> dict:
 
 def markdown(report: dict) -> str:
     rejected = {"unmapped", "explicit-unimplemented", "argument-rejected", "unknown-table"}
+    motion_stack_sites = sum(sum(row["games"].values()) for row in report["calls"]
+                             if row.get("argument_storage"))
     lines = ["# 全工作区 KCS 宿主分派核对", "",
              f"{report['game_count']} 个游戏目录，{report['archives_scanned']} 个已索引 INT，"
              f"{report['runtime_program_count']} 个运行时 KCS，{len(report['observed_opcodes'])} 个实见 opcode。", "",
              "分析基于物理文件、宿主表路径线索和当前源码。包含未确认实际挂载的补丁副本及未执行分支。"
              "普通宿主的条件路径需要实际 PE、参数和接收对象才能确定结果。", "",
-             "各游戏的 `mot.int` 都包含同一套六份 `pt*.kcs`，每份有一次 0 字节 `#23` 调用。"
-             "如果送进现在的运动宿主，参数校验会拒绝。已实现的 16 字节 `#23` 是 XYZ 矩阵旋转，"
-             "六个粒子控制脚本的原版注册表尚未核实。", "",
              "| 游戏 | KCS | 调用点 | VM 缺少的 opcode | 按表线索无路由或拒绝 | 普通参数待核 |",
              "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    if motion_stack_sites:
+        lines[6:6] = [
+            f"Motion `#23` 的 0 字节调用共 {motion_stack_sites} 处。"
+            "当前运动宿主从原参数栈指针读取四个 DWORD，调用指令不弹出参数。", "",
+        ]
     for game in report["games"]:
         counts = game["call_status_counts"]
         lines.append(f"| {game['game']} | {game['programs']} | {sum(counts.values())} | "

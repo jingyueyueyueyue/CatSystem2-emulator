@@ -313,12 +313,12 @@ impl Backlog {
         &mut self, source: &[u8], input: u32, name: &[u8], text: &[u8],
         mark: u32, space: u32, extra: u32,
     ) -> Result<bool> {
-        if std::str::from_utf8(nul(name)).is_err() || std::str::from_utf8(nul(text)).is_err() {
-            return Err(BacklogError::InvalidUtf8);
-        }
-        self.append_with_encoding(source, input, name, text, mark, space, extra, SegmentEncoding {
-            name: Some(ScriptTextEncoding::Utf8), body: Some(ScriptTextEncoding::Utf8),
-        })
+        let name = String::from_utf8_lossy(nul(name));
+        let text = String::from_utf8_lossy(nul(text));
+        self.append_with_encoding(
+            source, input, name.as_bytes(), text.as_bytes(), mark, space, extra,
+            SegmentEncoding { name: Some(ScriptTextEncoding::Utf8), body: Some(ScriptTextEncoding::Utf8) },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -768,11 +768,11 @@ mod tests {
         assert!(rows.len() > 1);
         assert!(rows[1].starts_with('\u{3000}'));
         assert_eq!(rows.iter().map(|row| row.trim_start()).collect::<String>(), body);
-        assert_eq!(
-            backlog.append_utf8(b"prologue", 1, b"", b"\x81", 0, 0, 0),
-            Err(BacklogError::InvalidUtf8),
-        );
-        assert_eq!(backlog, restored);
+        assert!(backlog.append_utf8(b"prologue", 1, b"A\x81", b"\x81B", 0, 0, 0)?);
+        assert_eq!(backlog.names()[1], "A\u{fffd}".as_bytes());
+        assert_eq!(backlog.lines().back().unwrap().text, "\u{fffd}B".as_bytes());
+        assert!(backlog.lines().iter().take(restored.lines().len()).eq(restored.lines()));
+        assert_eq!(Backlog::from_snapshot(&backlog.snapshot()?)?, backlog);
         Ok(())
     }
 }

@@ -1,0 +1,22 @@
+{
+  "6": {
+    "frames": 4180,
+    "checkpoint_files": {
+      "save0000.dat": "archive/2026-11/20261126_06_system_features_seed_save0000.dat",
+      "save0012.dat": "archive/2026-11/20261126_06_system_features_seed_save0012.dat"
+    },
+    "window_checks": {"2320": ["flow", "ttlflow", "saveload", "saveload_c"],
+      "4130": ["flow", "ttlflow", "saveload", "saveload_c"]},
+    "event_checks": [
+      {"from": 3630, "through": 4130, "contains": "fes-save-file command=saveexchg from=0 to=12 changed=true"}
+    ],
+    "save_checks": {"save0000.dat": "save0012.dat", "save0012.dat": "save0000.dat"},
+    "inputs": ["story-events", "capture-every:0", "no-final-capture",
+      "move:1915:84,308", "require-hit:1920:19", "1920:84,308", "inspect-log:2320",
+      "move:2322:684,59", "require-hit:2340:19", "2340:684,59",
+      "move:2540:1031,660", "require-hit:2600:29", "2600:1031,660",
+      "move:2740:682,208", "require-hit:2800:32", "2800:682,208",
+      "move:2950:745,59", "require-hit:3010:20", "3010:745,59",
+      "move:3560:682,208", "require-hit:3630:32", "3630:682,208", "inspect-log:4130"]
+  }
+}

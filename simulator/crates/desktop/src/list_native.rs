@@ -1936,13 +1936,6 @@ impl LoggingHost<'_> {
         } else { NativeReturn::Continue })
     }
 
-    pub(super) fn legacy_list_profile(&mut self) -> cs2_script::Result<bool> {
-        if self.css_task_sha().is_none() {
-            self.bind_utate_plane_input_profile()?;
-        }
-        Ok(is_legacy_list_pe(self.css_task_sha()))
-    }
-
     pub(super) fn list_contract_native(
         &mut self,
         index: u32,
@@ -1952,8 +1945,8 @@ impl LoggingHost<'_> {
             .iter()
             .find(|spec| spec.native == index)
             .ok_or_else(|| native_state_error("native has no image-list batch contract"))?;
-        if matches!(index, 257 | 259) && args.len() == 32 {
-            self.legacy_list_profile()?;
+        if matches!(index, 257 | 259) && args.len() == 32 && self.css_task_sha().is_none() {
+            self.bind_utate_plane_input_profile()?;
         }
         let short = uses_short_registration(self.css_task_sha(), index, args.len());
         if !short && args.len() < contract.bytes {

@@ -41,6 +41,9 @@ REPLAY_STATUS = re.compile(rb"replay_status=([a-z][a-z0-9_]*)(?=\s)")
 ENDING_EVENT = re.compile(rb"replay frame=([0-9]+) ending_(card|verified)=([A-Za-z0-9_]+)(?=\s)")
 ENGINE_ERROR = re.compile(rb"frame=([0-9]+) (task-error|vm-error) (.*)")
 ROUTE_DIAGNOSTIC = re.compile(r"trace-native:[0-9]+|inspect-log:[1-9][0-9]*")
+WINDOW_SNAPSHOT = re.compile(r"^frame (\d+): wait .*? windows\(owner,.*?\)=\[(.*?)\] body_wait_shell\(")
+WINDOW_NAME = re.compile(r'\(\d+, "([a-zA-Z0-9_.]+)", (?:true|false), ')
+REPLAY_EVENT_LINE = re.compile(r"^frame=(\d+) (.*)$")
 GUARDED_BODY_INPUT = re.compile(
     r"legacy-(?:(?:02|06|16|19)-(?:enter|continue|opening|segment)|02-next-segment|(?:02|16)-continuous"
     r"|(?:04|05)-(?:enter|opening|segment)"
@@ -131,6 +134,13 @@ def load_ordinary_saves(path):
     return manifest["approved"]
 
 
+def complete_css_file(path, size):
+    with path.open("rb") as stream:
+        header = stream.read(16)
+    return (len(header) == 16 and header[:4] == b"CSS\0"
+            and int.from_bytes(header[4:8], "little") <= size - 16)
+
+
 def load_checkpoint_files(files):
     if not isinstance(files, dict) or not files:
         raise ValueError("checkpoint_files must map profile filenames to archived files")
@@ -145,12 +155,8 @@ def load_checkpoint_files(files):
         info = checked_path(path)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"checkpoint source is not a regular file: {path}")
-        if SAVE_NAME.fullmatch(name):
-            with path.open("rb") as stream:
-                header = stream.read(16)
-            if (len(header) != 16 or header[:4] != b"CSS\0"
-                    or int.from_bytes(header[4:8], "little") > info.st_size - 16):
-                raise ValueError(f"checkpoint source is not a complete CSS file: {path}")
+        if SAVE_NAME.fullmatch(name) and not complete_css_file(path, info.st_size):
+            raise ValueError(f"checkpoint source is not a complete CSS file: {path}")
         staged[name] = path
     return staged
 
@@ -342,6 +348,55 @@ def route_stop_diagnostics(host_path):
     return diagnostics or None
 
 
+def check_fes_windows(host_path, checks):
+    snapshots = {}
+    with host_path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if (match := WINDOW_SNAPSHOT.match(line)) and (frame := int(match[1])) in checks:
+                snapshots[frame] = WINDOW_NAME.findall(match[2])
+    return [
+        {"frame": frame, "expected": expected, "actual": snapshots.get(frame),
+         "passed": frame in snapshots and set(expected) == set(snapshots[frame])}
+        for frame, expected in checks.items()
+    ]
+
+
+def check_replay_events(events_path, checks):
+    rows = [{**check, "matched_frame": None} for check in checks]
+    with events_path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            match = REPLAY_EVENT_LINE.match(line)
+            if match is None:
+                continue
+            frame = int(match[1])
+            for row in rows:
+                if (row["matched_frame"] is None and row["from"] <= frame <= row["through"]
+                        and row["contains"] in match[2]):
+                    row["matched_frame"] = frame
+    return rows
+
+
+def check_replay_pixels(prefix, checks):
+    from PIL import Image, ImageChops
+
+    crops = {}
+    rows = []
+    for check in checks:
+        bounds = tuple(check["bounds"])
+        for frame in (check["before"], check["after"]):
+            key = (frame, bounds)
+            if key not in crops:
+                path = prefix.with_name(f"{prefix.name}.{frame:04}.png")
+                with Image.open(path) as image:
+                    if bounds[2] > image.width or bounds[3] > image.height:
+                        raise ValueError(f"pixel check bounds exceed capture: {path}")
+                    crops[key] = image.crop(bounds).convert("RGB")
+        difference = ImageChops.difference(crops[check["before"], bounds], crops[check["after"], bounds])
+        changed = difference.getbbox() is not None
+        rows.append({**check, "changed": changed, "passed": changed == (check["expect"] == "changed")})
+    return rows
+
+
 def seed_fast_text_profile(profile):
     """Set the fastest standard message speed in a private replay profile."""
     profile.mkdir(exist_ok=True)
@@ -418,7 +473,7 @@ def attempt_key(player_sha256, game_path, command_args, timeout, stall_seconds, 
 def run_case(index, game, frames, inputs, player, output, timeout, env, *,
              route=None, diagnostics=(), stall_seconds=30, ordinary_save=None, neko_language=None,
              fast_text=False, reuse_attempts=None, game_root_override=None, checkpoint_files=None,
-             watchdog=False):
+             watchdog=False, window_checks=None, event_checks=None, pixel_checks=None, save_checks=None):
     game_root = game_root_override if game_root_override is not None else ROOT / game["root"]
     game_path = game_root
     if ordinary_save is None:
@@ -446,7 +501,10 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
     if checkpoint_files:
         profile.mkdir()
         for name, source in checkpoint_files.items():
-            shutil.copyfile(source, profile / name)
+            target = profile / name
+            shutil.copyfile(source, target)
+            # Games use save timestamps to choose the initial slot and page.
+            os.utime(target, ns=(target.stat().st_atime_ns, source.stat().st_mtime_ns))
     if neko_language is not None:
         from stage_neko_cold_language import seed_language_profile
 
@@ -473,7 +531,7 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
     if not save_rejected:
         if fast_text:
             text_setup = seed_fast_text_profile(profile)
-        if reuse_attempts is not None and not checkpoint_files:
+        if reuse_attempts is not None and not any((checkpoint_files, window_checks, event_checks, pixel_checks, save_checks)):
             player_sha256, history = reuse_attempts
             try:
                 key = attempt_key(player_sha256, game_path, [frames, route, inputs, diagnostics],
@@ -546,6 +604,32 @@ def run_case(index, game, frames, inputs, player, output, timeout, env, *,
         record["ordinary_save"] = save_receipt
     if checkpoint_files:
         record["checkpoint_files"] = {name: str(path) for name, path in checkpoint_files.items()}
+    if record["status"] in {"visual_review_required", "frame_limit"}:
+        if event_checks:
+            record["event_checks"] = check_replay_events(events_path, event_checks)
+            if any(row["matched_frame"] is None for row in record["event_checks"]):
+                record["status"] = "event_check_failed"
+        if window_checks:
+            record["window_checks"] = check_fes_windows(host_path, window_checks)
+            if not all(check["passed"] for check in record["window_checks"]):
+                record["status"] = "window_check_failed"
+        if pixel_checks:
+            record["pixel_checks"] = check_replay_pixels(prefix, pixel_checks)
+            if not all(check["passed"] for check in record["pixel_checks"]):
+                record["status"] = "pixel_check_failed"
+        if save_checks:
+            record["save_checks"] = []
+            for name, seed in save_checks.items():
+                expected = file_sha256(checkpoint_files[seed]) if seed is not None else None
+                path = profile / name
+                actual = file_sha256(path) if path.is_file() else None
+                complete = actual is not None and complete_css_file(path, path.stat().st_size)
+                record["save_checks"].append({
+                    "file": name, "seed": seed, "expected_sha256": expected,
+                    "actual_sha256": actual, "passed": complete and (seed is None or actual == expected),
+                })
+            if not all(check["passed"] for check in record["save_checks"]):
+                record["status"] = "save_check_failed"
     if neko_language is not None:
         record["neko_language"] = neko_language
     if text_setup is not None:
@@ -591,7 +675,7 @@ def available_ram_bytes():
 
 
 def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_text=False,
-              reuse_attempts=None, game_root_override=None, ledger=None):
+              reuse_attempts=None, game_root_override=None, ledger=None, strict=False):
     pending = deque(cases)
     active = {}
     case_failed = False
@@ -637,6 +721,7 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
                     result = {"index": index, "game": game["root"], "status": "scenario_deferred",
                               "reason": settings["defer"], "exit_code": None, "seconds": 0, "captures": []}
                     write_json(receipt, result)
+                    case_failed |= strict
                     if ledger:
                         ledger.finish(game["root"], result, receipt)
                     continue
@@ -651,7 +736,10 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
                                    ordinary_save=ordinary_save, neko_language=settings.get("neko_language"),
                                    fast_text=fast_text, reuse_attempts=reuse_attempts,
                                    game_root_override=game_root_override,
-                                   checkpoint_files=settings.get("checkpoint_files"), watchdog=ledger is not None)
+                                   checkpoint_files=settings.get("checkpoint_files"), watchdog=ledger is not None,
+                                   window_checks=settings.get("window_checks"),
+                                   event_checks=settings.get("event_checks"),
+                                   pixel_checks=settings.get("pixel_checks"), save_checks=settings.get("save_checks"))
                 active[task] = (index, game, settings)
             if active:
                 recheck_resources = pending and len(active) < args.jobs
@@ -669,7 +757,14 @@ def run_batch(cases, player, output, args, env, ordinary_saves=None, *, fast_tex
                             "seconds": 0, "captures": [], "reason": str(error),
                         }
                         write_json(output / f"{index:02}.json", result)
-                    case_failed |= result["status"] in {"ordinary_save_rejected", "case_setup_failed"}
+                    case_failed |= result["status"] in {
+                        "ordinary_save_rejected", "case_setup_failed", "window_check_failed", "pixel_check_failed",
+                        "event_check_failed", "save_check_failed",
+                    }
+                    if strict:
+                        case_failed |= (result.get("exit_code") != 0 or result.get("first_engine_error") is not None
+                                        or result["status"] not in {"visual_review_required", "frame_limit",
+                                                                    "checkpoint_reached", "ending_verified"})
                     if ledger:
                         ledger.finish(game["root"], result, output / f"{index:02}.json")
                     print(f'{result["index"]:02}: {result["status"]}, {result["seconds"]}s', flush=True)
@@ -815,9 +910,29 @@ def identify_player(player, *, require_integration=False):
     return {**identity, "source_tree_sha256": after, "provenance": str(provenance)}
 
 
+def playthrough_cache_root(option: Path | None = None, *, single_game: bool = False) -> Path:
+    override = os.environ.get("CS2_BUILD_CACHE_ROOT")
+    if option is not None:
+        if not option.is_absolute():
+            raise ValueError("--cache-root must be an absolute path")
+        base = option
+    elif override:
+        base = Path(override)
+        if not base.is_absolute():
+            raise ValueError("CS2_BUILD_CACHE_ROOT must be an absolute path")
+    elif single_game or os.name != "nt":
+        return ROOT / "archive"
+    elif Path("F:/").is_dir():
+        base = Path("F:/CS2-build-cache")
+    else:
+        base = Path(os.environ.get("SystemDrive", "C:") + "/cs2-playthrough-cache")
+    return base / "playthrough"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--player", type=Path, required=True)
+    parser.add_argument("--cache-root", type=Path, help="absolute directory for the playthrough cache")
     game_input = parser.add_mutually_exclusive_group()
     game_input.add_argument("--game-root", type=Path,
                             help="run one case (index 0) directly from an existing game directory")
@@ -838,6 +953,8 @@ def main():
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--button-probe", action="store_true",
                         help="record actual mouse targets at fixed-frame inspect checkpoints")
+    parser.add_argument("--strict", action="store_true",
+                        help="return a failing exit code for engine errors, missed inputs and incomplete runs")
     parser.add_argument("--jobs", type=int, default=2, help="worker cap, or 0 to derive it from available CPU cores")
     parser.add_argument("--progress", type=Path,
                         help="persist this campaign's checkpoints, blockers and verified clear results")
@@ -876,17 +993,8 @@ def main():
     if any(not math.isfinite(value) or value <= 0 for value in budgets):
         parser.error("stall seconds and resource budgets must be finite and positive")
     now = datetime.now().astimezone()
-    if args.game_root is not None or os.name != "nt":
-        default_root = ROOT / "archive"
-    else:
-        preferred = Path("F:/")
-        default_root = (preferred / "CS2-build-cache/playthrough" if preferred.is_dir()
-                        else Path(os.environ.get("SystemDrive", "C:") + "/cs2-playthrough-cache/playthrough"))
-    cache_override = os.environ.get("CS2_BUILD_CACHE_ROOT")
-    cache_root = Path(cache_override) / "playthrough" if cache_override else default_root
-    if not cache_root.is_absolute():
-        parser.error("CS2_BUILD_CACHE_ROOT must be an absolute path")
     try:
+        cache_root = playthrough_cache_root(args.cache_root, single_game=args.game_root is not None)
         with BatchProgress(args.progress) if args.progress else nullcontext() as ledger:
             if ledger:
                 ledger.sync_inventory(games, default_indices)
@@ -938,6 +1046,49 @@ def run_selection(args, parser, games, indices, cache_root, now, ledger):
             if "ordinary_save" in settings or "neko_language" in settings:
                 parser.error(f"scenario {index} checkpoint_files require an isolated profile")
             settings = {**settings, "checkpoint_files": load_checkpoint_files(settings["checkpoint_files"])}
+        if "save_checks" in settings:
+            checks = settings["save_checks"]
+            seeds = settings.get("checkpoint_files", {})
+            if (not isinstance(checks, dict) or not checks
+                    or any(not re.fullmatch(r"save[0-9]{4}\.dat", name)
+                           or (name in seeds or "ordinary_save" in settings if seed is None
+                               else not isinstance(seed, str) or seed not in seeds)
+                           for name, seed in checks.items())):
+                parser.error(f"scenario {index} save_checks require a seeded filename or null for an unseeded slot")
+        if "window_checks" in settings:
+            checks = settings["window_checks"]
+            if ("route" in settings or not isinstance(checks, dict) or not checks
+                    or any(not re.fullmatch(r"[1-9][0-9]*", frame) or int(frame) > frames
+                           or not {f"inspect:{frame}", f"inspect-log:{frame}"}.intersection(inputs)
+                           or not isinstance(names, list)
+                           or any(not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_.]+", name)
+                                  for name in names)
+                           for frame, names in checks.items())):
+                parser.error(f"scenario {index} window_checks must map inspect frames to FES window names")
+            settings = {**settings, "window_checks": {int(frame): names for frame, names in checks.items()}}
+        if "event_checks" in settings:
+            checks = settings["event_checks"]
+            if ("route" in settings or not isinstance(checks, list) or not checks
+                    or any(not isinstance(check, dict) or set(check) != {"from", "through", "contains"}
+                           or type(check["from"]) is not int or type(check["through"]) is not int
+                           or not 0 <= check["from"] <= check["through"] <= frames
+                           or not isinstance(check["contains"], str) or not check["contains"].strip()
+                           for check in checks)):
+                parser.error(f"scenario {index} event_checks require frame ranges and nonempty event text")
+        if "pixel_checks" in settings:
+            checks = settings["pixel_checks"]
+            if ("route" in settings or not isinstance(checks, list) or not checks
+                    or any(not isinstance(check, dict) or set(check) != {"before", "after", "bounds", "expect"}
+                           or type(check["before"]) is not int or type(check["after"]) is not int
+                           or not 1 <= check["before"] < check["after"] <= frames
+                           or any(not {f"inspect:{check[key]}", f"capture:{check[key]}"}.intersection(inputs)
+                                  for key in ("before", "after"))
+                           or not isinstance(check["bounds"], list) or len(check["bounds"]) != 4
+                           or any(type(value) is not int or value < 0 for value in check["bounds"])
+                           or check["bounds"][2] <= check["bounds"][0]
+                           or check["bounds"][3] <= check["bounds"][1]
+                           or check["expect"] not in ("same", "changed") for check in checks)):
+                parser.error(f"scenario {index} pixel_checks require two capture frames, a rectangle and an expectation")
         if "defer" in settings and (not isinstance(settings["defer"], str) or not settings["defer"].strip()):
             parser.error(f"scenario {index} defer must give a reason")
         if "neko_language" in settings and (
@@ -981,7 +1132,8 @@ def run_selection(args, parser, games, indices, cache_root, now, ledger):
     if ledger:
         cases = ledger.prioritize_blockers(cases)
     return run_batch(cases, player, output, args, env, ordinary_saves, fast_text=args.fast_text,
-                     reuse_attempts=reuse_attempts, game_root_override=args.game_root, ledger=ledger)
+                     reuse_attempts=reuse_attempts, game_root_override=args.game_root, ledger=ledger,
+                     strict=args.strict)
 
 
 if __name__ == "__main__":

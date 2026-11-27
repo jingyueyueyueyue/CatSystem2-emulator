@@ -134,10 +134,18 @@ impl FesSettingsStore {
 }
 
 impl LoggingHost<'_> {
+    fn fes_message_defaults(&mut self) -> &mut MessageDefaults {
+        let controls = self.data_services.fes_settings.fonts;
+        self.data_services.messages.defaults.get_or_insert_with(|| MessageDefaults {
+            font_name: Vec::new(), bold: controls[2] != 0, shadow: controls[1], outline: controls[0],
+            glyph_parameter: Some(if controls[3] == 0 { 1 } else { controls[4] }), gradual: false,
+        })
+    }
+
     pub(super) fn apply_settings_font(&mut self, name: &str, controls: [u32; 5]) -> Result<()> {
         let units: Vec<_> = name.encode_utf16().collect();
         if units.len() > 63 || units.contains(&0) { bail!("font page face exceeds the original bounded field"); }
-        let defaults = self.data_services.messages.defaults.as_mut().context("font page needs message defaults")?;
+        let defaults = self.fes_message_defaults();
         defaults.font_name = units;
         defaults.outline = controls[0]; defaults.shadow = controls[1]; defaults.bold = controls[2] != 0;
         defaults.glyph_parameter = Some(if controls[3] == 0 { 1 } else { controls[4] });
@@ -285,9 +293,6 @@ impl LoggingHost<'_> {
                 names[index] = Some(font_units(bytes)?);
             }
         }
-        if names[0].is_some() && self.data_services.messages.defaults.is_none() {
-            bail!("configured main font requires message defaults");
-        }
         for field in FIELDS {
             if let Some(value) = xml_integer(document, &format!("document/{}", field.xml)) {
                 put(&mut self.system_config_blocks[field.block], field.offset, value);
@@ -314,13 +319,12 @@ impl LoggingHost<'_> {
         }
         for (index, name) in names.into_iter().enumerate() {
             let Some(name) = name else { continue; };
-            state.fonts_specified[index] = true;
+            self.data_services.fes_settings.fonts_specified[index] = true;
             if index == 0 {
-                self.data_services.messages.defaults.as_mut()
-                    .context("main message font defaults are unavailable")?.font_name = name;
+                self.fes_message_defaults().font_name = name;
             } else { self.data_services.message_device.ruby_font_name = name; }
         }
-        let controls = state.fonts;
+        let controls = self.data_services.fes_settings.fonts;
         if let Some(defaults) = &mut self.data_services.messages.defaults {
             defaults.outline = controls[0];
             defaults.shadow = controls[1];
@@ -475,7 +479,7 @@ impl LoggingHost<'_> {
             b"use_sceneskip" => state.scene_skip,
             b"use_jtalk" => state.jtalk,
             b"screen" => state.fullscreen,
-            b"iswindow" => state.windowed_mode.context("platform window mode is unavailable")?,
+            b"iswindow" => state.windowed_mode.unwrap_or_else(|| u32::from(state.fullscreen == 0)),
             b"fshadow" => state.fonts[shadow_index(index)?],
             b"fontweight" => state.fonts[2],
             b"fontprop" => state.fonts[3],
@@ -523,6 +527,14 @@ impl LoggingHost<'_> {
             }
             return Ok(());
         }
+        if matches!(name, b"screen" | b"iswindow") {
+            let windowed = if name == b"screen" { value == 0 } else { value != 0 };
+            if self.data_services.fes_settings.windowed_mode.is_some() {
+                return self.post_fes_window_menu(if windowed { 11 } else { 10 });
+            }
+            self.data_services.fes_settings.set_presented_fullscreen(u32::from(!windowed));
+            return Ok(());
+        }
         let state = &mut self.data_services.fes_settings;
         match name {
             b"enable_sceneanm" => state.scene_animation = value,
@@ -539,15 +551,11 @@ impl LoggingHost<'_> {
             b"fontweight" => state.fonts[2] = value,
             b"fontprop" => state.fonts[3] = value,
             b"fontfix" => state.fonts[4] = value,
-            b"screen" | b"iswindow" => bail!("platform display-mode setter needs its separate host operation"),
             _ => return Ok(()),
         }
         if matches!(name, b"fshadow" | b"fontweight" | b"fontprop" | b"fontfix") {
             let controls = state.fonts;
-            let defaults = self.data_services.messages.defaults.get_or_insert(MessageDefaults {
-                font_name: Vec::new(), bold: false, shadow: 1, outline: 1,
-                glyph_parameter: Some(0), gradual: false,
-            });
+            let defaults = self.fes_message_defaults();
             defaults.outline = controls[0];
             defaults.shadow = controls[1];
             defaults.bold = controls[2] != 0;
@@ -593,13 +601,12 @@ pub(super) fn apply_effect(
                 let bytes = shared.strings.get(&(values[0] as u32)).cloned().unwrap_or_default();
                 let units = font_units(&bytes)?;
                 if name == b"font" {
-                    let defaults = host.data_services.messages.defaults.as_mut().context("message defaults are unavailable")?;
-                    defaults.font_name = units;
+                    host.fes_message_defaults().font_name = units;
                 } else { host.data_services.message_device.ruby_font_name = units; }
                 host.data_services.fes_settings.fonts_specified[usize::from(name == b"ruby")] = true;
             } else {
                 let units = if name == b"font" {
-                    host.data_services.messages.defaults.as_ref().context("message defaults are unavailable")?.font_name.as_slice()
+                    host.data_services.messages.defaults.as_ref().map_or(&[][..], |defaults| defaults.font_name.as_slice())
                 } else { host.data_services.message_device.ruby_font_name.as_slice() };
                 let destination = values[0] as u32;
                 let bytes = font_bytes(units);

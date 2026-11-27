@@ -103,7 +103,7 @@ impl HeadlessPlayer {
         data.tasks.fes.platform.validate_projection_links(&data.tasks.fes,
             &data.tasks.fes.platform.lists, &bindings, kinds, &data.fes_controls, &data.fes_text)?;
         data.fes_draw.validate_platform_links(&data.tasks.fes.platform, &data.tasks.fes.platform.lists, &bindings)?;
-        data.transitions.validate_draw_checkpoint(&data.fes_draw.checkpoint_transition_links(), kinds, &self.task_parents)?;
+        data.transitions.validate_draw_checkpoint(data.fes_draw.checkpoint_transition_links(), kinds, &self.task_parents)?;
         let snapshot = Snapshot { version: 2,
             text: data.fes_text.capture_checkpoint(&data.message_device, kinds, &self.backlogs.keys().copied().collect())?,
             controls: data.fes_controls.capture_checkpoint(kinds)?, draw: data.fes_draw.capture_checkpoint(kinds)?,
@@ -125,7 +125,7 @@ impl HeadlessPlayer {
         } else {
             // Older components never admitted lower/transition task records.
             // They cannot provide missing consumers for a newer graph.
-            if kinds.values().any(|kind| matches!(kind, 27 | 41 | 42)) {
+            if kinds.values().any(|kind| matches!(kind, 26 | 27 | 41 | 42)) {
                 bail!("legacy FES extension checkpoint lacks lower/transition task state");
             }
             let old: Legacy = if bytes.is_empty() {
@@ -150,7 +150,7 @@ impl HeadlessPlayer {
         validate_owners(text.store(), &controls, &draw, tasks, &kinds, &saved.parents)?;
         if text.store().checkpoint_options() != options { bail!("FES text component allocator/options copies differ"); }
         let transitions = TransitionStore::prepare_checkpoint(&snapshot.transitions, &kinds, images)?;
-        transitions.validate_draw_checkpoint(&draw.checkpoint_transition_links(), &kinds, &saved.parents)?;
+        transitions.validate_draw_checkpoint(draw.checkpoint_transition_links(), &kinds, &saved.parents)?;
         let lower = records.prepare_lower_command_state(&snapshot.lower, &controls, tasks)?;
         Ok(PreparedExtensions { text, controls, draw, transitions, lower })
     }

@@ -10,6 +10,9 @@ pub struct StateTreeCommands {
 }
 
 pub(super) fn commands(capture_body: &[u8], restore_body: &[u8]) -> Option<StateTreeCommands> {
+    if let Some(commands) = legacy_commands(capture_body, restore_body) {
+        return Some(commands);
+    }
     let (capture, releases) = capture_commands(capture_body)?;
     let restore = restore_command(restore_body)?;
     // Both capture exits that obtained a tree send the same release message.
@@ -17,6 +20,34 @@ pub(super) fn commands(capture_body: &[u8], restore_body: &[u8]) -> Option<State
     ((390..=460).contains(&capture)
         && restore == capture + 1
         && releases == [release; 2])
+        .then_some(StateTreeCommands { capture, restore, release })
+}
+
+fn legacy_commands(capture_body: &[u8], restore_body: &[u8]) -> Option<StateTreeCommands> {
+    let call_slot = *capture_body.get(0x30)?;
+    if !matches!(call_slot, 0x0c | 0x10) {
+        return None;
+    }
+    check(capture_body, 0, b"\x51\x53\x8b\x5c\x24\x14\x8b\x03\x89\x44\x24\x04\x85\xc0\x75\x14\x8b\x44\x24\x18\xc7\0\0\0\0\0\xb8\x01\0\0\0\x5b\x59\xc2\x10\0")?;
+    for offset in [0x2e, 0x7a, 0xf6] {
+        check(capture_body, offset, &[0x8b, 0x52, call_slot])?;
+    }
+    let capture = packet(capture_body, 0x31, b"\x8d\x44\x24\x18\x50\x8b\x46\x04\x6a\0\x6a\0\x6a\0\x68",
+        b"\x51\x50\x8b\xce\xff\xd2\x8b\x4c\x24\x18\x85\xc9\x75\x0f")?;
+    let release = packet(capture_body, 0x7d, b"\x8d\x44\x24\x1c\x50\x8b\x46\x04\x6a\0\x55\x6a\0\x68",
+        b"\x51\x50\x8b\xce\xff\xd2\x8b\x44\x24\x20\x5d\x5e\xc7\0\0\0\0\0")?;
+    let release_after_append = packet(capture_body, 0xf9, b"\x83\xc4\x04\x8d\x44\x24\x20\x50\x8b\x46\x04\x6a\0\x55\x6a\0\x68",
+        b"\x51\x50\x8b\xce\xff\xd2\x8b\x44\x24\x24\x5f\x5d\x5e\xc7\0\x01\0\0\0")?;
+    check(capture_body, 0xd8, b"\x8b\x54\x24\x1c\x8b\x43\x04\x8b\x4c\x24\x10\x52\x57\x50\xe8")?;
+    check(restore_body, 0, b"\x6a\xff\x68")?;
+    check(restore_body, 0x26, b"\x8b\x5c\x24\x30\x8b\x0b\x33\xff\x3b\xcf\x75\x0b\x8b\x44\x24\x34\x89\x38\xe9\xc7\0\0\0\x8b\x43\x04\x8d\x54\x24\x10\x52\x50\xe8")?;
+    check(restore_body, 0x4b, b"\x8b\xf0\x3b\xf7\x75\x0b\x8b\x4c\x24\x34\x89\x39\xe9\xa8\0\0\0")?;
+    check(restore_body, 0xa4, &[0x8b, 0x52, call_slot])?;
+    let restore = packet(restore_body, 0xa7, b"\x8d\x44\x24\x14\x50\x57\x8d\x44\x24\x38\x50\x8b\x43\x08\x57\x68",
+        b"\x50\x8b\x41\x04\x50\xff\xd2\x8b\x4e\xfc")?;
+    check(restore_body, 0xf0, b"\xc7\x01\x01\0\0\0\x3b\xc7\x74\x0a")?;
+    (matches!((capture, call_slot), (374, 0x0c) | (380, 0x10))
+        && restore == capture + 1 && release == capture + 2 && release_after_append == release)
         .then_some(StateTreeCommands { capture, restore, release })
 }
 
@@ -102,6 +133,8 @@ mod tests {
     fn native_state_tree_commands_follow_installed_registration() -> io::Result<()> {
         let games = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
         let samples = [
+            ("\u{795d}\u{798f}\u{306e}\u{30ab}\u{30f3}\u{30d1}\u{30cd}\u{30e9}/cs2.exe", 374),
+            ("\u{3046}\u{305f}\u{3066}\u{3081}\u{3050}\u{308a}/UTATEMEGURI.exe", 380),
             ("cs2_full_v401/system/cs2_open.exe", 434),
             ("[170526][NEKO WORKs] ネコぱら vol.3 steam版 (files)/nekopara_vol3/NEKOPARAvol3.exe", 439),
             ("ISLAND/ISLAND.exe", 429),

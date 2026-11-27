@@ -51,7 +51,6 @@ struct WallpaperTask {
     complete: bool,
     bytes: Option<Vec<u8>>,
     prompt: Option<JoinHandle<Result<Option<WallpaperExportSelection>>>>,
-    prompt_failure: Option<String>,
     selection: Option<WallpaperExportSelection>,
     file: Option<File>,
     written: usize,
@@ -61,7 +60,7 @@ impl WallpaperStore {
     pub(super) fn register(&mut self, id: u32) {
         self.tasks.insert(id, WallpaperTask {
             source: Vec::new(), member: None, encoding: ScriptTextEncoding::Cp932,
-            started: false, complete: true, bytes: None, prompt: None, prompt_failure: None,
+            started: false, complete: true, bytes: None, prompt: None,
             selection: None, file: None, written: 0,
         });
     }
@@ -75,7 +74,6 @@ impl WallpaperStore {
 impl HeadlessPlayer {
     pub fn set_wallpaper_export_prompt(&mut self, prompt: WallpaperExportPrompt) {
         self.data_services.wallpapers.prompt = Some(prompt);
-        for task in self.data_services.wallpapers.tasks.values_mut() { task.prompt_failure = None; }
     }
     pub fn set_wallpaper_apply_handler(&mut self, handler: WallpaperApplyHandler) {
         self.data_services.wallpapers.apply = Some(handler);
@@ -131,15 +129,22 @@ impl LoggingHost<'_> {
 
     pub(super) fn update_wallpaper_task(&mut self, id: u32) -> cs2_script::Result<()> {
         let Some(mut task) = self.data_services.wallpapers.tasks.remove(&id) else { return Ok(()); };
-        let result = self.update_wallpaper_inner(id, &mut task);
+        if let Err(error) = self.update_wallpaper_inner(id, &mut task) {
+            self.events.push(super::LogicEvent { frame: self.frame, kind: "wallpaper-export-error".into(),
+                detail: format!("task={id}: {error:#}") });
+            task.complete = true;
+        }
+        if task.complete {
+            task.file = None;
+            task.bytes = None;
+            task.selection = None;
+        }
         self.data_services.wallpapers.tasks.insert(id, task);
-        result.map_err(|cause| self.task_error(id,
-            cs2_runtime::RuntimeError::Host(format!("wallpaper worker: {cause:#}"))))
+        Ok(())
     }
 
     fn update_wallpaper_inner(&mut self, id: u32, task: &mut WallpaperTask) -> Result<()> {
         if !task.started || task.complete { return Ok(()); }
-        if let Some(failure) = &task.prompt_failure { bail!("{failure}"); }
         if task.bytes.is_none() {
             let source = task.encoding.decode(&task.source).replace('\\', "/");
             let names = if task.member.is_some() {
@@ -201,18 +206,8 @@ impl LoggingHost<'_> {
                 return Ok(());
             }
             if !task.prompt.as_ref().unwrap().is_finished() { return Ok(()); }
-            let selected = match task.prompt.take().unwrap().join() {
-                Ok(Ok(selected)) => selected,
-                result => {
-                    let reason = match result {
-                        Err(_) => "wallpaper prompt thread panicked".to_owned(),
-                        Ok(Err(cause)) => cause.to_string(),
-                        Ok(Ok(_)) => unreachable!(),
-                    };
-                    task.prompt_failure = Some(reason.clone());
-                    bail!("{reason}");
-                }
-            };
+            let selected = task.prompt.take().unwrap().join()
+                .map_err(|_| anyhow::anyhow!("wallpaper prompt thread panicked"))??;
             let Some(selection) = selected else { task.complete = true; return Ok(()); };
             if selection.placement.is_some_and(|mode| !matches!(mode, -1 | 1 | 2 | 3)) {
                 bail!("wallpaper placement is outside the original supported values");

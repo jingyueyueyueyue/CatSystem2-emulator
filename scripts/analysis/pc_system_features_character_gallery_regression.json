@@ -1,0 +1,42 @@
+{
+  "2": {
+    "frames": 7840,
+    "window_checks": {
+      "1850": ["flow", "ttlflow", "title2"],
+      "2810": ["flow", "ttlflow", "title2"],
+      "3660": ["flow", "premium", "prm_ch"],
+      "4070": ["flow", "premium", "prm_ch"],
+      "4450": ["flow", "premium", "prm_ch"],
+      "4890": ["flow", "premium", "prm_ch"],
+      "5950": ["flow", "premium", "prm_ch"],
+      "7020": ["flow", "premium", "prm_ch"],
+      "7740": ["flow", "ttlflow", "title2"]
+    },
+    "pixel_checks": [
+      {"before": 3660, "after": 4070, "bounds": [440, 390, 540, 455], "expect": "changed"},
+      {"before": 3660, "after": 4450, "bounds": [440, 390, 540, 455], "expect": "same"},
+      {"before": 4450, "after": 4890, "bounds": [160, 130, 853, 649], "expect": "changed"},
+      {"before": 4890, "after": 5950, "bounds": [6, 100, 165, 490], "expect": "changed"},
+      {"before": 5950, "after": 7020, "bounds": [180, 130, 853, 649], "expect": "changed"},
+      {"before": 5950, "after": 7020, "bounds": [1094, 74, 1175, 121], "expect": "changed"}
+    ],
+    "inputs": [
+      "story-events", "capture-every:0", "no-final-capture",
+      "inspect:1850", "move:1950:154,290", "require-hit:1980:19", "1980:154,290",
+      "inspect:2810", "move:2870:542,290", "require-hit:2900:24", "2900:542,290",
+      "inspect:3660", "move:3720:1068,96", "require-hit:3750:21", "3750:1068,96",
+      "inspect:4070", "move:4110:1207,96", "require-hit:4140:22", "4140:1207,96",
+      "inspect:4450", "move:4550:1207,166", "require-hit:4580:24", "4580:1207,166",
+      "inspect:4890", "move:4920:1207,376", "require-hit:4950:30", "4950:1207,376",
+      "require-hit:5150:30", "5150:1207,376",
+      "require-hit:5350:30", "5350:1207,376",
+      "require-hit:5550:30", "5550:1207,376",
+      "inspect:5950", "move:6600:1207,96", "require-hit:6670:22", "6670:1207,96",
+      "inspect:7020", "move:7090:1180,672", "require-hit:7120:16", "7120:1180,672",
+      "inspect-log:7740"
+    ],
+    "checkpoint_files": {
+      "savegen.dat": "archive/2026-11/20261125_02_pc_original_ending_savegen.dat"
+    }
+  }
+}

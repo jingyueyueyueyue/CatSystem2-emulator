@@ -551,13 +551,15 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
                 if not re.search(r"\bindex\s*==\s*648\b", rust_mask(support)) or not re.search(
                     r"return\s+self\.hg_window_native\s*\(\s*arguments\s*\)", caller.mask[brace:end]
                 ) or not all(token in rust_mask(native) for token in (
-                    ".tasks.hg_window_abi", ".ordinary.raw_image", "compose(&bytes, size, abi)",
+                    ".ordinary_native_table.as_ref()", "table.hg_window_blend()",
+                    "companion.hg_window_blend", ".ordinary.raw_image", "compose(&bytes, size, blend)",
                     "self.register_image_wrapper(image, true)",
                 )) or not all(token in rust_mask(compose) for token in (
                     "HgFile::parse", "for id in 0..9", "frame.decode_pixels_rgba8", "mix_tile(",
                     "RgbaFrame::from_rgba8_with_metadata",
                 )) or not all(token in rust_mask(blend) for token in (
-                    "image_blit::seed_rgb", "image_blit::blend_pixel_integer", "HgWindowAbi::Legacy", "HgWindowAbi::Modern",
+                    "image_blit::seed_rgb", "image_blit::blend_pixel_integer",
+                    "HgWindowBlend::SeedAdjacentRgb", "HgWindowBlend::SkipTransparent",
                 )):
                     raise ValueError("HG-window native lost its real source/decode/blend/registration chain")
                 body = native + compose + blend
@@ -1062,10 +1064,12 @@ def external_dispatches(root: Path, source: RustSource, blobs: dict[str, bytes])
                     raise ValueError(f"{path}: empty or unrecognized plane ABI descriptors")
                 helper_start, helper_end = module.functions["plane_geometry_native"]
                 helper_body = module.mask[helper_start:helper_end + 1]
-                dispatch = re.search(r"\bmatch\s+abi\.slot\s*\{", helper_body)
-                if not dispatch or not re.search(r"args\.len\(\)\s*<\s*abi\.argument_bytes", helper_body):
+                length_guard = re.search(r"args\.len\(\)\s*<\s*abi\.argument_bytes", helper_body)
+                dispatch = re.search(r"\bmatch\s+abi\.slot\s*\{",
+                                     helper_body[length_guard.end():]) if length_guard else None
+                if not dispatch:
                     raise ValueError(f"{path}: plane ABI receiver/length validation changed")
-                branches = module.match_arms(helper_start + dispatch.end() - 1)
+                branches = module.match_arms(helper_start + length_guard.end() + dispatch.end() - 1)
                 for declaration in declarations:
                     index, command, byte_count = map(int, declaration.group(1, 2, 3))
                     arm = next((arm for arm in branches if arm.values and index in arm.values), None)
@@ -1151,7 +1155,8 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
     commands = load("simulator/crates/desktop/src/task_commands.rs")
     for filename, function, guard_pattern in [
         ("effekseer_native", "effekseer_native",
-         r"\bif\s+effekseer_native::supports\s*\(\s*index\s*\)\s*&&\s*effekseer_native::identified\s*\(\s*self\.data_services\.native_profile\s*\)"),
+         r"\bif\s+effekseer_native::supports\s*\(\s*index\s*\)\s*&&\s*"
+         r"effekseer_native::identified\s*\(\s*self\.data_services\.ordinary_native_table\.as_ref\(\)\s*\)"),
         ("tweet_native", "tweet_native", r"\bif\s+matches!\s*\(\s*index\s*,\s*1018\s*\.\.=\s*1023\s*\)"),
     ]:
         guard = re.search(guard_pattern, prefix)
@@ -1175,6 +1180,8 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
             rows = [tuple(map(int, row)) for row in re.findall(r"\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", table[1])]
             if rows != [(1014, 578, 8), (1015, 579, 4), (1016, 580, 8)]:
                 raise ValueError("Effekseer wrapper descriptors changed; review the receivers")
+            native_table = load("simulator/crates/runtime/src/native_table.rs")
+            require(module, "identified", ("table.is_some_and(OrdinaryNativeTable::has_effekseer_family)",))
             require(module, "supports", ("NATIVE_COMMANDS.iter().any", "d.0 == index"))
             body, line = require(module, function, (
                 "NATIVE_COMMANDS", ".find", "args.len() < size", "identified", "OwnedTaskBuffers::new",
@@ -1200,8 +1207,11 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
             supported = {row[0] for row in rows}
             descriptors = {index: {"table": "NATIVE_COMMANDS", "command": command,
                                    "minimum_argument_bytes": size} for index, command, size in rows}
-            inspected.extend([runtime.path, format_source.path])
-            limitation = "Exact Yukikoi profile only; recovered SKFE subset with concrete node/geometry parsing. Further effect families and task rotation remain incomplete; active-source expansion requires separate semantic review."
+            inspected.extend([runtime.path, format_source.path, native_table.path])
+            limitation = (
+                "Requires the Effekseer family in the registered native table. "
+                "The receiver implements the supported SKFE node and geometry subset."
+            )
         else:
             guard_source = source.mask[begin:opening]
             if "feature_constant.is_none()" not in guard_source or not all(
@@ -1209,10 +1219,15 @@ def concrete_service_dispatches(source: RustSource, blobs: dict[str, bytes]) -> 
             ):
                 raise ValueError("Tweet lost its registered-table constant precedence")
             body, line = require(module, function, ("args.len() != expected", "583 + index - 1018", "OwnedTaskBuffers::new", "self.route_task_command_buffers", "NativeReturn::Value(output)"))
-            require(module, "register_tweet_task", ("self.data_services.native_profile", "TweetTask", "AtomicU32::new(8)", "install_buffer_receiver(62, receiver)"))
+            require(module, "has_registered_tweet_family", (
+                "ordinary_native_table.as_ref()", "OrdinaryNativeTable::has_tweet_family",
+            ))
+            require(module, "register_tweet_task", ("self.has_registered_tweet_family()", "TweetTask", "AtomicU32::new(8)", "install_buffer_receiver(62, receiver)"))
             require(module, "receive_tweet_command", ("583", "584", "585", "586", "587", "588", "task.config", "task.images", "task.tags", "task.body", "task.status.load", "self.start_tweet_worker"))
             require(module, "start_tweet_worker", ("self.read_tweet_media", "Request", "status.store(0", ".spawn", "crate::tweet_worker::run", "task.worker = Some"))
-            require(module, "update_tweet_task", ("JoinHandle::is_finished", "worker.join", "task.failure"))
+            require(module, "update_tweet_task", (
+                "JoinHandle::is_finished", "worker.join", "outcome.diagnostics", "self.events.push",
+            ))
             require(module, "release", ("self.can_release", "self.tasks.remove", "worker.join"))
             worker = load("simulator/crates/desktop/src/tweet_worker.rs")
             platform = load("simulator/crates/desktop/src/tweet_platform.rs")

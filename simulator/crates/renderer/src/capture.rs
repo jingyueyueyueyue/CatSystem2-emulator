@@ -21,6 +21,7 @@ pub fn encode_capture_bmp(canvas: &Canvas) -> Result<Vec<u8>> {
         .ok_or(RendererError::ScaledDimensionsOverflow)?;
     let allocation = file_size.checked_add(7).map(|value| value & !7)
         .ok_or(RendererError::ScaledDimensionsOverflow)?;
+    let rgba = canvas.try_pixels()?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(allocation)
         .map_err(|_| RendererError::AllocationFailed { bytes: allocation })?;
@@ -36,7 +37,7 @@ pub fn encode_capture_bmp(canvas: &Canvas) -> Result<Vec<u8>> {
     bytes[34..38].copy_from_slice(&(image_size as u32).to_le_bytes());
     let source_stride = width as usize * 4;
     for (file_y, source_y) in (0..height as usize).rev().enumerate() {
-        let source = &canvas.pixels()[source_y * source_stride..(source_y + 1) * source_stride];
+        let source = &rgba[source_y * source_stride..(source_y + 1) * source_stride];
         let target = &mut bytes[54 + file_y * stride..54 + file_y * stride + width as usize * 3];
         for (rgba, bgr) in source.chunks_exact(4).zip(target.chunks_exact_mut(3)) {
             bgr.copy_from_slice(&[rgba[2], rgba[1], rgba[0]]);

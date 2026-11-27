@@ -1,0 +1,30 @@
+{
+  "18": {
+    "frames": 4700,
+    "inputs": [
+      "story-events", "story-trace", "button-probe", "capture-every:0", "no-final-capture",
+      "trace-native:626", "trace-native:627", "trace-native:301", "trace-native:688", "trace-native:689",
+      "move:1480:327,433", "require-hit:1540:12", "1540:327,433",
+      "move:2190:134,559", "require-hit:2260:35", "2260:134,559",
+      "move:2820:749,76", "require-hit:2890:10", "2890:749,76",
+      "require-hit:2980:10", "2980:749,76",
+      "move:3170:189,128", "require-hit:3240:41", "3240:189,128",
+      "auto-choice-banks:0,0,1,1", "ctrl-hold:3350:4650"
+    ],
+    "event_checks": [
+      {"from": 3240, "through": 3950, "contains": "slot=1000 handle="},
+      {"from": 3240, "through": 4100, "contains": "native-call index=626 arguments=48 bytes"},
+      {"from": 3240, "through": 4100, "contains": "native-call index=627 arguments=48 bytes"},
+      {"from": 3240, "through": 4100, "contains": "native-call index=301 arguments=36 bytes"},
+      {"from": 3240, "through": 4100, "contains": "kind=42 parent=12 name=\"3D View\""},
+      {"from": 3240, "through": 4100, "contains": "native-call index=689 arguments=12 bytes"},
+      {"from": 3240, "through": 4250, "contains": "native-call index=688 arguments=12 bytes"},
+      {"from": 3240, "through": 4400, "contains": "sscript loaded > Q109_03a"},
+      {"from": 3500, "through": 4700, "contains": "sscript loaded > battle06_gs"}
+    ],
+    "checkpoint_files": {
+      "save1000.dat": "archive/2026-11/20261125_18_q109_choice_autosave1000.dat",
+      "savegen.dat": "archive/2026-11/20261125_18_q109_choice_savegen.dat"
+    }
+  }
+}

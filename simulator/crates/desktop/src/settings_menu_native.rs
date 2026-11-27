@@ -452,7 +452,7 @@ impl HeadlessPlayer {
         state.next_id = state.next_id.checked_add(1).context("host UI identities exhausted")?;
         Ok(state.next_id)
     }
-    pub(super) fn prepare_effect_settings(&mut self) -> Result<()> {
+    pub(super) fn prepare_effect_settings(&mut self) -> Result<bool> {
         self.data_services.window_control.ui.general = false;
         self.with_host(|host| { host.ensure_configuration_state()?; host.ensure_fes_settings() })?;
         let (effects, automatic, window, startup_drag, simple_alpha, alpha_only) = self.with_host(|host| {
@@ -625,7 +625,12 @@ impl HeadlessPlayer {
                     value: match self.data_services.fes_settings.auto_select { value @ 0..=2 => value, _ => 0 }, default: 0,
                     hidden: false, disabled: false, enabled_by: None, reset_changes_value: false }] });
         }
-        if pages.is_empty() { bail!("457: all recovered settings pages are disabled; other configured pages still lack receivers"); }
+        if pages.is_empty() {
+            self.events.push(LogicEvent { frame: self.state.clock.frame, kind: "settings-page-unavailable".into(),
+                detail: "457: no configured settings pages are available".into() });
+            self.data_services.window_control.ui.effects = None;
+            return Ok(false);
+        }
         let title = pages[0].title.clone();
         let request = HostEffectSettings { id: self.next_ui_id()?, title, pages };
         self.events.push(LogicEvent { frame: self.state.clock.frame,
@@ -634,7 +639,7 @@ impl HeadlessPlayer {
                 request.pages.iter().map(|page| page.resource).collect::<Vec<_>>()) });
         self.data_services.window_control.ui.effects = Some(request);
         self.data_services.window_control.ui.effects_applied = false;
-        Ok(())
+        Ok(true)
     }
     pub fn host_effect_settings(&self) -> Result<HostEffectSettings> {
         self.require_window_request(HostWindowRequest::Settings)?;

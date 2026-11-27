@@ -449,18 +449,15 @@ impl TextTable {
 
     fn image(&self, path: &[u32]) -> Option<Sprite> {
         let mut sprite = Sprite::default();
-        self.traverse(path, |depth, value| {
-            if depth == 1 {
-                if value != b"@" {
-                    sprite.merge(value, b"");
-                }
-            } else if depth > 1 {
-                let selectors: Vec<_> = value
-                    .split(|&byte| byte == b',')
-                    .map(|part| part.first().copied().unwrap_or(b'@'))
-                    .collect();
-                sprite.merge(b"", &selectors);
-            }
+        self.traverse(path, |_, value| {
+            // Column zero is the image stem on every row. An @ retains the
+            // preceding row's value in the same column, including the stem.
+            let mut columns = value.split(|&byte| byte == b',');
+            let stem = columns.next().filter(|stem| *stem != b"@").unwrap_or_default();
+            let selectors: Vec<_> = columns
+                .map(|part| part.first().copied().unwrap_or(b'@'))
+                .collect();
+            sprite.merge(stem, &selectors);
         })?;
         (!sprite.stem.is_empty()).then_some(sprite)
     }
@@ -473,11 +470,15 @@ mod text_table_tests {
     #[test]
     fn text_table_uses_unsigned_indices_and_composes_image_selectors() {
         let table = TextTable::parse(
-            b"#_TOP_\nentry CHAR\n#CHAR\nbg01 POSE\n#POSE\n1,2 VARIANT\n#VARIANT\nlast\n",
+            b"#_TOP_\n@ CHAR\n#CHAR\nsprite01 POSE\n#POSE\n@,1,@,4 VARIANT\n#VARIANT\n@,@,2,0\nsprite02,@,3,@\n",
         );
-        assert_eq!(table.count(&[0, 0, 0]), 1);
+        assert_eq!(table.count(&[0, 0, 0]), 2);
         let image = table.image(&[0, 0, 0]).unwrap();
-        assert_eq!(image.plan(crate::ScriptTextEncoding::Utf8), "bg01,1,2");
+        assert_eq!(image.plan(crate::ScriptTextEncoding::Utf8), "sprite01,1,0,4");
+        let image = table.image(&[0, 0, 0, 0]).unwrap();
+        assert_eq!(image.plan(crate::ScriptTextEncoding::Utf8), "sprite01,1,2,0");
+        let image = table.image(&[0, 0, 0, 1]).unwrap();
+        assert_eq!(image.plan(crate::ScriptTextEncoding::Utf8), "sprite02,1,3,4");
     }
 
     #[test]

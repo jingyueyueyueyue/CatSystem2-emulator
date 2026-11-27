@@ -229,6 +229,24 @@ impl FesRuntime {
             });
             return Ok(true);
         }
+        if subcommand == "seid"
+            && targets.iter().all(|target| {
+                matches!(target, Target::Image(key) if self.media[key].kind == "IMAGE")
+            })
+        {
+            if let Some(arg) = command.parameters.get(2) {
+                driver.evaluate_parameter(arg, command.context.current, expression)?;
+            }
+            events.push(LogicEvent {
+                frame,
+                kind: "fes-media".into(),
+                detail: format!(
+                    "object={name:?} command=seid action=ignored-image-typo targets={}",
+                    targets.len()
+                ),
+            });
+            return Ok(true);
+        }
         if !matches!(
             subcommand.as_str(),
             "pos"

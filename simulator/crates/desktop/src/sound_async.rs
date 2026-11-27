@@ -41,6 +41,11 @@ pub(super) enum Operation {
 impl LoggingHost<'_> {
     /// Device and model waits can resume on a later logical frame.
     pub(super) fn task_waits_for_audio(&self, owner: u32) -> bool {
+        // A synchronous sender still needs the receiver's scheduled body
+        // after its media ticket is consumed, even if that body has yet to run.
+        if self.data_services.tasks.waits_for_message_update(owner) {
+            return true;
+        }
         // Image preparation can interrupt a compound scene update after it has
         // registered a layer but before it has set its position and opacity.
         // Retry the same logical frame so those intermediate layers stay private.

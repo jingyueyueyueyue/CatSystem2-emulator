@@ -4121,9 +4121,9 @@ impl LoggingHost<'_> {
             1009 => self.image_export_native1009(arguments, vm),
             257..=259 | 263 | 339 | 455 | 462 | 463 | 464 | 622..=625 | 657 | 663 | 732 | 862 | 879..=881 =>
                 self.list_batch_native(index, arguments, vm),
-            626 if self.css_task_sha() == Some(particle_external::CAMPANELLA_SHA) =>
+            626 | 627 if self.data_services.ordinary_native_table.as_ref()
+                .is_some_and(|table| table.has_legacy_list_affine(index)) =>
                 self.list_contract_native(index, arguments),
-            627 if self.legacy_list_profile()? => self.list_contract_native(index, arguments),
             113 | 118 | 119 | 121 | 241 | 251 | 362..=364 | 369..=376 | 536..=538 | 558 | 641 | 1026 => {
                 self.image_wrapper_native(index, arguments, vm)
             }
@@ -5120,7 +5120,19 @@ impl LoggingHost<'_> {
                 self.string_values.insert(index, value);
                 Ok(NativeReturn::Continue)
             }
-            277 if arguments.len() >= 8 => self.read_shared_string_native277(arguments, vm),
+            277 if arguments.len() >= 8 => {
+                let result = self.read_shared_string_native277(arguments, vm)?;
+                if self.data_services.story_trace {
+                    let slot = read_u32(arguments, 0)?;
+                    let length = self.string_values.get(&slot).map(Vec::len);
+                    self.events.push(LogicEvent {
+                        frame: self.frame,
+                        kind: "shared-string-read".into(),
+                        detail: format!("slot={slot} length={length:?}"),
+                    });
+                }
+                Ok(result)
+            }
             278 if arguments.len() >= 4 => self.expand_shared_string_native278(arguments, vm),
             242 | 243 | 244 | 245 | 248 | 252 | 253 | 254 | 389 if word(0) == Some(0) =>
                 Ok(NativeReturn::Value(0)),
@@ -5156,13 +5168,18 @@ impl LoggingHost<'_> {
                     None
                 };
                 let (file, digest) = match read_save_css(self.save_root, &filename) {
-                    Ok(bytes) => {
-                        let file = CssFile::from_css(&bytes)
-                            .map_err(|_| audio_script_error("CSS file structure or capacity is invalid"))?;
-                        let digest = (file.is_some() && slot_event.is_some())
-                            .then(|| particle_plugin_digest::sha256(&bytes));
-                        (file, digest)
-                    }
+                    Ok(bytes) => match CssFile::from_css(&bytes) {
+                        Ok(file) => {
+                            let digest = (file.is_some() && slot_event.is_some())
+                                .then(|| particle_plugin_digest::sha256(&bytes));
+                            (file, digest)
+                        }
+                        Err(error) => {
+                            self.events.push(LogicEvent { frame: self.frame, kind: "save-file-error".into(),
+                                detail: format!("native247 {filename:?}: {error}") });
+                            (None, None)
+                        }
+                    },
                     Err(_) => (None, None),
                 };
                 let handle = file
@@ -5216,10 +5233,13 @@ impl LoggingHost<'_> {
                 let data = file
                     .to_css()
                     .map_err(|_| audio_script_error("CSS serialization failed"))?;
-                if write_save_css(self.save_root, &filename, &data).is_ok() {
-                    Ok(NativeReturn::Value(1))
-                } else {
-                    Ok(NativeReturn::Value(0))
+                match write_save_css(self.save_root, &filename, &data) {
+                    Ok(()) => Ok(NativeReturn::Value(1)),
+                    Err(error) => {
+                        self.events.push(LogicEvent { frame: self.frame, kind: "save-file-error".into(),
+                            detail: format!("native245 {filename:?}: {error:#}") });
+                        Ok(NativeReturn::Value(0))
+                    }
                 }
             }
             242 if arguments.len() >= 12 => {
@@ -8941,8 +8961,9 @@ fn apply_window_control_requests(
     player: &mut HeadlessPlayer, window: &winit::window::Window, fullscreen: &mut bool,
 ) -> Result<()> {
     if let Some(request) = player.take_host_text_entry() {
-        let result = fes_window_windows::show(settings_menu_windows::hwnd(window)?, &request)?;
-        player.complete_host_text_entry(request.id, result)?;
+        let result = settings_menu_windows::hwnd(window)
+            .and_then(|owner| fes_window_windows::show(owner, &request));
+        player.finish_host_text_entry(request.id, result);
     }
     settings_menu_windows::apply_general_policy(player, window)?;
     settings_menu_windows::consume_menu_commands(player, window)?;
@@ -9655,6 +9676,11 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
     if let Some(error) = app.error {
         bail!("{error}");
     }
+    if let Some(player) = app.player.as_mut()
+        && let Err(error) = player.persist_host_configuration()
+    {
+        eprintln!("save configuration on window close: {error:#}");
+    }
     Ok(())
 }
 
@@ -9854,6 +9880,11 @@ pub fn run_windowed(path: impl AsRef<Path>) -> Result<()> {
         .context("run Windows event loop")?;
     if let Some(error) = app.error {
         bail!("{error}");
+    }
+    if let Some(player) = app.player.as_mut()
+        && let Err(error) = player.persist_host_configuration()
+    {
+        eprintln!("save configuration on window close: {error:#}");
     }
     Ok(())
 }
@@ -10486,7 +10517,8 @@ fn write_save_css(root: &Path, name: &str, data: &[u8]) -> Result<()> {
     let path = save_path(root, name)?;
     fs::create_dir_all(root)
         .with_context(|| format!("create save directory {}", root.display()))?;
-    fs::write(&path, data).with_context(|| format!("write save file {}", path.display()))
+    cs2_runtime::write_private_file(&path, data)
+        .with_context(|| format!("write save file {}", path.display()))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> cs2_script::Result<u32> {
@@ -13522,6 +13554,36 @@ mod tests {
     }
 
     #[test]
+    fn css_native_read_recovers_after_a_truncated_slot() -> Result<()> {
+        let temp = TempDir::new();
+        let save_root = temp.0.join("save");
+        fs::create_dir(&save_root)?;
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, &save_root)?;
+        let program = cs2_script::KcsProgram::from_code(&[0x3b], Vec::new(), 0)?;
+        let mut vm = Vm::from_program(program)?;
+        let filename = vm.allocate_region(b"save0001.dat\0")?.to_le_bytes();
+        let path = save_root.join("save0001.dat");
+        fs::write(&path, b"CSS\0")?;
+        let read = |player: &mut HeadlessPlayer, vm: &mut Vm| {
+            player.with_host(|host| Ok(host.call(247, &filename, vm)?))
+        };
+
+        assert_eq!(read(&mut player, &mut vm)?, NativeReturn::Value(0));
+        assert!(player.events().iter().any(|event| event.kind == "save-file-error"
+            && event.detail.starts_with("native247 \"save0001.dat\":")));
+        assert_eq!(fs::read(&path)?, b"CSS\0");
+
+        let mut file = CssFile::new(7);
+        file.append(9, b"saved payload")?;
+        write_save_css(&save_root, "save0001.dat", &file.to_css()?)?;
+        let NativeReturn::Value(handle) = read(&mut player, &mut vm)? else {
+            anyhow::bail!("native 247 did not return a CSS handle");
+        };
+        assert_eq!(player.css_handles[&handle].record(9), Some(b"saved payload".as_slice()));
+        Ok(())
+    }
+
+    #[test]
     fn synchronous_task_message_can_copy_from_and_to_its_live_caller() {
         fn native_instruction(code: &mut Vec<u8>, opcode: u8, operands: &[u32]) {
             code.push(opcode);
@@ -13824,7 +13886,7 @@ mod tests {
 
         let mut player = HeadlessPlayer::open(&temp.0).unwrap();
         player.load_entry("main.cst").unwrap();
-        player.run_frames(2, 100).unwrap();
+        player.run_frames(2, 10_000).unwrap();
         assert!(player.events().iter().any(|event| {
             event.kind == "cst-scene-transfer" && event.detail.contains("second.cst")
         }));
@@ -13865,7 +13927,7 @@ mod tests {
 
         let mut player = HeadlessPlayer::open(&temp.0).unwrap();
         player.load_entry("main.cst").unwrap();
-        player.run_frames(1, 100).unwrap();
+        player.run_frames(1, 10_000).unwrap();
         assert!(
             player.events().iter().any(|event| {
                 event.kind == "cst-scene-transfer" && event.detail.contains("call")
@@ -13950,7 +14012,7 @@ mod tests {
         let mut player = HeadlessPlayer::open(&temp.0).unwrap();
         player.set_script_encoding(ScriptTextEncoding::Utf8);
         player.load_entry("main.cst").unwrap();
-        player.run_frames(1, 100).unwrap();
+        player.run_frames(1, 10_000).unwrap();
         assert!(player
             .events()
             .iter()
@@ -13982,7 +14044,7 @@ mod tests {
 
         let mut player = HeadlessPlayer::open(&temp.0).unwrap();
         player.load_entry("main.cst").unwrap();
-        player.run_frames(1, 100).unwrap();
+        player.run_frames(1, 10_000).unwrap();
         assert!(
             player
                 .events()
@@ -13990,7 +14052,7 @@ mod tests {
                 .any(|event| event.kind == "cst-choices" && event.detail.contains("Right"))
         );
         player.queue_message([2, 1, 0, 0]);
-        player.run_frames(1, 100).unwrap();
+        player.run_frames(1, 10_000).unwrap();
         assert!(player.events().iter().any(|event| {
             event.kind == "cst-choice-transfer" && event.detail.contains("right.cst")
         }));
@@ -14040,7 +14102,7 @@ mod tests {
         let mut player = HeadlessPlayer::open(&temp.0).unwrap();
         player.set_script_encoding(ScriptTextEncoding::Utf8);
         player.load_entry("main.cst").unwrap();
-        player.run_frames(1, 100).unwrap();
+        player.run_frames(1, 10_000).unwrap();
         assert!(player.events().iter().any(|event| {
             event.kind == "cst-choices" && event.detail.contains("本地化选项")
         }));
@@ -14266,159 +14328,72 @@ mod tests {
     }
 
     #[test]
-    fn particle_natives_cover_create_control_query_release_and_unknown_plugin() {
+    fn particle_natives_cover_create_control_query_release_and_unknown_plugin() -> Result<()> {
         let temp = TempDir::new();
-        let resources = ResourceIndex::scan(&temp.0).unwrap();
-        let mut events = Vec::new();
-        let mut xml_handles = BTreeMap::new();
-        let mut next_xml_handle = 1;
-        let mut shared_values = Vec::new();
-        let mut current_parameter = 0;
-        let mut string_values = BTreeMap::new();
-        let mut next_task_id = 1;
-        let mut task_parents = BTreeMap::new();
-        let mut scene_nodes = BTreeMap::new();
-        let mut image_handles = BTreeMap::new();
-        let script_replacements = BTreeMap::new();
-        let mut particles = BTreeMap::new();
-        let mut css_handles = BTreeMap::new();
-        let mut integer_maps = BTreeMap::new();
-        let mut cst_contexts = BTreeMap::new();
-        let mut motion_controllers = BTreeMap::new();
-        let mut motion_snapshots = BTreeMap::new();
-        let mut message_wait_address = None;
-        let mut audio_host =
-            OggAudioHost::new(|_| Err(RuntimeError::Host("unexpected audio resolution".into())));
-        let mut sound_channels = BTreeMap::new();
-        let mut script_random = ScriptRandom::default();
-        let mut system_config_blocks = [vec![0; 5628], vec![0; 72], vec![0; 32], vec![0; 12]];
-        let mut menu_item_requests = Vec::new();
-        let mut host = LoggingHost {
-            events: &mut events,
-            frame: 3,
-            resources: &resources,
-            xml_handles: &mut xml_handles,
-            next_xml_handle: &mut next_xml_handle,
-            configured_shared_slots: 0,
-            text_encoding: ScriptTextEncoding::Cp932,
-            shared_values: &mut shared_values,
-            current_parameter: &mut current_parameter,
-            current_task_id: 7,
-            pointer_position: [0, 0],
-            task_time: 0,
-            task_origin: 0,
-            auto_select: 0,
-            scene_animation_enabled: 1,
-            fullscreen: 0,
-            fullscreen_mw_pos: 0,
-            string_values: &mut string_values,
-            next_task_id: &mut next_task_id,
-            task_parents: &mut task_parents,
-            scene_nodes: &mut scene_nodes,
-            image_handles: &mut image_handles,
-            image_resources: &mut BTreeMap::new(),
-            backlogs: &mut BTreeMap::new(),
-            canvas: None,
-            back_buffer: None,
-            particles: &mut particles,
-            record_stacks: &mut BTreeMap::new(),
-            input_task: &mut DesktopInputTask::default(),
-            task_vms: &mut BTreeMap::new(),
-            script_replacements: &script_replacements,
-            system_config_blocks: &mut system_config_blocks,
-            css_handles: &mut css_handles,
-            integer_maps: &mut integer_maps,
-            data_services: &mut data_services::DataServices::default(),
-            cst_contexts: &mut cst_contexts,
-            motion_controllers: &mut motion_controllers,
-            motion_snapshots: &mut motion_snapshots,
-            save_root: &temp.0.join("save"),
-            message_wait_address: &mut message_wait_address,
-            audio_host: &mut audio_host,
-            movie_host: None,
-            movie_playbacks: &mut BTreeMap::new(),
-            movie_resources: &mut BTreeMap::new(),
-            sound_channels: &mut sound_channels,
-            sound_groups: &[],
-            sound_config: &mut DesktopSoundConfig::default(),
-            script_random: &mut script_random,
-            menu_item_requests: &mut menu_item_requests,
-            debug_mode: 0,
-            sound_config_enabled: 0,
-        };
-        let program = cs2_script::KcsProgram::from_code(&[0x3b], vec![0; 1024], 512).unwrap();
-        let mut vm = Vm::from_program(program).unwrap();
-        vm.write(64, b"particle.kcs\0").unwrap();
-        vm.write(96, b"particle.hg3\0").unwrap();
-        vm.write(512, &[0x5a; 128]).unwrap();
-
-        let mut load = Vec::new();
-        for word in [42_u32, 64, 96, 3, 0x4120_0000, 512] {
-            load.extend_from_slice(&word.to_le_bytes());
+        let mut program = b"KCS\0".to_vec();
+        for word in [2_u32, 1, 52, 1, 53, 0, 0, 0, 64, 53, 0, 1] {
+            program.extend_from_slice(&word.to_le_bytes());
         }
-        assert_eq!(
-            host.call(271, &load, &mut vm).unwrap(),
-            NativeReturn::Value(1)
-        );
-        assert_eq!(host.particles[&42].program_name, "particle.kcs");
-        assert_eq!(host.particles[&42].image_name, "particle.hg3");
-        assert_eq!(host.particles[&42].depth_bits, 0x4120_0000);
-        assert_eq!(host.particles[&42].parameters, [0x5a; 128]);
+        // Zlib stream containing one KCS return instruction (0x3b).
+        program.extend_from_slice(&[0x78, 0x9c, 0xb3, 0x06, 0, 0, 0x3c, 0, 0x3c]);
+        fs::write(temp.0.join("startup.xml"), br#"<?xml version="1.0" encoding="UTF-8"?><document><INT><int00><name>ptcl</name><int>ptcl.int</int><ext>kcs</ext><dir>ptcl</dir></int00></INT></document>"#)?;
+        fs::create_dir(temp.0.join("ptcl"))?;
+        fs::write(temp.0.join("ptcl/particle.kcs"), program)?;
+        fs::create_dir(temp.0.join("plugins"))?;
+        fs::write(temp.0.join("plugins/unknown.ppi"), b"invalid particle plugin")?;
+        let mut player = HeadlessPlayer::open_with_save_root(&temp.0, temp.0.join("save"))?;
 
-        assert_eq!(
-            host.call(274, &42_u32.to_le_bytes(), &mut vm).unwrap(),
-            NativeReturn::Value(0)
-        );
-        assert_eq!(
-            host.call(272, &42_u32.to_le_bytes(), &mut vm).unwrap(),
-            NativeReturn::Continue
-        );
-        assert_eq!(
-            host.call(274, &42_u32.to_le_bytes(), &mut vm).unwrap(),
-            NativeReturn::Value(1)
-        );
-        assert_eq!(
-            host.call(273, &42_u32.to_le_bytes(), &mut vm).unwrap(),
-            NativeReturn::Continue
-        );
-        assert_eq!(
-            host.call(274, &42_u32.to_le_bytes(), &mut vm).unwrap(),
-            NativeReturn::Value(0)
-        );
+        player.with_host(|host| {
+            let target = host.create_task_object(16, 0, b"particle", b"")?;
+            let caller = KcsProgram::from_code(&[0x3b], vec![0; 1024], 512)?;
+            let mut vm = Vm::from_program(caller)?;
+            vm.write(64, b"particle.kcs\0")?;
+            vm.write(512, &[0x5a; 128])?;
+            let load = [target, 64, 96, 3, 0x4120_0000, 512].map(u32::to_le_bytes).concat();
+            assert!(host.call(271, &load, &mut vm).unwrap_err().to_string()
+                .contains("particle message numbering requires an identified PE profile"));
+            host.data_services.particle_message_pe_sha256 = Some(crate::css_model::SHA);
 
-        let mut set_parameters = 42_u32.to_le_bytes().to_vec();
-        set_parameters.extend_from_slice(&512_u32.to_le_bytes());
-        vm.write(512, &[0xa5; 128]).unwrap();
-        host.call(275, &set_parameters, &mut vm).unwrap();
-        assert_eq!(host.particles[&42].parameters, [0xa5; 128]);
+            assert_eq!(host.call(271, &load, &mut vm)?, NativeReturn::Value(1));
+            let particle = &host.particles[&target];
+            assert_eq!(particle.program_name, "ptcl.int/particle.kcs");
+            assert!(particle.image_name.is_empty());
+            assert_eq!(particle.depth_bits, 0x4120_0000);
+            assert_eq!(particle.parameters, [0x5a; 128]);
 
-        let mut opacity = 42_u32.to_le_bytes().to_vec();
-        opacity.extend_from_slice(&127_u32.to_le_bytes());
-        host.call(426, &opacity, &mut vm).unwrap();
-        assert_eq!(host.particles[&42].opacity, 127);
-        let mut source = 42_u32.to_le_bytes().to_vec();
-        source.extend_from_slice(&99_u32.to_le_bytes());
-        host.call(427, &source, &mut vm).unwrap();
-        assert_eq!(host.particles[&42].transform_source, 99);
-        host.apply_particle_command(42, 591, Some(4));
-        assert_eq!(host.particles[&42].coordinate_group, 4);
-        host.apply_particle_command(42, 592, None);
-        assert_eq!(host.particles[&42].coordinate_group, 0);
-        host.apply_particle_command(42, 323, None);
-        assert!(!host.particles.contains_key(&42));
+            let receiver = target.to_le_bytes();
+            assert_eq!(host.call(274, &receiver, &mut vm)?, NativeReturn::Value(0));
+            assert_eq!(host.call(272, &receiver, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(274, &receiver, &mut vm)?, NativeReturn::Value(1));
+            assert_eq!(host.call(273, &receiver, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.call(274, &receiver, &mut vm)?, NativeReturn::Value(0));
 
-        vm.write(64, b"unknown.ppi\0").unwrap();
-        let error = host.call(693, &load, &mut vm).unwrap_err();
-        assert!(matches!(
-            error,
-            cs2_script::ScriptError::InvalidStructuredText {
-                message: "particle plugin type or version is unknown",
-                ..
-            }
-        ));
-        assert!(host.events.iter().any(|event| {
-            event.kind == "particle-error" && event.detail.contains("unknown.ppi")
-        }));
+            vm.write(512, &[0xa5; 128])?;
+            let parameters = [target, 512].map(u32::to_le_bytes).concat();
+            host.call(275, &parameters, &mut vm)?;
+            assert_eq!(host.particles[&target].parameters, [0xa5; 128]);
+            let opacity = [target, 127].map(u32::to_le_bytes).concat();
+            host.call(426, &opacity, &mut vm)?;
+            assert_eq!(host.particles[&target].opacity, 127);
+            let source = [target, 99].map(u32::to_le_bytes).concat();
+            host.call(427, &source, &mut vm)?;
+            assert_eq!(host.particles[&target].transform_source, 99);
+
+            host.apply_particle_command(target, 591, Some(4))?;
+            assert_eq!(host.particles[&target].coordinate_group, 4);
+            host.apply_particle_command(target, 592, None)?;
+            assert_eq!(host.particles[&target].coordinate_group, 0);
+            host.apply_particle_command(target, 323, None)?;
+            let released = &host.particles[&target];
+            assert!(released.runner.is_none() && !released.enabled);
+            assert_eq!(released.opacity, 127);
+
+            vm.write(64, b"plugins/unknown.ppi\0")?;
+            let error = host.call(693, &load, &mut vm).unwrap_err();
+            assert!(error.to_string().contains("invalid particle plugin PE or SDK export family"));
+            assert!(host.particles.get(&target).is_none_or(|particle| particle.plugin.is_none()));
+            Ok(())
+        })
     }
 
     #[test]
@@ -14426,7 +14401,7 @@ mod tests {
         let temp = TempDir::new();
         fs::write(temp.0.join("readme.txt"), b"fixture").unwrap();
         let mut player = HeadlessPlayer::open(&temp.0).unwrap();
-        player.run_frames(3, 8).unwrap();
+        player.run_frames(3, 10_000).unwrap();
         assert_eq!(player.state().clock.frame, 3);
         assert_eq!(player.report().current_task_id, 0);
         assert!(
@@ -14611,7 +14586,8 @@ mod tests {
             return;
         }
 
-        let mut player = HeadlessPlayer::open(&v401).unwrap();
+        let startup_profile = TempDir::new();
+        let mut player = HeadlessPlayer::open_with_save_root(&v401, &startup_profile.0).unwrap();
         let entry = player.default_entry().unwrap().to_owned();
         player.load_entry(entry).unwrap();
         player.run_frames(12, 10_000).unwrap();
@@ -14642,100 +14618,60 @@ mod tests {
         );
         assert!(player.message_wait_address.is_some());
 
-        let mut title = HeadlessPlayer::open(&v401).unwrap();
-        title.load_entry("system/fes/title.fes").unwrap();
-        title.run_frames(7, 10_000).unwrap();
-        let title_hash_before_image = title.report().frame_hash;
-        title.run_frames(3, 10_000).unwrap();
-        let title_hash_after_image = title.report().frame_hash;
-        assert_ne!(
-            title_hash_before_image, title_hash_after_image,
-            "FES image command should change the final RGBA frame"
-        );
-        title.run_frames(4, 10_000).unwrap();
-        let title_fes = title.fes.as_ref().expect("title FES should be active");
-        assert!(
-            title_fes
-                .media
-                .get("img_bg")
-                .and_then(|layer| layer.image.as_ref())
-                .is_some(),
-            "title FES should decode sys_title.hg3 for img_bg"
-        );
-        assert!(
-            title.events().iter().any(|event| {
-                event.kind == "fes-media" && event.detail.contains("object=img_bg")
-            })
-        );
-        assert!(title.fes.as_ref().unwrap().exit_code.is_none());
-        for _ in 0..60 {
-            if title.fes.as_ref().is_some_and(|fes| {
-                fes.media
-                    .get("btn1[0]")
-                    .is_some_and(|button| button.enabled)
-            }) {
-                break;
+        let title_profile = TempDir::new();
+        let mut title = HeadlessPlayer::open_with_save_root(&v401, &title_profile.0).unwrap();
+        title.enable_host_window_requests();
+        title.initialize_general_window_host(1).unwrap();
+        title.set_host_input_update_rate(60);
+        title.load_startup().unwrap();
+        title.apply_host_input(InputEvent::FocusChanged(true)).unwrap();
+        let advance_title = |title: &mut HeadlessPlayer, frames| {
+            for _ in 0..frames {
+                assert!((0..4096).any(|_| title.advance_host_frame(20_000).unwrap()),
+                    "title frame stalled: {}", title.host_tick_state());
             }
-            title.run_frames(1, 10_000).unwrap();
-        }
-        assert!(
-            title.fes.as_ref().unwrap().exit_code.is_none(),
-            "title wait section should remain active across frame boundaries"
-        );
-        let button_point = {
-            let fes = title.fes.as_ref().unwrap();
-            let button = fes.media.get("btn1[0]").unwrap();
-            let image = button.image.as_ref().expect("visible title button image");
-            let position = button.draw_position(&fes.planes);
-            Point::new(
-                position.x + image.width() as i32 / 2,
-                position.y + image.height() as i32 / 2,
-            )
         };
-        assert!(
-            title
-                .fes
-                .as_ref()
-                .unwrap()
-                .media
-                .get("btn1[0]")
-                .unwrap()
-                .enabled
-        );
-        assert_eq!(
-            title.fes.as_ref().unwrap().hit_test_button(button_point),
-            Some("btn1[0]".to_string())
-        );
-        title.state.apply_input(InputEvent::MouseMove {
-            x: button_point.x,
-            y: button_point.y,
-        });
-        title.queue_fes_event(2);
-        title.run_frames(1, 10_000).unwrap();
-        let title_section = title
-            .fes
-            .as_ref()
-            .and_then(|fes| fes.document.sections.get(fes.section))
-            .map(|section| String::from_utf8_lossy(&section.header).into_owned());
-        assert_eq!(title_section.as_deref(), Some("GO_STORY"));
-        assert!(
-            title.events().iter().any(|event| {
-                event.kind == "fes-event-command" && event.detail.contains("setid")
-            })
-        );
-        assert_eq!(
-            title
-                .events()
-                .iter()
-                .filter(|event| {
-                    event.kind == "fes-event-command" && event.detail == "@ setid 2"
-                })
-                .count(),
-            1,
-            "one queued click should dispatch one FES PUSH_L handler"
-        );
+        advance_title(&mut title, 12);
+        let title_hash_before_image = title.report().frame_hash;
+        advance_title(&mut title, 183);
+        assert_ne!(title_hash_before_image, title.report().frame_hash);
 
-        let mut newton = HeadlessPlayer::open(&newton).unwrap();
+        let title_owner = {
+            let (owner, _, runtime, _) = title.data_services.tasks.fes.story_runtimes()
+                .find(|(_, name, _, _)| *name == b"title").expect("title FES should be active");
+            assert!(runtime.media["img_bg"].image.is_some());
+            assert!(runtime.media["btn1[0]"].image.is_some());
+            owner
+        };
+        assert!(title.events().iter().any(|event| {
+            event.kind == "fes-media" && event.detail.contains("object=\"img_bg\"")
+        }));
+        let button_point = [399, 328];
+        advance_title(&mut title, 3);
+        title.apply_host_input(InputEvent::MouseMove { x: button_point[0], y: button_point[1] }).unwrap();
+        advance_title(&mut title, 7);
+        let region = title.masked_input_region_at(button_point).unwrap()
+            .expect("start button should be active under the pointer");
+        assert_eq!(region[1], 220);
+        assert_ne!(region[8], 0);
+        title.apply_host_input(InputEvent::KeyDown(InputKey::MouseButton(0))).unwrap();
+        let mut start_consumed = false;
+        for _ in 0..3 {
+            advance_title(&mut title, 1);
+            start_consumed |= title.host_input_route_receipts().iter().any(|receipt| {
+                receipt.region == region[0] && receipt.receiver == title_owner
+                    && receipt.pressed == 1 && receipt.response == 0
+            });
+        }
+        assert!(start_consumed, "title task should consume the start click");
+        title.apply_host_input(InputEvent::KeyUp(InputKey::MouseButton(0))).unwrap();
+        advance_title(&mut title, 11);
+        let runtime = title.data_services.tasks.fes.runtime(title_owner).unwrap();
+        assert_eq!(runtime.driver.as_ref().unwrap().interpreter.current_block(), b"GO_STORY");
+        assert_eq!(title.string_values.get(&200).map(Vec::as_slice), Some(b"start".as_slice()));
+
+        let newton_profile = TempDir::new();
+        let mut newton = HeadlessPlayer::open_with_save_root(&newton, &newton_profile.0).unwrap();
         assert!(newton.sound_groups.len() >= 4);
         assert_eq!(newton.sound_config_enabled, 1);
         let entry = newton.default_entry().unwrap().to_owned();
@@ -14750,97 +14686,40 @@ mod tests {
         let mut group_vm =
             Vm::from_program(KcsProgram::from_code(&[0x3b], vec![0; 256], 0).unwrap()).unwrap();
         group_vm.write(64, b"B_lav_004_004.ogg\0").unwrap();
-        let mut group_arguments = Vec::new();
-        for word in [0_u32, 0, 64, 0, 1, 60] {
-            group_arguments.extend_from_slice(&word.to_le_bytes());
-        }
-        {
-            let mut group_host = LoggingHost {
-                events: &mut newton.events,
-                frame: 0,
-                resources: &newton.scan.resources,
-                xml_handles: &mut newton.xml_handles,
-                next_xml_handle: &mut newton.next_xml_handle,
-                configured_shared_slots: newton.configured_shared_slots,
-                text_encoding: newton.script_encoding,
-                shared_values: &mut newton.shared_values,
-                current_parameter: &mut newton.current_parameter,
-                current_task_id: 0,
-                pointer_position: [0, 0],
-                task_time: 0,
-                task_origin: 0,
-                auto_select: 0,
-                scene_animation_enabled: 1,
-                fullscreen: 0,
-                fullscreen_mw_pos: 0,
-                string_values: &mut newton.string_values,
-                next_task_id: &mut newton.next_task_id,
-                task_parents: &mut newton.task_parents,
-                scene_nodes: &mut newton.scene_nodes,
-                image_handles: &mut newton.image_handles,
-                image_resources: &mut newton.image_resources,
-                backlogs: &mut newton.backlogs,
-                canvas: Some(&mut newton.graphics_canvas),
-                back_buffer: Some(&newton.canvas),
-                particles: &mut newton.particles,
-                record_stacks: &mut newton.record_stacks,
-                input_task: &mut newton.input_task,
-                task_vms: &mut newton.task_vms,
-                script_replacements: &newton.script_replacements,
-                system_config_blocks: &mut newton.system_config_blocks,
-                css_handles: &mut newton.css_handles,
-                integer_maps: &mut newton.integer_maps,
-                data_services: &mut newton.data_services,
-                cst_contexts: &mut newton.cst_contexts,
-                motion_controllers: &mut newton.motion_controllers,
-                motion_snapshots: &mut newton.motion_snapshots,
-                save_root: &newton.save_root,
-                message_wait_address: &mut newton.message_wait_address,
-                audio_host: &mut newton.audio_host,
-                movie_host: Some(&mut newton.movie_host),
-                movie_playbacks: &mut newton.movie_playbacks,
-                movie_resources: &mut newton.movie_resources,
-                sound_channels: &mut newton.sound_channels,
-                sound_groups: &newton.sound_groups,
-                sound_config: &mut newton.sound_config,
-                script_random: &mut newton.script_random,
-                menu_item_requests: &mut newton.menu_item_requests,
-                debug_mode: newton.debug_mode,
-                sound_config_enabled: newton.sound_config_enabled,
-            };
-            assert_eq!(
-                group_host
-                    .call(936, &group_arguments, &mut group_vm)
-                    .unwrap(),
-                NativeReturn::Value(0)
-            );
-            let mut keyed_arguments = Vec::new();
-            for word in [2_u32, 0, 64, 1, 2, 60] {
-                keyed_arguments.extend_from_slice(&word.to_le_bytes());
+        let mut load_group = |arguments: [u32; 6]| {
+            let bytes = arguments.map(u32::to_le_bytes).concat();
+            let started = std::time::Instant::now();
+            loop {
+                newton.audio_host.poll().unwrap();
+                let result = newton.with_host(|host| Ok(host.call(936, &bytes, &mut group_vm)?))
+                    .unwrap();
+                if result != NativeReturn::Retry {
+                    break result;
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(10),
+                    "sound group {} did not finish loading", arguments[0]);
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            assert_eq!(
-                group_host
-                    .call(936, &keyed_arguments, &mut group_vm)
-                    .unwrap(),
-                NativeReturn::Value(15)
-            );
-        }
+        };
+        assert_eq!(load_group([0, 0, 64, 0, 1, 60]), NativeReturn::Value(0));
+        assert_eq!(load_group([2, 0, 64, 1, 2, 60]), NativeReturn::Value(15));
         assert_eq!(
             newton
                 .sound_channels
                 .get(&0)
                 .and_then(|state| state.resource.as_deref()),
-            Some("B_lav_004_004.ogg")
+            Some("pcm_b.int/B_lav_004_004.ogg")
         );
         assert_eq!(
             newton
                 .sound_channels
                 .get(&15)
                 .and_then(|state| state.resource.as_deref()),
-            Some("B_lav_004_004.ogg")
+            Some("pcm_b.int/B_lav_004_004.ogg")
         );
 
-        let mut newton_scene = HeadlessPlayer::open(&newton.root.path).unwrap();
+        let scene_profile = TempDir::new();
+        let mut newton_scene = HeadlessPlayer::open_with_save_root(&newton.root.path, &scene_profile.0).unwrap();
         newton_scene.set_script_encoding(ScriptTextEncoding::Gbk);
         newton_scene.load_entry("scene/ali_001A.cst").unwrap();
         newton_scene.run_frames(1, 10_000).unwrap();
@@ -14873,7 +14752,8 @@ mod tests {
                 .any(|event| { event.kind == "cst-image" && event.detail.contains("be01_a.hg3") })
         );
 
-        let mut neko = HeadlessPlayer::open(&neko).unwrap();
+        let neko_profile = TempDir::new();
+        let mut neko = HeadlessPlayer::open_with_save_root(&neko, &neko_profile.0).unwrap();
         let entry = neko.default_entry().unwrap().to_owned();
         neko.load_entry(entry).unwrap();
         neko.run_frames(2, 10_000).unwrap();

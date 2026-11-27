@@ -209,7 +209,7 @@ impl FesTaskPlatform {
         Ok(())
     }
 
-    /// A narrow borrowed view of DRAW's existing 44-byte transition record.
+    /// A narrow borrowed view of DRAW or WIPE's retained transition record.
     /// C supplies these fields from the prepared DRAW store; no second DRAW
     /// state or transition pixels are serialized by the platform component.
     pub(crate) fn validate_draw_projection_link(
@@ -226,7 +226,7 @@ impl FesTaskPlatform {
         }
         if let Some(bytes) = parameters {
             let target = target.context("FES DRAW source record has no shared image list")?;
-            if bytes.len() != 44 || u32::from_le_bytes(bytes[16..20].try_into()?) != target.output {
+            if !matches!(bytes.len(), 44 | 56) || u32::from_le_bytes(bytes[16..20].try_into()?) != target.output {
                 bail!("FES DRAW new-image source differs from the canonical list output wrapper");
             }
         }

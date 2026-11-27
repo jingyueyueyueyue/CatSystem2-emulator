@@ -909,6 +909,18 @@ impl CanvasReadback for TestCanvasReadback {
 }
 
 #[test]
+fn capture_bmp_propagates_device_readback_failure() {
+    let source = std::sync::Arc::new(TestCanvasReadback { rgba: vec![], calls: 0.into() });
+    let mut canvas = Canvas::new(1, 1).unwrap();
+    canvas.set_deferred_device_pixels(source);
+    assert!(matches!(cs2_renderer::encode_capture_bmp(&canvas), Err(RendererError::DeviceReadbackFailed)));
+
+    canvas.clear(Color::rgb(10, 20, 30));
+    let bmp = cs2_renderer::encode_capture_bmp(&canvas).unwrap();
+    assert_eq!(&bmp[54..58], &[30, 20, 10, 0]);
+}
+
+#[test]
 fn deferred_device_pixels_materialize_once_and_clear_skips_readback() {
     use std::sync::{Arc, atomic::Ordering};
 

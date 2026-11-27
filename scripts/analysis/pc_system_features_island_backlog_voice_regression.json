@@ -1,0 +1,30 @@
+{
+  "3": {
+    "frames": 7830,
+    "window_checks": {
+      "7080": ["flow", "log_01.fes"],
+      "7250": ["flow", "log_01.fes"],
+      "7430": ["flow", "log_01.fes"],
+      "7780": ["flow", "meswnd.fes"]
+    },
+    "event_checks": [
+      {"from": 7100, "through": 7115, "contains": "backlog-lineinfo slot=1010 source=Some(\"com01\")"},
+      {"from": 7100, "through": 7115, "contains": "resource=\"pcm_o.int/YAA_com01_005_mix.ogg\""},
+      {"from": 7260, "through": 7290, "contains": "resource=\"pcm_o.int/YAA_com01_005_mix.ogg\""},
+      {"from": 7440, "through": 7470, "contains": "resource=\"pcm_o.int/YAA_com01_005_mix.ogg\""}
+    ],
+    "inputs": [
+      "story-events", "story-trace", "trace-native:604", "capture-every:0", "no-final-capture",
+      "230:557,324", "465:557,324", "525:557,324", "549:557,324", "573:557,324",
+      "move:3930:184,361", "require-hit:4050:15", "4050:184,361",
+      "4370:13", "4590:13", "4810:13", "ctrl-hold:5500:6000",
+      "inspect-log:6730", "6790:9",
+      "inspect:7080", "move:7090:450,150", "7100:450,150",
+      "move:7160:1109,150", "7170:1109,150",
+      "inspect:7250", "move:7260:450,348", "7270:450,348",
+      "move:7340:1109,150", "7350:1109,150",
+      "inspect:7430", "move:7440:450,545", "7450:450,545",
+      "move:7600:1231,677", "require-hit-priority:7620:40130", "7620:1231,677", "inspect:7780"
+    ]
+  }
+}

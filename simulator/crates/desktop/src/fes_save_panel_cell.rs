@@ -1,7 +1,7 @@
 //! Original 188-byte definitions and applied content. Definitions do not
 //! replace previously applied text/images until a source actually updates.
 use super::*;
-use cs2_renderer::RgbaFrame;
+use cs2_renderer::{FrameMetadata, RgbaFrame};
 use cs2_runtime::graph_serde::{Serialize, Deserialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,6 +164,26 @@ fn value(data: &SavePanelData, definition: &Cell) -> Result<Option<(i32, Vec<u8>
     Ok(Some((value, value.to_string().into_bytes())))
 }
 
+fn decode_thumbnail(host: &mut LoggingHost<'_>, bytes: &[u8]) -> Result<Option<RgbaFrame>> {
+    if bytes.starts_with(b"\x89PNG") {
+        let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        let decoder = reader.into_decoder()?;
+        let (width, height) = image::ImageDecoder::dimensions(&decoder);
+        let size = [width, height];
+        pixels::checked_size(size)?;
+        let pixels = image::DynamicImage::from_decoder(decoder)?.into_rgba8();
+        return Ok(Some(RgbaFrame::from_rgba8(size[0], size[1], pixels.into_raw())?
+            .with_raw_metadata(FrameMetadata::raster(size))));
+    }
+    if [b"HG-3".as_slice(), b"HG-2", b"BM", b"\xff\xd8"].iter().any(|magic| bytes.starts_with(magic)) {
+        return Ok(host.decode_managed_image_frame(bytes, 0)?);
+    }
+    Ok(None)
+}
+
 pub(super) fn apply_sources(panel: &mut bank::Bank, host: &mut LoggingHost<'_>) -> Result<()> {
     // Ordered cells make source retries deterministic. Applying a cell has no
     // script/external effects; old content survives a failed source/decode.
@@ -178,12 +198,16 @@ pub(super) fn apply_sources(panel: &mut bank::Bank, host: &mut LoggingHost<'_>) 
                 }
                 if kind == 7 && definition.word(4) != 10 { continue; }
                 let Some(bytes) = panel.data.record(definition.word(0x10))? else { continue };
-                if bytes.starts_with(b"BM") || bytes.starts_with(b"\xff\xd8") || bytes.starts_with(b"\x89PNG") {
-                    anyhow::bail!("SAVEPANEL CSS image codec is not confirmed for this encoding");
-                }
-                let image = if bytes.starts_with(b"HG-3") || bytes.starts_with(b"HG-2") {
-                    host.decode_managed_image_frame(bytes, 0)?
-                } else { None };
+                let image = match decode_thumbnail(host, bytes) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        host.events.push(crate::LogicEvent { frame: host.frame, kind: "save-panel-image-error".into(),
+                            detail: format!("file={:?} record={:#x} cell={id}: {error}",
+                                String::from_utf8_lossy(panel.data.save_name()), definition.word(0x10)),
+                        });
+                        continue;
+                    }
+                };
                 if let Some(image) = image {
                     let content = panel.contents.entry(id).or_default();
                     content.record.put(0, kind); content.record.put(0x28, 0);

@@ -25,15 +25,6 @@ pub(super) struct FesDrawStore {
     restore_lists: BTreeMap<u32, u32>,
 }
 
-impl FesDrawStore {
-    pub(crate) fn check_graph_boundary(&self) -> Result<()> {
-        if !self.owners.is_empty() || !self.restore_lists.is_empty() {
-            bail!("FES DRAW transition owner checkpoints are not yet supported");
-        }
-        Ok(())
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 struct Draw {
@@ -49,12 +40,13 @@ struct Draw {
     phase: Option<i32>,
     last_frame: Option<u32>,
     prepared_hidden: bool,
-    // Active FES wipes use a kind-26 native receiver. The optional portable
-    // DRAW component still uses its version-1 kind-27 wire.
+    // Stored alongside the original DRAW record by the checkpoint adapter.
     #[serde(skip)]
     wipe: Option<Wipe>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "cs2_runtime::graph_serde")]
 struct Wipe {
     resource: String,
     mask: Option<u32>,
@@ -67,6 +59,10 @@ impl Draw {
 
     fn task_kind(&self) -> u32 {
         if self.wipe.is_some() { 26 } else { 27 }
+    }
+
+    fn temporary_kind(&self) -> &'static [u8] {
+        if self.wipe.is_some() { b"WIPE" } else { b"DRAW" }
     }
 
     fn prepare_code(&self) -> u32 {
@@ -293,7 +289,8 @@ fn prepare(host: &mut LoggingHost<'_>, view: &FesTaskView, runtime: &FesRuntime,
         draw.list = Some(binding.task);
     }
     if !draw.prepared_hidden {
-        let list = host.data_services.tasks.fes.platform.lists.get_mut(&draw.list.unwrap())
+        let list_id = draw.list.context("DRAW submission target was not prepared")?;
+        let list = host.data_services.tasks.fes.platform.lists.get_mut(&list_id)
             .context("DRAW submission target was released")?;
         list.submit = false;
         draw.prepared_hidden = true;

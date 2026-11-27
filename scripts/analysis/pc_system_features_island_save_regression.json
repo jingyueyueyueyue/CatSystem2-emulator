@@ -1,0 +1,24 @@
+{
+  "3": {
+    "frames": 9610,
+    "window_checks": {
+      "7460": ["flow", "saveload", "novelwnd.fes"],
+      "7810": ["flow", "saveload", "save", "novelwnd.fes"],
+      "8780": ["flow", "saveload", "save", "novelwnd.fes"],
+      "9580": ["flow", "saveload", "load", "novelwnd.fes"]
+    },
+    "inputs": [
+      "story-events", "capture-every:0", "no-final-capture",
+      "text-entry:\u6c49\u5b57\u65e5\u672c\u8a9e\uff76 QA42", "text-entry-cancel",
+      "230:557,324", "465:557,324", "525:557,324", "549:557,324", "573:557,324",
+      "move:3930:184,361", "require-hit:4050:15", "4050:184,361",
+      "4370:13", "4590:13", "4810:13", "5030:13", "5250:13", "5470:13", "5690:13", "right:6500:640,540",
+      "move:6780:967,233", "require-hit:6800:21", "6800:967,233",
+      "move:7030:954,398", "require-hit:7050:71", "7050:954,398", "right:7150:1058,677", "inspect-log:7460",
+      "move:7520:328,233", "require-hit:7530:18", "7530:328,233", "inspect-log:7810",
+      "move:7830:471,146", "require-hit:7850:127", "7850:471,146",
+      "move:8430:471,254", "require-hit:8450:128", "8450:471,254", "inspect-log:8780",
+      "right:8840:640,360", "move:9140:541,233", "require-hit:9160:19", "9160:541,233", "inspect:9580"
+    ]
+  }
+}

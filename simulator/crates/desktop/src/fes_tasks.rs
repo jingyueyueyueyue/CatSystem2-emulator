@@ -2826,7 +2826,7 @@ impl FesTask {
                 }
                 Ok(EffectResult::Boundary) => {
                     if !finishing_boundary && matches!(effect, FesDriverEffect::Waiting { .. }) {
-                        driver.finish_left_input_frame();
+                        driver.finish_click_input_frame();
                     }
                     self.refresh_child_status(host, driver);
                     let finish = (|| {
@@ -3122,7 +3122,12 @@ impl FesTask {
             FesDriverEffect::MediaStatementReturned => Ok(EffectResult::Continue),
             FesDriverEffect::SharedStringWrite { destination, source } => {
                 let bytes = host.string_values.get(destination).map_or(&[][..], Vec::as_slice);
-                host.data_services.cst_text_origins.note_shared_string_write(*destination, *source, bytes);
+                let origins = &mut host.data_services.cst_text_origins;
+                if source.is_none() && driver.is_island_gbk_fes_source() {
+                    origins.set_shared_encoding(*destination, bytes, crate::ScriptTextEncoding::Gbk);
+                } else {
+                    origins.note_shared_string_write(*destination, *source, bytes);
+                }
                 Ok(EffectResult::Continue)
             }
             FesDriverEffect::ExecKcs { name, external } => {

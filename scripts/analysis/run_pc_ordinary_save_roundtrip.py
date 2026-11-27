@@ -1,23 +1,28 @@
 """Write and cold-load an ordinary slot through the Windows replay player."""
 
 import argparse
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
+import subprocess
 import time
 
 from check_neko_save_roundtrip import slot_identity
 from run_djibril_save_roundtrip import WRITE, log
 from run_playthrough_batch import (
     GIB, INVENTORY, available_ram_bytes, identify_player, load_inventory,
-    new_output_directory, run_case, write_json,
+    new_output_directory, playthrough_cache_root, run_case, write_json,
 )
 from run_yukikoi_save_roundtrip import pointer_receipts
 
 
 SLOT = "save0000.dat"
+WRITE_REJECTED = re.compile(r"frame=\d+ fes-datasave slot=0 container=\d+ written=false error=.+")
 CASES = {
     3: {
         "save_receipts": {(2771, 18, 12, 1), (2921, 128, 32, 0)},
@@ -34,16 +39,23 @@ CASES = {
         ],
     },
     6: {
-        "save_receipts": {(2121, 23, 12, 0), (2311, 55, 36, 0), (2486, 106, 101, 0)},
-        "load_receipts": {(499, 19, 11, 0), (611, 32, 13, 0), (771, 50, 45, 0), (1441, 64, 8, 0)},
-        "resume": "frame=1441 message-resume message=[2, 1135, 687, 0]",
-        "captures": ("06.1400.png", "06.1600.png"),
-        "frames": 1640,
+        "save_receipts": {(3911, 23, 12, 0), (4201, 55, 36, 0), (4426, 105, 100, 0)},
+        "rejected_write_frame": 4590,
+        "load_receipts": {(2331, 32, 13, 0), (2671, 50, 45, 0), (3451, 64, 8, 0)},
+        "load_windows": {
+            1910: ["flow", "ttlflow", "title"],
+            2310: ["flow", "ttlflow", "saveload", "saveload_c"],
+            2650: ["flow", "ttlflow", "saveload", "saveload_c", "confirm"],
+            3420: ["flow", "meswnd.fes"],
+        },
+        "resume": "frame=3451 message-resume message=[2, 1135, 687, 0]",
+        "captures": ("06.3420.png", "06.3660.png"),
+        "frames": 3690,
         "inputs": [
-            "inspect:495", "move:497:84,308", "require-hit:498:19", "498:84,308", "inspect:603",
-            "move:608:682,208", "require-hit:610:32", "610:682,208", "inspect:760",
-            "move:768:543,346", "require-hit:770:50", "770:543,346", "inspect:1400",
-            "move:1438:1135,687", "require-hit:1440:64", "1440:1135,687", "inspect:1600",
+            "inspect-log:1910", "move:1915:84,308", "require-hit:1920:19", "1920:84,308", "inspect-log:2310",
+            "move:2315:682,208", "require-hit:2330:32", "2330:682,208", "inspect-log:2650",
+            "move:2655:543,346", "require-hit:2670:50", "2670:543,346", "inspect:3420",
+            "move:3435:1135,687", "require-hit:3450:64", "3450:1135,687", "inspect:3660",
         ],
     },
 }
@@ -61,20 +73,61 @@ def observed_receipts(result, expected):
     return expected.issubset(pointer_receipts(log(result, "stderr"), {press[0] for press in expected}))
 
 
+@contextmanager
+def deny_new_files(profile):
+    identity = subprocess.check_output(["whoami.exe", "/user", "/fo", "csv", "/nh"])
+    sid = re.search(rb"\bS-1-(?:\d+-)+\d+\b", identity)
+    if sid is None:
+        raise ValueError("Windows user SID unavailable for the private profile")
+    account = "*" + sid[0].decode("ascii")
+
+    def change_acl(option, entry):
+        result = subprocess.run(["icacls.exe", str(profile), option, entry], capture_output=True)
+        if result.returncode:
+            raise ValueError(f"icacls {option} failed for the private profile (exit {result.returncode})")
+
+    change_acl("/deny", account + ":(WD)")
+    try:
+        try:
+            with (profile / "directory-acl-check").open("xb"):
+                pass
+        except PermissionError:
+            yield
+        else:
+            (profile / "directory-acl-check").unlink()
+            raise ValueError("the private profile still allows new files")
+    finally:
+        change_acl("/remove:d", account)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--player", required=True, type=Path)
+    parser.add_argument("--cache-root", type=Path, help="absolute directory for the playthrough cache")
     parser.add_argument("--index", required=True, choices=CASES, type=int)
     parser.add_argument("--timeout", type=int, default=360)
+    parser.add_argument("--overwrite-seed", type=Path,
+                        help="overwrite an existing ordinary slot staged from this archive")
+    denial = parser.add_mutually_exclusive_group()
+    denial.add_argument("--read-only", action="store_true",
+                        help="on Windows, verify a read-only seeded slot survives a rejected overwrite")
+    denial.add_argument("--deny-directory-writes", action="store_true",
+                        help="on Windows, deny file creation in the isolated profile and verify the seeded slot")
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("timeout must be positive")
+    reject_write = args.read_only or args.deny_directory_writes
+    if reject_write and (os.name != "nt" or args.index != 6 or args.overwrite_seed is None):
+        parser.error("write rejection probes require Windows, --index 6, and --overwrite-seed")
 
     player = args.player.resolve(strict=True)
     build = identify_player(player, require_integration=True)
     env = os.environ.copy()
-    cache = Path(env.get("CS2_BUILD_CACHE_ROOT", "F:/CS2-build-cache"))
-    output = new_output_directory(cache / "playthrough", datetime.now().astimezone())
+    try:
+        cache = playthrough_cache_root(args.cache_root)
+    except ValueError as error:
+        parser.error(str(error))
+    output = new_output_directory(cache, datetime.now().astimezone())
     print(output, flush=True)
     env["CS2_MEDIA_CACHE"] = str(output / "movie-input")
     if os.name == "nt":
@@ -89,19 +142,46 @@ def main():
     save_dir.mkdir()
     result = {"status": "failed", "build": build}
     try:
+        if args.overwrite_seed is not None:
+            seed = args.overwrite_seed.resolve(strict=True)
+            profile = save_dir / f"{index:02}.profile"
+            profile.mkdir()
+            staged_seed = profile / SLOT
+            shutil.copyfile(seed, staged_seed)
+            result["seed"] = {"path": str(seed), **slot_identity(staged_seed)}
+            if args.read_only:
+                staged_seed.chmod(stat.S_IREAD)
+                result["read_only"] = True
         await_resources(output)
-        saved = run_case(index, game, scenario["frames"], scenario["inputs"],
-                         player, save_dir, args.timeout, env)
+        save_windows = {case["rejected_write_frame"]: ["flow", "meswnd.fes", "saveload", "saveload_c"]} if reject_write else None
+        writers = deny_new_files(profile) if args.deny_directory_writes else nullcontext()
+        with writers:
+            saved = run_case(index, game, scenario["frames"], scenario["inputs"],
+                             player, save_dir, args.timeout, env, window_checks=save_windows)
+        if args.deny_directory_writes:
+            result["directory_write_denied"] = True
+            with (profile / "directory-acl-check").open("xb"):
+                pass
+            (profile / "directory-acl-check").unlink()
         result["producer"] = saved
+        expected_write = WRITE_REJECTED if reject_write else WRITE
         if (saved["status"] != "visual_review_required"
-                or sum(bool(WRITE.fullmatch(line)) for line in log(saved, "stdout")) != 1
+                or sum(bool(expected_write.fullmatch(line)) for line in log(saved, "stdout")) != 1
                 or not observed_receipts(saved, case["save_receipts"])):
             detail = (saved["first_engine_error"] or {}).get("detail")
-            raise ValueError(detail or "ordinary slot write or menu click was not verified")
+            raise ValueError(detail or "expected ordinary slot write outcome or menu click was not verified")
 
         slot = Path(saved["profile"]) / SLOT
         identity = slot_identity(slot)
         result["slot"] = identity
+        if args.overwrite_seed is not None:
+            identical = result["seed"]["sha256"] == identity["sha256"]
+            if reject_write and not identical:
+                raise ValueError("rejected overwrite changed the slot bytes")
+            if args.read_only and slot.stat().st_mode & stat.S_IWRITE:
+                raise ValueError("rejected overwrite changed the read-only attribute")
+            if not reject_write and identical:
+                raise ValueError("overwrite left the seeded slot byte-identical")
         profile = reopen_dir / f"{index:02}.profile"
         profile.mkdir(parents=True)
         staged = profile / SLOT
@@ -111,7 +191,8 @@ def main():
 
         await_resources(output)
         inputs = ["story-events", "capture-every:0", "button-probe", *case["inputs"]]
-        reopened = run_case(index, game, case["frames"], inputs, player, reopen_dir, args.timeout, env)
+        reopened = run_case(index, game, case["frames"], inputs, player, reopen_dir, args.timeout, env,
+                            window_checks=case.get("load_windows"))
         result["consumer"] = reopened
         if (reopened["status"] != "visual_review_required" or reopened["pid"] is None
                 or reopened["pid"] == saved["pid"]):

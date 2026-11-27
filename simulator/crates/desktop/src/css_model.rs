@@ -158,6 +158,55 @@ impl LoggingHost<'_>{
         let paths=self.resources.category_names(b"image",&path).map_err(|_|native_state_error("legacy model image category resolution failed"))?;
         for path in paths {if let Some(image)=self.load_managed_image(&path,0,false)?{return Ok(Some(image));}}Ok(None)
     }
+
+    fn restore_css_model_bindings(&mut self, target: u32, bytes: &[u8]) -> Result<bool> {
+        // The original clears both consumers before inspecting the size field.
+        self.data_services.css_models.owners.get_mut(&target)
+            .ok_or_else(|| native_state_error("CSS341 target lost its DAE model owner"))?
+            .clear_bindings();
+        let decoded = (|| -> Result<Option<_>> {
+            if read_u32(bytes, 0)? != BODY as u32 {
+                return Ok(None);
+            }
+            if bytes.len() < BODY {
+                return Err(native_state_error("CSS341 material record is truncated"));
+            }
+            let base = name(bytes, 4)?;
+            let mut overrides = Vec::new();
+            // Preserve strings crossing nominal subslots, bounded by owned CSS.
+            for index in 0..32 {
+                let start = 0x24 + index * 0x40;
+                if bytes[start] != 0 {
+                    overrides.push((name(bytes, start)?, name(bytes, start + 0x20)?));
+                }
+            }
+            let base = if base.is_empty() { None } else {
+                let image = self.css_model_image(&base)?;
+                Some((base, image))
+            };
+            Ok(Some((base, overrides)))
+        })();
+        let (base, overrides) = match decoded {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                self.events.push(super::LogicEvent {
+                    frame: self.frame,
+                    kind: "save-file-error".into(),
+                    detail: format!("CSS341 target={target}: {error}"),
+                });
+                return Ok(false);
+            }
+        };
+        let owner = self.data_services.css_models.owners.get_mut(&target)
+            .ok_or_else(|| native_state_error("CSS341 target lost its DAE model owner"))?;
+        owner.base = base;
+        for (selector, shader) in overrides {
+            owner.bind_shader(&selector, &shader)?;
+        }
+        Ok(true)
+    }
+
     pub(crate) fn receive_css_model_command(&mut self,command:TaskCommand,buffers:&mut TaskCommandBuffers<'_>,output:&mut u32)->Result<Option<TaskCommandOutcome>>{
         if let Some(outcome)=self.receive_utate_model_command(command,buffers,output)?{return Ok(Some(outcome));}
         let target=command.target as u32;
@@ -207,20 +256,7 @@ impl LoggingHost<'_>{
             341=>{
                 *output=0;
                 if self.data_services.css_models.owners[&target].scene.is_some(){
-                    // 486a80 clears both real consumers before even reading
-                    // DWORD0. Invalid size is deliberately not transactional.
-                    self.data_services.css_models.owners.get_mut(&target).unwrap().clear_bindings();
-                    let bytes=body()?;if read_u32(bytes,0)?!=BODY as u32{return Ok(Some(TaskCommandOutcome{done:true,propagate:false}));}
-                    let base=name(bytes,4)?;
-                    if !base.is_empty(){let image=self.css_model_image(&base)?;self.data_services.css_models.owners.get_mut(&target).unwrap().base=Some((base,image));}
-                    // A slot's first NUL skips just that slot. Strings may
-                    // cross their nominal32-byte subslot, bounded by owned CSS.
-                    for index in 0..32{let at=0x24+index*0x40;
-                        if *bytes.get(at).ok_or_else(||native_state_error("CSS341 binding slot truncated"))?==0{continue;}
-                        let key=name(bytes,at)?;let value=name(bytes,at+0x20)?;
-                        self.data_services.css_models.owners.get_mut(&target).unwrap().bind_shader(&key,&value)?;
-                    }
-                    *output=1;
+                    *output=u32::from(self.restore_css_model_bindings(target,body()?)?);
                 }
             },
             342=>{*output=0;if self.data_services.css_models.owners[&target].scene.is_some(){
@@ -302,4 +338,58 @@ impl LoggingHost<'_>{
 fn string_read(vm:Option<&Vm>,address:u32,size:Option<usize>)->Result<Vec<u8>>{
     let vm=vm.ok_or_else(||native_state_error("raw legacy DAE command requires caller VM"))?;
     if let Some(size)=size{vm.read(address,size)}else{let mut name=vm.read_string(address)?;name.push(0);Ok(name)}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cs2_formats::CssFile;
+    use cs2_script::Host;
+
+    #[test]
+    #[ignore = "requires the installed Tsunaban engine"]
+    fn native_css_restore_legacy_model_rejects_truncated_record_and_continues() -> anyhow::Result<()> {
+        let games = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+        let game = games.read_dir()?.filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("\u{30c4}\u{30ca}\u{30d0}\u{30f3}"))
+            .expect("installed Tsunaban game");
+        let scratch = crate::tests::TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(game.path(), &scratch.0)?;
+        let mut body = vec![0; BODY];
+        body[..4].copy_from_slice(&(BODY as u32).to_le_bytes());
+        body[0x24..0x2c].copy_from_slice(b":surface");
+        body[0x44..0x4a].copy_from_slice(b"shader");
+        let mut css = CssFile::new(1000);
+        css.append(13, &body)?;
+        css.append(14, &body[..0x60])?;
+        let mut unterminated = body;
+        let last_shader = 0x44 + 31 * 0x40;
+        unterminated[last_shader - 0x20] = b':';
+        unterminated[last_shader..].fill(b'A');
+        css.append(15, &unterminated)?;
+        player.with_host(|host| {
+            let target = host.create_task_object(42, 0, b"3D View", b"")?;
+            let owner = host.data_services.css_models.owners.get_mut(&target).unwrap();
+            owner.scene = Some(Scene {
+                nodes: Vec::new(), meshes: BTreeMap::new(),
+                materials: BTreeMap::from([("test".into(), super::super::css_dae::Material {
+                    id: b"surface".to_vec(), name: Vec::new(), color: [1.0; 4],
+                    texture: None, shader: Vec::new(),
+                })]),
+            });
+            host.css_handles.insert(1, CssFile::parse(&css.to_css()?)?);
+            let args = |item| [1, item, target].map(u32::to_le_bytes).concat();
+            let mut vm = Vm::new();
+            for (item, expected) in [(13, 1), (14, 0), (13, 1), (15, 0), (13, 1)] {
+                assert_eq!(host.call(576, &args(item), &mut vm)?, NativeReturn::Value(expected));
+                let owner = &host.data_services.css_models.owners[&target];
+                assert_eq!(owner.material_shaders.get("test").map(Vec::as_slice),
+                    (expected != 0).then_some(b"shader".as_slice()));
+                assert_eq!(owner.overrides.len(), expected as usize);
+            }
+            assert_eq!(host.events.iter().filter(|event| event.kind == "save-file-error"
+                && event.detail.contains("CSS341")).count(), 2);
+            Ok(())
+        })
+    }
 }

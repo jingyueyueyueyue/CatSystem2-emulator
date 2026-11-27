@@ -151,7 +151,6 @@ impl FesSavePanelStore {
             let field = cursor % fields;
             let column = init.columns[field].as_slice();
             let value = init.values[field].as_slice();
-            ensure!(column != b"SIZE2", "SAVEPANEL SIZE2 needs its inherited image resize consumer");
             let layer = self.banks[key].layer.clone();
             if !crate::fes_driver::main_flow::initialize_field(runtime, driver, shared,
                 host.text_encoding, &layer, b"SAVEPANEL", column, value)?
@@ -371,7 +370,6 @@ impl FesSavePanelStore {
             return Ok(true);
         }
         if matches!(verb, b"pos2" | b"size2") {
-            ensure!(verb != b"size2", "SAVEPANEL size2 needs its inherited image resize consumer");
             if let Some(source) = command.parameters.get(2) {
                 for key in keys {
                     crate::fes_driver::main_flow::initialize_field(runtime, driver, shared,

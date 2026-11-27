@@ -41,8 +41,20 @@ pub(crate) fn apply(
         let handle = bank.log.as_ref().unwrap().handle;
         let main = language_argument(host, command.parameters.get(2), driver, shared)?;
         let subtitle = language_argument(host, command.parameters.get(3), driver, shared)?;
-        if subtitle.is_some() {
-            bail!("LOGSTRING remake subtitle requires the original independent subtitle row surfaces; history is unchanged");
+        let unavailable = if subtitle.is_some() {
+            Some("independent subtitle row surfaces are unavailable")
+        } else if main.as_deref().is_some_and(|name| {
+            let (bytes, _, errors) = encoding_rs::SHIFT_JIS.encode(name);
+            errors || bytes.len() >= 64 || bytes.contains(&0)
+        }) {
+            Some("language name exceeds its CP932 buffer")
+        } else {
+            None
+        };
+        if let Some(reason) = unavailable {
+            host.data_services.note_text_decode(host.events, host.frame,
+                format!("LOGSTRING remake skipped offset={:#x}: {reason}", command.offset));
+            continue;
         }
         if handle == 0 { continue; }
         remake_backlog(host, handle, main.as_deref())?;
@@ -65,14 +77,7 @@ fn language_argument(
     let value = driver.evaluate_parameter(source, 0, shared)? as u32;
     // The original lookup uses the configured wide prefix, then CP932, not a
     // CSTL table index. Invalid (also -1) is a null language, with no fallback.
-    let Some(name) = host.data_services.language.platform.declared_cstl_name(value)? else {
-        return Ok(None);
-    };
-    let (bytes, _, errors) = encoding_rs::SHIFT_JIS.encode(&name);
-    if errors || bytes.len() >= 64 || bytes.contains(&0) {
-        bail!("LOGSTRING remake language name cannot fit its original CP932 name buffer");
-    }
-    Ok(Some(name))
+    host.data_services.language.platform.declared_cstl_name(value)
 }
 
 fn remake_backlog(host: &mut LoggingHost<'_>, handle: u32, language: Option<&str>) -> Result<()> {
@@ -159,30 +164,41 @@ fn read_input_with_recovery(
         let mut base_utf8 = || {
             let (text, bad_at) = scene.encoding.decode_message(crate::trim_nul(&record.text));
             if let Some(bad_at) = bad_at { warn(ordinal, scene.encoding, bad_at); }
-            text.into_bytes()
+            text
         };
-        let bytes = match record.kind {
+        let mut value = match record.kind {
             0x20 => {
-                let bytes = if let Some(table) = bound {
-                    table.segment(language, input, fragment).unwrap_or("").as_bytes().to_vec()
+                let value = if let Some(table) = bound {
+                    table.segment(language, input, fragment).unwrap_or("").to_owned()
                 } else { base_utf8() };
                 fragment += 1;
-                bytes
+                value
             }
             0x21 => {
-                let bytes = if let Some(table) = bound {
-                    table.message(language, input).map_or("", |message| &message.name).as_bytes().to_vec()
-                } else { base_utf8() };
-                check_record(&bytes)?;
-                name = Some(bytes);
-                continue;
+                if let Some(table) = bound {
+                    table.message(language, input).map_or("", |message| &message.name).to_owned()
+                } else { base_utf8() }
             }
             _ => continue,
         };
-        check_record(&bytes)?;
+        if let Some(offset) = value.find('\0') {
+            warn(ordinal, ScriptTextEncoding::Utf8, offset);
+            value = value.replace('\0', "\u{fffd}");
+        }
+        const RECORD_LIMIT: usize = 2048;
+        if value.len() >= RECORD_LIMIT {
+            let keep = value.floor_char_boundary(RECORD_LIMIT - 1 - '\u{fffd}'.len_utf8());
+            warn(ordinal, ScriptTextEncoding::Utf8, keep);
+            value.truncate(keep);
+            value.push('\u{fffd}');
+        }
+        if record.kind == 0x21 {
+            name = Some(value.into_bytes());
+            continue;
+        }
         // The actual body drops repeated leading literal \\r from each
         // message, then concatenates. It neither rewraps nor changes line ids.
-        let mut bytes = bytes.as_slice();
+        let mut bytes = value.as_bytes();
         while bytes.starts_with(b"\\r") { bytes = &bytes[2..]; }
         if text.len().checked_add(bytes.len()).is_none_or(|n| n > MAX_TEXT_BYTES) {
             bail!("LOGSTRING remade input exceeds 64 MiB");
@@ -190,13 +206,6 @@ fn read_input_with_recovery(
         text.extend_from_slice(bytes);
     }
     Ok((text, name))
-}
-
-fn check_record(bytes: &[u8]) -> Result<()> {
-    if bytes.len() >= 2048 || bytes.contains(&0) {
-        bail!("LOGSTRING remake record exceeds its original UTF-8 buffer or contains a zero byte");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -237,6 +246,18 @@ fn log_remake_keeps_declared_base_codec_and_bound_utf8_overrides() {
     }
     scene.document.records[1].text = b"\x81".to_vec();
     assert_eq!(read_input(&scene, 0, "unbound").unwrap().0, "\u{fffd}!".as_bytes());
+
+    let table = scene.localization.as_mut().unwrap();
+    table.messages[0][0].name = "A\0B".into();
+    table.messages[0][0].content = "\u{65e5}".repeat(800);
+    let mut warnings = Vec::new();
+    let (row, name) = read_input_with_recovery(&scene, 0, "bound", |record, codec, offset| {
+        warnings.push((record, codec, offset));
+    }).unwrap();
+    let row = std::str::from_utf8(&row).unwrap();
+    assert_eq!(name.unwrap(), "A\u{fffd}B".as_bytes());
+    assert_eq!(row, format!("{}\u{fffd}", "\u{65e5}".repeat(681)));
+    assert_eq!(warnings, [(0, ScriptTextEncoding::Utf8, 1), (1, ScriptTextEncoding::Utf8, 2043)]);
 }
 
 #[test]

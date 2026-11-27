@@ -142,3 +142,69 @@ impl HeadlessPlayer {
         if let Some(bridge) = &self.data_services.tweets.bridge { bridge.cancel(); }
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn tweet_editor_host_error_finishes_as_cancellation() -> Result<()> {
+        let bridge = Bridge::default();
+        let status = Arc::new(AtomicU32::new(0));
+        let worker_status = status.clone();
+        let request = super::super::tweet_worker::Request {
+            key: "test-key".into(),
+            secret: "test-secret".into(),
+            cache_name: Vec::new(),
+            text: "draft".into(),
+            media: Vec::new(),
+            private_root: std::env::temp_dir().join(format!(
+                "cs2-tweet-test-{}-{}", std::process::id(), platform::nonce()?,
+            )),
+            backend: Backend { bridge: Some(bridge.clone()), task: 1 },
+            suffix: Vec::new(),
+            legacy: None,
+        };
+        let worker = std::thread::spawn(move || super::super::tweet_worker::run(request, worker_status));
+        let receipts: &[(u32, u32, u32, &[u8])] = &[
+            (1, 0, 200, b"oauth_token=temporary&oauth_token_secret=temporary-secret"),
+            (3, 0, 0, b""),
+            (2, 0, 0, b"1234"),
+            (1, 0, 200, b"oauth_token=access&oauth_token_secret=access-secret"),
+            (4, 2, 0, b"credential storage unavailable"),
+            (1, 0, 200, b"{}"),
+            (6, 2, 0, b"editor closed"),
+        ];
+        let result = (|| -> Result<()> {
+            for &(operation, outcome, value, body) in receipts {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let wire = loop {
+                    if let Some(wire) = bridge.take() {
+                        break wire;
+                    }
+                    anyhow::ensure!(!worker.is_finished() && Instant::now() < deadline,
+                        "Tweet host operation {operation} did not arrive");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                anyhow::ensure!(u32::from_le_bytes(wire[16..20].try_into()?) == operation,
+                    "unexpected Tweet host operation");
+                bridge.complete(u64::from_le_bytes(wire[4..12].try_into()?), outcome, value, body.to_vec())?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() {
+                anyhow::ensure!(bridge.take().is_none(), "unexpected host request after editor error");
+                anyhow::ensure!(Instant::now() < deadline, "Tweet worker did not finish after editor error");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        })();
+        bridge.cancel();
+        let outcome = worker.join().map_err(|_| anyhow::anyhow!("Tweet worker panicked"))?;
+        result?;
+        assert_eq!(status.load(Ordering::Acquire), 6);
+        assert!(outcome.diagnostics.iter().any(|line| line.contains("editor closed")));
+        Ok(())
+    }
+}

@@ -23,8 +23,7 @@ impl Drop for TweetStore {
 }
 struct TweetTask {
     config: Option<Vec<u8>>, images: [Vec<u8>; 4], tags: [Vec<u8>; 8], body: Vec<u8>,
-    status: Arc<AtomicU32>, started: bool, worker: Option<JoinHandle<anyhow::Result<Outcome>>>,
-    failure: Option<String>,
+    status: Arc<AtomicU32>, started: bool, worker: Option<JoinHandle<Outcome>>,
 }
 impl Drop for TweetTask {
     fn drop(&mut self) {
@@ -44,8 +43,7 @@ impl TweetStore {
         if !self.can_release(id) { return Err(native_state_error("Tweet destructor must await its actual worker")); }
         if let Some(mut task) = self.tasks.remove(&id) {
             if let Some(worker) = task.worker.take() {
-                worker.join().map_err(|_| native_state_error("Tweet worker panicked during release"))?
-                    .map_err(|_| native_state_error("Tweet worker failed during release"))?;
+                worker.join().map_err(|_| native_state_error("Tweet worker panicked during release"))?;
             }
         }
         Ok(())
@@ -70,7 +68,6 @@ impl LoggingHost<'_> {
         self.data_services.tweets.tasks.insert(id, TweetTask {
             config: None, images: Default::default(), tags: Default::default(), body: Vec::new(),
             status: Arc::new(AtomicU32::new(8)), started: false, worker: None,
-            failure: None,
         });
         self.data_services.tasks.install_buffer_receiver(62, receiver);
         Ok(())
@@ -233,19 +230,11 @@ impl LoggingHost<'_> {
 
     pub(super) fn update_tweet_task(&mut self, id: u32) -> Result<()> {
         let Some(task) = self.data_services.tweets.tasks.get_mut(&id) else { return Ok(()); };
-        if task.failure.is_some() { return Err(native_state_error("Tweet worker has an unresolved host failure; see tweet-worker-error")); }
         if !task.worker.as_ref().is_some_and(JoinHandle::is_finished) { return Ok(()); }
         let worker = task.worker.take().unwrap();
-        let result = worker.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Tweet worker panicked")));
-        match result {
-            Ok(outcome) => for detail in outcome.diagnostics {
-                self.events.push(crate::LogicEvent { frame: self.frame, kind: "tweet-worker".into(), detail: format!("task={id} {detail}") });
-            },
-            Err(error) => {
-                task.failure = Some(format!("{error:#}"));
-                self.events.push(crate::LogicEvent { frame: self.frame, kind: "tweet-worker-error".into(), detail: format!("task={id} {error:#}") });
-                return Err(native_state_error("Tweet worker failed; see tweet-worker-error"));
-            }
+        let outcome = worker.join().map_err(|_| native_state_error("Tweet worker panicked"))?;
+        for detail in outcome.diagnostics {
+            self.events.push(crate::LogicEvent { frame: self.frame, kind: "tweet-worker".into(), detail: format!("task={id} {detail}") });
         }
         Ok(())
     }

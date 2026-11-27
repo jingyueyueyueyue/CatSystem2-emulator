@@ -1,0 +1,27 @@
+{
+  "5": {
+    "frames": 3650,
+    "event_checks": [{"from": 1770, "through": 3650, "contains": "native-call index=627 arguments=48 bytes"}],
+    "inputs": [
+      "story-events", "story-trace", "capture-every:0", "no-final-capture", "trace-native:627",
+      "215:13", "260:400,300", "310:32", "380:400,300", "435:13", "510:13",
+      "inspect-log:1710", "move:1740:235,509", "require-hit:1770:15", "1770:235,509",
+      "1920:13", "2100:13", "2350:13", "2600:13", "inspect:3550"
+    ]
+  },
+  "8": {
+    "frames": 6900,
+    "checkpoint_files": {"save0003.dat": "archive/2026-11/20261125_08_chapter4_save0003.dat"},
+    "event_checks": [
+      {"from": 5450, "through": 6300, "contains": "slot=3 handle="},
+      {"from": 5450, "through": 6850, "contains": "native-call index=301 arguments=36 bytes"}
+    ],
+    "save_checks": {"save0003.dat": "save0003.dat"},
+    "inputs": [
+      "story-events", "story-trace", "capture-every:0", "no-final-capture", "trace-native:301",
+      "move:2430:399,299", "require-hit:2460:8", "2460:399,299",
+      "move:4820:634,240", "require-hit:4900:14", "4900:634,240",
+      "move:5300:577,190", "5450:577,190", "inspect:5800", "inspect:6890"
+    ]
+  }
+}

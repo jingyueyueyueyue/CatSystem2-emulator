@@ -15,11 +15,25 @@ mod happiness;
 mod yukikoi_save;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-
 enum Action {
     Pointer { x: i32, y: i32, button: Option<u8> },
     Key(InputKey),
     Menu(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitGuard {
+    Region(u32),
+    Priority(i32),
+}
+
+impl HitGuard {
+    fn matches(self, region: [u32; 15]) -> bool {
+        region[8] != 0 && match self {
+            Self::Region(id) => region[0] == id,
+            Self::Priority(priority) => region[1] as i32 == priority,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +154,7 @@ fn replay(
     }
     let mut inputs = BTreeMap::new();
     let mut ctrl_windows = BTreeMap::new();
-    let mut required_hits = BTreeMap::<u64, u32>::new();
+    let mut required_hits = BTreeMap::<u64, HitGuard>::new();
     let mut same_frame_taps = BTreeSet::new();
     let mut captures = BTreeSet::new();
     let mut probes = BTreeSet::new();
@@ -227,6 +241,16 @@ fn replay(
         }
         if values == "settings-apply" {
             button_probe.apply_settings = true;
+            continue;
+        }
+        if let Some(value) = values.strip_prefix("text-entry:") {
+            button_probe.enabled = true;
+            button_probe.text_entries.push_back(Some(value.to_owned()));
+            continue;
+        }
+        if values == "text-entry-cancel" {
+            button_probe.enabled = true;
+            button_probe.text_entries.push_back(None);
             continue;
         }
         if let Some(frame) = values.strip_prefix("tap:") {
@@ -411,7 +435,15 @@ fn replay(
         }
         if let Some(guard) = values.strip_prefix("require-hit:") {
             let (frame, region) = guard.split_once(':').context("expected require-hit:frame:region")?;
-            ensure!(required_hits.insert(frame.parse()?, region.parse()?).is_none(),
+            let expected = HitGuard::Region(region.parse()?);
+            ensure!(required_hits.insert(frame.parse()?, expected).is_none(),
+                "duplicate hit guard at frame {frame}");
+            continue;
+        }
+        if let Some(guard) = values.strip_prefix("require-hit-priority:") {
+            let (frame, priority) = guard.split_once(':').context("expected require-hit-priority:frame:priority")?;
+            let expected = HitGuard::Priority(priority.parse()?);
+            ensure!(required_hits.insert(frame.parse()?, expected).is_none(),
                 "duplicate hit guard at frame {frame}");
             continue;
         }
@@ -592,7 +624,8 @@ fn replay(
                 (vec![(241, click(640, 441)), (361, click(640, 549))], vec![(241, 20), (361, 55)])
             };
         ensure!(inputs.iter().map(|(&frame, &action)| (frame, action)).eq(expected)
-                && required_hits.iter().map(|(&frame, &region)| (frame, region)).eq(hits),
+                && required_hits.iter().map(|(&frame, &guard)| (frame, guard))
+                    .eq(hits.into_iter().map(|(frame, id)| (frame, HitGuard::Region(id)))),
                 "legacy body action requires the known guarded entry timeline");
     }
 
@@ -1006,10 +1039,13 @@ fn replay(
                         masked,
                         player.mouse_press_candidate_regions([x, y])
                     );
-                    if let Some(expected) = required_hits.get(&completed)
-                        && !masked.is_some_and(|region| region[0] == *expected && region[8] != 0)
+                    if let Some(&expected) = required_hits.get(&completed)
+                        && !masked.is_some_and(|region| expected.matches(region))
                     {
-                        eprintln!("frame {completed}: click withheld; expected enabled region {expected}");
+                        match expected {
+                            HitGuard::Region(id) => eprintln!("frame {completed}: click withheld; expected enabled region {id}"),
+                            HitGuard::Priority(priority) => eprintln!("frame {completed}: click withheld; expected enabled region with priority {priority}"),
+                        }
                         println!("replay_status=input_missed");
                         return Ok(());
                     }
@@ -1126,6 +1162,11 @@ fn replay(
             let advanced = result.with_context(|| format!("frame {completed}"))?;
             if player.quit_requested() {
                 eprintln!("frame {completed}: game requested normal exit");
+                let previous_events = player.events().len();
+                player.persist_host_configuration().context("save configuration on game exit")?;
+                for event in &player.events()[previous_events..] {
+                    println!("frame={} {} {}", event.frame, event.kind, event.detail);
+                }
                 if button_probe.enabled {
                     eprintln!("frame {}: pointer {:?}, routes {:?}",
                         completed + 1, player.host_pointer_logical_position(),

@@ -1,0 +1,12 @@
+{
+  "3": {"frames": 5690,
+    "window_checks": {"4600": ["flow", "title"], "5620": ["flow", "title"]},
+    "event_checks": [
+      {"from": 4750, "through": 5100, "contains": "system-open-error background replay does not open external targets"}
+    ],
+    "inputs": ["story-events", "capture-every:0", "no-final-capture",
+      "230:557,324", "465:557,324", "525:557,324", "549:557,324", "573:557,324",
+      "move:3930:176,521", "require-hit:4050:19", "4050:176,521",
+      "inspect-log:4600", "move:4720:178,413", "require-hit:4750:27", "4750:178,413",
+      "inspect-log:5100", "move:5150:184,518", "require-hit:5180:29", "5180:184,518", "inspect-log:5620"]}
+}

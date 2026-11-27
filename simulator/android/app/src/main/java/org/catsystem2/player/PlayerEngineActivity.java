@@ -2012,7 +2012,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         worker.post(() -> {
             if (session != handle) return;
             if (nativeSystemOpenResult(handle, request, result) < 0) {
-                fail("外部打开结果提交失败", new IOException(nativeErrorText()));
+                reportOptionalHostFailure(handle, "外部打开结果提交失败", nativeErrorText());
             }
         });
     }
@@ -2076,7 +2076,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         worker.post(() -> {
             if (session != handle) return;
             if (nativeDialogResult(handle, request, shown ? 1 : 0) < 0) {
-                fail("对话框结果提交失败", new IOException(nativeErrorText()));
+                reportOptionalHostFailure(handle, "对话框结果提交失败", nativeErrorText());
             }
         });
     }
@@ -2095,43 +2095,53 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         } catch (RuntimeException error) { finishHostDialog(handle, request, false); }
     }
 
-    private void showTextEntry(long handle, long request, String title, String initial, int limit, boolean allowCancel) {
-        if (destroyed || messageUiSession != handle) return;
-        EditText editor = new EditText(this);
-        editor.setSingleLine(true);
-        editor.setFilters(new InputFilter[] { new InputFilter.LengthFilter(limit) });
-        editor.setText(initial);
-        editor.selectAll();
-        final byte[][] result = { null };
-        AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(title).setView(editor)
-            .setCancelable(allowCancel).setPositiveButton(android.R.string.ok, (dialog, which) -> {
-                result[0] = editor.getText().toString().getBytes(StandardCharsets.UTF_8);
-            });
-        if (allowCancel) builder.setNegativeButton(android.R.string.cancel, null);
-        AlertDialog dialog = builder.create();
-        textEntryDialog = dialog;
-        dialog.setOnDismissListener(ignored -> {
-            if (textEntryDialog == dialog) textEntryDialog = null;
-            worker.post(() -> {
-                if (session == handle && nativeTextEntryResult(handle, request, result[0]) < 0) {
-                    stopWithError("Text entry failed", new IOException(nativeErrorText()));
-                }
-            });
+    private void finishTextEntry(long handle, long request, byte[] value) {
+        worker.post(() -> {
+            if (session != handle || nativeTextEntryResult(handle, request, value) >= 0) return;
+            String detail = nativeErrorText();
+            if (value != null) nativeTextEntryResult(handle, request, null);
+            reportOptionalHostFailure(handle, "文字输入结果提交失败", detail);
         });
+    }
+
+    private void showTextEntry(long handle, long request, String title, String initial, int limit, boolean allowCancel) {
+        if (destroyed || messageUiSession != handle) {
+            finishTextEntry(handle, request, null);
+            return;
+        }
+        AlertDialog dialog = null;
         try {
+            EditText editor = new EditText(this);
+            editor.setSingleLine(true);
+            editor.setFilters(new InputFilter[] { new InputFilter.LengthFilter(limit) });
+            editor.setText(initial);
+            editor.selectAll();
+            final byte[][] result = { null };
+            AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(title).setView(editor)
+                .setCancelable(allowCancel).setPositiveButton(android.R.string.ok, (window, which) -> {
+                    result[0] = editor.getText().toString().getBytes(StandardCharsets.UTF_8);
+                });
+            if (allowCancel) builder.setNegativeButton(android.R.string.cancel, null);
+            final AlertDialog entry = builder.create();
+            dialog = entry;
+            textEntryDialog = entry;
+            entry.setOnDismissListener(ignored -> {
+                if (textEntryDialog == entry) textEntryDialog = null;
+                finishTextEntry(handle, request, result[0]);
+            });
             dialog.show();
             editor.requestFocus();
             if (dialog.getWindow() != null) {
                 dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
             }
         } catch (RuntimeException error) {
-            dialog.setOnDismissListener(null);
-            if (textEntryDialog == dialog) textEntryDialog = null;
-            worker.post(() -> {
-                if (session == handle && nativeTextEntryResult(handle, request, null) < 0) {
-                    stopWithError("Text entry failed", new IOException(nativeErrorText()));
-                }
-            });
+            finishTextEntry(handle, request, null);
+            if (dialog != null) {
+                dialog.setOnDismissListener(null);
+                if (textEntryDialog == dialog) textEntryDialog = null;
+                if (dialog.isShowing()) dialog.dismiss();
+            }
+            reportOptionalHostFailure(handle, "无法打开文字输入", error.toString());
         }
     }
 
@@ -2340,7 +2350,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         worker.post(() -> {
             if (session != handle) return;
             if (nativeMessageListAction(handle, task, operation, value) < 0) {
-                fail("消息列表操作失败", new IOException(nativeErrorText()));
+                reportOptionalHostFailure(handle, "消息列表操作失败", nativeErrorText());
             }
         });
     }
@@ -2348,7 +2358,7 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
         worker.post(() -> {
             if (session != handle) return;
             if (nativeSceneToolAction(handle, task, operation, parameter, value) < 0) {
-                fail("场景窗口操作失败", new IOException(nativeErrorText()));
+                reportOptionalHostFailure(handle, "场景窗口操作失败", nativeErrorText());
             }
         });
     }
@@ -3017,6 +3027,15 @@ public abstract class PlayerEngineActivity extends ComponentActivity implements 
     }
 
     private String nativeErrorText() { return new String(nativeError(), StandardCharsets.UTF_8); }
+    private void reportOptionalHostFailure(long handle, String title, String detail) {
+        String message = title + ": " + detail;
+        android.util.Log.w("CS2Player", message);
+        appendDiagnostic(message);
+        ui.post(() -> {
+            if (!destroyed && messageUiSession == handle) Toast.makeText(this, title, Toast.LENGTH_LONG).show();
+        });
+    }
+
     private void fail(String title, Exception error) {
         String message = error.getMessage() == null ? error.toString() : error.getMessage();
         android.util.Log.e("CS2Player", title, error);

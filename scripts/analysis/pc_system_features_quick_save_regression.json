@@ -1,0 +1,34 @@
+{
+  "16": {
+    "frames": 4420,
+    "save_checks": {"save5000.dat": null},
+    "window_checks": {
+      "2050": ["flow", "meswnd.fes"],
+      "2440": ["flow", "conf", "meswnd.fes"],
+      "2790": ["flow", "meswnd.fes"],
+      "3630": ["flow", "conf", "meswnd.fes"],
+      "4360": ["flow", "meswnd.fes"]
+    },
+    "event_checks": [
+      {"from": 2490, "through": 2790, "contains": "fes-media object=\"qsave_ok\" command=disp"},
+      {"from": 3680, "through": 4360, "contains": "save-slot-read task="},
+      {"from": 3680, "through": 4360, "contains": "slot=5000 handle="}
+    ],
+    "pixel_checks": [
+      {"before": 2050, "after": 3260, "bounds": [300, 606, 1130, 640], "expect": "changed"},
+      {"before": 2050, "after": 4360, "bounds": [300, 606, 1130, 640], "expect": "same"}
+    ],
+    "inputs": [
+      "story-events", "capture-every:0", "no-final-capture",
+      "require-hit:425:14", "425:640,480",
+      "require-hit:661:15", "661:66,72",
+      "require-hit:1041:62", "1041:640,420",
+      "auto-first-choice", "ctrl-hold:1050:1200", "inspect:2050",
+      "move:2070:1064,590", "2105:1064,590", "inspect-log:2440",
+      "move:2460:580,422", "2490:580,422", "inspect:2790",
+      "2960:13", "inspect:3260",
+      "move:3280:1134,590", "3310:1134,590", "inspect:3630",
+      "move:3650:580,422", "3680:580,422", "inspect:4360"
+    ]
+  }
+}

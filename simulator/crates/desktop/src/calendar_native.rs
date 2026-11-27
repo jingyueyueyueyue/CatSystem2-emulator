@@ -32,7 +32,7 @@ pub(super) fn script_random_seed() -> Result<u32> {
 }
 
 #[cfg(windows)]
-fn local_calendar() -> Result<[u32; 8]> {
+pub(super) fn local_calendar() -> Result<[u32; 8]> {
     #[repr(C)]
     #[derive(Default)]
     struct SystemTime {
@@ -53,7 +53,7 @@ fn local_calendar() -> Result<[u32; 8]> {
 }
 
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
-fn local_calendar() -> Result<[u32; 8]> {
+pub(super) fn local_calendar() -> Result<[u32; 8]> {
     use std::ffi::{c_char, c_long};
     use std::time::{SystemTime, UNIX_EPOCH};
     // The installed NDK's 64-bit Bionic tm layout. The timezone extension is preserved
@@ -97,6 +97,6 @@ fn local_calendar() -> Result<[u32; 8]> {
 }
 
 #[cfg(not(any(windows, all(target_os = "android", target_pointer_width = "64"))))]
-fn local_calendar() -> Result<[u32; 8]> {
+pub(super) fn local_calendar() -> Result<[u32; 8]> {
     Err(native_state_error("local calendar requires a platform calendar adapter"))
 }

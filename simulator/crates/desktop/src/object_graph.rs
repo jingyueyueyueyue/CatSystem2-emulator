@@ -230,7 +230,7 @@ impl HeadlessPlayer {
             })).collect(),
             message_defaults: self.data_services.messages.defaults.clone(),
             image_lists: self.image_list_state_snapshot()?,
-            back_buffer: capture_canvas(&self.canvas), graphics_canvas: capture_canvas(&self.graphics_canvas),
+            back_buffer: capture_canvas(&self.canvas)?, graphics_canvas: capture_canvas(&self.graphics_canvas)?,
             data: self.script_data_objects_snapshot()?, backlogs: self.backlog_snapshots()?,
             emocon: self.emocon_state_snapshot(),
             pending_messages: self.pending_messages.iter().copied().collect(),
@@ -319,7 +319,6 @@ impl HeadlessPlayer {
         let queue_lengths = saved.records.iter().map(|(&id, r)| (id, r.queued.len())).collect();
         let scene = NativeTaskStore::prepare_scene_message_memory_restore(&saved.scene_memory, &programs, &owners, &queue_lengths)?;
         let mut tasks = NativeTaskStore::default();
-        tasks.original_state_tree_abi = self.data_services.tasks.original_state_tree_abi;
         tasks.preserve_graph_buffer_adapters(&self.data_services.tasks);
         for (&id, r) in &saved.records {
             let ordinary_vm = if saved.vm_owners.get(&id) == Some(&VmOwner::Ordinary) { programs.remove(&id) } else { None };
@@ -631,10 +630,10 @@ fn restore_node(n: &SceneNodeSnapshot) -> anyhow::Result<SceneNode> {
 fn capture_frame(frame: &RgbaFrame) -> ImageFrameSnapshot {
     crate::image_manager::capture_frame(frame)
 }
-fn capture_canvas(canvas: &Canvas) -> ImageFrameSnapshot {
-    ImageFrameSnapshot { size: [canvas.width(), canvas.height()], rgba: canvas.pixels().to_vec(),
+fn capture_canvas(canvas: &Canvas) -> cs2_renderer::Result<ImageFrameSnapshot> {
+    Ok(ImageFrameSnapshot { size: [canvas.width(), canvas.height()], rgba: canvas.try_pixels()?.to_vec(),
         container: 0, frame_id: None, bit_depth: 32, offset: [0; 2], canvas_size: [canvas.width(), canvas.height()],
-        base: [0; 2], alpha_flag: 0, attributes: BTreeMap::new() }
+        base: [0; 2], alpha_flag: 0, attributes: BTreeMap::new() })
 }
 fn restore_frame(frame: &ImageFrameSnapshot) -> anyhow::Result<RgbaFrame> {
     crate::image_manager::restore_frame(frame)

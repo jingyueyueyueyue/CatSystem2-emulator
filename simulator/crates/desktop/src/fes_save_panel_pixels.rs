@@ -11,7 +11,7 @@ use crate::{FesRuntime, ScriptTextEncoding};
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_SOURCES: usize = 128 * 1024 * 1024;
 
-fn checked_size(size: [u32; 2]) -> Result<()> {
+pub(super) fn checked_size(size: [u32; 2]) -> Result<()> {
     ensure!(size.into_iter().all(|axis| axis != 0 && axis <= i32::MAX as u32)
         && u64::from(size[0]) * u64::from(size[1]) * 4 <= MAX_PIXELS,
         "SAVEPANEL pixel canvas exceeds its supported allocation");
@@ -21,7 +21,7 @@ fn checked_size(size: [u32; 2]) -> Result<()> {
 fn source<'a>(host: &mut LoggingHost<'_>, sources: &'a mut BTreeMap<Vec<u8>, Vec<u8>>,
     name: &str) -> Result<Option<&'a [u8]>> {
     if name.is_empty() { return Ok(None); }
-    for candidate in host.resources.category_names(b"image", name)? {
+    for candidate in host.resources.optional_category_names(b"image", name)?.into_iter().flatten() {
         let key = candidate.as_bytes().to_vec();
         if !sources.contains_key(&key) {
             let Some(bytes) = host.read_managed_raw_image_bytes(&candidate)? else { continue };
@@ -53,6 +53,8 @@ pub(super) fn update(panel: &mut bank::Bank, sources: &mut BTreeMap<Vec<u8>, Vec
     let name = host.text_encoding.decode(&expanded);
     let layer = runtime.media.get_mut(&panel.layer).context("SAVEPANEL composition layer is absent")?;
     ensure!(layer.kind == "SAVEPANEL", "SAVEPANEL composition layer has a different owner kind");
+    if layer.metadata.size_dirty { panel.dirty = true; }
+    let size_source = layer.metadata.size_source.clone();
     if let Some(reference) = layer.metadata.position_source.clone() {
         let position = crate::fes_controls::read_metadata(host, &reference)?.map_or([0; 2], |(position, _)| position);
         layer.position = Point::new(position[0], position[1]);
@@ -75,8 +77,9 @@ pub(super) fn update(panel: &mut bank::Bank, sources: &mut BTreeMap<Vec<u8>, Vec
     if panel.reference_sources != references { panel.dirty = true; }
     if !panel.dirty { return Ok(()); }
     let Some(bytes) = source(host, sources, &name)? else {
-        let layer = runtime.media.get_mut(&panel.layer).unwrap();
+        let layer = runtime.media.get_mut(&panel.layer).context("SAVEPANEL composition layer is absent")?;
         layer.image = None; layer.file = (!name.is_empty()).then_some(name);
+        layer.metadata.size_dirty = false;
         panel.expanded_file = Some(expanded); panel.reference_sources = references;
         panel.dirty = false; return Ok(());
     };
@@ -127,11 +130,25 @@ pub(super) fn update(panel: &mut bank::Bank, sources: &mut BTreeMap<Vec<u8>, Vec
             _ => bail!("SAVEPANEL applied content kind is invalid"),
         }
     }
-    let output = RgbaFrame::from_rgba8(size[0], size[1], canvas.pixels().to_vec())?
+    let mut output = RgbaFrame::from_rgba8(size[0], size[1], canvas.pixels().to_vec())?
         .with_raw_metadata(FrameMetadata::raster(size));
-    let layer = runtime.media.get_mut(&panel.layer).unwrap();
+    // The assembled cells use the HG source coordinates. Resize the complete
+    // layer so their positions and pixels follow the same mapping as the base.
+    if let Some(reference) = &size_source
+        && let Some((_, [width, height])) = crate::fes_controls::read_metadata(host, reference)?
+        && width > 0 && height > 0
+    {
+        let requested = [width as u32, height as u32];
+        checked_size(requested)?;
+        if requested != size {
+            output = crate::image_resample::resize_canvas(&output, requested)?;
+        }
+    }
+    let size = [output.width() as i32, output.height() as i32];
+    let layer = runtime.media.get_mut(&panel.layer).context("SAVEPANEL composition layer is absent")?;
     layer.image = Some(output); layer.image_offset = [0; 2]; layer.image_base = [0; 2];
-    layer.file = Some(name); layer.navigation.set_size(size.map(|v| v as i32));
+    layer.file = Some(name); layer.navigation.set_size(size);
+    layer.metadata.size_dirty = false;
     panel.expanded_file = Some(expanded); panel.reference_sources = references; panel.dirty = false;
     Ok(())
 }
@@ -213,7 +230,13 @@ fn text(target: &mut Canvas, host: &mut LoggingHost<'_>, sources: &mut BTreeMap<
     let source_record = panel.cells.get(&id).filter(|cell| cell.word(0) == 3 && cell.word(4) == 2)
         .map_or(u32::MAX, |cell| cell.word(0x10));
     let encoding = panel.data.text_encoding(host, source_record, &content.text)?;
-    let text = decode_css_text(&content.text, encoding)?;
+    let (text, bad_at) = encoding.decode_message(&content.text);
+    if let Some(offset) = bad_at {
+        host.data_services.note_text_decode(host.events, host.frame, format!(
+            "SAVEPANEL file={:?} record={source_record:#x} cell={id} encoding={encoding:?} offset={offset}",
+            String::from_utf8_lossy(panel.data.save_name()),
+        ));
+    }
     let size_i = size as i32;
     let limit = (record.word(0x3c) as i32).wrapping_mul(size_i).wrapping_sub(size_i / 2);
     let start = position[0]; let (mut width, mut line) = (0i32, 0i32);
@@ -256,37 +279,6 @@ fn text(target: &mut Canvas, host: &mut LoggingHost<'_>, sources: &mut BTreeMap<
         }
     }
     Ok(())
-}
-
-fn decode_css_text(bytes: &[u8], encoding: ScriptTextEncoding) -> Result<String> {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Ok(text.to_owned()),
-        Err(_) if encoding == ScriptTextEncoding::Cp932 => encoding_rs::SHIFT_JIS
-            .decode_without_bom_handling_and_without_replacement(bytes)
-            .context("SAVEPANEL CSS text is neither valid UTF8 nor CP932")
-            .map(|text| text.into_owned()),
-        Err(_) => Ok(encoding.decode(bytes)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn css_preview_prefers_utf8_and_recovers_cp932() {
-        let encoding = ScriptTextEncoding::Cp932;
-        let expected = "\u{3042}";
-        assert_eq!(decode_css_text(expected.as_bytes(), encoding).unwrap(), expected);
-        assert_eq!(decode_css_text(&[0x82, 0xa0], encoding).unwrap(), expected);
-        assert!(decode_css_text(&[0x82], encoding).is_err());
-    }
-
-    #[test]
-    fn css_preview_preserves_gbk_fallback() {
-        let encoding = ScriptTextEncoding::Gbk;
-        assert_eq!(decode_css_text(&[0xd6, 0xd0], encoding).unwrap(), "\u{4e2d}");
-    }
 }
 
 fn user_character(code: u16) -> Option<char> {

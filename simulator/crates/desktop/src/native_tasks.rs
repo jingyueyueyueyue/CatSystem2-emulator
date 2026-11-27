@@ -60,7 +60,6 @@ pub(super) struct NativeTaskStore {
     audio_deletion_waiters: BTreeMap<u32, BTreeSet<u32>>,
     pub(super) new_visible_list_sources: BTreeSet<u32>,
     graph: object_graph::GraphRequests,
-    original_state_tree_abi: Option<state_tree_native::OriginalStateTreeAbi>,
     model_state_trees: BTreeMap<u32, (u32, cs2_formats::StateTree)>,
     pub(super) fes: super::fes_tasks::FesTaskStore,
     pub(super) javascript: super::javascript_native::JavaScriptStore,
@@ -113,8 +112,18 @@ impl NativeTaskStore {
             if let Some(callers) = self.audio_deletion_waiters.get(&current) {
                 pending.extend(callers.iter().copied());
             }
+            pending.extend(self.message_traversals.iter().filter_map(|(&caller, message)| {
+                (message.waiting_for_update() == Some(current)).then_some(caller)
+            }));
         }
         false
+    }
+
+    pub(super) fn waits_for_message_update(&self, owner: u32) -> bool {
+        self.message_traversals.iter().any(|(&caller, message)| {
+            matches!(message.stack.last(), Some((_, MessagePhase::WaitForUpdate | MessagePhase::Cancelled)))
+                && self.audio_wait_reaches(caller, owner)
+        })
     }
 
     pub(crate) fn checkpoint_task_kinds(&self) -> BTreeMap<u32, u32> {
@@ -511,6 +520,8 @@ impl NativeSubtreeContinuation {
 enum MessagePhase {
     Receiver,
     Children(Option<i32>),
+    WaitForUpdate,
+    Cancelled,
 }
 
 #[derive(Clone, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -521,6 +532,21 @@ struct MessageTraversal {
     queued: bool,
     output: u32,
     stack: Vec<(u32, MessagePhase)>,
+}
+
+impl MessageTraversal {
+    fn waiting_for_update(&self) -> Option<u32> {
+        match self.stack.last() {
+            Some(&(id, MessagePhase::WaitForUpdate)) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn cancel_wait(&mut self, caller: u32) {
+        if let Some(receiver) = self.stack.last_mut() {
+            *receiver = (caller, MessagePhase::Cancelled);
+        }
+    }
 }
 
 pub(super) struct TaskValueScope {
@@ -549,6 +575,19 @@ impl LoggingHost<'_> {
                 if subtree.contains(parent) { subtree.insert(child); }
             }
             if subtree.len() == before { break; }
+        }
+        // A receiver deleting an already suspended sender must let that
+        // sender finish its update before the delete callback enters its VM.
+        let tasks = &mut self.data_services.tasks;
+        let blocked_senders: Vec<_> = tasks.message_traversals.iter().filter_map(|(&sender, message)| {
+            let receiver = message.waiting_for_update()?;
+            (tasks.audio_wait_reaches(caller, receiver)
+                && subtree.iter().any(|&id| tasks.audio_wait_reaches(sender, id))).then_some(sender)
+        }).collect();
+        for sender in blocked_senders {
+            if let Some(message) = tasks.message_traversals.get_mut(&sender) {
+                message.cancel_wait(sender);
+            }
         }
         let waiting: Vec<_> = subtree.into_iter().filter(|&id| self.task_waits_for_audio(id)).collect();
         for &id in &waiting {
@@ -1220,33 +1259,37 @@ impl LoggingHost<'_> {
         };
         let result = (|| {
             for _ in 0..4096 {
-                let Some((id, phase)) = traversal.stack.last().copied() else {
-                    return Ok(true);
-                };
                 if traversal.stack.len() > 256 {
                     return Err(native_state_error("task message hierarchy exceeds 256 levels"));
                 }
-                match phase {
-                    MessagePhase::Receiver => {
+                let Some((id, phase)) = traversal.stack.last_mut() else {
+                    return Ok(true);
+                };
+                let id = *id;
+                match *phase {
+                    MessagePhase::Receiver | MessagePhase::WaitForUpdate => {
                         let Some(outcome) = self.receive_task_message(
-                            id, packet, queued, &mut traversal.output, vm.as_deref_mut(),
+                            id, packet, queued, &mut traversal.output, vm.as_deref_mut(), phase,
                         )? else {
                             return Ok(false);
                         };
                         if outcome {
-                            traversal.stack.last_mut().unwrap().1 = MessagePhase::Children(None);
+                            *phase = MessagePhase::Children(None);
                         } else {
                             traversal.stack.pop();
                         }
                     }
                     MessagePhase::Children(cursor) => {
                         if let Some(child) = self.next_task_message_child(id, cursor) {
-                            traversal.stack.last_mut().unwrap().1 =
-                                MessagePhase::Children(Some(child as i32));
+                            *phase = MessagePhase::Children(Some(child as i32));
                             traversal.stack.push((child, MessagePhase::Receiver));
                         } else {
                             traversal.stack.pop();
                         }
+                    }
+                    MessagePhase::Cancelled => {
+                        traversal.output = 0;
+                        traversal.stack.pop();
                     }
                 }
             }
@@ -1263,7 +1306,7 @@ impl LoggingHost<'_> {
     /// Some(true) permits signed-id traversal of its current children.
     fn receive_task_message(
         &mut self, target: u32, mut packet: TaskMessage, queued: bool,
-        output: &mut u32, mut vm: Option<&mut Vm>,
+        output: &mut u32, mut vm: Option<&mut Vm>, phase: &mut MessagePhase,
     ) -> Result<Option<bool>> {
         if !self.task_is_reachable(target) {
             return Ok(Some(false));
@@ -1491,9 +1534,48 @@ impl LoggingHost<'_> {
             } else if !self.data_services.tasks.records[&target].active
                 && target != self.current_task_id
             {
+                let tasks = &self.data_services.tasks;
+                let record = &tasks.records[&target];
+                let already_waiting = matches!(phase, MessagePhase::WaitForUpdate);
+                // The independent body can finish when the scheduler reaches
+                // it. Keep native 69's packet and reply at the original call.
+                if vm.is_some() && record.loading.is_none() && self.task_parents.contains_key(&target)
+                    && record.ordinary.as_ref().is_some_and(OrdinaryTask::has_pending_update)
+                    && (already_waiting || (self.task_waits_for_audio(target)
+                        && !tasks.audio_wait_reaches(self.current_task_id, target)))
+                {
+                    if !already_waiting && self.data_services.story_trace {
+                        self.events.push(super::LogicEvent {
+                            frame: self.frame,
+                            kind: "task-message-wait-update".into(),
+                            detail: format!("sender={} target={target} command={}", packet[0], packet[1]),
+                        });
+                    }
+                    *phase = MessagePhase::WaitForUpdate;
+                    return Ok(None);
+                }
+                if already_waiting && self.data_services.story_trace {
+                    self.events.push(super::LogicEvent {
+                        frame: self.frame,
+                        kind: "task-message-update-ready".into(),
+                        detail: format!("sender={} target={target} command={}", packet[0], packet[1]),
+                    });
+                }
+                *phase = MessagePhase::Receiver;
                 let done = self.dispatch_ordinary_message_with_caller(target, &mut packet, output, 4096, vm)?;
                 return Ok(done.then_some(false));
             } else {
+                if self.data_services.story_trace {
+                    self.events.push(super::LogicEvent {
+                        frame: self.frame,
+                        kind: "task-message-busy".into(),
+                        detail: format!(
+                            "sender={} target={target} command={} active={} self_send={}",
+                            packet[0], packet[1], self.data_services.tasks.records[&target].active,
+                            target == self.current_task_id,
+                        ),
+                    });
+                }
                 *output = 0;
             }
             return Ok(Some(false));
@@ -1517,6 +1599,19 @@ impl LoggingHost<'_> {
             || record.ordinary.as_ref().is_some_and(|task| task.has_pending_update()
                 || (task.has_pending_command() && record.message_owner != Some(caller)));
         if busy {
+            if self.data_services.story_trace {
+                self.events.push(super::LogicEvent {
+                    frame: self.frame,
+                    kind: "task-message-busy".into(),
+                    detail: format!(
+                        "sender={caller} target={target} command={} active={} loading={} update_pending={} command_pending={} owner={:?}",
+                        packet[1], record.active, record.loading.is_some(),
+                        record.ordinary.as_ref().is_some_and(OrdinaryTask::has_pending_update),
+                        record.ordinary.as_ref().is_some_and(OrdinaryTask::has_pending_command),
+                        record.message_owner,
+                    ),
+                });
+            }
             *output = 0;
             return Ok(true);
         }
@@ -1767,7 +1862,8 @@ impl LoggingHost<'_> {
                     if ordinary_kind(kind)
                         && self.data_services.tasks.records[&id].ordinary.as_ref()
                             .is_some_and(OrdinaryTask::has_pending_command)
-                        && self.task_waits_for_audio(id)
+                        && (self.data_services.tasks.records[&id].message_owner.is_some()
+                            || self.task_waits_for_audio(id))
                     {
                         traversal.stack.pop();
                         continue;
@@ -1780,6 +1876,16 @@ impl LoggingHost<'_> {
                         && (self.data_services.tasks.records[&id].loading.is_some()
                             || self.data_services.tasks.records[&id].ordinary.as_ref()
                                 .is_some_and(OrdinaryTask::has_pending_update));
+                    // Once that body finishes, let a parked synchronous
+                    // sender dispatch before starting another ordinary body.
+                    if ordinary_kind(kind) && !resuming_ordinary
+                        && self.data_services.tasks.records[&id].deletion == 0
+                        && self.data_services.tasks.message_traversals.values()
+                            .any(|message| message.waiting_for_update() == Some(id))
+                    {
+                        traversal.stack.pop();
+                        continue;
+                    }
                     if self.data_services.tasks.records[&id].deletion != 0 && !resuming_ordinary {
                         Phase::Unregister
                     } else {
@@ -2003,6 +2109,11 @@ impl LoggingHost<'_> {
                     self.data_services.tasks.lower_commands.remove(&id);
                     self.release_task_command_buffers(id);
                     self.data_services.tasks.message_traversals.remove(&id);
+                    for (&sender, message) in &mut self.data_services.tasks.message_traversals {
+                        if message.waiting_for_update() == Some(id) {
+                            message.cancel_wait(sender);
+                        }
+                    }
                     self.release_task_values(shared_area);
                     self.data_services.tasks.fes.release(id);
                     if self.data_services.tasks.root_dispatch

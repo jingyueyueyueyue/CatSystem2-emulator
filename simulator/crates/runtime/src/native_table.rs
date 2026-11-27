@@ -27,6 +27,8 @@ mod image_records;
 mod javascript_save;
 #[path = "native_language.rs"]
 mod language;
+#[path = "native_legacy_layout.rs"]
+mod legacy_layout;
 #[path = "native_message_list.rs"]
 mod message_list;
 #[path = "native_scene_tools.rs"]
@@ -582,6 +584,8 @@ pub struct OrdinaryNativeTable {
     model_message_348: bool,
     model_transform_set: [bool; 4],
     legacy_list_wrapper_query: bool,
+    legacy_list_affine: [bool; 2],
+    short_motion_properties: [bool; 4],
     camera_relative_position: bool,
     legacy_display_rectangle: bool,
     draw_order: Option<RenderArgumentOrder>,
@@ -912,6 +916,16 @@ impl OrdinaryNativeTable {
         let legacy_list_wrapper_query = entries.get(657).is_some_and(|&(_, body)| {
             body.starts_with(b"\x51\x8b\x4c\x24\x0c\x8b\x11\x8b\x52\x0c\x56\x8d\x44\x24\x10\x50\x6a\x00\x8d\x44\x24\x0c\x50\x8b\x44\x24\x20\x8b\x70\x04\x8b\x00\x56\x68\x0d\x01\x00\x00\x50\x8b\x41\x04\x50\xc7\x44\x24\x20\x00\x00\x00\x00\xff\xd2\x8b\x44\x24\x18\x8b\x4c\x24\x04\x89\x08\xb8\x01\x00\x00\x00\x5e\x59\xc2\x10\x00")
         });
+        let legacy_list_affine = [626, 627].map(|index| {
+            entries.get(index).is_some_and(|&(rva, body)| {
+                legacy_layout::list_affine(index, rva, body, |callee| file_bytes_at(callee, true).is_some()).is_some()
+            })
+        });
+        let short_motion_properties = [299, 300, 301, 302].map(|index| {
+            entries.get(index).is_some_and(|&(rva, body)| {
+                legacy_layout::short_motion(index, rva, body, |callee| file_bytes_at(callee, true).is_some()).is_some()
+            })
+        });
         let camera_relative_position = entries.get(670).is_some_and(|&(rva, body)| {
             camera_relative_position(rva, body, |target| file_bytes_at(target, true)).is_some()
         });
@@ -1049,6 +1063,8 @@ impl OrdinaryNativeTable {
             model_message_348,
             model_transform_set,
             legacy_list_wrapper_query,
+            legacy_list_affine,
+            short_motion_properties,
             camera_relative_position,
             legacy_display_rectangle,
             draw_order,
@@ -1191,6 +1207,14 @@ impl OrdinaryNativeTable {
 
     pub fn has_legacy_list_wrapper_query(&self) -> bool {
         self.legacy_list_wrapper_query
+    }
+
+    pub fn has_legacy_list_affine(&self, index: u32) -> bool {
+        (626..=627).contains(&index) && self.legacy_list_affine[(index - 626) as usize]
+    }
+
+    pub fn has_short_motion_properties(&self, index: u32) -> bool {
+        (299..=302).contains(&index) && self.short_motion_properties[(index - 299) as usize]
     }
 
     pub fn model_motion_message(&self, index: u32) -> Option<u32> {
@@ -1871,6 +1895,42 @@ mod tests {
             assert!(!OrdinaryNativeTable::from_pe(&std::fs::read(modern)?)
                 .expect("ordinary table").has_legacy_display_rectangle());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_legacy_affine_and_motion_layouts_survive_pe_overlays() -> std::io::Result<()> {
+        let games = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../games");
+        let legacy = [
+            "\u{3046}\u{305f}\u{3066}\u{3081}\u{3050}\u{308a}/UTATEMEGURI.exe",
+            "\u{30c4}\u{30ca}\u{30d0}\u{30f3} \u{3089}\u{3076}\u{307f}\u{304f}\u{3059}/cs2.exe",
+            "\u{795d}\u{798f}\u{306e}\u{30ab}\u{30f3}\u{30d1}\u{30cd}\u{30e9}/cs2.exe",
+        ];
+        let check = |table: OrdinaryNativeTable, expected| {
+            for index in 626..=627 {
+                assert_eq!(table.has_legacy_list_affine(index), expected, "list {index}");
+            }
+            for index in 299..=302 {
+                assert_eq!(table.has_short_motion_properties(index), expected, "motion {index}");
+            }
+        };
+        for relative in legacy {
+            let path = games.join(relative);
+            if !path.is_file() {
+                continue;
+            }
+            let scan = crate::GameRoot::open(path.parent().unwrap()).unwrap().scan().unwrap();
+            check(OrdinaryNativeTable::from_game_executable(&scan).expect(relative), true);
+            let mut pe = std::fs::read(path)?;
+            pe.extend_from_slice(b"overlay");
+            check(OrdinaryNativeTable::from_pe(&pe).expect(relative), true);
+        }
+        let modern = games.join("Yukikoi Melt/YukikoiMelt.exe");
+        if modern.is_file() {
+            let pe = std::fs::read(modern)?;
+            check(OrdinaryNativeTable::from_pe(&pe).expect("modern table"), false);
+        }
+        check(OrdinaryNativeTable::from_pe(&sample_pe()).unwrap(), false);
         Ok(())
     }
 

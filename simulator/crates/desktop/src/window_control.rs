@@ -51,7 +51,9 @@ impl LoggingHost<'_> {
         if !state.enabled && id != 13 { return Ok(()); }
         let notify = matches!(id, 0 | 22);
         if state.commands.len() + state.requests.len() + usize::from(notify) >= 4096 {
-            bail!("window command queue is full");
+            self.events.push(LogicEvent { frame: self.frame, kind: "window-command-unavailable".into(),
+                detail: format!("FES window menu {id}: posted command queue is full") });
+            return Ok(());
         }
         if notify { state.commands.push_back(PostedWindowCommand::Notify([0, 159, 0, 1])); }
         state.commands.push_back(command);
@@ -61,7 +63,9 @@ impl LoggingHost<'_> {
     pub(super) fn post_title_return(&mut self) -> cs2_script::Result<()> {
         let state = &mut self.data_services.window_control;
         if state.commands.len() + state.requests.len() >= 4096 {
-            return Err(native_state_error("posted window command queue exceeds 4096 entries"));
+            self.events.push(LogicEvent { frame: self.frame, kind: "window-command-unavailable".into(),
+                detail: "FES return to title: posted command queue is full".into() });
+            return Ok(());
         }
         // The FES command posts the return request for delivery after the frame.
         state.commands.push_back(PostedWindowCommand::ReturnToTitle);
@@ -94,15 +98,42 @@ impl LoggingHost<'_> {
             state.ui.mode = u32::from_le_bytes(arguments.try_into().unwrap());
         }
         if !state.enabled {
-            return Err(native_state_error("window command needs an attached platform window"));
+            self.events.push(LogicEvent { frame: self.frame, kind: "window-command-unavailable".into(),
+                detail: format!("native {index} needs an attached platform window") });
+            return Ok(NativeReturn::Continue);
         }
         if state.commands.len() + state.requests.len() >= 4096 {
-            return Err(native_state_error("posted window command queue exceeds 4096 entries"));
+            self.events.push(LogicEvent { frame: self.frame, kind: "window-command-unavailable".into(),
+                detail: format!("native {index}: posted command queue is full") });
+            return Ok(NativeReturn::Continue);
         }
         state.commands.push_back(command);
         // The pinned wrappers post a message, ignore its BOOL and return 2.
         Ok(NativeReturn::Continue)
     }
+}
+
+#[test]
+fn exhausted_window_queue_records_the_failed_posts_and_retains_queued_work() -> Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut player = HeadlessPlayer::open(root)?;
+    player.with_host(|host| {
+        let state = &mut host.data_services.window_control;
+        state.enabled = true;
+        state.commands.resize(4096, PostedWindowCommand::Minimize);
+
+        assert!(host.window_control_native(628, &[]).is_err());
+        assert_eq!(host.window_control_native(628, &5_u32.to_le_bytes())?, NativeReturn::Continue);
+        host.post_fes_window_menu(0)?;
+        host.post_title_return()?;
+
+        let state = &host.data_services.window_control;
+        assert_eq!(state.ui.mode, 5);
+        assert_eq!(state.commands.len(), 4096);
+        assert!(state.commands.iter().all(|command| *command == PostedWindowCommand::Minimize));
+        assert_eq!(host.events.iter().filter(|event| event.kind == "window-command-unavailable").count(), 3);
+        Ok(())
+    })
 }
 
 impl HeadlessPlayer {
@@ -285,7 +316,10 @@ impl HeadlessPlayer {
                 }
                 PostedWindowCommand::Settings | PostedWindowCommand::GeneralSettings | PostedWindowCommand::Menu => {
                     let request = if command == PostedWindowCommand::Settings {
-                        self.prepare_effect_settings()?;
+                        if !self.prepare_effect_settings()? {
+                            self.data_services.window_control.commands.pop_front();
+                            continue;
+                        }
                         HostWindowRequest::Settings
                     } else if command == PostedWindowCommand::GeneralSettings {
                         self.prepare_general_settings()?;

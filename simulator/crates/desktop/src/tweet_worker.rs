@@ -1,6 +1,6 @@
 //! Owned asynchronous Tweet consumer. HTTP responses, authorization, edit
 //! cancellation and the PE's final status overwrite are separate outcomes.
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use super::tweet_platform as platform;
@@ -116,11 +116,13 @@ fn read_legacy(request: &Request, cache: &std::path::Path) -> Result<Option<(Str
     Ok(Some((token, secret)))
 }
 
-pub(super) fn run(request: Request, status: Arc<AtomicU32>) -> Result<Outcome> {
-    if !cfg!(windows) && request.backend.bridge.is_none() {
-        bail!("Tweet has no actual authorization/editor/HTTPS consumer on this target");
-    }
+pub(super) fn run(request: Request, status: Arc<AtomicU32>) -> Outcome {
     let mut diagnostics = Vec::new();
+    if !cfg!(windows) && request.backend.bridge.is_none() {
+        status.store(3, Ordering::Release);
+        diagnostics.push("Tweet authorization host is unavailable".into());
+        return Outcome { diagnostics };
+    }
     let cache = cache_path(&request);
     let mut credentials = Credentials { key: request.key.clone(), secret: request.secret.clone(),
         token: String::new(), token_secret: String::new() };
@@ -155,10 +157,10 @@ pub(super) fn run(request: Request, status: Arc<AtomicU32>) -> Result<Outcome> {
             Ok(Some((access_token_field(&fields, "oauth_token")?, access_token_field(&fields, "oauth_token_secret")?)))
         })();
         match authorization {
-            Ok(None) => { status.store(2, Ordering::Release); invalidate(&cache, &mut diagnostics); return Ok(Outcome { diagnostics }); }
+            Ok(None) => { status.store(2, Ordering::Release); invalidate(&cache, &mut diagnostics); return Outcome { diagnostics }; }
             Err(error) => {
                 status.store(3, Ordering::Release); invalidate(&cache, &mut diagnostics);
-                diagnostics.push(format!("authorization failed: {error:#}")); return Ok(Outcome { diagnostics });
+                diagnostics.push(format!("authorization failed: {error:#}")); return Outcome { diagnostics };
             }
             Ok(Some((token, secret))) => { credentials.token = token; credentials.token_secret = secret; }
         }
@@ -168,14 +170,14 @@ pub(super) fn run(request: Request, status: Arc<AtomicU32>) -> Result<Outcome> {
     // of the original machine-seeded encrypted file; never overwrite it.
     if let Err(error) = write_tokens(&cache, &credentials, backend) { diagnostics.push(format!("private credential write: {error:#}")); }
     if credentials.token.is_empty() || credentials.token_secret.is_empty() {
-        status.store(4, Ordering::Release); invalidate(&cache, &mut diagnostics); return Ok(Outcome { diagnostics });
+        status.store(4, Ordering::Release); invalidate(&cache, &mut diagnostics); return Outcome { diagnostics };
     }
     let verified = signed(backend, &credentials, "GET", "https://api.twitter.com/1.1/account/verify_credentials.json", &[], &[], None)
         .and_then(|response| successful(response, "verify-credentials"))
         .and_then(|bytes| wire::api_reply(&bytes));
     if let Err(error) = verified {
         status.store(7, Ordering::Release); invalidate(&cache, &mut diagnostics);
-        diagnostics.push(format!("account verification failed: {error:#}")); return Ok(Outcome { diagnostics });
+        diagnostics.push(format!("account verification failed: {error:#}")); return Outcome { diagnostics };
     }
     let prompt = if request.media.is_empty() { "Edit the text. OK submits this Tweet to Twitter.".to_owned() }
         else { format!("OK submits this Tweet with {} image(s): {}", request.media.len(),
@@ -184,19 +186,32 @@ pub(super) fn run(request: Request, status: Arc<AtomicU32>) -> Result<Outcome> {
     let mut initial = request.text.clone();
     let mut editor_prompt = prompt.clone();
     let text = loop {
-        match backend.edit_tweet(&editor_prompt, &initial, &suffix).context("Tweet editor")? {
-            platform::EditorResult::Cancelled => {
-                status.store(6, Ordering::Release); return Ok(Outcome { diagnostics });
+        match backend.edit_tweet(&editor_prompt, &initial, &suffix) {
+            Ok(platform::EditorResult::Cancelled) => {
+                status.store(6, Ordering::Release); return Outcome { diagnostics };
             }
-            platform::EditorResult::Forget => {
+            Ok(platform::EditorResult::Forget) => {
                 invalidate(&cache, &mut diagnostics);
-                status.store(6, Ordering::Release); return Ok(Outcome { diagnostics });
+                status.store(6, Ordering::Release); return Outcome { diagnostics };
             }
-            platform::EditorResult::Edited(text) => {
-                let count = super::tweet_host::tweet_character_count(&text, &suffix)?;
-                if count <= 140 { break format!("{text}{suffix}"); }
-                initial = text;
-                editor_prompt = format!("{prompt}\nOriginal Tweet limit exceeded: {count}/140.");
+            Ok(platform::EditorResult::Edited(text)) => {
+                match super::tweet_host::tweet_character_count(&text, &suffix) {
+                    Ok(0..=140) => break format!("{text}{suffix}"),
+                    Ok(count) => {
+                        initial = text;
+                        editor_prompt = format!("{prompt}\nOriginal Tweet limit exceeded: {count}/140.");
+                    }
+                    Err(error) => {
+                        status.store(6, Ordering::Release);
+                        diagnostics.push(format!("Tweet editor text was rejected: {error:#}"));
+                        return Outcome { diagnostics };
+                    }
+                }
+            }
+            Err(error) => {
+                status.store(6, Ordering::Release);
+                diagnostics.push(format!("Tweet editor unavailable: {error:#}"));
+                return Outcome { diagnostics };
             }
         }
     };
@@ -225,5 +240,5 @@ pub(super) fn run(request: Request, status: Arc<AtomicU32>) -> Result<Outcome> {
     // 590b6d/590c01 write5, then unconditional 590c93 writes1, even when
     // upload/post failed. It is a native completion value, not success proof.
     status.store(1, Ordering::Release);
-    Ok(Outcome { diagnostics })
+    Outcome { diagnostics }
 }

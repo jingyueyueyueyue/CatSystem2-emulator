@@ -389,6 +389,26 @@ impl FesScriptDriver {
         self.focus.as_ref()
     }
 
+    pub(crate) fn set_focus(&mut self, focus: Option<FesDriverTarget>) {
+        self.focus = focus;
+    }
+
+    pub(crate) fn set_keyblock_binding(
+        &mut self,
+        offset: usize,
+        target: Vec<u8>,
+        block: i32,
+        position: [i32; 2],
+    ) {
+        self.adapter.keyblock_bindings.retain(|binding| binding.target != target);
+        self.adapter.keyblock_bindings.push(cs2_script::FesKeyBlockBinding {
+            offset,
+            target,
+            block,
+            position,
+        });
+    }
+
     pub(super) fn send_button_selection(&self) -> u32 {
         self.send_button.unwrap_or(1)
     }
@@ -841,7 +861,7 @@ impl FesScriptDriver {
                     }
                     self.waiting = Some(FesDriverWait::Frame { after: frame });
                     self.clear_transient_input();
-                    self.finish_left_input_frame();
+                    self.finish_click_input_frame();
                     return Ok(FesDriverEffect::Frame);
                 }
                 FesEvent::Exit(code) => {
@@ -1302,7 +1322,7 @@ impl FesScriptDriver {
 
     fn clear_transient_input(&mut self) {
         for name in [
-            "_CLICK_R_", "_SCRL_U_", "_SCRL_D_", "_SCRL_P_", "_PAGE_U_", "_PAGE_D_",
+            "_SCRL_U_", "_SCRL_D_", "_SCRL_P_", "_PAGE_U_", "_PAGE_D_",
             "_PUSH_UP_", "_PUSH_DOWN_", "_PUSH_LEFT_", "_PUSH_RIGHT_",
             "_RELEASE_UP_", "_RELEASE_DOWN_", "_RELEASE_LEFT_", "_RELEASE_RIGHT_", "_TOUCH_",
         ] {
@@ -1310,7 +1330,9 @@ impl FesScriptDriver {
         }
     }
 
-    pub(super) fn finish_left_input_frame(&mut self) {
+    pub(super) fn finish_click_input_frame(&mut self) {
+        // The synchronous input callback can write this before the next main poll.
+        self.set_named_value("_CLICK_R_", 0, 0);
         if !self.raw_input && !self.skip_input && !self.keyskip_cont {
             self.set_named_value("_CLICK_L_", 0, 0);
             self.cancel_wait = false;

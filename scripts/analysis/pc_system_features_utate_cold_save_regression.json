@@ -1,0 +1,25 @@
+{
+  "5": {
+    "frames": 5300,
+    "checkpoint_files": {"save0004.dat": "archive/2026-11/20261127_05_opening_save0004.dat"},
+    "window_checks": {
+      "1600": ["flow", "title"], "2950": ["flow", "saveload"],
+      "3770": ["flow"], "4380": ["flow"], "5240": ["flow"]
+    },
+    "event_checks": [
+      {"from": 3250, "through": 3570, "contains": "fes-media baseimg snapshot queued"},
+      {"from": 3400, "through": 3750, "contains": "slot=4 handle="}
+    ],
+    "pixel_checks": [
+      {"before": 4380, "after": 5000, "bounds": [120, 465, 680, 530], "expect": "changed"}
+    ],
+    "save_checks": {"save0004.dat": "save0004.dat"},
+    "inputs": [
+      "story-events", "story-trace", "capture-every:0", "no-final-capture", "trace-native:576",
+      "215:13", "260:400,300", "310:32", "380:400,300", "435:13", "510:13", "1050:13", "1200:400,300",
+      "inspect-log:1600", "move:1730:348,510", "require-hit:2300:16", "2300:348,510", "inspect-log:2950",
+      "move:3200:233,151", "require-hit:3250:29", "3250:233,151", "inspect-log:3770",
+      "inspect:4380", "4570:13", "inspect:5000", "inspect-log:5240"
+    ]
+  }
+}

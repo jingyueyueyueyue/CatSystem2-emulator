@@ -205,6 +205,7 @@ impl FesTextProjection {
         if super::gpu_raster::draw_image(canvas, &self.frame, &self.options) {
             return Ok(());
         }
+        canvas.try_pixels()?;
         canvas.draw_frame(&self.frame, &self.options)
     }
 
@@ -704,6 +705,15 @@ impl FesTextStore {
         }
         let args = &command.parameters[2..];
         if log::command(self, &keys, command, driver, shared, host.backlogs, bank == Some(-1))? {
+            if verb == b"lineinfo" && host.data_services.story_trace {
+                let slot = optional_number(args, 1, 0, driver, shared)? as u32;
+                let source = shared.strings.get(&slot).map(|value| String::from_utf8_lossy(value));
+                host.events.push(crate::LogicEvent {
+                    frame: host.frame,
+                    kind: "backlog-lineinfo".into(),
+                    detail: format!("slot={slot} source={source:?}"),
+                });
+            }
             return Ok(true);
         }
         if self.banks[&keys[0]].log.is_some()
@@ -744,7 +754,7 @@ impl FesTextStore {
                         ),
                     });
                 }
-                self.layout(&keys, command, driver, shared, defaults, reset_file_font)?;
+                self.layout(&keys, command, driver, shared, defaults, resource_encoding, host, reset_file_font)?;
             }
             b"insert" if self.banks[&keys[0]].novel.is_some() => {
                 let paragraph_local_draw = driver.is_rebellions_message_fes_source()
@@ -1232,6 +1242,11 @@ impl FesTextStore {
                 for key in &keys { self.banks.get_mut(key).unwrap().clip =
                     Some(Rect::new(values[0], values[1], values[2] as u32, values[3] as u32)); }
             }
+            b"mag" => {
+                // CS2 stores reveal wait scaling separately from pixel geometry;
+                // 0 and -1 disable artificial pacing rather than zeroing scale.
+                let _ = optional_number(args, 0, 100, driver, shared)?;
+            }
             _ => bail!("unsupported ordinary STRING command {:?}", String::from_utf8_lossy(verb)),
         }
         for key in &keys {
@@ -1299,7 +1314,8 @@ impl FesTextStore {
 
     fn layout(
         &mut self, keys: &[Key], command: &FesDriverCommand, driver: &mut FesScriptDriver,
-        shared: &mut ExpressionState, defaults: &MessageDefaults, reset_file_font: bool,
+        shared: &mut ExpressionState, defaults: &MessageDefaults,
+        resource_encoding: ScriptTextEncoding, host: &mut LoggingHost<'_>, reset_file_font: bool,
     ) -> Result<()> {
         let Some(verb) = command.parameters.get(2).map(Vec::as_slice) else { return Ok(()) };
         let args = &command.parameters[3..];
@@ -1363,7 +1379,7 @@ impl FesTextStore {
                     else if verb == b"font" && record.message.encoding() == MessageEncoding::Unicode {
                         unicode_layout_font(name)?
                     } else {
-                        std::str::from_utf8(name).context("STRING layout font must be UTF-8")?
+                        decode_layout_font(name, resource_encoding, command.offset, host)
                             .encode_utf16().collect()
                     };
                 put_font(&mut record.configuration, record.message.encoding(), &font)?;
@@ -1866,12 +1882,16 @@ fn legacy_fes_text_uses_selected_gbk_and_keeps_separator() {
     message.clear();
 
     let raw = b"\xb7\xc7\xff\xd5\xe2";
-    assert!(message.append(raw).is_err());
+    message.append(raw).unwrap();
+    assert!(message.source().contains('\u{fffd}'));
+    message.clear();
     message.append_legacy_gbk(raw).unwrap();
     assert_eq!(message.source(), "\u{975e}\u{ffff}\u{8fd9}");
     assert_eq!(message.raw_appends(), &[raw.to_vec()]);
-    assert!(message.append_legacy_gbk(b"\x81").is_err());
-    assert_eq!(message.source(), "\u{975e}\u{ffff}\u{8fd9}");
+    message.append_legacy_gbk(b"\x81").unwrap();
+    assert_eq!(message.source(), "\u{975e}\u{ffff}\u{8fd9}\u{fffd}");
+    assert!(message.append_legacy_gbk(b"embedded\0zero").is_err());
+    assert_eq!(message.raw_appends().last().unwrap(), b"\x81");
 }
 
 /// None means this service has made no change. Install in the extra_effect
@@ -2985,6 +3005,33 @@ fn unicode_layout_font(mut raw: &[u8]) -> Result<Vec<u16>> {
         raw = &raw[length..];
     }
     Ok(font)
+}
+fn decode_layout_font(
+    name: &[u8],
+    resource_encoding: ScriptTextEncoding,
+    offset: usize,
+    host: &mut LoggingHost<'_>,
+) -> String {
+    if let Ok(text) = std::str::from_utf8(name) {
+        return text.to_owned();
+    }
+    if let Some(text) = resource_encoding.decode_strict(name) {
+        return text.into_owned();
+    }
+    if resource_encoding != ScriptTextEncoding::Cp932
+        && let Some(text) = ScriptTextEncoding::Cp932.decode_strict(name)
+    {
+        return text.into_owned();
+    }
+    let (text, bad_at) = resource_encoding.decode_message(name);
+    if let Some(bad_at) = bad_at {
+        host.data_services.note_text_decode(
+            host.events,
+            host.frame,
+            format!("STRING layout font offset={offset:#x} encoding={resource_encoding:?} bad_at={bad_at}"),
+        );
+    }
+    text
 }
 fn normalize_text(raw: &[u8], encoding: MessageEncoding, sjis: bool, resource: ScriptTextEncoding) -> Result<Vec<u8>> {
     if sjis {

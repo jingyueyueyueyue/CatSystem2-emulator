@@ -1,0 +1,42 @@
+{
+  "6": {
+    "frames": 5290,
+    "checkpoint_files": {"save0000.dat": "archive/2026-11/20261126_06_system_features_seed_save0000.dat"},
+    "window_checks": {"2320": ["flow", "ttlflow", "saveload", "saveload_c"],
+      "3280": ["flow", "ttlflow", "saveload", "saveload_c", "confirm"],
+      "3680": ["flow", "ttlflow", "saveload", "saveload_c"],
+      "5220": ["flow", "ttlflow", "saveload", "saveload_c"]},
+    "event_checks": [
+      {"from": 2675, "through": 2870, "contains": "fes-save-file command=savecopy from=0 to=1 changed=true"},
+      {"from": 3320, "through": 3680, "contains": "fes-save-file command=savedelete slot=1 changed=true"},
+      {"from": 4110, "through": 4300, "contains": "fes-save-file command=saveexchg from=0 to=2 changed=true"},
+      {"from": 4940, "through": 5220, "contains": "fes-save-file command=saveexchg from=2 to=12 changed=true"}
+    ],
+    "save_checks": {"save0012.dat": "save0000.dat"},
+    "inputs": ["story-events", "capture-every:0", "no-final-capture",
+      "move:1915:84,308", "require-hit:1920:19", "1920:84,308",
+      "inspect-log:2320", "move:2328:946,660", "require-hit:2355:30", "2355:946,660",
+      "inspect-log:2460", "move:2475:682,208", "require-hit:2500:32", "2500:682,208",
+      "inspect-log:2630", "move:2650:852,208", "require-hit:2675:33", "2675:852,208",
+      "inspect-log:2870", "move:2910:861,660", "require-hit:2940:28", "2940:861,660",
+      "inspect-log:3060", "move:3070:852,208", "require-hit:3100:33", "3100:852,208",
+      "inspect-log:3280", "move:3290:543,346", "require-hit:3320:50", "3320:543,346",
+      "inspect-log:3680", "move:3690:1031,660", "require-hit:3720:29", "3720:1031,660",
+      "inspect-log:3870", "move:3880:682,208", "require-hit:3910:32", "3910:682,208",
+      "inspect-log:4070", "move:4080:1022,208", "require-hit:4110:34", "4110:1022,208",
+      "inspect-log:4300", "move:4310:1031,660", "require-hit:4340:29", "4340:1031,660",
+      "move:4510:1022,208", "require-hit:4540:34", "4540:1022,208",
+      "move:4690:745,59", "require-hit:4720:20", "4720:745,59",
+      "move:4910:682,208", "require-hit:4940:32", "4940:682,208", "inspect-log:5220"]
+  },
+  "9": {
+    "frames": 5240,
+    "checkpoint_files": {"savegen.dat": "archive/2026-11/20261125_09_pc_original_ending_savegen.dat"},
+    "window_checks": {"4470": ["flow", "cgmode", "cgview"], "5180": ["flow", "cgmode"]},
+    "inputs": ["story-events", "capture-every:0", "no-final-capture", "move:2325:195,510",
+      "require-hit:2340:17", "2340:195,510", "move:3220:195,357",
+      "require-hit:3240:19", "3240:195,357", "move:4020:474,194",
+      "require-hit:4050:14", "4050:474,194", "inspect-log:4470",
+      "right:4500:640,360", "inspect-log:5180"]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "18": {
+    "frames": 3880,
+    "checkpoint_files": {
+      "save1000.dat": "archive/2026-11/20261126_system_features_18_written_save1000.dat",
+      "savegen.dat": "archive/2026-11/20261126_system_features_18_written_savegen.dat"
+    },
+    "window_checks": {"3860": ["flow"]},
+    "event_checks": [
+      {"from": 3240, "through": 3860, "contains": "slot=1000 handle="}
+    ],
+    "save_checks": {"save1000.dat": "save1000.dat"},
+    "inputs": [
+      "story-events", "button-probe", "capture-every:0", "no-final-capture",
+      "move:1480:327,433", "require-hit:1540:12", "1540:327,433",
+      "move:2190:134,559", "require-hit:2260:35", "2260:134,559",
+      "inspect-log:2780", "move:2820:749,76", "require-hit:2890:10", "2890:749,76",
+      "require-hit:2980:10", "2980:749,76", "inspect:3100",
+      "move:3170:189,128", "require-hit:3240:41", "3240:189,128", "inspect-log:3860"
+    ]
+  }
+}

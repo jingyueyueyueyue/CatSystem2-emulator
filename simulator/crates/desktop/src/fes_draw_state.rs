@@ -3,6 +3,8 @@ use super::*;
 use std::collections::BTreeSet;
 use cs2_runtime::object_graph::{encode_component, decode_component};
 
+const WIPE_TAG: &[u8] = b"CS2FESDRAW\x02";
+
 #[derive(Serialize)]
 #[serde(crate = "cs2_runtime::graph_serde")]
 struct Capture<'a> { version: u32, store: &'a FesDrawStore }
@@ -10,13 +12,36 @@ struct Capture<'a> { version: u32, store: &'a FesDrawStore }
 #[serde(crate = "cs2_runtime::graph_serde")]
 struct Saved { version: u32, store: FesDrawStore }
 
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "cs2_runtime::graph_serde")]
+struct WithWipes<Store, Mask> {
+    draw: Store,
+    wipes: BTreeMap<u32, Mask>,
+}
+
 impl FesDrawStore {
     pub(crate) fn capture_checkpoint(&self, kinds: &BTreeMap<u32, u32>) -> Result<Vec<u8>> {
         self.validate_checkpoint(kinds)?;
-        Ok(encode_component(&Capture { version: 1, store: self })?)
+        let draw = Capture { version: 1, store: self };
+        let wipes: BTreeMap<_, _> = self.owners.iter().filter_map(|(&owner, draw)|
+            draw.wipe.as_ref().map(|wipe| (owner, wipe))).collect();
+        if wipes.is_empty() {
+            return Ok(encode_component(&draw)?);
+        }
+        let mut bytes = WIPE_TAG.to_vec();
+        bytes.extend(encode_component(&WithWipes { draw, wipes })?);
+        Ok(bytes)
     }
     pub(crate) fn prepare_checkpoint(bytes: &[u8], kinds: &BTreeMap<u32, u32>) -> Result<Self> {
-        let saved: Saved = decode_component(bytes)?;
+        let saved: Saved = if let Some(bytes) = bytes.strip_prefix(WIPE_TAG) {
+            let WithWipes { mut draw, wipes }: WithWipes<Saved, Wipe> = decode_component(bytes)?;
+            for (owner, wipe) in wipes {
+                draw.store.owners.get_mut(&owner).context("FES wipe checkpoint has no DRAW owner")?.wipe = Some(wipe);
+            }
+            draw
+        } else {
+            decode_component(bytes)?
+        };
         if saved.version != 1 { bail!("unsupported FES DRAW checkpoint version"); }
         saved.store.validate_checkpoint(kinds)?;
         Ok(saved.store)
@@ -27,7 +52,7 @@ impl FesDrawStore {
         &self,
     ) -> BTreeMap<(u32, Vec<u8>, i32), (Vec<u8>, i32)> {
         self.owners.iter().map(|(&owner, draw)|
-            ((owner, DRAW_NAME.to_vec(), 0), draw.parent_motion.clone())).collect()
+            ((owner, draw.temporary_name().to_vec(), 0), draw.parent_motion.clone())).collect()
     }
 
     /// The dynamic adapter name is published before attach_draw_motion can
@@ -36,22 +61,18 @@ impl FesDrawStore {
         self.owners.get(&owner).is_some_and(|draw| draw.creating)
     }
 
-    /// Call after validate_checkpoint_links: retained parameters are either
-    /// absent or the original 44-byte record, never truncated/reconstructed.
-    pub(crate) fn checkpoint_transition_links(
-        &self,
-    ) -> Vec<(u32, u32, Option<i32>, Option<Vec<u8>>)> {
+    pub(crate) fn checkpoint_transition_links(&self) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
         self.owners.iter().filter_map(|(&owner, draw)| draw.native_task.map(|task|
-            (owner, task, draw.phase, draw.parameters.clone()))).collect()
+            (owner, task, draw.task_kind())))
     }
 
     pub(crate) fn validate_checkpoint_owner(&self, owner: u32, driver: &FesScriptDriver) -> Result<()> {
         if let Some(draw) = self.owners.get(&owner) {
-            let temporary = driver.adapter.object_bank_definition(DRAW_NAME, 0)
+            let temporary = driver.adapter.object_bank_definition(draw.temporary_name(), 0)
                 .context("DRAW checkpoint lost its dynamic driver identity")?;
             let parent = driver.adapter.object_bank_definition(&draw.parent_motion.0, draw.parent_motion.1 as usize)
                 .context("DRAW checkpoint lost its actual parent PLANE bank")?;
-            if temporary.kind_name != b"DRAW" || parent.kind_name != b"PLANE" {
+            if temporary.kind_name != draw.temporary_kind() || parent.kind_name != b"PLANE" {
                 bail!("DRAW checkpoint driver identity/parent kind differs");
             }
         }
@@ -65,21 +86,25 @@ impl FesDrawStore {
         let mut tasks = BTreeSet::new();
         let mut snapshots = BTreeSet::new();
         for (owner, draw) in &self.owners {
-            if draw.wipe.is_some() {
-                bail!("portable checkpoint does not support an active FES PLANE wipe");
-            }
             if kinds.get(owner) != Some(&34) || draw.duration == 0 || draw.parent.len() > 4096
                 || draw.parent_motion.0.len() > 31 || draw.parent_motion.0.contains(&0) || draw.parent_motion.1 < 0
-                || draw.native_task.is_some_and(|id| kinds.get(&id) != Some(&27) || !tasks.insert(id))
+                || draw.native_task.is_some_and(|id| kinds.get(&id) != Some(&draw.task_kind()) || !tasks.insert(id))
                 || draw.list.is_some_and(|id| kinds.get(&id) != Some(&15))
-                || draw.snapshot.is_some_and(|id| id == 0 || !snapshots.insert(id))
+                || [draw.snapshot, draw.wipe.as_ref().and_then(|wipe| wipe.mask)].into_iter().flatten()
+                    .any(|id| id == 0 || !snapshots.insert(id))
+                || draw.wipe.as_ref().is_some_and(|wipe| wipe.resource.is_empty()
+                    || wipe.resource.len() > 4096 || wipe.resource.contains('\0'))
                 || draw.prepared_hidden && (draw.list.is_none() || draw.parameters.is_none()) {
                 bail!("FES DRAW checkpoint lost an actual owner or preparation stage");
             }
             if let Some(bytes) = &draw.parameters {
-                if bytes.len() != 44 || draw.snapshot.is_none() || draw.list.is_none()
+                let size = if draw.wipe.is_some() { 56 } else { 44 };
+                if bytes.len() != size
+                    || draw.snapshot.is_none() || draw.list.is_none()
                     || word(bytes, 0)? != draw.duration || Some(word(bytes, 1)?) != draw.snapshot
-                    || word(bytes, 2)? != 0 || word(bytes, 3)? != 0 {
+                    || word(bytes, 2)? != 0 || word(bytes, 3)? != 0
+                    || draw.wipe.as_ref().is_some_and(|wipe| wipe.mask.is_none())
+                    || (draw.wipe.is_some() && Some(word(bytes, 7)?) != draw.wipe.as_ref().and_then(|wipe| wipe.mask)) {
                     bail!("FES DRAW checkpoint parameter record differs from its captured sources");
                 }
             }
@@ -99,7 +124,8 @@ impl FesDrawStore {
         self.validate_checkpoint(kinds)?;
         for (owner, draw) in &self.owners {
             if draw.native_task.is_some_and(|id| parents.get(&id) != Some(owner))
-                || draw.snapshot.is_some_and(|id| !wrappers.contains(&id)) {
+                || [draw.snapshot, draw.wipe.as_ref().and_then(|wipe| wipe.mask)].into_iter().flatten()
+                    .any(|id| !wrappers.contains(&id)) {
                 bail!("FES DRAW checkpoint task parent/snapshot wrapper differs");
             }
             if let Some(bytes) = &draw.parameters {
@@ -137,4 +163,40 @@ impl FesDrawStore {
 fn word(bytes: &[u8], index: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes.get(index * 4..index * 4 + 4)
         .context("DRAW checkpoint word exceeds retained record")?.try_into()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipe_checkpoint_preserves_mask_and_motion_identity() -> Result<()> {
+        let draw = Draw {
+            command: 0,
+            parent: "plane".into(),
+            parent_motion: (b"plane".to_vec(), 0),
+            duration: 30,
+            creating: false,
+            native_task: Some(4),
+            snapshot: Some(10),
+            list: Some(2),
+            parameters: Some([30u32, 10, 0, 0, 11, 0, 0, 12, 0, 0, 0, 0, 0, 0]
+                .into_iter().flat_map(u32::to_le_bytes).collect()),
+            phase: Some(3),
+            last_frame: Some(19),
+            prepared_hidden: true,
+            wipe: Some(Wipe { resource: "image/mask.hg3".into(), mask: Some(12) }),
+        };
+        let store = FesDrawStore { owners: BTreeMap::from([(1, draw)]), ..Default::default() };
+        let kinds = BTreeMap::from([(1, 34), (2, 15), (4, 26)]);
+        let bytes = store.capture_checkpoint(&kinds)?;
+        let restored = FesDrawStore::prepare_checkpoint(&bytes, &kinds)?;
+        let parents = BTreeMap::from([(4, 1)]);
+        restored.validate_checkpoint_links(&kinds, &parents, &BTreeSet::from([10, 11, 12]))?;
+        assert!(restored.validate_checkpoint_links(&kinds, &parents, &BTreeSet::from([10, 11])).is_err());
+        assert!(restored.checkpoint_motion_identities().contains_key(&(1, WIPE_NAME.to_vec(), 0)));
+        assert_eq!(restored.checkpoint_transition_links().collect::<Vec<_>>(), [(1, 4, 26)]);
+        assert_eq!(restored.capture_checkpoint(&kinds)?, bytes);
+        Ok(())
+    }
 }

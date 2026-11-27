@@ -81,44 +81,48 @@
   },
   "18": {
     "load-scroll-drag": {
-      "before": 1050,
-      "click": 1053,
-      "after": 1100,
+      "before": 1150,
+      "click": 1166,
+      "after": 1260,
       "region": 9,
+      "region_change": [9, [735, 89, 764, 414], [735, 171, 764, 496]],
       "inputs": [
-        "settings-apply", "move:857:327,433", "require-hit:858:12", "858:327,433",
-        "move:1052:749,250", "require-hit:1053:9", "1053:749,250", "move:1055:749,380"
+        "settings-apply", "move:916:327,433", "require-hit:930:12", "930:327,433",
+        "move:1155:749,250", "require-hit:1166:9", "1166:749,250", "move:1168:749,380"
       ]
     },
     "load-scroll-down": {
-      "before": 1050,
-      "click": 1053,
-      "after": 1100,
+      "before": 1150,
+      "click": 1166,
+      "after": 1260,
       "region": 11,
+      "region_change": [9, [735, 89, 764, 414], [735, 171, 764, 496]],
       "inputs": [
-        "settings-apply", "move:857:327,433", "require-hit:858:12", "858:327,433",
-        "move:1052:749,509", "require-hit:1053:11", "1053:749,509"
+        "settings-apply", "move:916:327,433", "require-hit:930:12", "930:327,433",
+        "move:1155:749,509", "require-hit:1166:11", "1166:749,509"
       ]
     },
     "load-scroll-up": {
-      "before": 1100,
-      "click": 1103,
-      "after": 1150,
+      "before": 1260,
+      "click": 1276,
+      "after": 1440,
       "region": 10,
+      "region_change": [9, [735, 171, 764, 496], [735, 89, 764, 414]],
       "inputs": [
-        "settings-apply", "move:857:327,433", "require-hit:858:12", "858:327,433",
-        "move:1052:749,509", "require-hit:1053:11", "1053:749,509",
-        "move:1102:749,76", "require-hit:1103:10", "1103:749,76"
+        "settings-apply", "move:916:327,433", "require-hit:930:12", "930:327,433",
+        "move:1155:749,509", "require-hit:1166:11", "1166:749,509",
+        "move:1265:749,76", "require-hit:1276:10", "1276:749,76"
       ]
     },
     "load-scroll-track": {
-      "before": 1050,
-      "click": 1053,
-      "after": 1100,
+      "before": 1150,
+      "click": 1166,
+      "after": 1260,
       "region": 8,
+      "region_change": [9, [735, 89, 764, 414], [735, 171, 764, 496]],
       "inputs": [
-        "settings-apply", "move:857:327,433", "require-hit:858:12", "858:327,433",
-        "move:1052:749,465", "require-hit:1053:8", "1053:749,465"
+        "settings-apply", "move:916:327,433", "require-hit:930:12", "930:327,433",
+        "move:1155:749,465", "require-hit:1166:8", "1166:749,465"
       ]
     }
   }

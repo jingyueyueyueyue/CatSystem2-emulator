@@ -46,6 +46,25 @@ impl ConfigXml {
         data: &[u8],
         first_path: Option<&[&[u8]]>,
     ) -> Result<Self, ConfigError> {
+        Self::parse_runtime_fields(data, first_path, None)
+    }
+
+    /// Preserve the UTF-8 document's raw display text at the requested depth
+    /// and tag. The caller decodes it for display and reports replacements.
+    /// Names, markup and all other text still require valid UTF-8.
+    pub fn parse_runtime_with_raw_field_text(
+        data: &[u8],
+        depth: usize,
+        tag: &[u8],
+    ) -> Result<Self, ConfigError> {
+        Self::parse_runtime_fields(data, None, Some((depth, tag)))
+    }
+
+    fn parse_runtime_fields(
+        data: &[u8],
+        first_path: Option<&[&[u8]]>,
+        raw_field: Option<(usize, &[u8])>,
+    ) -> Result<Self, ConfigError> {
         use std::collections::BTreeMap;
         let end = data.iter().position(|&byte| byte == 0).unwrap_or(data.len());
         let limited = end > MAX_XML_SIZE;
@@ -77,7 +96,7 @@ impl ConfigXml {
                 .ok_or(ConfigError::Malformed(position))?;
             let mut normalized = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_vec();
             normalized.extend_from_slice(text.as_bytes());
-            return Self::parse_runtime_with_first_path(&normalized, first_path);
+            return Self::parse_runtime_fields(&normalized, first_path, raw_field);
         }
         if !encoding.eq_ignore_ascii_case(b"UTF-8") { return Err(ConfigError::Malformed(0)); }
         let mut stack: Vec<(Vec<u8>, Option<usize>)> = Vec::new();
@@ -85,12 +104,17 @@ impl ConfigXml {
         let mut fields: Vec<XmlField> = Vec::new();
         let mut indices: BTreeMap<Vec<Vec<u8>>, usize> = BTreeMap::new();
         let mut stored_paths = 0usize;
+        let mut validated_until = 0usize;
         while position < data.len() {
             if data[position] != b'<' {
                 let next = data[position..].iter().position(|&byte| byte == b'<')
                     .map_or(data.len(), |offset| position + offset);
                 let text = &data[position..next];
-                if let Some((_, field)) = stack.last() {
+                if let Some((name, field)) = stack.last() {
+                    if raw_field.is_some_and(|(depth, tag)| stack.len() == depth && name == tag) {
+                        validate_runtime_utf8(data, validated_until, position)?;
+                        validated_until = next;
+                    }
                     if let Some(field) = *field {
                         append_runtime_text(&mut fields[field].text, text);
                     }
@@ -120,7 +144,7 @@ impl ConfigXml {
                 stack.pop();
                 position = close + 1;
                 if stack.is_empty() {
-                    validate_runtime_utf8(&data[..position])?;
+                    validate_runtime_utf8(data, validated_until, position)?;
                     return Ok(Self { root, fields });
                 }
                 continue;
@@ -154,7 +178,7 @@ impl ConfigXml {
             };
             position = close + 1;
             if self_closing {
-                validate_runtime_utf8(&data[..position])?;
+                validate_runtime_utf8(data, validated_until, position)?;
                 return Ok(Self { root, fields });
             }
             stack.push((name, field));
@@ -301,8 +325,9 @@ impl ConfigXml {
     }
 }
 
-fn validate_runtime_utf8(data: &[u8]) -> Result<(), ConfigError> {
-    std::str::from_utf8(data).map(|_| ()).map_err(|error| ConfigError::Malformed(error.valid_up_to()))
+fn validate_runtime_utf8(data: &[u8], start: usize, end: usize) -> Result<(), ConfigError> {
+    std::str::from_utf8(&data[start..end]).map(|_| ())
+        .map_err(|error| ConfigError::Malformed(start + error.valid_up_to()))
 }
 
 fn runtime_declaration(data: &[u8]) -> Result<(usize, &[u8]), ConfigError> {

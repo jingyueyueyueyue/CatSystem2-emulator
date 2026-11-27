@@ -285,6 +285,7 @@ impl ReadyEntry {
 pub(super) struct Probe {
     pub enabled: bool,
     pub apply_settings: bool,
+    pub text_entries: std::collections::VecDeque<Option<String>>,
     installed_menu: Option<u64>,
     prior_setting: Option<(u32, u32, u32)>,
 }
@@ -400,7 +401,7 @@ impl Probe {
         Ok(true)
     }
 
-    pub fn complete_local_requests(&self, player: &mut HeadlessPlayer, frame: u64) -> Result<()> {
+    pub fn complete_local_requests(&mut self, player: &mut HeadlessPlayer, frame: u64) -> Result<()> {
         if self.enabled {
             while let Some(dialog) = player.take_host_dialog_request() {
                 eprintln!("frame {frame}: game dialog title={:?} text={:?}", dialog.title, dialog.text);
@@ -409,6 +410,16 @@ impl Probe {
             while let Some(open) = player.take_host_system_open_request() {
                 eprintln!("frame {frame}: external open request observed");
                 player.complete_host_system_open(open.id, Err("background replay does not open external targets".into()))?;
+            }
+            if !self.text_entries.is_empty() && let Some(request) = player.take_host_text_entry() {
+                let answer = self.text_entries.pop_front().unwrap();
+                ensure!(answer.is_some() || request.allow_cancel, "text entry disallows cancellation");
+                eprintln!(
+                    "frame {frame}: text entry title={:?} initial={:?} limit={} accepted={}",
+                    request.title, request.initial, request.limit, answer.is_some(),
+                );
+                anyhow::ensure!(player.complete_host_text_entry(request.id, answer),
+                    "replay text-entry result has no matching request");
             }
         }
         Ok(())

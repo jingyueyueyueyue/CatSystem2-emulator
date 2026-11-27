@@ -685,7 +685,7 @@ impl LoggingHost<'_> {
             //manager is absent or no selector0 bank contributes any text.
             if self.data_services.emote.state.backend_ready() {
                 let bytes = self.data_services.emote.state.debug_m2_text_cp932().map_err(error)?;
-                if !bytes.is_empty() { self.publish_cp932_clipboard(933, &bytes)?; }
+                if !bytes.is_empty() { self.publish_cp932_clipboard(933, &bytes); }
             }
             return Ok(NativeReturn::Continue);
         }

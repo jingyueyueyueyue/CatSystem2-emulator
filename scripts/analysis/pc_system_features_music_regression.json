@@ -1,0 +1,35 @@
+{
+  "9": {
+    "frames": 6840,
+    "checkpoint_files": {"savegen.dat": "archive/2026-11/20261125_09_pc_original_ending_savegen.dat"},
+    "window_checks": {"4050": ["flow", "musicmode"], "4650": ["flow", "musicmode"], "6800": ["flow", "title"]},
+    "event_checks": [
+      {"from": 4100, "through": 4300, "contains": "sound_load channel=0 selector=1 resource=\"bgm.int/bgm01.ogg\""},
+      {"from": 4350, "through": 4650, "contains": "sound_load channel=1 selector=1 resource=\"bgm.int/bgm02.ogg\""},
+      {"from": 5070, "through": 5480, "contains": "sound_load channel=0 selector=1 resource=\"bgm.int/bgm"}
+    ],
+    "pixel_checks": [
+      {"before": 4650, "after": 4940, "bounds": [875, 510, 945, 551], "expect": "changed"},
+      {"before": 4650, "after": 4940, "bounds": [951, 510, 1021, 551], "expect": "changed"},
+      {"before": 4650, "after": 4940, "bounds": [1027, 510, 1097, 551], "expect": "changed"},
+      {"before": 4940, "after": 5050, "bounds": [723, 510, 793, 551], "expect": "changed"},
+      {"before": 5050, "after": 5480, "bounds": [723, 510, 793, 551], "expect": "changed"},
+      {"before": 4940, "after": 5050, "bounds": [185, 507, 537, 551], "expect": "changed"},
+      {"before": 5050, "after": 5480, "bounds": [185, 507, 537, 551], "expect": "changed"}
+    ],
+    "inputs": ["story-events", "capture-every:0", "no-final-capture", "move:2325:195,510",
+      "require-hit:2340:17", "2340:195,510", "move:3220:195,408", "require-hit:3240:20", "3240:195,408",
+      "inspect-log:4050", "move:4060:252,144", "require-hit:4100:11", "4100:252,144",
+      "move:4310:639,144", "require-hit:4350:12", "4350:639,144",
+      "move:4550:640,480", "inspect:4650",
+      "move:4655:909,530", "require-hit:4670:33", "4670:909,530",
+      "move:4755:985,530", "require-hit:4770:34", "4770:985,530",
+      "move:4855:1061,530", "require-hit:4870:35", "4870:1061,530",
+      "move:4890:640,480", "inspect:4940",
+      "move:4955:605,530", "require-hit:4970:30", "4970:605,530",
+      "move:4990:640,480", "inspect:5050",
+      "move:5055:757,530", "require-hit:5070:31", "5070:757,530",
+      "move:5100:640,480", "inspect:5480",
+      "right:5520:640,360", "inspect-log:6800"]
+  }
+}

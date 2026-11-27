@@ -181,10 +181,14 @@ struct ButtonProperties {
     syskey: i32,
     raw_type: u32,
     locked_position: Option<[f32; 2]>,
+    #[serde(default)]
+    draggable: bool,
 }
 
 impl Default for ButtonProperties {
-    fn default() -> Self { Self { enabled: 1, syskey: -1, raw_type: 0, locked_position: None } }
+    fn default() -> Self {
+        Self { enabled: 1, syskey: -1, raw_type: 0, locked_position: None, draggable: false }
+    }
 }
 
 impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ButtonProperties {
@@ -207,6 +211,7 @@ impl<'de> cs2_runtime::graph_serde::Deserialize<'de> for ButtonProperties {
                     syskey: sequence.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?,
                     raw_type: sequence.next_element()?.ok_or_else(|| A::Error::invalid_length(2, &self))?,
                     locked_position: sequence.next_element()?.unwrap_or_default(),
+                    draggable: sequence.next_element()?.unwrap_or_default(),
                 })
             }
         }
@@ -1406,7 +1411,11 @@ fn button_property_command(
 ) -> Result<bool> {
     let Some(verb) = command.parameters.get(1) else { return Ok(false); };
     let lock = verb.eq_ignore_ascii_case(b"lock");
-    if !lock && !verb.eq_ignore_ascii_case(b"enable") {
+    let enable = verb.eq_ignore_ascii_case(b"enable");
+    let drag = verb.eq_ignore_ascii_case(b"drag");
+    let setact = verb.eq_ignore_ascii_case(b"setact");
+    let keyblock = verb.eq_ignore_ascii_case(b"keyblock");
+    if !lock && !enable && !drag && !setact && !keyblock {
         return Ok(false);
     }
     let source = object_command_target(command)?;
@@ -1435,6 +1444,63 @@ fn button_property_command(
         Some(bank) if bank >= 0 => vec![bank],
         _ => Vec::new(),
     };
+    if drag {
+        let value = command.parameters.get(2)
+            .map(|source| driver.evaluate_parameter(source, 0, shared))
+            .transpose()?.unwrap_or(0);
+        for bank in banks {
+            if driver.adapter.object_bank(name, bank as usize).is_none() { continue; }
+            let identity = (view.id, name.to_vec(), bank);
+            if let Some(properties) = host.data_services.tasks.fes.platform.button_properties.get_mut(&identity) {
+                properties.draggable = value != 0;
+            }
+        }
+        return Ok(true);
+    }
+    if setact {
+        if let Some(&bank) = banks.first()
+            && driver.adapter.object_bank(name, bank as usize).is_some()
+        {
+            let target = navigation_binding(host, view.id, name, bank)
+                .map(|(actual, _, _)| actual)
+                .unwrap_or_else(|| FesDriverTarget {
+                    name: name.to_vec(),
+                    bank,
+                    default_group: None,
+                    value: -1,
+                });
+            driver.set_focus(Some(target.clone()));
+            host.data_services
+                .messages
+                .fes_button_controllers
+                .entry(view.id)
+                .or_default()
+                .focus = Some(target);
+        }
+        return Ok(true);
+    }
+    if keyblock {
+        let block = command.parameters.get(2)
+            .map(|source| driver.evaluate_parameter(source, 0, shared))
+            .transpose()?.unwrap_or(-1);
+        let col = command.parameters.get(3)
+            .map(|source| driver.evaluate_parameter(source, 0, shared))
+            .transpose()?.unwrap_or(0);
+        let row = command.parameters.get(4)
+            .map(|source| driver.evaluate_parameter(source, 0, shared))
+            .transpose()?.unwrap_or(0);
+        for bank in banks {
+            if driver.adapter.object_bank(name, bank as usize).is_none() { continue; }
+            let target = FesDriverTarget {
+                name: name.to_vec(),
+                bank,
+                default_group: None,
+                value: -1,
+            };
+            driver.set_keyblock_binding(command.offset, target.parameter(), block, [col, row]);
+        }
+        return Ok(true);
+    }
     if lock {
         let value = command.parameters.get(2).map(|source| driver.evaluate_parameter(source, 0, shared))
             .transpose()?.unwrap_or(0);
@@ -1626,6 +1692,21 @@ fn initialize_objects(
         (0..object.definition.bank_count as i32).collect()
     };
     let fields = init.columns.len().min(init.values.len());
+    // Some CIMAGE rows put a literal priority in SIZE and an explicit
+    // positive width/height pair in PRI. Correct the transposed fields
+    // before evaluating the row so BASEIMG can use the initialized pixels.
+    let transposed_color_image_columns = driver.adapter.object(raw_name)
+        .filter(|object| object.definition.kind_name == b"CIMAGE")
+        .and_then(|_| {
+            let size = init.columns[..fields].iter().position(|column| column == b"SIZE")?;
+            let priority = init.columns[..fields].iter().position(|column| column == b"PRI")?;
+            let integer = |bytes: &[u8]| std::str::from_utf8(bytes).ok()?.parse::<i32>().ok();
+            integer(&init.values[size])?;
+            let pair = &init.values[priority];
+            let comma = pair.iter().position(|&byte| byte == b',')?;
+            (integer(&pair[..comma])? > 0 && integer(&pair[comma + 1..])? > 0)
+                .then_some((size, priority))
+        });
     let identity = (view.id, init.offset);
     let mut cursor = *host
         .data_services
@@ -1663,7 +1744,12 @@ fn initialize_objects(
             );
         }
         let column = init.columns[field].as_slice();
-        let value = init.values[field].as_slice();
+        let value_field = match transposed_color_image_columns {
+            Some((size, priority)) if field == size => priority,
+            Some((size, priority)) if field == priority => size,
+            _ => field,
+        };
+        let value = init.values[value_field].as_slice();
         let button_field = kind == b"BUTTON" && matches!(column, b"ENABLE" | b"SYSKEY" | b"TYPE");
         if button_field {
             let value = driver.evaluate_parameter(value, 0, shared)?;
@@ -2257,9 +2343,26 @@ mod media_lifecycle_tests {
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
         std::fs::create_dir(&directory)?;
         let result = (|| -> Result<()> {
-            for (name, bytes) in files { std::fs::write(directory.join(name), bytes)?; }
-            HeadlessPlayer::open_with_save_root(&directory, directory.join("profile"))
-            .and_then(|mut player| player.with_host(|host| {
+            for (name, bytes) in files {
+                let path = directory.join(name);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, bytes)?;
+            }
+            let mut player = HeadlessPlayer::open_with_save_root(&directory, directory.join("profile"))?;
+            if directory.join("image").is_dir() {
+                use cs2_runtime::resource_router::{ResourceRouter, ResourceSlot};
+                let mut router = ResourceRouter::default();
+                router.slots[0] = ResourceSlot {
+                    prefix: "image".encode_utf16().collect(),
+                    loose_directory: "image".encode_utf16().collect(),
+                    loose_enabled: true,
+                    archive: None,
+                };
+                player.scan.resources.set_resource_router(router)?;
+            }
+            player.with_host(|host| {
                 let mut offset = 0;
                 let mut section = |header: &[u8], lines: &[&[u8]]| FesSection {
                     header: header.to_vec(),
@@ -2273,6 +2376,8 @@ mod media_lifecycle_tests {
                     section(header, lines)).collect() };
                 let mut driver = FesScriptDriver::new(&document)?;
                 let mut runtime = FesRuntime::new(document);
+                runtime.media.clear();
+                runtime.planes.clear();
                 let mut shared = ExpressionState::default();
                 let id = host.create_task_object(34, 0, b"media test", b"")?;
                 let view = FesTaskView { id, parent: 0, context: Vec::new(), list: None, now: 1, paused: 0 };
@@ -2283,7 +2388,7 @@ mod media_lifecycle_tests {
                     }
                 }
                 test(host, &view, &mut runtime, &mut driver, &mut shared)
-            }))
+            })
         })();
         let cleanup = std::fs::remove_dir_all(&directory).map_err(Into::into);
         result.and(cleanup)
@@ -3034,9 +3139,137 @@ wait 30\n")?;
         let legacy = encode_component(&(1u32, -1i32, 0u32))?;
         let mut properties: ButtonProperties = decode_component(&legacy)?;
         assert!(properties.locked_position.is_none());
+        assert!(!properties.draggable);
         properties.locked_position = Some([40.5, 65.0]);
+        properties.draggable = true;
         let restored: ButtonProperties = decode_component(&encode_component(&properties)?)?;
         assert_eq!(restored.locked_position, properties.locked_position);
+        assert!(restored.draggable);
         Ok(())
+    }
+
+    #[test]
+    fn fes_button_drag_setact_and_keyblock_update_runtime_state() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"btn[0] drag 1",
+            b"btn[1] setact",
+            b"btn[0] keyblock 2 3 4",
+            b"btn[0] keyblock 5 6 7",
+        ];
+        with_script(b"BUTTON btn[2]", commands, |host, view, runtime, driver, shared| {
+            for _ in commands {
+                command(host, view, runtime, driver, shared)?;
+            }
+            assert!(host.data_services.tasks.fes.platform.button_properties[&(view.id, b"btn".to_vec(), 0)].draggable);
+            assert!(!host.data_services.tasks.fes.platform.button_properties[&(view.id, b"btn".to_vec(), 1)].draggable);
+            assert_eq!(driver.focus().map(|focus| focus.bank), Some(1));
+            assert_eq!(
+                host.data_services.messages.fes_button_controllers.get(&view.id).and_then(|c| c.focus.as_ref()).map(|f| f.bank),
+                Some(1)
+            );
+            assert_eq!(driver.adapter.keyblock_bindings.len(), 1);
+            assert_eq!(driver.adapter.keyblock_bindings[0].block, 5);
+            assert_eq!(driver.adapter.keyblock_bindings[0].position, [6, 7]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fes_globals_and_text_media_extensions_handle_system_ui_commands() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"img seid ($10+=3)",
+            b"txt mag ($11+=5)",
+            b"txt mag -1",
+            b"txt layout font \x8c\xb9\x8f_\x83S\x83V\x83b\x83NX Bold",
+            b"gettime 850 851 852 853 854 855 856 857",
+            b"fw_init",
+            b"fw_auth user token",
+            b"fw_hash game.exe deadbeef",
+            b"fw_limitpos ($12+=2)",
+            b"fw_activate",
+            b"fw_status 700",
+            b"fw_actcode 1000",
+            b"fw_uniquecode 1001",
+            b"clipboard $str1000",
+            b"messagebox 701 0 Notice body, line",
+            b"dbgstr 100+no1, Japanese",
+            b"dbgstru8 utf8 debug",
+            b"cursormove 120 240",
+            b"automoveex 200 300 4",
+            b"btnsimulate 0 1",
+            b"touch_enable ($13+=1)",
+            b"touch_kill",
+            b"rdraw ($14+=2)",
+        ];
+        with_script_sections(
+            &[
+                (b"DEFINE", &[b"IMAGE img", b"STRING txt"]),
+                (b"START", commands),
+            ],
+            &[],
+            |host, view, runtime, driver, shared| {
+                for _ in commands {
+                    command(host, view, runtime, driver, shared)?;
+                }
+                assert_eq!(shared.shared[10..15], [3, 5, 2, 1, 2]);
+                assert!(shared.shared[850] >= 2024);
+                assert!((1..=12).contains(&shared.shared[851]));
+                assert!((1..=31).contains(&shared.shared[852]));
+                assert!((0..=6).contains(&shared.shared[853]));
+                assert!((0..=23).contains(&shared.shared[854]));
+                assert!((0..=59).contains(&shared.shared[855]));
+                assert!((0..=59).contains(&shared.shared[856]));
+                assert!((0..=999).contains(&shared.shared[857]));
+                assert_eq!(shared.shared[700], 2);
+                assert_eq!(shared.shared[701], 1);
+                assert!(!shared.strings[&1000].is_empty());
+                assert!(!shared.strings[&1001].is_empty());
+                assert!(host.events.iter().any(|e| e.kind == "fes-media" && e.detail.contains("ignored-image-typo")));
+                assert!(host.events.iter().any(|e| e.kind == "fes-messagebox" && e.detail.contains("Notice body, line")));
+                assert!(host.events.iter().any(|e| e.kind == "fes-dbgstr" && e.detail.contains("100+no1")));
+                assert!(host.events.iter().any(|e| e.kind.contains("clipboard")));
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn fes_save_panel_size2_updates_the_composed_raster_and_navigation() -> Result<()> {
+        let hg = |frame_size: [u32; 2], canvas_size: [u32; 2]| {
+            let mut bytes = b"HG-3".to_vec();
+            bytes.extend([12u32, 0x300, 0, 0].into_iter().flat_map(u32::to_le_bytes));
+            bytes.extend_from_slice(b"stdinfo\0");
+            bytes.extend([
+                0, 40, frame_size[0], frame_size[1], 32, 0, 0,
+                canvas_size[0], canvas_size[1], 1, 0, 0,
+            ].into_iter().flat_map(u32::to_le_bytes));
+            bytes
+        };
+        let panel = hg([2, 2], [2, 2]);
+        let large = hg([6, 4], [8, 8]);
+        let small = hg([3, 2], [8, 8]);
+        with_script_sections(
+            &[
+                (b"DEFINE", &[b"SAVEPANEL panel"]),
+                (b"OBJECT FILE SIZE2", &[b"panel image/panel.hg3 image/large.hg3"]),
+                (b"START", &[b"panel size2 image/small.hg3"]),
+            ],
+            &[("image/panel.hg3", &panel), ("image/large.hg3", &large), ("image/small.hg3", &small)],
+            |host, view, runtime, driver, shared| {
+                let verify = |runtime: &FesRuntime, size: [u32; 2]| {
+                    let layer = &runtime.media["panel"];
+                    let pixels = layer.image.as_ref().context("SAVEPANEL raster was not composed")?;
+                    assert_eq!([pixels.width(), pixels.height()], size);
+                    assert_eq!(layer.navigation.size, size.map(|axis| axis as i32));
+                    assert!(!layer.metadata.size_dirty);
+                    Ok::<(), anyhow::Error>(())
+                };
+                crate::fes_save_panel::update_owner(host, view, runtime)?;
+                verify(runtime, [6, 4])?;
+                command(host, view, runtime, driver, shared)?;
+                crate::fes_save_panel::update_owner(host, view, runtime)?;
+                verify(runtime, [3, 2])
+            },
+        )
     }
 }

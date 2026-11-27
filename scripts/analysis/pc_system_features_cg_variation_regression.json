@@ -1,0 +1,23 @@
+{
+  "9": {
+    "frames": 5250,
+    "checkpoint_files": {"savegen.dat": "archive/2026-11/20261125_09_pc_original_ending_savegen.dat"},
+    "window_checks": {
+      "4470": ["flow", "cgmode", "cgview"],
+      "4800": ["flow", "cgmode", "cgview"],
+      "5130": ["flow", "cgmode"]
+    },
+    "pixel_checks": [
+      {"before": 4470, "after": 4800, "bounds": [204, 116, 447, 376], "expect": "changed"},
+      {"before": 4470, "after": 4800, "bounds": [520, 280, 1024, 610], "expect": "same"}
+    ],
+    "inputs": [
+      "story-events", "capture-every:0", "no-final-capture",
+      "move:2325:195,510", "require-hit:2340:17", "2340:195,510",
+      "move:3220:195,357", "require-hit:3240:19", "3240:195,357",
+      "move:4020:474,194", "require-hit:4050:14", "4050:474,194",
+      "inspect:4470", "4530:640,360", "inspect:4800",
+      "4860:640,360", "inspect:5130"
+    ]
+  }
+}

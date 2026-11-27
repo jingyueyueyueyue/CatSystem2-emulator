@@ -1,4 +1,4 @@
-//! Preserve the actual kind27 work surface and owned message queue. Preparing
+//! Preserve each transition's work surface and owned message queue. Preparing
 //! never prepares sources, samples a transition, submits pixels or reads a clock.
 use super::*;
 use cs2_runtime::graph_serde::{Deserialize, Serialize};
@@ -41,7 +41,8 @@ impl TransitionStore {
             bail!("unsupported transition checkpoint version or task count");
         }
         let store = Self { tasks: saved.tasks.into_iter().map(|(id, t)| Ok((id, Transition {
-            kind: 27, words: t.words, duration: t.duration, started: t.started,
+            kind: *kinds.get(&id).context("transition checkpoint has no original task")?,
+            words: t.words, duration: t.duration, started: t.started,
             speed: f32::from_bits(t.speed), active: t.active, size: t.size, pixels: t.pixels,
             output: Point::new(t.output[0], t.output[1]), local: t.local, submitted: t.submitted,
             rendered_sample: None,
@@ -59,15 +60,29 @@ impl TransitionStore {
         }
         let mut bytes = 0usize;
         for (&id, task) in &self.tasks {
-            if kinds.get(&id) != Some(&27) || task.kind != 27 || task.words.len() != 11
+            if kinds.get(&id) != Some(&task.kind) || !matches!(task.kind, 26 | 27)
+                || task.words.len() * 4 != record_size(task.kind)
                 || task.duration != (task.words[0] as i32).max(1) as u32
                 || ![1.0f32, 1.5, 2.0, 3.0, 4.0].contains(&task.speed)
-                || task.local != [0; 2]
-                || task.words[9..11].iter().any(|word| (*word as i32) < 0)
-                || task.size[0] > task.words[9] || task.size[1] > task.words[10]
-                || task.output != Point::new(task.words[7] as i32, task.words[8] as i32)
                 || task.submitted && task.rendered.is_none() {
-                bail!("transition checkpoint has no matching kind27 receiver/work state");
+                bail!("transition checkpoint has no matching fade or wipe receiver/work state");
+            }
+            let output_index = if task.kind == 26 {
+                let mask = images.get(&task.words[7]).context("wipe checkpoint mask wrapper was released")?;
+                validate_local(task, mask)?;
+                if task.local != [0; 2] && task.local != [task.words[12], task.words[13]] {
+                    bail!("wipe checkpoint local origin differs from its work record");
+                }
+                8
+            } else {
+                if task.local != [0; 2] || task.words[9..11].iter().any(|word| (*word as i32) < 0)
+                    || task.size[0] > task.words[9] || task.size[1] > task.words[10] {
+                    bail!("fade checkpoint work region differs from its retained record");
+                }
+                7
+            };
+            if task.output != Point::new(task.words[output_index] as i32, task.words[output_index + 1] as i32) {
+                bail!("transition checkpoint destination differs from its retained record");
             }
             let expected = (task.size[0] as usize).checked_mul(task.size[1] as usize)
                 .and_then(|n| n.checked_mul(4)).context("transition checkpoint pixel count overflow")?;
@@ -81,7 +96,17 @@ impl TransitionStore {
             }
             bytes = bytes.checked_add(expected).context("transition checkpoint pixel accounting overflow")?;
             if let Some((at, frame)) = &task.rendered {
-                if *at != task.output || frame.dimensions() != (task.size[0], task.size[1]) {
+                let full = *at == task.output && frame.dimensions() == (task.size[0], task.size[1]);
+                let mut partial = false;
+                if task.kind == 26 {
+                    let mask = images.get(&task.words[7]).context("wipe checkpoint mask wrapper was released")?;
+                    let [x, y] = [task.words[12], task.words[13]];
+                    let region = (task.size[0].saturating_sub(x).min(mask.width()),
+                        task.size[1].saturating_sub(y).min(mask.height()));
+                    partial = *at == Point::new(task.output.x.wrapping_add(x as i32), task.output.y.wrapping_add(y as i32))
+                        && frame.dimensions() == region;
+                }
+                if !full && !partial {
                     bail!("transition checkpoint rendered frame differs from its actual output dimensions");
                 }
                 // A failed canvas copy can leave the last submission older
@@ -90,12 +115,12 @@ impl TransitionStore {
             }
         }
         for (&id, queue) in &self.queued {
-            if kinds.get(&id) != Some(&27) || queue.len() > 4096 {
-                bail!("transition checkpoint queue lost its kind27 receiver");
-            }
+            let kind = kinds.get(&id).copied().filter(|kind| matches!(kind, 26 | 27))
+                .context("transition checkpoint queue lost its fade or wipe receiver")?;
+            if queue.len() > 4096 { bail!("transition checkpoint command queue exceeds 4096 entries"); }
             for (code, record) in queue {
                 let size = match code { 263..=267 if *code != 266 => 0,
-                    266 => 20, 280 | 281 => 44,
+                    266 => 20, 280 | 281 => record_size(kind),
                     _ => bail!("transition checkpoint contains an unknown queued command"), };
                 if record.len() != size { bail!("transition checkpoint queued owned record is truncated"); }
                 bytes = bytes.checked_add(record.len()).context("transition checkpoint queue byte overflow")?;
@@ -106,11 +131,11 @@ impl TransitionStore {
     }
 
     pub(crate) fn validate_draw_checkpoint(&self,
-        links: &[(u32, u32, Option<i32>, Option<Vec<u8>>)], kinds: &BTreeMap<u32, u32>,
+        links: impl Iterator<Item = (u32, u32, u32)>, kinds: &BTreeMap<u32, u32>,
         parents: &BTreeMap<u32, u32>) -> Result<()> {
-        for (owner, id, _, _) in links {
-            if kinds.get(owner) != Some(&34) || kinds.get(id) != Some(&27)
-                || parents.get(id) != Some(owner) {
+        for (owner, id, kind) in links {
+            if kinds.get(&owner) != Some(&34) || kinds.get(&id) != Some(&kind)
+                || parents.get(&id) != Some(&owner) {
                 bail!("DRAW checkpoint native transition lost its original FES parent");
             }
             // The native receiver is independently mutable. A later raw

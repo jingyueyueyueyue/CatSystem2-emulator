@@ -12,36 +12,39 @@ pub(super) struct ClipboardState {
 impl LoggingHost<'_> {
     /// Owned CP932 payload, already formatted by the M2 manager. Unlike10 this
     /// path performs no KCS formatting, newline expansion or4095-byte clamp.
-    pub(super) fn publish_cp932_clipboard(&mut self, index: u32, bytes: &[u8]) -> Result<()> {
+    pub(super) fn publish_cp932_clipboard(&mut self, index: u32, bytes: &[u8]) {
         #[cfg(windows)]
-        let state = if write_windows_clipboard(1, 1, || Ok(bytes.to_vec()))? {
-            "clipboard-written"
-        } else { "clipboard-write-failed" };
+        let result = windows_result(write_windows_clipboard(1, 1, bytes));
         #[cfg(target_os = "android")]
-        let state = {
-            let pending = &mut self.data_services.clipboard.pending;
-            if pending.len() >= 64 {
-                return Err(native_state_error("Android clipboard host queue exceeds 64 requests"));
-            }
-            let text = super::ScriptTextEncoding::Cp932.decode(bytes);
-            pending.push_back(text.encode_utf16().collect());
-            "clipboard-host-request"
-        };
+        let result = self.data_services.clipboard.queue(|| {
+            Ok(super::ScriptTextEncoding::Cp932.decode(bytes).encode_utf16().collect())
+        });
         #[cfg(not(any(windows, target_os = "android")))]
-        return Err(native_state_error("clipboard requires a platform adapter"));
-        #[cfg(any(windows, target_os = "android"))]
-        {
-            self.events.push(LogicEvent { frame: self.frame, kind: state.into(),
-                detail: format!("native={index} source_bytes={}", bytes.len()) });
-            Ok(())
-        }
+        let result = Err(native_state_error("clipboard requires a platform adapter"));
+        self.note_clipboard_result(index, bytes.len(), result);
+    }
+
+    pub(super) fn publish_fes_clipboard(&mut self, bytes: &[u8]) {
+        let text = self.text_encoding.decode(bytes);
+        #[cfg(windows)]
+        let result = {
+            let wide: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            windows_result(write_windows_clipboard(13, 2, &wide))
+        };
+        #[cfg(target_os = "android")]
+        let result = self.data_services.clipboard.queue(|| Ok(text.encode_utf16().collect()));
+        #[cfg(not(any(windows, target_os = "android")))]
+        let result = Err(native_state_error("clipboard requires a platform adapter"));
+        self.note_clipboard_result(0, bytes.len(), result);
     }
 
     pub(super) fn clipboard_native(&mut self, index: u32, args: &[u8], vm: &Vm) -> Result<NativeReturn> {
         let source = expand_kcs_format(vm, &vm.read_string(read_u32(args, 0)?)?, 0)?;
         let source = super::trim_nul(&source);
         if source.len() > 4095 {
-            return Err(native_state_error("clipboard format exceeds the original temporary buffer"));
+            self.note_clipboard_result(index, source.len(),
+                Err(native_state_error("clipboard format exceeds the original temporary buffer")));
+            return Ok(NativeReturn::Continue);
         }
         let mut bytes = source.to_vec();
         let mut at = 0;
@@ -52,32 +55,42 @@ impl LoggingHost<'_> {
             } else { at += 1; }
         }
         #[cfg(windows)]
-        let state = if write_windows_clipboard(
-            if index == 1039 { 13 } else { 1 },
-            if index == 1039 { 2 } else { 1 },
-            || if index == 1039 {
-                Ok(legacy_wide(&bytes)?.into_iter().flat_map(u16::to_le_bytes).collect())
-            } else { Ok(bytes.clone()) },
-        )? { "clipboard-written" } else { "clipboard-write-failed" };
-        #[cfg(target_os = "android")]
-        let state = {
-            let pending = &mut self.data_services.clipboard.pending;
-            if pending.len() >= 64 {
-                return Err(native_state_error("Android clipboard host queue exceeds 64 requests"));
-            }
-            let units = if index == 1039 { legacy_wide(&bytes)? }
-                else { self.text_encoding.decode(&bytes).encode_utf16().collect() };
-            pending.push_back(units);
-            "clipboard-host-request"
+        let result = if index == 1039 {
+            legacy_wide(&bytes).and_then(|units| {
+                let wide: Vec<_> = units.into_iter().flat_map(u16::to_le_bytes).collect();
+                windows_result(write_windows_clipboard(13, 2, &wide))
+            })
+        } else {
+            windows_result(write_windows_clipboard(1, 1, &bytes))
         };
+        #[cfg(target_os = "android")]
+        let result = self.data_services.clipboard.queue(|| {
+            if index == 1039 { legacy_wide(&bytes) }
+            else { Ok(self.text_encoding.decode(&bytes).encode_utf16().collect()) }
+        });
         #[cfg(not(any(windows, target_os = "android")))]
-        return Err(native_state_error("clipboard requires a platform adapter"));
-        #[cfg(any(windows, target_os = "android"))]
-        {
-            self.events.push(LogicEvent { frame: self.frame, kind: state.into(),
-                detail: format!("native={index} source_bytes={}", bytes.len()) });
-            Ok(NativeReturn::Continue)
+        let result = Err(native_state_error("clipboard requires a platform adapter"));
+        self.note_clipboard_result(index, bytes.len(), result);
+        Ok(NativeReturn::Continue)
+    }
+
+    fn note_clipboard_result(&mut self, index: u32, bytes: usize, result: Result<&str>) {
+        let (kind, detail) = match result {
+            Ok(kind) => (kind, format!("native={index} source_bytes={bytes}")),
+            Err(error) => ("clipboard-write-failed", format!("native={index} source_bytes={bytes}: {error}")),
+        };
+        self.events.push(LogicEvent { frame: self.frame, kind: kind.into(), detail });
+    }
+}
+
+#[cfg(target_os = "android")]
+impl ClipboardState {
+    fn queue(&mut self, payload: impl FnOnce() -> Result<Vec<u16>>) -> Result<&'static str> {
+        if self.pending.len() >= 64 {
+            return Err(native_state_error("Android clipboard host queue exceeds 64 requests"));
         }
+        self.pending.push_back(payload()?);
+        Ok("clipboard-host-request")
     }
 }
 
@@ -119,9 +132,13 @@ fn legacy_wide(bytes: &[u8]) -> Result<Vec<u16>> {
 }
 
 #[cfg(windows)]
-fn write_windows_clipboard(
-    format: u32, terminators: usize, payload: impl FnOnce() -> Result<Vec<u8>>,
-) -> Result<bool> {
+fn windows_result(written: bool) -> Result<&'static str> {
+    if written { Ok("clipboard-written") }
+    else { Err(native_state_error("Windows clipboard write failed")) }
+}
+
+#[cfg(windows)]
+fn write_windows_clipboard(format: u32, terminators: usize, bytes: &[u8]) -> bool {
     use std::ffi::c_void;
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -139,14 +156,11 @@ fn write_windows_clipboard(
         fn GlobalFree(memory: *mut c_void) -> *mut c_void;
     }
     unsafe {
-        if OpenClipboard(GetActiveWindow()) == 0 { return Ok(false); }
-        EmptyClipboard();
-        // Unicode conversion is AFTER Open/Empty, as in1039. On a decoding
-        // diagnostic the clipboard must still be closed before propagating.
-        let bytes = match payload() {
-            Ok(bytes) => bytes,
-            Err(error) => { CloseClipboard(); return Err(error); }
-        };
+        if OpenClipboard(GetActiveWindow()) == 0 { return false; }
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return false;
+        }
         let memory = GlobalAlloc(0x42, bytes.len() + 8);
         let success = if memory.is_null() { false } else {
             let target = GlobalLock(memory).cast::<u8>();
@@ -164,6 +178,36 @@ fn write_windows_clipboard(
             }
         };
         CloseClipboard();
-        Ok(success)
+        success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_optional_clipboard_payloads_do_not_stop_the_script() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("cs2-clipboard-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&path)?;
+        let player = HeadlessPlayer::open_with_save_root(&path, &path);
+        std::fs::remove_dir(path)?;
+        let mut player = player?;
+        let program = cs2_script::KcsProgram::from_code(&[0x3b], Vec::new(), 0)?;
+        let mut vm = Vm::from_program(program)?;
+        let mut source = vec![b'a'; 4096];
+        source.push(0);
+        let long_bytes = vm.allocate_region(&source)?;
+        source.truncate(2048);
+        source.push(0);
+        let long_wide = vm.allocate_region(&source)?;
+        for (index, address) in [(10, long_bytes), (1039, long_wide)] {
+            let result = player.with_host(|host| Ok(host.clipboard_native(index, &address.to_le_bytes(), &vm)?))?;
+            assert!(matches!(result, NativeReturn::Continue));
+        }
+        assert_eq!(player.events().iter().filter(|event| event.kind == "clipboard-write-failed").count(), 2);
+        assert!(player.take_host_clipboard_request().is_none());
+        Ok(())
     }
 }

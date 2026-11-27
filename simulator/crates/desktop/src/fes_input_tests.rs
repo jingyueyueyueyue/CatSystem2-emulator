@@ -17,24 +17,25 @@ fn driver(lines: &[&[u8]]) -> (FesScriptDriver, ExpressionState) {
     let mut driver = FesScriptDriver::new(&document).unwrap();
     let mut shared = ExpressionState::default();
     driver.set_named_value("_CLICK_L_", 0, 0);
+    driver.set_named_value("_CLICK_R_", 0, 0);
     while driver.initialization_pending() {
         driver.advance_initialization(&mut shared).unwrap();
     }
     (driver, shared)
 }
 
-fn notify_left_press(driver: &mut FesScriptDriver, shared: &mut ExpressionState) {
+fn notify_press(driver: &mut FesScriptDriver, shared: &mut ExpressionState, code: u32, event: &[u8]) {
     let scope = driver.begin_media_notification_scope();
     driver
         .on_input(FesDriverInput {
-            code: 2,
+            code,
             target: Some(FesDriverTarget {
                 name: b"start_button".to_vec(),
                 bank: 0,
                 default_group: None,
                 value: 17,
             }),
-            event: Some(b"PUSH_L".to_vec()),
+            event: Some(event.to_vec()),
         })
         .unwrap();
     assert!(matches!(
@@ -134,7 +135,7 @@ fn routed_click_reaches_next_title_poll_only_once() {
         driver.advance(10, &mut shared, 32).unwrap(),
         FesDriverEffect::Frame
     ));
-    notify_left_press(&mut driver, &mut shared);
+    notify_press(&mut driver, &mut shared, 2, b"PUSH_L");
     assert!(matches!(
         driver.advance(11, &mut shared, 32).unwrap(),
         FesDriverEffect::Exit(42)
@@ -150,13 +151,24 @@ fn routed_click_reaches_next_title_poll_only_once() {
 }
 
 #[test]
+fn routed_right_click_reaches_the_next_fes_poll_only_once() -> Result<()> {
+    let (mut driver, mut shared) = driver(&[b"if (_CLICK_R_==17)", b"exit 42", b"endif"]);
+    assert!(matches!(driver.advance(10, &mut shared, 32)?, FesDriverEffect::Frame));
+    notify_press(&mut driver, &mut shared, 3, b"PUSH_R");
+    assert!(matches!(driver.advance(11, &mut shared, 32)?, FesDriverEffect::Exit(42)));
+    assert!(matches!(driver.advance(11, &mut shared, 32)?, FesDriverEffect::Frame));
+    assert!(matches!(driver.advance(12, &mut shared, 32)?, FesDriverEffect::Frame));
+    Ok(())
+}
+
+#[test]
 fn routed_click_reaches_wait_cancellation() {
     let (mut driver, mut shared) = driver(&[b"wait 100", b"exit 42"]);
     assert!(matches!(
         driver.advance(10, &mut shared, 32).unwrap(),
         FesDriverEffect::Waiting { .. }
     ));
-    notify_left_press(&mut driver, &mut shared);
+    notify_press(&mut driver, &mut shared, 2, b"PUSH_L");
     assert!(matches!(
         driver.advance(11, &mut shared, 32).unwrap(),
         FesDriverEffect::CancelWait { .. }

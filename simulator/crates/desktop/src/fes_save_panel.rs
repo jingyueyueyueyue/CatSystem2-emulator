@@ -124,36 +124,11 @@ impl SavePanelData {
     }
 
     fn text_encoding(&self, host: &LoggingHost<'_>, record: u32, text: &[u8]) -> Result<ScriptTextEncoding> {
-        if std::str::from_utf8(text).is_ok() {
-            return Ok(ScriptTextEncoding::Utf8);
-        }
-        let encoding = host.text_encoding;
-        // Script-defined CSS preview records can copy the same raw scene text
-        // as the standard snapshot. Keep their valid host-encoded strings.
-        if record == u32::MAX || (record != STANDARD_TEXT_RECORD && (encoding != ScriptTextEncoding::Cp932
-            || encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(text).is_some()))
-            || self.record(record)?.map(crate::trim_nul) != Some(text)
-        {
-            return Ok(encoding);
-        }
-        if record == STANDARD_TEXT_RECORD && text == KCS_CHOICE_PREVIEW {
-            return Ok(ScriptTextEncoding::Cp932);
-        }
-        // The legacy CST snapshot puts the scene name after its first DWORD
-        // and can copy preview text in that scene's original codec.
-        let Some(scene) = self.record(5)?.and_then(|header| header.get(4..))
-            .map(crate::trim_nul).filter(|scene| !scene.is_empty()) else { return Ok(encoding) };
-        if encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(text).is_some()
-            && host.cst_resource_with_source(b"scene", scene)?.is_some_and(|(_, source)|
-                host.cst_scene_encoding_override(&source) == Some(ScriptTextEncoding::Gbk))
-        {
-            return Ok(ScriptTextEncoding::Gbk);
-        }
-        Ok(encoding)
+        save_record_text_encoding(host, self.data.as_ref(), record, text)
     }
 
     pub(crate) fn apply(
-        &mut self, request: &mut PanelDataRequest, host: &LoggingHost<'_>,
+        &mut self, request: &mut PanelDataRequest, host: &mut LoggingHost<'_>,
         shared: &mut ExpressionState,
     ) -> Result<PanelDataOutcome> {
         match *request {
@@ -172,22 +147,27 @@ impl SavePanelData {
                 let name = format!("save{slot:04}.dat");
                 self.save_name = name.as_bytes().to_vec();
                 self.record_id = record;
-                let loaded = host.read_fes_css_save(&name)?;
                 self.date = [0; 6];
-                if let Some(data) = loaded {
-                    self.data = Some(data);
-                    self.date = file_date::modified_date(host.save_root, &name)?.unwrap_or([0; 6]);
-                    let source = self.data.as_ref().unwrap().try_record(record)
+                let result = host.read_fes_css_save(&name).and_then(|loaded| {
+                    let Some(data) = loaded else { return Ok(()) };
+                    let source = data.try_record(record)
                         .context("SAVEPANEL numeric CSS record is invalid")?;
                     if let (Some(source), Some(target)) =
                         (source, self.flags.0.get_mut(start as usize..))
                     {
                         // Preserve unwritten words, truncate at the region
                         // end, and ignore a source's incomplete final DWORD.
-                        for (target, bytes) in target.iter_mut().zip(source.chunks_exact(4)) {
-                            *target = i32::from_le_bytes(bytes.try_into().unwrap());
+                        for (target, bytes) in target.iter_mut().zip(source.as_chunks::<4>().0) {
+                            *target = i32::from_le_bytes(*bytes);
                         }
                     }
+                    self.data = Some(data);
+                    self.date = file_date::modified_date(host.save_root, &name)?.unwrap_or([0; 6]);
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    host.events.push(crate::LogicEvent { frame: host.frame, kind: "save-panel-source-error".into(),
+                        detail: format!("file={name:?} record={record:#x}: {error:#}") });
                 }
                 *request = PanelDataRequest::ApplyCellSources;
                 Ok(PanelDataOutcome::ApplyCellSources)
@@ -196,9 +176,93 @@ impl SavePanelData {
     }
 }
 
+pub(super) fn save_record_text_encoding(
+    host: &LoggingHost<'_>, file: Option<&CssFile>, record: u32, text: &[u8],
+) -> Result<ScriptTextEncoding> {
+    if std::str::from_utf8(text).is_ok() {
+        return Ok(ScriptTextEncoding::Utf8);
+    }
+    let encoding = host.text_encoding;
+    let Some(file) = file else { return Ok(encoding) };
+    // Script-defined preview records can copy scene bytes or hold legacy
+    // strings already expressed in the host encoding.
+    if record == u32::MAX || (record != STANDARD_TEXT_RECORD && (encoding != ScriptTextEncoding::Cp932
+        || encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(text).is_some()))
+        || file.try_record(record)?.map(crate::trim_nul) != Some(text)
+    {
+        return Ok(encoding);
+    }
+    if record == STANDARD_TEXT_RECORD && text == KCS_CHOICE_PREVIEW {
+        return Ok(ScriptTextEncoding::Cp932);
+    }
+    // A legacy CST snapshot can copy the preview from the recorded scene.
+    let Some(scene) = file.try_record(5)?.and_then(|header| header.get(4..))
+        .map(crate::trim_nul).filter(|scene| !scene.is_empty()) else { return Ok(encoding) };
+    if ScriptTextEncoding::Gbk.decode_strict(text).is_some()
+        && host.cst_resource_with_source(b"scene", scene)?.is_some_and(|(_, source)|
+            host.cst_scene_encoding_override(&source) == Some(ScriptTextEncoding::Gbk))
+    {
+        return Ok(ScriptTextEncoding::Gbk);
+    }
+    Ok(encoding)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_panel_loads_legacy_image_formats_and_preserves_cells_on_corruption() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("cs2-save-panel-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let mut player = crate::HeadlessPlayer::open_with_save_root(&root, &root)?;
+            let mut panel = bank::Bank::default();
+            let mut css = CssFile::new(0);
+            let pixel = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([11, 31, 71])));
+            for (index, format) in [image::ImageFormat::Bmp, image::ImageFormat::Png, image::ImageFormat::Jpeg]
+                .into_iter().enumerate()
+            {
+                let id = index as u32 + 1;
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                pixel.write_to(&mut encoded, format)?;
+                css.append(id, encoded.get_ref())?;
+                let mut cell = cell::Cell::default();
+                cell.put(0, 1);
+                cell.put(4, 1);
+                cell.put(0x10, id);
+                panel.cells.insert(id as i32, cell);
+            }
+            let path = root.join("save0001.dat");
+            std::fs::write(&path, css.to_css()?)?;
+            let mut request = PanelDataRequest::SetSave { slot: 1, record: 0x400, start: 0 };
+            player.with_host(|host| {
+                panel.data.apply(&mut request, host, &mut ExpressionState::default())?;
+                cell::apply_sources(&mut panel, host)
+            })?;
+            let frames = panel.contents.values().map(|content| content.image.as_ref().unwrap()).collect::<Vec<_>>();
+            assert_eq!(frames.len(), 3);
+            assert!(frames.iter().all(|frame| frame.width() == 2 && frame.height() == 2));
+            assert_eq!(&frames[0].pixels()[..4], &[11, 31, 71, 255]);
+            assert_eq!(&frames[1].pixels()[..4], &[11, 31, 71, 255]);
+            css.try_remove(2)?;
+            css.append(2, b"\x89PNG invalid thumbnail")?;
+            panel.data.data = Some(css);
+            player.with_host(|host| cell::apply_sources(&mut panel, host))?;
+            assert_eq!(&panel.contents[&2].image.as_ref().unwrap().pixels()[..4], &[11, 31, 71, 255]);
+            assert!(player.events().iter().any(|event| event.kind == "save-panel-image-error"));
+            std::fs::write(&path, b"CSS\0 truncated")?;
+            let mut request = PanelDataRequest::SetSave { slot: 1, record: 0x400, start: 0 };
+            player.with_host(|host| panel.data.apply(&mut request, host, &mut ExpressionState::default()))?;
+            assert!(player.events().iter().any(|event| event.kind == "save-panel-source-error"));
+            Ok(())
+        })();
+        let path = root.join("save0001.dat");
+        if path.exists() { std::fs::remove_file(path)?; }
+        std::fs::remove_dir(root)?;
+        result
+    }
 
     #[test]
     #[ignore = "requires the installed ISLAND Chinese patch and an isolated copy of com05_selB save0000.dat"]

@@ -300,9 +300,9 @@ pub(super) enum LowerControlOutcome {
     Notify(ControlNotification),
 }
 
-/// The button mask is the result of the actual BUTTON 96 query. A configured
-/// key classification is required for SCROLL2; a VM key slot is not a mouse
-/// device code. Movement coordinates are decoded from both explicit buffers.
+/// The button mask is the result of the actual BUTTON 96 query. Mouse-button
+/// classification comes from the input producer. Synthetic releases have no
+/// physical classification. Movement coordinates come from both buffers.
 #[derive(Default)]
 pub(super) struct LowerInputContext {
     pub button_mask: Option<u32>,
@@ -590,18 +590,16 @@ impl FesControlStore {
             2
         };
         let known = object.has_region(region);
-        let left = if object.kind == Kind::Scroll && command.code == 10 {
-            // Re-selecting a region may synthesize a release without a
-            // physical edge. Only an active legacy press can be released.
-            object.buttons.has_pressed_region() && context.left_button != Some(false)
-        } else if known && object.kind == Kind::Scroll && command.code == 9 && mask & 2 != 0 {
-            context.left_button == Some(true)
-        } else if known && object.kind == Kind::Scroll2 && command.code != 6 && mask & 2 != 0 {
-            context.left_button.context(
-                "SCROLL2 input requires an explicit configured left-button classification",
-            )?
-        } else {
-            true
+        let left = match (object.kind, command.code) {
+            (Kind::Scroll | Kind::Scroll2, 9) => context.left_button == Some(true),
+            (Kind::Scroll, 10) => {
+                object.buttons.has_pressed_region() && context.left_button != Some(false)
+            }
+            (Kind::Scroll2, 10) => context.left_button.unwrap_or_else(|| {
+                // A synthetic release can end an existing knob capture.
+                object.drag_origin.is_some() && object.buttons.primary[1] == Some(region)
+            }),
+            _ => true,
         };
         if !known || mask & 2 == 0 || !left {
             effects.commands.push(TaskCommand {
@@ -2728,7 +2726,9 @@ fn optional_image(host: &LoggingHost<'_>, name: &[u8]) -> Result<Option<std::syn
         return Ok(None);
     }
     let name = decode(name, host.text_encoding)?;
-    let names = host.resources.category_names(b"image", &name)?;
+    let Some(names) = host.resources.optional_category_names(b"image", &name)? else {
+        return Ok(None);
+    };
     for name in names {
         if let Some(resource) = host.resources.find(&name) {
             if resource.size > MAX_IMAGE {
@@ -3179,4 +3179,47 @@ fn read_dword(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(value.try_into().map_err(|_| {
         anyhow::anyhow!("control DWORD is truncated")
     })?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll2_synthetic_release_only_ends_an_active_knob_capture() -> Result<()> {
+        let key = (1, b"scroll".to_vec(), 0);
+        let mut bank = Bank::new(Kind::Scroll2);
+        bank.lower = Some(2);
+        bank.buttons.primary = [Some(3), Some(4)];
+        bank.scroll.travel = [0, 60];
+        let mut controls = FesControlStore::default();
+        controls.banks.insert(key.clone(), bank);
+        let command = |code, region| TaskCommand {
+            target: 2, sender: 5, code, data: [region, 0, 0],
+        };
+        let mut input = LowerInputContext {
+            button_mask: Some(2), pointer: Some(Point::new(20, 0)),
+            ..LowerInputContext::default()
+        };
+        for (code, region) in [(9, 4), (10, 3), (10, 4)] {
+            let LowerInputOutcome::Applied(effects) = controls.lower_input(command(code, region), &input)?
+            else { panic!("SCROLL2 must reply to unclassified input"); };
+            assert_eq!(effects.commands[0].code, 95);
+            assert!(!effects.refresh);
+        }
+        assert!(controls.banks[&key].drag_origin.is_none());
+        input.left_button = Some(true);
+        controls.lower_input(command(9, 4), &input)?;
+        assert!(controls.banks[&key].drag_origin.is_some());
+        input.left_button = Some(false);
+        controls.lower_input(command(10, 4), &input)?;
+        assert!(controls.banks[&key].drag_origin.is_some());
+        input.left_button = None;
+        controls.lower_input(command(10, 3), &input)?;
+        assert!(controls.banks[&key].drag_origin.is_some());
+        controls.lower_input(command(10, 4), &input)?;
+        assert!(controls.banks[&key].drag_origin.is_none());
+        assert!(!controls.banks[&key].scroll.dragging);
+        Ok(())
+    }
 }

@@ -47,13 +47,19 @@ impl HeadlessPlayer {
 }
 
 impl LoggingHost<'_> {
+    fn finish_system_dialog(&mut self, result: std::result::Result<(), String>) -> NativeReturn {
+        if let Err(detail) = result {
+            self.events.push(super::LogicEvent { frame: self.frame, kind: "system-dialog-error".into(), detail });
+        }
+        NativeReturn::Continue
+    }
+
     pub(super) fn system_dialog_native(&mut self, args: &[u8], vm: &Vm) -> Result<NativeReturn> {
         let key = (self.current_task_id, vm.instruction_pointer, vm.frame_base(), vm.stack_pointer());
         if let Some(pending) = self.data_services.dialogs.pending.get_mut(&key) {
             let Some(result) = pending.result.take() else { return Ok(NativeReturn::Retry); };
             self.data_services.dialogs.pending.remove(&key);
-            return result.map(|()| NativeReturn::Continue)
-                .map_err(|_| native_state_error("native 445 platform dialog failed"));
+            return Ok(self.finish_system_dialog(result));
         }
         let text = expand_kcs_format(vm, &vm.read_string(read_u32(args, 0)?)?, 0)?;
         if text.len() >= 4096 {
@@ -63,7 +69,7 @@ impl LoggingHost<'_> {
         if self.data_services.dialogs.queued {
             let state = &mut self.data_services.dialogs;
             if state.pending.len() >= 64 {
-                return Err(native_state_error("platform dialog queue exceeds 64 requests"));
+                return Ok(self.finish_system_dialog(Err("platform dialog queue exceeds 64 requests".into())));
             }
             let id = state.next_id.checked_add(1)
                 .ok_or_else(|| native_state_error("platform dialog identities exhausted"))?;
@@ -74,8 +80,7 @@ impl LoggingHost<'_> {
             });
             return Ok(NativeReturn::Retry);
         }
-        show_system_error(&text)?;
-        Ok(NativeReturn::Continue)
+        Ok(self.finish_system_dialog(show_system_error(&text).map_err(|cause| cause.to_string())))
     }
 }
 
@@ -89,8 +94,9 @@ fn show_system_error(text: &str) -> Result<()> {
     }
     let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     let title: Vec<u16> = "system error".encode_utf16().chain(Some(0)).collect();
-    // The original ignores both IDOK and the platform error return.
-    unsafe { MessageBoxW(GetActiveWindow(), text.as_ptr(), title.as_ptr(), 0); }
+    if unsafe { MessageBoxW(GetActiveWindow(), text.as_ptr(), title.as_ptr(), 0) } == 0 {
+        return Err(super::native_state_error_owned(format!("MessageBoxW failed: {}", std::io::Error::last_os_error())));
+    }
     Ok(())
 }
 

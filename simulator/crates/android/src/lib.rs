@@ -29,7 +29,45 @@ struct Sessions {
     tweet: Vec<u8>,
     dialog: Vec<u8>,
     window_ui: Vec<u8>,
-    stalled_steps: usize,
+    frame_retries: BTreeMap<u64, FrameRetries>,
+}
+
+#[derive(Default)]
+struct FrameRetries {
+    total: usize,
+    last_progress: usize,
+    ordinary: Vec<(u32, usize, u64)>,
+    reported: bool,
+}
+
+impl FrameRetries {
+    fn stalled(&mut self, ordinary: impl Iterator<Item = (u32, usize, u64)>, driver_yielded: bool) -> bool {
+        if self.reported { return false; }
+        self.total += 1;
+        let current: Vec<_> = ordinary.collect();
+        if current != self.ordinary || driver_yielded {
+            self.ordinary = current;
+            self.last_progress = self.total;
+        }
+        let stalled = self.total >= 4096 || self.total - self.last_progress >= 128;
+        self.reported = stalled;
+        stalled
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn frame_retries_allow_progress_and_report_once() {
+    let mut state = FrameRetries::default();
+    for _ in 0..300 { assert!(!state.stalled(std::iter::empty(), true)); }
+    for index in 0..300 { assert!(!state.stalled([(1, index, 0)].into_iter(), false)); }
+    for _ in 0..127 { assert!(!state.stalled([(1, 299, 0)].into_iter(), false)); }
+    assert!(state.stalled([(1, 299, 0)].into_iter(), false));
+    assert!(!state.stalled(std::iter::empty(), false));
+
+    let mut state = FrameRetries::default();
+    for _ in 0..4095 { assert!(!state.stalled(std::iter::empty(), true)); }
+    assert!(state.stalled(std::iter::empty(), true));
 }
 
 const FRAME_CHANGED: i32 = 1;
@@ -344,6 +382,7 @@ pub extern "C" fn cs2_android_close(id: u64) -> i32 {
         let mut player = sessions.players.remove(&id).ok_or("Android session is absent")?;
         player.cancel_host_tweet_requests();
         let saved = player.persist_host_configuration();
+        sessions.frame_retries.remove(&id);
         sessions.published_frames.remove(&id);
         let discarded = FRAME_OUTPUT.lock().ok().and_then(|mut output| output.remove(&id));
         if let Some(output) = discarded {
@@ -737,11 +776,11 @@ pub unsafe extern "C" fn cs2_android_step_profiled_v4(
             Ok(completed) => completed,
             Err(error) => return Err(format!("Script: {error:#}\n{}", runtime_diagnostic(id, player, true))),
         };
-        if completed {
-            sessions.stalled_steps = 0;
+        if completed || player.quit_requested() {
+            sessions.frame_retries.remove(&id);
         } else {
-            sessions.stalled_steps += 1;
-            if sessions.stalled_steps == 128 {
+            let retries = sessions.frame_retries.entry(id).or_default();
+            if retries.stalled(player.host_pending_ordinary_execution(), player.host_frame_retry_delay_ms() == 0) {
                 sessions.error = CString::new(runtime_diagnostic(id, player, true).replace('\0', " "))
                     .unwrap_or_default();
                 return Ok(3);
@@ -864,11 +903,11 @@ pub unsafe extern "C" fn cs2_android_text_entry_result(id: u64, request: u64, ac
             return Err("Invalid text-entry result".into());
         }
         let bytes = if length == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(text, length) } };
-        let value = if accepted == 0 { None } else {
-            Some(std::str::from_utf8(bytes).map_err(|_| "Text-entry result is not UTF-8")?.to_owned())
-        };
+        let value = (accepted != 0)
+            .then(|| String::from_utf8_lossy(bytes).replace('\0', ""));
+        // A result can arrive after the FES task that opened the keyboard has closed.
         sessions.players.get_mut(&id).ok_or("Android session is absent")?
-            .complete_host_text_entry(request, value).map_err(|error| format!("Text entry: {error:#}"))?;
+            .complete_host_text_entry(request, value);
         Ok(0)
     })
 }

@@ -2291,47 +2291,25 @@ impl MessageObject {
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        self.append_with_legacy_codec(bytes, encoding_rs::SHIFT_JIS)
+        self.append_with_legacy_codec(bytes, ScriptTextEncoding::Cp932)
     }
 
     pub fn append_legacy_gbk(&mut self, bytes: &[u8]) -> Result<()> {
-        self.append_with_legacy_codec(bytes, encoding_rs::GBK)
+        self.append_with_legacy_codec(bytes, ScriptTextEncoding::Gbk)
     }
 
-    fn append_with_legacy_codec(&mut self, bytes: &[u8], codec: &'static encoding_rs::Encoding) -> Result<()> {
+    fn append_with_legacy_codec(&mut self, bytes: &[u8], codec: ScriptTextEncoding) -> Result<()> {
         if !self.configured() {
             return Ok(());
         }
         if bytes.contains(&0) {
             return Err(invalid("message append contains an embedded zero"));
         }
-        let text = match self.encoding {
-            MessageEncoding::Cp932 => {
-                // The original append front-end (0x1ea047) recognizes a raw
-                // FF before CP932 decoding and stores the U+FFFF separator.
-                // SHIFT_JIS alone would turn FF into a private-use glyph.
-                let mut text = String::new();
-                for (index, part) in bytes.split(|&byte| byte == 0xff).enumerate() {
-                    if index != 0 {
-                        text.push('\u{ffff}');
-                    }
-                    let decoded = if std::ptr::eq(codec, encoding_rs::GBK) {
-                        codec.decode_without_bom_handling_and_without_replacement(part)
-                            .ok_or_else(|| invalid("message append has invalid GBK input"))?
-                    } else {
-                        decode_cp932_display(part)
-                            .ok_or_else(|| invalid("message append has invalid CP932 input"))?
-                    };
-                    text.push_str(&decoded);
-                }
-                text
-            }
-            MessageEncoding::Unicode => {
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|_| invalid("message append has invalid UTF-8 input"))?;
-                text.to_owned()
-            }
+        let codec = match self.encoding {
+            MessageEncoding::Cp932 => codec,
+            MessageEncoding::Unicode => ScriptTextEncoding::Utf8,
         };
+        let (text, _) = codec.decode_message(bytes);
         self.append_decoded(bytes, &text)
     }
 

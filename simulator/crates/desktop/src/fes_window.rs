@@ -49,21 +49,45 @@ fn set_result(shared: &mut ExpressionState, destination: usize, accepted: bool) 
     }
 }
 
-fn decode_string(raw: &[u8], encoding: ScriptTextEncoding) -> (String, ScriptTextEncoding) {
-    let raw = trim_nul(raw);
-    if !raw.is_ascii()
-        && let Ok(text) = std::str::from_utf8(raw)
-    {
-        return (text.to_owned(), ScriptTextEncoding::Utf8);
+fn decode_string(
+    host: &mut LoggingHost<'_>, shared: &ExpressionState, id: u32,
+) -> (String, ScriptTextEncoding) {
+    let bytes = shared.strings.get(&id).map_or(&[][..], Vec::as_slice);
+    let raw = trim_nul(bytes);
+    let origins = &host.data_services.cst_text_origins;
+    let encoding = origins.shared(id, bytes).unwrap_or_else(|| {
+        if !raw.is_ascii() && std::str::from_utf8(raw).is_ok() {
+            ScriptTextEncoding::Utf8
+        } else {
+            host.text_encoding
+        }
+    });
+    if let Some(display) = origins.shared_display(id, bytes) {
+        return (trim_display(display).to_owned(), encoding);
     }
-    (encoding.decode(raw), encoding)
+    let (display, bad_at) = encoding.decode_message(raw);
+    if let Some(offset) = bad_at {
+        host.data_services.note_text_decode(host.events, host.frame,
+            format!("input_text string={id} encoding={encoding:?} offset={offset}"));
+    }
+    (display, encoding)
 }
 
-fn encode_string(input: &str, encoding: ScriptTextEncoding) -> Vec<u8> {
-    match encoding {
-        ScriptTextEncoding::Cp932 => encoding_rs::SHIFT_JIS.encode(input).0.into_owned(),
-        ScriptTextEncoding::Gbk => encoding_rs::GBK.encode(input).0.into_owned(),
-        ScriptTextEncoding::Utf8 => input.as_bytes().to_vec(),
+fn trim_display(display: &str) -> &str {
+    display.split('\0').next().unwrap_or_default()
+}
+
+fn encode_string(input: &str, encoding: ScriptTextEncoding) -> (Vec<u8>, ScriptTextEncoding) {
+    let codec = match encoding {
+        ScriptTextEncoding::Cp932 => encoding_rs::SHIFT_JIS,
+        ScriptTextEncoding::Gbk => encoding_rs::GBK,
+        ScriptTextEncoding::Utf8 => return (input.as_bytes().to_vec(), encoding),
+    };
+    let (bytes, _, had_errors) = codec.encode(input);
+    if !had_errors && encoding.decode_strict(&bytes).as_deref() == Some(input) {
+        (bytes.into_owned(), encoding)
+    } else {
+        (input.as_bytes().to_vec(), ScriptTextEncoding::Utf8)
     }
 }
 
@@ -83,6 +107,9 @@ pub(super) fn apply_effect(
     let mut number =
         |value: &[u8]| driver.evaluate_parameter(value, command.context.current, shared);
     match verb.as_slice() {
+        b"opensite" | b"opensiteenc" => return Ok(Some(
+            host.fes_open_site(view.id, command.offset, args, verb == b"opensiteenc"),
+        )),
         b"wndmenu" => {
             if let Some(id) = args.first() {
                 host.post_fes_window_menu(number(id)? as u32)?;
@@ -129,21 +156,13 @@ pub(super) fn apply_effect(
                     .fes
                     .entries
                     .remove(&key)
-                    .unwrap();
-                let result = pending.result.unwrap();
+                    .context("completed FES text entry disappeared")?;
+                let result = pending.result.context("completed FES text entry lacks its result")?;
                 set_result(shared, pending.output, result.is_some());
-                if let Some(value) = result {
-                    let value = if value == pending.request.initial {
-                        // Preserve untouched legacy bytes, including their original codepage.
-                        shared
-                            .strings
-                            .get(&pending.text)
-                            .cloned()
-                            .unwrap_or_default()
-                    } else {
-                        encode_string(&value, pending.encoding)
-                    };
-                    shared.strings.insert(pending.text, value);
+                if let Some(value) = result.filter(|value| *value != pending.request.initial) {
+                    let (bytes, encoding) = encode_string(&value, pending.encoding);
+                    host.data_services.cst_text_origins.set_shared_encoding(pending.text, &bytes, encoding);
+                    shared.strings.insert(pending.text, bytes);
                 }
                 return Ok(Some(true));
             }
@@ -165,14 +184,8 @@ pub(super) fn apply_effect(
                 set_result(shared, output, false);
                 return Ok(Some(true));
             }
-            let raw = |key| shared.strings.get(&key).map_or(&[][..], Vec::as_slice);
-            let (title, title_encoding) = decode_string(raw(title), host.text_encoding);
-            let encoding = if title_encoding == ScriptTextEncoding::Utf8 {
-                title_encoding
-            } else {
-                host.text_encoding
-            };
-            let (initial, encoding) = decode_string(raw(text), encoding);
+            let (title, _) = decode_string(host, shared, title);
+            let (initial, encoding) = decode_string(host, shared, text);
             let state = &mut host.data_services.window_control.fes;
             state.next_entry = state
                 .next_entry
@@ -208,6 +221,7 @@ pub(super) fn apply_effect(
 }
 
 pub(super) fn release_owner(host: &mut LoggingHost<'_>, owner: u32) {
+    host.data_services.system_open.release_fes_owner(owner);
     host.data_services
         .window_control
         .fes
@@ -240,15 +254,18 @@ impl HeadlessPlayer {
         Some(request)
     }
 
-    pub fn complete_host_text_entry(&mut self, id: u64, value: Option<String>) -> Result<()> {
-        let pending = self
+    /// Returns false when the host answers a request that has already finished or lost its owner.
+    pub fn complete_host_text_entry(&mut self, id: u64, value: Option<String>) -> bool {
+        let Some(pending) = self
             .data_services
             .window_control
             .fes
             .entries
             .values_mut()
             .find(|entry| entry.request.id == id && entry.delivered && entry.result.is_none())
-            .context("text-entry result has no matching request")?;
+        else {
+            return false;
+        };
         let normalized = value.map(|value| {
             let limit = pending.request.limit;
             let mut remaining = limit;
@@ -264,7 +281,20 @@ impl HeadlessPlayer {
                 .collect()
         });
         pending.result = Some(normalized);
-        Ok(())
+        true
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn finish_host_text_entry(&mut self, id: u64, result: Result<Option<String>>) {
+        let value = result.unwrap_or_else(|error| {
+            self.events.push(crate::LogicEvent {
+                frame: self.state.clock.frame,
+                kind: "text-entry-error".into(),
+                detail: format!("request={id}: {error:#}"),
+            });
+            None
+        });
+        self.complete_host_text_entry(id, value);
     }
 }
 
@@ -309,14 +339,10 @@ fn load_cursor(
 
 fn decode_cursor(bytes: &[u8], x: Option<u16>, y: Option<u16>) -> Result<HostCursorImage> {
     let word = |at| {
-        bytes
-            .get(at..at + 2)
-            .map(|v| u16::from_le_bytes(v.try_into().unwrap()))
+        Some(u16::from_le_bytes(*bytes.get(at..)?.first_chunk::<2>()?))
     };
     let dword = |at| {
-        bytes
-            .get(at..at + 4)
-            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+        Some(u32::from_le_bytes(*bytes.get(at..)?.first_chunk::<4>()?))
     };
     if word(0) != Some(0) || word(2) != Some(2) || word(4).unwrap_or(0) == 0 {
         bail!("invalid CUR directory");
@@ -328,8 +354,8 @@ fn decode_cursor(bytes: &[u8], x: Option<u16>, y: Option<u16>) -> Result<HostCur
         .context("CUR image is truncated")?;
     let (width, height, rgba) = if data.starts_with(b"\x89PNG\r\n\x1a\n") {
         let dimension = |at| {
-            data.get(at..at + 4)
-                .map_or(0, |v| u32::from_be_bytes(v.try_into().unwrap()))
+            data.get(at..).and_then(<[u8]>::first_chunk::<4>)
+                .map_or(0, |v| u32::from_be_bytes(*v))
         };
         if !(1..=256).contains(&dimension(16)) || !(1..=256).contains(&dimension(20)) {
             bail!("invalid CUR PNG dimensions");
@@ -447,12 +473,68 @@ mod tests {
     }
 
     #[test]
+    fn fes_open_site_completes_after_host_rejection() -> Result<()> {
+        let (mut player, view, mut driver, mut shared) = setup()?;
+        player.enable_host_system_open_queue();
+        let open = command(&driver, &shared, &[b"opensite", b"https", b"example.invalid/manual"], 72);
+        let mut apply = |player: &mut HeadlessPlayer| {
+            player.with_host(|host| apply_effect(host, &view, &mut driver, &open, &mut shared))
+        };
+        assert_eq!(apply(&mut player)?, Some(false));
+        let request = player.take_host_system_open_request().unwrap();
+        assert_eq!(request.request.task_id, view.id);
+        assert_eq!(request.request.target, b"https://example.invalid/manual");
+        assert_eq!(apply(&mut player)?, Some(false));
+        assert!(player.take_host_system_open_request().is_none());
+        player.complete_host_system_open(request.id, Err("no browser".into()))?;
+        assert_eq!(apply(&mut player)?, Some(true));
+        assert!(player.take_host_system_open_request().is_none());
+        assert!(player.events().iter().any(|event| {
+            event.kind == "system-open-error" && event.detail == "no browser"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn fes_open_site_encoded_preserves_query_fields_and_resumes_after_rejection() -> Result<()> {
+        let (mut player, view, mut driver, mut shared) = setup()?;
+        player.enable_host_system_open_queue();
+        let (line, _, _) = encoding_rs::SHIFT_JIS.encode(concat!(
+            "opensiteenc https example.invalid/intent? original_referer=http: ",
+            "example.invalid/&text=\u{4f53}\u{9a13}\u{7248} 42&url=https: ",
+            "example.invalid/game/&hashtags=\u{65e5}\u{672c}\u{8a9e}",
+        ));
+        let parameters = driver.interpreter.program.command_parameters(&line, &shared.strings)?;
+        let arguments: Vec<&[u8]> = parameters.iter().map(Vec::as_slice).collect();
+        let open = command(&driver, &shared, &arguments, 73);
+        let mut apply = |player: &mut HeadlessPlayer| {
+            player.with_host(|host| apply_effect(host, &view, &mut driver, &open, &mut shared))
+        };
+        assert_eq!(apply(&mut player)?, Some(false));
+        let request = player.take_host_system_open_request().unwrap();
+        assert_eq!(request.request.target, concat!(
+            "https://example.invalid/intent?original_referer=http%3A%2F%2Fexample.invalid%2F",
+            "&text=%E4%BD%93%E9%A8%93%E7%89%88%2042&url=https%3A%2F%2Fexample.invalid%2Fgame%2F",
+            "&hashtags=%E6%97%A5%E6%9C%AC%E8%AA%9E",
+        ).as_bytes());
+        player.complete_host_system_open(request.id, Err("no browser".into()))?;
+        assert_eq!(apply(&mut player)?, Some(true));
+        assert!(player.take_host_system_open_request().is_none());
+        assert!(player.events().iter().any(|event| {
+            event.kind == "system-open-error" && event.detail == "no browser"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn fes_window_text_entry_retries_then_writes_only_accepted_text() -> Result<()> {
         let (mut player, view, mut driver, mut shared) = setup()?;
         shared
             .strings
             .insert(481, "\u{7de8}\u{96c6}".as_bytes().to_vec());
-        shared.strings.insert(480, b"original".to_vec());
+        let original = b"\x82\xa0\x82";
+        shared.strings.insert(480, original.to_vec());
+        player.data_services.cst_text_origins.set_shared_encoding(480, original, ScriptTextEncoding::Cp932);
         let command = command(
             &driver,
             &shared,
@@ -466,22 +548,30 @@ mod tests {
         };
         assert_eq!(apply(&mut player, &mut driver, &mut shared)?, Some(false));
         let first = player.take_host_text_entry().unwrap();
-        assert_eq!(first.initial, "original");
+        assert_eq!(first.initial, "\u{3042}\u{fffd}");
+        assert!(player.events().iter().any(|event| event.kind == "text-decode-recovered"
+            && event.detail.contains("input_text string=480 encoding=Cp932 offset=2")));
         assert_eq!(first.limit, 3);
         assert!(first.allow_cancel);
         assert_eq!(apply(&mut player, &mut driver, &mut shared)?, Some(false));
         assert!(player.take_host_text_entry().is_none());
-        player.complete_host_text_entry(first.id, Some("a\u{1f30d}b".into()))?;
+        assert!(player.complete_host_text_entry(first.id, Some("a\u{1f30d}b".into())));
+        assert!(!player.complete_host_text_entry(first.id, None));
         assert_eq!(apply(&mut player, &mut driver, &mut shared)?, Some(true));
         assert_eq!(shared.shared[850], 1);
         assert_eq!(shared.strings[&480], "a\u{1f30d}".as_bytes());
+        assert_eq!(player.data_services.cst_text_origins.shared(480, &shared.strings[&480]), Some(ScriptTextEncoding::Utf8));
         assert_eq!(apply(&mut player, &mut driver, &mut shared)?, Some(false));
         let second = player.take_host_text_entry().unwrap();
         assert_ne!(first.id, second.id);
-        player.complete_host_text_entry(second.id, None)?;
+        assert_eq!(second.initial, "a\u{1f30d}");
+        assert!(!player.complete_host_text_entry(first.id, None));
+        player.finish_host_text_entry(second.id, Err(anyhow::anyhow!("unable to open native dialog")));
         assert_eq!(apply(&mut player, &mut driver, &mut shared)?, Some(true));
         assert_eq!(shared.shared[850], 0);
         assert_eq!(shared.strings[&480], "a\u{1f30d}".as_bytes());
+        assert!(player.events().iter().any(|event| event.kind == "text-entry-error"
+            && event.detail.contains("unable to open native dialog")));
         Ok(())
     }
 

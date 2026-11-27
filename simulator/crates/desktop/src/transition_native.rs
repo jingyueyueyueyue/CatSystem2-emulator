@@ -485,6 +485,20 @@ mod tests {
             assert_eq!(frame.pixels(), [80, 100, 120, 200, 50, 70, 90, 132]);
             assert!(task.active);
 
+            let kinds = BTreeMap::from([(4, 26)]);
+            let store = TransitionStore {
+                tasks: BTreeMap::from([(4, task)]),
+                queued: BTreeMap::from([(4, VecDeque::from([(265, Vec::new())]))]),
+            };
+            let checkpoint = store.capture_checkpoint(&kinds, host.image_handles)?;
+            let mut restored = TransitionStore::prepare_checkpoint(&checkpoint, &kinds, host.image_handles)?;
+            assert_eq!(restored.queued, store.queued);
+            let mut task = restored.tasks.remove(&4).context("wipe task missing after checkpoint restore")?;
+            assert_eq!(task.local, [1, 1]);
+            let (at, frame) = task.rendered.as_ref().context("submitted wipe pixels missing after restore")?;
+            assert_eq!(*at, Point::new(5, 9));
+            assert_eq!(frame.pixels(), [80, 100, 120, 200, 50, 70, 90, 132]);
+
             host.sample_transition(&mut task, 100, false, true)?;
             let (at, frame) = task.rendered.as_ref().unwrap();
             assert_eq!(*at, Point::new(4, 8));

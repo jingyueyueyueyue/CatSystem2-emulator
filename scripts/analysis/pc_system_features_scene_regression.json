@@ -1,0 +1,18 @@
+{
+  "9": {
+    "frames": 7650,
+    "checkpoint_files": {"savegen.dat": "archive/2026-11/20261125_09_pc_original_ending_savegen.dat"},
+    "window_checks": {
+      "4050": ["flow", "scenemode"],
+      "4650": ["flow", "meswnd.fes"],
+      "6200": ["flow", "scenemode"],
+      "7550": ["flow", "meswnd.fes"]
+    },
+    "inputs": ["story-events", "capture-every:0", "no-final-capture",
+      "move:2325:195,510", "require-hit:2340:17", "2340:195,510",
+      "move:3220:195,459", "require-hit:3240:21", "3240:195,459", "inspect-log:4050",
+      "move:4070:206,349", "require-hit:4100:11", "4100:206,349", "inspect-log:4650",
+      "ctrl-hold:4700:6100", "inspect-log:6200",
+      "move:6260:487,349", "require-hit:6300:12", "6300:487,349", "inspect-log:7550"]
+  }
+}

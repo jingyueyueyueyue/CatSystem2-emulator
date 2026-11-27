@@ -142,15 +142,18 @@ impl LoggingHost<'_> {
         if !matches!(index, 299..=302) || args.len() != (1 + LEGACY_MOTION_GROUP_COUNT) * 4 {
             return Ok(None);
         }
-        let verified_short_layout = matches!(index, 299 | 301 | 302)
-            && matches!(self.css_task_sha(), Some(CAMPANELLA_SHA) | Some(TSUNABAN_SHA));
-        if !verified_short_layout && !self.bind_utate_plane_input_profile()? {
+        if !self.data_services.ordinary_native_table.as_ref()
+            .is_some_and(|table| table.has_short_motion_properties(index))
+        {
             return Ok(None);
         }
+        self.short_motion_properties(index, args, vm).map(Some)
+    }
 
+    fn short_motion_properties(&mut self, index: u32, args: &[u8], vm: &mut Vm) -> Result<NativeReturn> {
         let handle = read_u32(args, 0)?;
         if handle == 0 {
-            return Ok(Some(NativeReturn::Continue));
+            return Ok(NativeReturn::Continue);
         }
         let controller = self
             .motion_controllers
@@ -182,7 +185,7 @@ impl LoggingHost<'_> {
                 vm.write(address, &bytes)?;
             }
         }
-        Ok(Some(NativeReturn::Continue))
+        Ok(NativeReturn::Continue)
     }
 }
 
@@ -217,14 +220,14 @@ mod tests {
             assert_eq!(host.events.len(), event_count + 1);
             let event = host.events.last().unwrap();
             assert_eq!(event.kind, "campanella-motion-controller");
-            assert!(event.detail.contains("native=311 pc=Some(0x5dc64)"));
+            assert!(event.detail.contains("native=311 pc=Some(") && event.detail.contains("0x5dc64"));
             assert!(event.detail.contains("handle=0x12345678 field=unresolved"));
             Ok(())
         }).unwrap();
     }
 
     #[test]
-    fn legacy_native301_short_layout_preserves_last_dword_for_verified_pes() {
+    fn legacy_native301_short_layout_preserves_last_dword() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let save_root = std::env::temp_dir().join(format!("cs2-legacy-301-{}", std::process::id()));
         let mut player = HeadlessPlayer::open_with_save_root(root, save_root).unwrap();
@@ -244,21 +247,16 @@ mod tests {
                 handle, pointer(0), pointer(3), pointer(6), pointer(9),
                 pointer(25), u32::MAX, pointer(29), pointer(32),
             ].map(u32::to_le_bytes).concat();
-            for (sha, tail) in [(CAMPANELLA_SHA, 0xdead_beef), (TSUNABAN_SHA, 0xface_cafe)] {
-                host.data_services.css_task_pe_sha256 = Some(sha);
-                let controller = host.motion_controllers.get_mut(&handle).unwrap();
-                controller.properties = [0; 36];
-                controller.properties[35] = tail;
-                assert!(host.motion_native(300, &short, &mut vm).is_err());
-                assert_eq!(host.motion_native(301, &short, &mut vm)?, NativeReturn::Continue);
-                expected[35] = tail;
-                assert_eq!(host.motion_controllers[&handle].properties, expected);
-                assert_eq!(host.motion_controllers[&handle].base_properties, base_before);
-            }
-
-            host.data_services.css_task_pe_sha256 = Some("unverified");
+            host.data_services.css_task_pe_sha256 = Some(CAMPANELLA_SHA);
             assert!(host.motion_native(301, &short, &mut vm).is_err());
+
+            let controller = host.motion_controllers.get_mut(&handle).unwrap();
+            controller.properties = [0; 36];
+            controller.properties[35] = 0xdead_beef;
+            assert_eq!(host.short_motion_properties(301, &short, &mut vm)?, NativeReturn::Continue);
+            expected[35] = 0xdead_beef;
             assert_eq!(host.motion_controllers[&handle].properties, expected);
+            assert_eq!(host.motion_controllers[&handle].base_properties, base_before);
 
             let mut full = short;
             expected[35] = 0x1357_9bdf;
@@ -270,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_native299_and_302_use_only_eight_groups_for_verified_pes() {
+    fn legacy_motion_wrappers_use_only_eight_groups() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let save_root = std::env::temp_dir().join(format!("cs2-legacy-299-302-{}", std::process::id()));
         let mut player = HeadlessPlayer::open_with_save_root(root, save_root).unwrap();
@@ -297,23 +295,22 @@ mod tests {
                 address(61), address(64), address(65), address(68),
             ].map(u32::to_le_bytes).concat();
 
-            host.data_services.css_task_pe_sha256 = Some("unverified");
+            host.data_services.css_task_pe_sha256 = Some(TSUNABAN_SHA);
             assert!(host.motion_native(299, &set, &mut vm).is_err());
+            assert!(host.motion_native(300, &get, &mut vm).is_err());
             assert!(host.motion_native(302, &get, &mut vm).is_err());
 
-            for sha in [CAMPANELLA_SHA, TSUNABAN_SHA] {
-                host.data_services.css_task_pe_sha256 = Some(sha);
-                let controller = host.motion_controllers.get_mut(&handle).unwrap();
-                controller.base_properties = [0; 36];
-                controller.base_properties[35] = expected_base[35];
-                controller.properties = current;
-                vm.write(address(36), &[sentinel; 36].map(u32::to_le_bytes).concat())?;
+            let controller = host.motion_controllers.get_mut(&handle).unwrap();
+            controller.base_properties = [0; 36];
+            controller.base_properties[35] = expected_base[35];
+            controller.properties = current;
 
-                assert_eq!(host.motion_native(299, &set, &mut vm)?, NativeReturn::Continue);
-                assert_eq!(host.motion_controllers[&handle].base_properties, expected_base);
-                assert_eq!(host.motion_controllers[&handle].properties, current);
-                assert_eq!(host.motion_native(302, &get, &mut vm)?, NativeReturn::Continue);
-                for (index, value) in current[..35].iter().enumerate() {
+            assert_eq!(host.short_motion_properties(299, &set, &mut vm)?, NativeReturn::Continue);
+            assert_eq!(host.motion_controllers[&handle].base_properties, expected_base);
+            assert_eq!(host.motion_controllers[&handle].properties, current);
+            for (native, expected) in [(300, expected_base), (302, current)] {
+                assert_eq!(host.short_motion_properties(native, &get, &mut vm)?, NativeReturn::Continue);
+                for (index, value) in expected[..35].iter().enumerate() {
                     assert_eq!(vm.read_u32(address(36 + index as u32))?, *value);
                 }
                 assert_eq!(vm.read_u32(address(71))?, sentinel);

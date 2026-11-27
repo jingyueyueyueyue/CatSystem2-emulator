@@ -1,0 +1,23 @@
+{
+  "18": {
+    "frames": 8700,
+    "checkpoint_files": {
+      "save1004.dat": "archive/2026-11/20261125_18_chapter2_quest_sp_save1004.dat",
+      "savegen.dat": "archive/2026-11/20261125_18_chapter2_quest_sp_savegen.dat"
+    },
+    "event_checks": [
+      {"from": 3310, "through": 4450, "contains": "slot=1004 handle="},
+      {"from": 5500, "through": 8700, "contains": "bt autosave"}
+    ],
+    "save_checks": {"save1000.dat": null},
+    "inputs": [
+      "story-events", "story-trace", "button-probe", "capture-every:0", "no-final-capture",
+      "move:1480:327,433", "require-hit:1540:12", "1540:327,433",
+      "move:2190:134,559", "require-hit:2260:35", "2260:134,559",
+      "trace-native:245",
+      "move:3250:189,128", "require-hit:3310:41", "3310:189,128",
+      "move:4650:563,377", "require-hit:4750:15", "4750:563,377",
+      "auto-first-choice", "ctrl-hold:4950:8650"
+    ]
+  }
+}

@@ -125,6 +125,7 @@ pub(super) trait MessageNativeContext: MessageBackend {
     fn message_time_scale(&self) -> Option<u32>;
     /// Ordinary task time base, independent of GAME/strframe_frame.
     fn legacy_frame_rate(&self) -> u32;
+    fn note_legacy_text_decode(&mut self, _offset: usize) {}
 }
 
 #[derive(Clone, Copy, Debug)]

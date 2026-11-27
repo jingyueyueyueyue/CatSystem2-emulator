@@ -29,6 +29,10 @@
 - **手动构建**：
   - Windows：`python -B scripts/build/cs2_workspace.py build --integration`
   - Android：`python -B scripts/build/android_workspace.py build --integration`
+- **后台系统功能回归**：复用带 `build.json` 的 perf 集成回放器，交互和存档测试使用独立的回放档案。
+  ```powershell
+  python -B -X utf8 scripts/analysis/run_pc_system_features.py --player <story_replay.exe 的绝对路径> --jobs 2
+  ```
 
 ## 外挂汉化配置（`cs2-localization.json`）
 

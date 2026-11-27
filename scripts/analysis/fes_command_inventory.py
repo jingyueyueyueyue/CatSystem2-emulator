@@ -100,7 +100,7 @@ def statement(line, macros, kind):
     return 'unclassified'
 
 
-def script_commands(body):
+def script_sections(body):
     sections = []
     for number, line in original_lines(body):
         if line.startswith(b'#'):
@@ -109,7 +109,23 @@ def script_commands(body):
                 sections.append((fields, []))
         elif sections:
             sections[-1][1].append((number, line))
+    return sections
 
+
+def script_subcommands(sections):
+    bindings = {}
+    for fields, lines in sections:
+        if fields[0] != b'SUBCOMMAND':
+            continue
+        for number, line in lines:
+            words = line.split()
+            if (len(words) >= 4 and words[0] in (b'oneshot', b'continue')
+                    and b':' in words[3:] and IDENTIFIER.fullmatch(words[1])):
+                bindings.setdefault(text(words[1]), {'target': text(words[2]), 'line': number})
+    return bindings
+
+
+def script_commands(sections):
     kinds, macros = {}, {}
     for fields, lines in sections:
         if fields[0] not in (b'DEFINE', b'MACRO'):
@@ -183,14 +199,16 @@ def audit_game(root, selected_seeds):
             body = unpack(content)
             if not content.startswith(b'FES\0') and not re.search(rb'^\s*#[A-Za-z_]', body, re.M):
                 raise ValueError('no FES signature or structured text headers')
+            sections = script_sections(body)
             statements = Counter()
-            for key, number, line in script_commands(body):
+            for key, number, line in script_commands(sections):
                 statements[key] += 1
                 if len(examples[key]) < 4:
                     examples[key].append({'source': source, 'line': number, 'statement': text(line)})
             counts.update(statements)
             game['scripts'].append({'source': source, 'resource': resource, 'sha256': hashlib.sha256(content).hexdigest(),
-                                    'statements': dict(sorted(statements.items()))})
+                                    'statements': dict(sorted(statements.items())),
+                                    'subcommands': script_subcommands(sections)})
         except (ValueError, zlib.error, struct.error) as error:
             game['diagnostics'].append({'source': source, 'error': str(error)})
 

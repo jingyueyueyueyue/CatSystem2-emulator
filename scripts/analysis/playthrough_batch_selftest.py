@@ -15,10 +15,24 @@ from unittest.mock import patch
 import zlib
 
 import run_playthrough_batch as batch
+import run_button_batch as buttons
 from batch_progress import BatchProgress
 
 
 class PlaythroughBatchSelfTest(unittest.TestCase):
+    def test_playthrough_cache_prefers_explicit_absolute_root(self):
+        explicit = self.root / "explicit"
+        configured = self.root / "configured"
+        with patch.dict(os.environ, {"CS2_BUILD_CACHE_ROOT": str(configured)}):
+            self.assertEqual(batch.playthrough_cache_root(), configured / "playthrough")
+            self.assertEqual(batch.playthrough_cache_root(explicit), explicit / "playthrough")
+            with self.assertRaisesRegex(ValueError, "--cache-root must be an absolute path"):
+                batch.playthrough_cache_root(Path("relative"))
+
+    def test_playthrough_cache_defaults_to_archive_for_local_game(self):
+        with patch.dict(os.environ, {"CS2_BUILD_CACHE_ROOT": ""}):
+            self.assertEqual(batch.playthrough_cache_root(single_game=True), self.root / "archive")
+
     def setUp(self):
         temporary = TemporaryDirectory(prefix="playthrough-batch-selftest-")
         self.addCleanup(temporary.cleanup)
@@ -83,6 +97,23 @@ class PlaythroughBatchSelfTest(unittest.TestCase):
         popen.assert_called_once()
         self.assertEqual(receipt["ordinary_save"]["status"], "staged")
         self.assertEqual(receipt["status"], "launch_error")
+
+    def test_checkpoint_copies_preserve_save_page_order(self):
+        other = self.source.with_name("save0012.dat")
+        other.write_bytes(self.content)
+        older = 1_700_000_000_000_000_000
+        newer = older + 60_000_000_000
+        os.utime(self.source, ns=(older, older))
+        os.utime(other, ns=(newer, newer))
+
+        def spawn(command, **kwargs):
+            self.assertEqual((self.profile / "save0000.dat").stat().st_mtime_ns, older)
+            self.assertEqual((self.profile / "save0012.dat").stat().st_mtime_ns, newer)
+            raise OSError("synthetic launch failure")
+
+        with patch.object(batch.subprocess, "Popen", side_effect=spawn) as popen:
+            self.run_case(checkpoint_files={"save0012.dat": other, "save0000.dat": self.source})
+        popen.assert_called_once()
 
     def test_existing_profile_is_not_modified(self):
         self.profile.mkdir()
@@ -255,6 +286,75 @@ class PlaythroughBatchSelfTest(unittest.TestCase):
         popen.assert_called_once()
         result = json.loads((self.output / "01.json").read_text(encoding="utf-8"))
         self.assertEqual(result["status"], "launch_error")
+
+    def test_strict_batch_rejects_engine_errors_and_missed_inputs(self):
+        args = SimpleNamespace(jobs=1, frames=12, timeout=30, stall_seconds=10,
+                               reserve_ram_gib=1, ram_per_job_gib=1,
+                               reserve_disk_gib=1, disk_per_job_gib=1, admission_wait_seconds=0)
+        cases = [(1, self.game_entry, {})]
+        with patch.object(batch, "available_ram_bytes", return_value=8 * batch.GIB), \
+                patch.object(batch.shutil, "disk_usage", return_value=SimpleNamespace(free=8 * batch.GIB)), \
+                patch.object(batch, "run_case") as run_case, redirect_stdout(io.StringIO()):
+            for status, exit_code, first_error, expected in [
+                ("visual_review_required", 0, None, 0),
+                ("input_missed", 0, None, 1),
+                ("engine_error", 1, {"frame": 9}, 1),
+            ]:
+                with self.subTest(status=status):
+                    run_case.return_value = {"index": 1, "status": status, "seconds": 1,
+                                             "exit_code": exit_code, "first_engine_error": first_error}
+                    self.assertEqual(batch.run_batch(cases, self.player, self.output, args, {}, strict=True), expected)
+
+    def test_fes_window_checks_require_a_snapshot_and_exact_names(self):
+        host = self.output / "replay.host.log"
+        host.write_text(
+            'frame 12: wait scene=- windows(owner,name,wait_key,driver)='
+            '[(6, "flow", false, Some(("EX_WAIT", false, None))), (32, "cgview", false, None)] '
+            'body_wait_shell(window,owner)=None\n'
+            'frame 24: wait scene=- windows(owner,name,wait_key,driver)='
+            '[(6, "flow", false, None)] body_wait_shell(window,owner)=None\n',
+            encoding="utf-8",
+        )
+        checks = batch.check_fes_windows(host, {12: ["flow", "cgview"], 24: ["cgview"], 30: []})
+        self.assertEqual([row["passed"] for row in checks], [True, False, False])
+        self.assertEqual(checks[1]["actual"], ["flow"])
+
+    def test_replay_event_must_match_inside_the_declared_frame_range(self):
+        events = self.output / "replay.events.log"
+        events.write_text("frame=15 logic-frame sound_load bgm02.ogg\n", encoding="utf-8")
+        checks = [{"from": 15, "through": 17, "contains": "sound_load bgm02.ogg"},
+                  {"from": 16, "through": 17, "contains": "sound_load bgm02.ogg"}]
+        self.assertEqual([row["matched_frame"] for row in batch.check_replay_events(events, checks)], [15, None])
+
+    def test_replay_pixel_checks_only_compare_the_requested_crop(self):
+        from PIL import Image
+
+        prefix = self.output / "09"
+        with Image.new("RGB", (10, 10)) as image:
+            image.save(self.output / "09.0015.png")
+            image.putpixel((6, 6), (255, 0, 0))
+            image.save(self.output / "09.0016.png")
+        checks = [
+            {"before": 15, "after": 16, "bounds": [0, 0, 5, 5], "expect": "same"},
+            {"before": 15, "after": 16, "bounds": [5, 5, 10, 10], "expect": "changed"},
+            {"before": 15, "after": 16, "bounds": [5, 5, 10, 10], "expect": "same"},
+        ]
+        self.assertEqual([row["passed"] for row in batch.check_replay_pixels(prefix, checks)], [True, True, False])
+
+    def test_exit_click_can_arrive_on_second_tick(self):
+        host = self.output / "replay.host.log"
+        host.write_text(
+            "frame 11: pointer [0, 0], routes []\n"
+            "frame 12: pointer [0, 0], routes [InputRouteReceipt { frame: 12, key: 0, group: 0, "
+            "raw_mask: 2, pressed: 1, repeated: false, region: 35, receiver: 33, response: 0, "
+            "physical: [RoutedPhysicalButton { source: Mouse, code: 1 }] }]\n"
+            "frame 18: game requested normal exit\n",
+            encoding="utf-8",
+        )
+        result = {"index": 11, "status": "unexpected_exit", "stderr": str(host),
+                  "captures": ["11.0008.png", "11.0018.png"]}
+        spec = buttons.ButtonCase("exit-yes", 8, 10, 35, [], expectation="exit")
+        self.assertEqual(buttons.evaluate_button(result, spec)["status"], "normal_exit")
 
     def test_batch_rechecks_resources_with_an_active_case(self):
         args = SimpleNamespace(jobs=2, frames=12, timeout=30, stall_seconds=10,

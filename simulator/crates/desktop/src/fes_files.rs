@@ -2,7 +2,7 @@
 //! This module is a child of fes_driver so its continuations participate in
 //! driver snapshots without exposing host file handles or process pointers.
 use std::fs::{self, File, Metadata};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +11,7 @@ use cs2_script::ExpressionState;
 
 use super::{FesDriverCommand, FesDriverEffect, FesScriptDriver};
 use crate::{LoggingHost, LogicEvent};
+use crate::save_native::remove_slot;
 
 const MAX_SAVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_QUERY_SLOTS: i64 = 1_000_000;
@@ -336,7 +337,14 @@ impl FileCommand {
                 let count = (i64::from(*last) - i64::from(*first) + 1) as usize;
                 for index in slots.len()..count.min(slots.len() + QUERY_BATCH) {
                     let slot = *first + index as i32;
-                    slots.push((slot, modified_time(host.save_root, slot)?.unwrap_or(0)));
+                    let time = match modified_time(host.save_root, slot) {
+                        Ok(time) => time.unwrap_or(0),
+                        Err(error) => {
+                            record_file_result(host, "sortsave", format!("slot={slot}"), Err(error));
+                            0
+                        }
+                    };
+                    slots.push((slot, time));
                 }
                 if slots.len() < count { return Ok(false); }
                 sort_save_slots(slots);
@@ -347,11 +355,15 @@ impl FileCommand {
             }
             Operation::SaveExist { destination, filename, lower, upper } => {
                 let filename = host.text_encoding.decode(filename);
-                let found = match read_css(host.save_root, &filename)? {
-                    None => 0,
-                    Some(file) if *lower == u32::MAX
+                let found = match read_css(host.save_root, &filename) {
+                    Ok(None) => 0,
+                    Ok(Some(file)) if *lower == u32::MAX
                         || (*lower <= file.tag && file.tag <= *upper) => 1,
-                    Some(_) => -1,
+                    Ok(Some(_)) => -1,
+                    Err(error) => {
+                        record_file_result(host, "saveexist", format!("file={filename:?}"), Err(error));
+                        0
+                    }
                 };
                 write_shared(shared, *destination, found);
                 Ok(true)
@@ -364,13 +376,10 @@ impl FileCommand {
                     .context("FES datasave has an invalid or wrong-type CSS container")?;
                 let bytes = file.to_css().context("FES datasave CSS serialization failed")?;
                 let filename = slot_filename(*slot);
-                let path = crate::save_path(host.save_root, &filename)?;
                 // The file-service contract distinguishes ordinary write
                 // failure from protocol/serialization errors. Record the
                 // former while completing the command as documented.
-                let write = fs::create_dir_all(host.save_root)
-                    .and_then(|()| File::create(&path))
-                    .and_then(|mut file| file.write_all(&bytes));
+                let write = crate::write_save_css(host.save_root, &filename, &bytes);
                 host.events.push(LogicEvent {
                     frame: host.frame,
                     kind: "fes-datasave".into(),
@@ -384,13 +393,13 @@ impl FileCommand {
                 Ok(true)
             }
             Operation::SaveAppendString { slot, record, text } => {
-                append_save_string(host.save_root, *slot, *record, text)?;
+                if let Err(error) = append_save_string(host.save_root, *slot, *record, text) {
+                    record_file_result(host, "saveapend_str", format!("slot={slot} record={record:#x}"), Err(error));
+                }
                 Ok(true)
             }
             Operation::SaveGetString { slot, record, destination } => {
-                if let Some(text) = get_save_string(host.save_root, *slot, *record)? {
-                    shared.strings.insert(*destination, text);
-                }
+                read_save_string(host, shared, *slot, *record, *destination);
                 Ok(true)
             }
             Operation::DeleteSave { slot } => {
@@ -421,28 +430,6 @@ fn record_file_result(host: &mut LoggingHost<'_>, verb: &str, slots: String, res
         kind: "fes-save-file".into(),
         detail: format!("command={verb} {slots} {outcome}"),
     });
-}
-
-fn remove_slot(path: &Path) -> Result<bool> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    #[cfg(windows)]
-    if metadata.permissions().readonly() {
-        let mut permissions = metadata.permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions)?;
-    }
-    #[cfg(not(windows))]
-    let _ = metadata;
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
 }
 
 struct SlotContents {
@@ -538,9 +525,21 @@ fn append_save_string(root: &Path, slot: i32, record: u32, text: &[u8]) -> Resul
     Ok(())
 }
 
-fn get_save_string(root: &Path, slot: i32, record: u32) -> Result<Option<Vec<u8>>> {
-    let Some(file) = read_css(root, &slot_filename(slot))? else { return Ok(None); };
-    Ok(file.try_record(record)?.map(|bytes| nul(bytes).to_vec()))
+fn read_save_string(host: &mut LoggingHost<'_>, shared: &mut ExpressionState,
+    slot: i32, record: u32, destination: u32,
+) {
+    let result = (|| -> Result<()> {
+        let Some(file) = read_css(host.save_root, &slot_filename(slot))? else { return Ok(()) };
+        let Some(text) = file.try_record(record)?.map(nul) else { return Ok(()) };
+        shared.strings.insert(destination, text.to_vec());
+        host.data_services.cst_text_origins.invalidate_shared(destination);
+        let codec = crate::fes_save_panel::save_record_text_encoding(host, Some(&file), record, text)?;
+        host.data_services.cst_text_origins.set_shared_encoding(destination, text, codec);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        record_file_result(host, "saveget_str", format!("slot={slot} record={record:#x}"), Err(error));
+    }
 }
 
 fn write_shared(state: &mut ExpressionState, destination: i32, value: i32) {
@@ -725,7 +724,7 @@ mod tests {
         let mut interpreter = FesInterpreter::new(program)?;
         let mut state = ExpressionState::default();
         let title = b"Chapter \"2 (one $str3";
-        let comment = b"First save\t[story]";
+        let comment = "First save\t[\u{6c49}\u{5b57}\u{3042}]".as_bytes();
         state.strings.insert(155, title.to_vec());
         state.strings.insert(751, comment.to_vec());
 
@@ -747,7 +746,7 @@ mod tests {
 
             for (id, record, text) in [
                 (b"0x80000000".as_slice(), 0x80000000, title.as_slice()),
-                (b"0x200".as_slice(), 0x200, comment.as_slice()),
+                (b"0x200".as_slice(), 0x200, comment),
             ] {
                 assert!(matches!(interpreter.run(&mut state, 8)?, FesStep::Event));
                 let parameters = interpreter.pending_command_parameters().unwrap();
@@ -762,8 +761,8 @@ mod tests {
             assert_eq!(file.record(0x10), Some(b"game state".as_slice()));
             assert_eq!(file.record(0x80000000), Some([title.as_slice(), &[0; 4]].concat().as_slice()));
             assert_eq!(file.records.iter().filter(|record| record.id == 0x80000000).count(), 1);
-            assert_eq!(get_save_string(&root, 0, 0x200)?.as_deref(), Some(comment.as_slice()));
-            assert_eq!(get_save_string(&root, 0, 0x201)?, None);
+            assert_eq!(file.try_record(0x200)?.map(nul), Some(comment));
+            assert_eq!(file.try_record(0x201)?, None);
             assert_eq!(fs::metadata(&path)?.modified()?, modified);
             Ok(())
         })();

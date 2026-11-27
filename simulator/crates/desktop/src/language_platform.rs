@@ -760,7 +760,8 @@ mod tests {
         let profile = scratch.0.join("profile");
         fs::create_dir_all(game.join("config")).unwrap();
         fs::create_dir(&profile).unwrap();
-        fs::write(game.join("config/startup.xml"), br#"<document>
+        fs::write(game.join("config/startup.xml"), br#"<?xml version="1.0" encoding="UTF-8"?>
+        <document>
           <APP><title>$ui$Default title</title></APP>
           <language><default>0</default><L00><prefix>en</prefix></L00>
             <L01><prefix>jp</prefix></L01><L02><prefix>cn</prefix></L02>
@@ -782,7 +783,7 @@ mod tests {
         ] {
             if let Some((interface, main)) = setup {
                 fs::write(profile.join("setup.xml"), format!(
-                    "<document><language><id><UI>{interface}</UI><main>{main}</main></id></language></document>"
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><document><language><id><UI>{interface}</UI><main>{main}</main></id></language></document>"
                 )).unwrap();
             }
             let player = HeadlessPlayer::open_with_save_root(&game, &profile).unwrap();

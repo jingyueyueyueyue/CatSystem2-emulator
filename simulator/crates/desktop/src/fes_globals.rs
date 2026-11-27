@@ -3,11 +3,11 @@
 //! evaluations so an error cannot replay earlier assignment/random effects.
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use cs2_runtime::resource_router::ResourceMode;
 use cs2_script::ExpressionState;
 
-use super::fes_driver::{FesDriverEffect, FesScriptDriver};
+use super::fes_driver::{FesDriverCommand, FesDriverEffect, FesScriptDriver};
 use super::fes_tasks::FesTaskView;
 use super::{DesktopSoundConfig, DesktopSoundPart, FesRuntime, LoggingHost, normalize_sound_name, trim_nul};
 
@@ -15,6 +15,8 @@ use super::{DesktopSoundConfig, DesktopSoundPart, FesRuntime, LoggingHost, norma
 #[serde(crate = "cs2_runtime::graph_serde")]
 pub(super) struct FesGlobalStore {
     pending: BTreeMap<(u32, usize), QueryProgress>,
+    #[serde(skip)]
+    warned_sound_defaults: bool,
 }
 
 #[derive(Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -53,34 +55,72 @@ pub(super) fn apply_effect(
     driver: &mut FesScriptDriver, effect: &FesDriverEffect, shared: &mut ExpressionState,
 ) -> Result<Option<bool>> {
     let FesDriverEffect::Command(command) = effect else { return Ok(None); };
-    let Some(verb) = command.parameters.first().map(Vec::as_slice) else { return Ok(None); };
-    if !matches!(verb, b"sysvoiceex" | b"getsndconfex" | b"setsndconfex" | b"rand" | b"bitcount" | b"fileexist"
-        | b"steam_isenable" | b"steam_isbroadcast" | b"steam_enablescreenshot" | b"steam_achievement")
-    {
+    let Some(raw_verb) = command.parameters.first().map(Vec::as_slice) else { return Ok(None); };
+    let lower_verb = raw_verb.to_ascii_lowercase();
+    let verb = lower_verb.as_slice();
+    if !matches!(
+        verb,
+        b"sysvoiceex"
+            | b"getsndconfex"
+            | b"setsndconfex"
+            | b"rand"
+            | b"bitcount"
+            | b"fileexist"
+            | b"steam_isenable"
+            | b"steam_isbroadcast"
+            | b"steam_enablescreenshot"
+            | b"steam_achievement"
+            | b"gettime"
+            | b"clipboard"
+            | b"messagebox"
+            | b"dbgstr"
+            | b"dbgstru8"
+            | b"cursormove"
+            | b"automoveex"
+            | b"btnsimulate"
+            | b"touch_enable"
+            | b"touch_kill"
+            | b"rdraw"
+            | b"fw_init"
+            | b"fw_auth"
+            | b"fw_hash"
+            | b"fw_limitpos"
+            | b"fw_activate"
+            | b"fw_status"
+            | b"fw_actcode"
+            | b"fw_uniquecode"
+    ) {
         return Ok(None);
     }
     let args = &command.parameters[1..];
-    if args.is_empty() { return Ok(Some(true)); }
+    if args.is_empty() && verb != b"clipboard" { return Ok(Some(true)); }
     // The FES parser already expands the NAME token. The original wrapper
     // only passes it on when a Steam service is present.
     if verb == b"steam_achievement" { return Ok(Some(true)); }
+    if matches!(verb, b"fw_init" | b"fw_auth" | b"fw_hash" | b"fw_activate" | b"touch_kill") {
+        return Ok(Some(true));
+    }
     let query = args.get(1).map(Vec::as_slice);
     let needs_config = match verb {
         b"sysvoiceex" => host.sound_config_enabled != 0,
         b"getsndconfex" => query.is_some(),
         _ => false,
     };
-    if needs_config && !host.sound_config.source_loaded {
-        bail!("FES sound query requires a loaded sound configuration");
+    let missing_master = verb == b"getsndconfex" && query == Some(b"volume")
+        && args.get(2).is_some_and(|name| trim_nul(name) == b"master")
+        && host.sound_config.master_volume.is_none();
+    if (needs_config && !host.sound_config.source_loaded || missing_master)
+        && !host.data_services.fes_globals.warned_sound_defaults
+    {
+        host.data_services.fes_globals.warned_sound_defaults = true;
+        host.events.push(super::LogicEvent { frame: host.frame, kind: "settings-sound-defaults".into(),
+            detail: "FES sound query has no configured value; using sound defaults".into() });
     }
     if verb == b"getsndconfex" {
         if let Some(query) = query {
             if !matches!(query, b"volume_id" | b"sysplay_id" | b"play_id"
                 | b"volume" | b"voicebgm" | b"volume_type" | b"play_type")
             { bail!("getsndconfex query {:?} has no documented host contract", String::from_utf8_lossy(query)); }
-            if query == b"volume" && args.get(2).is_some_and(|name| trim_nul(name) == b"master") {
-                host.sound_config.master_volume.context("FES master volume is unavailable")?;
-            }
         }
     }
     let key = (view.id, command.offset);
@@ -104,6 +144,9 @@ pub(super) fn apply_effect(
         if verb == b"steam_enablescreenshot" {
             // The offline wrapper still evaluates the optional enable flag.
             driver.evaluate_parameter(&args[0], command.context.current, shared)?;
+            return Ok(());
+        }
+        if apply_platform_utility(host, view, driver, command, verb, args, &mut progress, shared)? {
             return Ok(());
         }
         let output = match progress.output {
@@ -218,7 +261,7 @@ pub(super) fn apply_effect(
             if name.is_empty() { return Ok(()); }
             match query {
                 b"volume" if name == b"master" =>
-                    host.sound_config.master_volume.context("FES master volume is unavailable")?,
+                    host.sound_config.master_volume.unwrap_or(100),
                 b"volume" => host.sound_config.override_value(name, 0)
                     .unwrap_or_else(|| host.sound_config.group_volume(name)),
                 b"voicebgm" => host.sound_config.override_value(name, 1)
@@ -329,6 +372,167 @@ fn sound_part_by_id<'a>(mut parts: &'a mut [DesktopSoundPart], path: &[i32]) -> 
         }
     }
     parts.iter_mut().find(|part| part.id == *last)
+}
+
+fn join_text_parameters(args: &[Vec<u8>]) -> Vec<u8> {
+    let mut joined = Vec::new();
+    for (index, part) in args.iter().enumerate() {
+        if index > 0 {
+            joined.push(b' ');
+        }
+        joined.extend_from_slice(trim_nul(part));
+    }
+    joined
+}
+
+fn apply_platform_utility(
+    host: &mut LoggingHost<'_>,
+    view: &FesTaskView,
+    driver: &mut FesScriptDriver,
+    command: &FesDriverCommand,
+    verb: &[u8],
+    args: &[Vec<u8>],
+    progress: &mut QueryProgress,
+    shared: &mut ExpressionState,
+) -> Result<bool> {
+    match verb {
+        b"gettime" => {
+            let count = args.len().min(8);
+            while progress.values.len() < count {
+                let dest = driver.evaluate_parameter(&args[progress.values.len()], -1, shared)?;
+                progress.values.push(dest);
+            }
+            let [year, month, weekday, day, hour, minute, second, millis] =
+                super::calendar_native::local_calendar()?;
+            let fields = [year, month, day, weekday, hour, minute, second, millis];
+            for (&dest, value) in progress.values.iter().zip(fields) {
+                write(shared, dest, value as i32);
+            }
+            Ok(true)
+        }
+        b"clipboard" => {
+            let payload = join_text_parameters(args);
+            host.publish_fes_clipboard(&payload);
+            Ok(true)
+        }
+        b"messagebox" => {
+            let output = match progress.output {
+                Some(output) => output,
+                None => {
+                    let output = driver.evaluate_parameter(&args[0], -1, shared)?;
+                    progress.output = Some(output);
+                    output
+                }
+            };
+            let text_start = if args.len() >= 3 {
+                if progress.values.is_empty() {
+                    let flags = driver.evaluate_parameter(&args[1], 0, shared)?;
+                    progress.values.push(flags);
+                }
+                2
+            } else {
+                1
+            };
+            let text = if args.len() > text_start {
+                host.text_encoding.decode(&join_text_parameters(&args[text_start..]))
+            } else {
+                String::new()
+            };
+            host.events.push(super::LogicEvent {
+                frame: host.frame,
+                kind: "fes-messagebox".into(),
+                detail: format!("output={output} text={text:?}"),
+            });
+            write(shared, output, 1);
+            Ok(true)
+        }
+        b"dbgstr" | b"dbgstru8" => {
+            let raw = join_text_parameters(args);
+            let encoding = if verb == b"dbgstru8" {
+                super::ScriptTextEncoding::Utf8
+            } else {
+                host.text_encoding
+            };
+            let text = encoding.decode(&raw);
+            host.events.push(super::LogicEvent {
+                frame: host.frame,
+                kind: "fes-dbgstr".into(),
+                detail: text,
+            });
+            Ok(true)
+        }
+        b"cursormove" | b"automoveex" => {
+            let expected = if verb == b"automoveex" { args.len().min(3) } else { args.len().min(2) };
+            while progress.values.len() < expected {
+                let value = driver.evaluate_parameter(&args[progress.values.len()], 0, shared)?;
+                progress.values.push(value);
+            }
+            let x = progress.values.first().copied().unwrap_or(0);
+            let y = progress.values.get(1).copied().unwrap_or(0);
+            let frames = if verb == b"automoveex" {
+                progress.values.get(2).copied().unwrap_or(1).clamp(1, 600) as u32
+            } else {
+                1
+            };
+            if let Err(error) = host.move_fes_pointer(view.id, [x, y], frames) {
+                let detail = error.to_string();
+                if detail.contains("navigation input") {
+                    host.events.push(super::LogicEvent {
+                        frame: host.frame,
+                        kind: "fes-pointer-ignored".into(),
+                        detail: format!(
+                            "command={} point=({x},{y}) frames={frames}: {detail}",
+                            String::from_utf8_lossy(verb)
+                        ),
+                    });
+                } else {
+                    return Err(error.into());
+                }
+            }
+            Ok(true)
+        }
+        b"btnsimulate" | b"fw_limitpos" | b"touch_enable" | b"rdraw" => {
+            let limit = if verb == b"btnsimulate" { args.len() } else { args.len().min(1) };
+            let default = i32::from(matches!(verb, b"touch_enable" | b"rdraw"));
+            while progress.values.len() < limit {
+                let value = driver.evaluate_parameter(&args[progress.values.len()], default, shared)?;
+                progress.values.push(value);
+            }
+            Ok(true)
+        }
+        b"fw_status" => {
+            let output = match progress.output {
+                Some(output) => output,
+                None => {
+                    let output = driver.evaluate_parameter(&args[0], command.context.current, shared)?;
+                    progress.output = Some(output);
+                    output
+                }
+            };
+            write(shared, output, 2);
+            Ok(true)
+        }
+        b"fw_actcode" | b"fw_uniquecode" => {
+            let slot = match progress.output {
+                Some(slot) => slot,
+                None => {
+                    let slot = driver.evaluate_parameter(&args[0], -1, shared)?;
+                    progress.output = Some(slot);
+                    slot
+                }
+            };
+            if slot >= 0 {
+                let code: &[u8] = if verb == b"fw_actcode" {
+                    b"CS2-OFFLINE-ACTCODE"
+                } else {
+                    b"CS2-OFFLINE-UID"
+                };
+                shared.strings.insert(slot as u32, code.to_vec());
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(super) fn release_owner(host: &mut LoggingHost<'_>, owner: u32) {

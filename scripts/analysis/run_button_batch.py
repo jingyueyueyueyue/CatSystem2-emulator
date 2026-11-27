@@ -12,8 +12,8 @@ import shutil
 import time
 
 from run_playthrough_batch import (
-    GIB, INVENTORY, available_ram_bytes, identify_player, load_inventory,
-    new_output_directory, run_case, write_json,
+    GIB, INVENTORY, REPLAY_EVENT_LINE, available_ram_bytes, identify_player, load_inventory,
+    new_output_directory, playthrough_cache_root, run_case, write_json,
 )
 
 TITLE_SCENARIOS = Path(__file__).with_name("pc_button_titles.json")
@@ -21,12 +21,21 @@ REGION = re.compile(
     r"frame (\d+): button region=(\d+) bounds=\[(-?\d+), (-?\d+), (-?\d+), (-?\d+)\]"
     r" enabled=true point=Some\(\[(\d+), (\d+)\]\)"
 )
+REGION_STATE = re.compile(
+    r"frame (\d+): button region=(\d+) bounds=\[(-?\d+), (-?\d+), (-?\d+), (-?\d+)\]"
+    r" enabled=(true|false) point=.*"
+)
+INSPECTED_FRAME = re.compile(r"frame (\d+): wait ")
 MENU = re.compile(r"frame (\d+): menu installed HostGameMenu.*visible: true")
 INPUT = re.compile(r"(?:move:|right:|require-hit:)?(\d+):(?:-?\d+,-?\d+|\d+)$")
 MOUSE_PRESS = re.compile(
     r"pressed: 1, repeated: false, region: (\d+), receiver: (\d+), response: (\d+), "
     r"physical: \[RoutedPhysicalButton \{ source: Mouse, code: 1 \}\]"
 )
+FRAMED_MOUSE_PRESS = re.compile(
+    r"InputRouteReceipt \{ frame: (\d+), key: \d+, group: \d+, raw_mask: \d+, " + MOUSE_PRESS.pattern
+)
+POINTER_ROUTES = re.compile(r"frame (\d+): pointer \[")
 NORMAL_EXIT = re.compile(r"frame (\d+): game requested normal exit")
 LIVE_BUTTON = re.compile(r"frame (\d+): live button before=(\d+) region=(\d+)")
 CASE_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -43,6 +52,8 @@ class ButtonCase:
     after: int | None = None
     live_frames: int | None = None
     response: int = 0
+    region_change: tuple[int, bool | tuple | None, bool | tuple | None] | None = None
+    message_point: tuple[int, int] | None = None
 
 
 def entry_inputs(source, frame):
@@ -119,13 +130,53 @@ def named_cases(path):
             elif (type(live_frames) is not int or live_frames <= 0 or expectation == "disabled"
                     or any(frame is not None for frame in (before, click, after))):
                 raise ValueError(f"invalid live button case {index}/{name}")
+            accept_message = fields.get("accept_message_resume", False)
+            if type(accept_message) is not bool:
+                raise ValueError(f"invalid accept_message_resume flag for {index}/{name}")
+            message_point = None
+            if accept_message:
+                clicks = [match.groups() for flag in flags
+                          if (match := re.fullmatch(rf"{click}:(-?\d+),(-?\d+)", flag))]
+                if (expectation == "disabled" or response != 0 or len(clicks) != 1
+                        or f"require-hit:{click}:{region}" not in flags):
+                    raise ValueError(f"invalid guarded legacy click {index}/{name}")
+                x, y = clicks[0]
+                message_point = (int(x), int(y))
+            region_change = fields.get("region_change")
+            if region_change is not None:
+                if (expectation != "action" or live_frames is not None
+                        or f"require-hit:{click}:{region}" not in flags
+                        or not isinstance(region_change, list) or len(region_change) != 3):
+                    raise ValueError(f"invalid region change case {index}/{name}")
+                watched, prior, following = region_change
+                if (type(watched) is not int or watched <= 0 or prior == following
+                        or (prior is not None and following is not None and type(prior) is not type(following))
+                        or any(state is not None and type(state) is not bool and (
+                            not isinstance(state, list) or len(state) != 4
+                            or any(type(coordinate) is not int for coordinate in state)
+                        ) for state in (prior, following))):
+                    raise ValueError(f"invalid region states for {index}/{name}")
+                region_change = (watched, *(tuple(state) if isinstance(state, list) else state
+                                            for state in (prior, following)))
             game_cases[name] = ButtonCase(
                 name, before, click, region,
                 ["story-events", "capture-every:0", "button-probe", *flags],
-                expectation, after, live_frames, response,
+                expectation, after, live_frames, response, region_change, message_point,
             )
         cases[int(index)] = list(game_cases.values())
     return cases
+
+
+def message_resume_frame(path, click, after, point):
+    x, y = point
+    expected = f"message-resume message=[2, {x}, {y}, 0]"
+    with Path(path).open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if match := REPLAY_EVENT_LINE.match(line):
+                frame, event = match.groups()
+                if click < int(frame) <= after and event == expected:
+                    return int(frame)
+    return None
 
 
 def evaluate_button(result, spec):
@@ -141,11 +192,16 @@ def evaluate_button(result, spec):
                 result["status"] = "live_button_missing"
             return result
         click, before = found[0]
-    receipts = [line for line in log if line.startswith(f"frame {click + 1}: pointer ")]
+    # The replay releases three ticks after key-down. FES may consume the
+    # native input on any tick before the release is processed.
+    last_click_frame = click + 4
+    receipts = [line for line in log if (hit := POINTER_ROUTES.match(line))
+                and click < int(hit[1]) <= last_click_frame]
     settings = [line for line in log if "settings " in line and line.startswith("frame ")]
     presses = [
-        {"region": int(hit[1]), "receiver": int(hit[2]), "response": int(hit[3])}
-        for line in receipts for hit in MOUSE_PRESS.finditer(line)
+        {"region": int(hit[2]), "receiver": int(hit[3]), "response": int(hit[4])}
+        for line in receipts for hit in FRAMED_MOUSE_PRESS.finditer(line)
+        if click < int(hit[1]) <= last_click_frame
     ]
     exit_frame = next((int(match[1]) for line in log if (match := NORMAL_EXIT.fullmatch(line))), None)
     before_name = f"{index:02}.{before:04}.png"
@@ -157,7 +213,13 @@ def evaluate_button(result, spec):
         after_captures=[capture for capture in result["captures"]
                         if int(Path(capture).stem.split(".")[-1]) > click],
     )
-    consumed = any(press["region"] == region and press["response"] == 0 for press in presses)
+    message_frame = None
+    if spec.message_point is not None:
+        message_frame = message_resume_frame(result["stdout"], click, spec.after, spec.message_point)
+        result["message_resume_frame"] = message_frame
+    consumed = message_frame is not None or any(
+        press["region"] == region and press["response"] == 0 for press in presses
+    )
     if spec.expectation == "action":
         result["expected_response"] = spec.response
     if result["status"] == "unexpected_exit" and exit_frame is not None and exit_frame >= click:
@@ -171,6 +233,24 @@ def evaluate_button(result, spec):
             result["status"] = "button_capture_missing"
         elif spec.expectation == "exit":
             result["status"] = "expected_exit_missing"
+        elif spec.region_change is not None:
+            watched, prior, following = spec.region_change
+            frames = {before, spec.after}
+            inspected = {int(match[1]) for line in log if (match := INSPECTED_FRAME.match(line))}
+            states = {}
+            for line in log:
+                hit = REGION_STATE.fullmatch(line)
+                if hit is None or int(hit[2]) != watched or (frame := int(hit[1])) not in frames:
+                    continue
+                states[frame] = (hit[7] == "true" if type(prior if prior is not None else following) is bool
+                                 else tuple(int(hit[index]) for index in range(3, 7)))
+            actual = [states.get(before), states.get(spec.after)]
+            result["region_change"] = {"region": watched, "expected": [prior, following], "actual": actual}
+            if not frames <= inspected:
+                result["status"] = "region_snapshot_missing"
+            else:
+                result["status"] = ("region_change_verified" if actual == [prior, following]
+                                    else "region_change_missing")
         elif spec.expectation == "disabled":
             prefix = f"frame {before}: button region={region} "
             disabled = any(line.startswith(prefix) and line.endswith(" enabled=false point=None")
@@ -187,7 +267,7 @@ def evaluate_button(result, spec):
             result["status"] = "settings_roundtrip" if any(
                 "settings reopened resource=" in line for line in settings
             ) else "settings_review_required"
-        elif any(press["region"] == region and (
+        elif message_frame is not None or any(press["region"] == region and (
             spec.expectation == "observed" or press["response"] == spec.response
         ) for press in presses):
             result["status"] = "action_review_required"
@@ -202,9 +282,9 @@ def run_button(index, game, spec, player, output, timeout, env):
     try:
         if spec.live_frames is None:
             after = spec.after or spec.click + 105
-            before = "inspect" if spec.expectation == "disabled" else "capture"
+            before = "inspect" if spec.expectation == "disabled" or spec.region_change else "capture"
             frames = after + 46
-            flags = [*spec.flags, f"{before}:{spec.before}", f"inspect:{after}"]
+            flags = [*spec.flags, "no-final-capture", f"{before}:{spec.before}", f"inspect:{after}"]
         else:
             frames = spec.live_frames
             flags = [*spec.flags, "no-final-capture"]
@@ -219,6 +299,7 @@ def run_button(index, game, spec, player, output, timeout, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--player", type=Path, required=True)
+    parser.add_argument("--cache-root", type=Path, help="absolute directory for the playthrough cache")
     parser.add_argument("--probes", type=Path)
     parser.add_argument("--scenarios", type=Path, default=TITLE_SCENARIOS)
     parser.add_argument("--cases", type=Path, action="append", default=[],
@@ -271,15 +352,18 @@ def main():
             parser.error(f"duplicate button case for index {index}")
         counts[str(index)] = len(cases)
         pending.extend((index, games[index], case) for case in cases)
-    cache = Path(os.environ.get("CS2_BUILD_CACHE_ROOT", "F:/CS2-build-cache"))
-    output = new_output_directory(cache / "playthrough", datetime.now().astimezone())
+    try:
+        cache = playthrough_cache_root(args.cache_root)
+    except ValueError as error:
+        parser.error(str(error))
+    output = new_output_directory(cache, datetime.now().astimezone())
     write_json(output / "button_inventory.json", {
         "counts": counts, "probes": str(args.probes) if args.probes else None,
         "cases": [str(path) for path in args.cases], "build": identity,
     })
     print(output, flush=True)
     env = os.environ.copy()
-    env["CS2_MEDIA_CACHE"] = str(output / "movie-input")
+    env.setdefault("CS2_MEDIA_CACHE", str(cache / "movie-input"))
     if os.name == "nt":
         env["PATH"] = os.pathsep.join(("C:/msys64/mingw64/bin", env.get("PATH", "")))
     active = set()
@@ -312,7 +396,7 @@ def main():
     write_json(output / "button_results.json", results)
     reviewed_or_pending = {
         "action_review_required", "exit_review_required", "settings_roundtrip",
-        "settings_review_required", "disabled_review_required", "normal_exit",
+        "settings_review_required", "disabled_review_required", "normal_exit", "region_change_verified",
     }
     return int(any(count == 0 for count in counts.values())
                or any(item["status"] not in reviewed_or_pending for item in results))

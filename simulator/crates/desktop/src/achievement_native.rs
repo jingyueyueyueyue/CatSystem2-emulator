@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use cs2_formats::ConfigXml;
 use cs2_runtime::RuntimeError;
 use cs2_script::{NativeReturn, Result, Vm};
-use super::{HeadlessPlayer, LoggingHost, LogicEvent, expand_kcs_format, native_state_error, read_u32};
+use super::{HeadlessPlayer, LoggingHost, LogicEvent, ScriptTextEncoding, expand_kcs_format, native_state_error, read_u32};
 
 const MAGIC: &[u8; 8] = b"CS2ACH01";
 const FILE: &str = "simulator-achievements.dat";
@@ -36,10 +36,11 @@ pub(super) struct AchievementState {
 impl AchievementState {
     pub(super) fn supports(index: u32) -> bool { matches!(index, 1041..=1044) }
 
-    fn initialize(&mut self, document: Option<ConfigXml>, root: &Path) -> anyhow::Result<()> {
-        if self.initialized { return Ok(()); }
+    fn initialize(&mut self, document: Option<ConfigXml>, root: &Path) -> anyhow::Result<Vec<String>> {
+        if self.initialized { return Ok(Vec::new()); }
         let stored = load(root)?;
         let mut entries = BTreeMap::new();
+        let mut diagnostics = Vec::new();
         if let Some(document) = document {
             // The producer enumerates the XML root's direct children, reads
             // child/NAME and child/COMMENT, and keys the map by NAME (not child).
@@ -51,17 +52,25 @@ impl AchievementState {
                 if id.len() > 8191 || entries.len() >= MAX_ENTRIES {
                     bail!("achievement declaration exceeds the receiver capacity");
                 }
-                let comment = std::str::from_utf8(document.text(&comment_path).unwrap_or_default())
-                    .context("achievement COMMENT is not UTF-8")?.to_owned();
                 // std::map insertion in the producer keeps the first NAME.
-                let unlocked = stored.contains(&id);
-                entries.entry(id.clone()).or_insert(LocalAchievement { id, comment, unlocked });
+                entries.entry(id.clone()).or_insert_with(|| {
+                    let (comment, invalid) = ScriptTextEncoding::Utf8
+                        .decode_message(document.text(&comment_path).unwrap_or_default());
+                    if let Some(offset) = invalid {
+                        diagnostics.push(format!(
+                            "achievement COMMENT for {:?}: invalid UTF-8 at byte {offset}",
+                            String::from_utf8_lossy(&id),
+                        ));
+                    }
+                    let unlocked = stored.contains(&id);
+                    LocalAchievement { id, comment, unlocked }
+                });
             }
         }
         self.entries = entries;
         self.stored = stored;
         self.initialized = true;
-        Ok(())
+        Ok(diagnostics)
     }
 
     fn unlock(&mut self, id: &[u8], root: &Path) -> anyhow::Result<bool> {
@@ -96,7 +105,10 @@ impl HeadlessPlayer {
             return Ok(());
         }
         let document = read_declarations(&self.scan.resources)?;
-        self.data_services.achievements.initialize(document, &self.save_root)?;
+        let diagnostics = self.data_services.achievements.initialize(document, &self.save_root)?;
+        for detail in diagnostics {
+            self.log.push(detail);
+        }
         self.log.push(format!("local achievement profile: {} entries; Steam account synchronization unavailable",
             self.data_services.achievements.entries.len()));
         Ok(())
@@ -121,8 +133,11 @@ impl LoggingHost<'_> {
         } else { None };
         if !self.data_services.achievements.initialized {
             let document = read_declarations(self.resources).map_err(|error| self.achievement_error(error))?;
-            self.data_services.achievements.initialize(document, self.save_root)
+            let diagnostics = self.data_services.achievements.initialize(document, self.save_root)
                 .map_err(|error| self.achievement_error(error))?;
+            for detail in diagnostics {
+                self.data_services.note_text_decode(self.events, self.frame, detail);
+            }
         }
         match index {
             1041 => Ok(NativeReturn::Continue),
@@ -161,7 +176,8 @@ impl LoggingHost<'_> {
 
 fn read_declarations(resources: &cs2_runtime::ResourceIndex) -> anyhow::Result<Option<ConfigXml>> {
     match resources.read_category(b"config", "SteamAchievements.xml") {
-        Ok(bytes) => Ok(Some(ConfigXml::parse_runtime(&bytes).context("parse SteamAchievements.xml")?)),
+        Ok(bytes) => Ok(Some(ConfigXml::parse_runtime_with_raw_field_text(&bytes, 3, b"COMMENT")
+            .context("parse SteamAchievements.xml")?)),
         Err(RuntimeError::ResourceNotFound(_)) | Err(RuntimeError::InvalidResourceName(_)) => Ok(None),
         Err(error) => Err(error).context("read SteamAchievements.xml through config category"),
     }
@@ -245,6 +261,29 @@ mod tests {
     use super::*;
     use crate::tests::TempDir;
     use cs2_script::{Host, KcsProgram};
+
+    #[test]
+    fn malformed_achievement_comment_keeps_local_entry_and_raw_id() -> anyhow::Result<()> {
+        let profile = TempDir::new();
+        let bytes = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><document><one><NAME>ID</NAME>\
+                      <COMMENT>keep \x81 text</COMMENT></one></document>";
+        assert!(ConfigXml::parse_runtime(bytes).is_err());
+        let mut bad_id = bytes.to_vec();
+        let id_at = bad_id.windows(2).position(|bytes| bytes == b"ID").unwrap();
+        bad_id[id_at] = 0x81;
+        assert_eq!(
+            ConfigXml::parse_runtime_with_raw_field_text(&bad_id, 3, b"COMMENT"),
+            Err(cs2_formats::ConfigError::Malformed(id_at)),
+        );
+        let xml = ConfigXml::parse_runtime_with_raw_field_text(bytes, 3, b"COMMENT")?;
+        let mut state = AchievementState::default();
+        let diagnostics = state.initialize(Some(xml), &profile.0)?;
+        assert_eq!(diagnostics, ["achievement COMMENT for \"ID\": invalid UTF-8 at byte 5"]);
+        assert_eq!(state.entries[b"ID".as_slice()].comment, "keep \u{fffd} text");
+        assert!(state.unlock(b"ID", &profile.0)?);
+        assert_eq!(load(&profile.0)?, BTreeSet::from([b"ID".to_vec()]));
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires the installed NEKOPARA Vol.3 game"]

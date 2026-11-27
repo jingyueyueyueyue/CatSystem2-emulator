@@ -1,0 +1,33 @@
+{
+  "16": {
+    "frames": 7850,
+    "window_checks": {
+      "5270": ["flow", "meswnd.fes"],
+      "5700": ["flow", "tips.fes"],
+      "6050": ["flow", "tips.fes"],
+      "7110": ["flow", "meswnd.fes"],
+      "7790": ["flow", "tips.fes"]
+    },
+    "pixel_checks": [
+      {"before": 5700, "after": 6050, "bounds": [690, 60, 1145, 620], "expect": "changed"},
+      {"before": 5700, "after": 6050, "bounds": [168, 127, 211, 169], "expect": "changed"},
+      {"before": 6050, "after": 6380, "bounds": [211, 125, 612, 648], "expect": "changed"},
+      {"before": 6380, "after": 6740, "bounds": [211, 125, 612, 648], "expect": "changed"},
+      {"before": 6050, "after": 7790, "bounds": [168, 127, 211, 169], "expect": "same"}
+    ],
+    "inputs": [
+      "story-events", "capture-every:0", "no-final-capture",
+      "require-hit:425:14", "425:640,480",
+      "require-hit:661:15", "661:66,72",
+      "require-hit:1041:62", "1041:640,420",
+      "auto-first-choice", "ctrl-hold:1050:5110",
+      "inspect-log:5270", "move:5290:1209,691", "require-hit-priority:5325:232", "5325:1209,691",
+      "inspect:5700",
+      "move:5710:412,147", "5740:412,147", "inspect:6050",
+      "move:6060:144,631", "require-hit:6090:109", "6090:144,631", "inspect:6380",
+      "move:6390:192,678", "6420:192,678", "inspect:6740",
+      "move:6750:1113,678", "require-hit:6780:112", "6780:1113,678", "inspect-log:7110",
+      "move:7170:1209,691", "require-hit-priority:7200:232", "7200:1209,691", "inspect:7790"
+    ]
+  }
+}
