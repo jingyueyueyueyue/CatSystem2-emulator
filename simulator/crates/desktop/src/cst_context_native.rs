@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cs2_formats::{ConfigXml, CstlTable};
-use cs2_runtime::{ResourceIndex, ResourceLocation};
+use cs2_runtime::{ResourceCandidate, ResourceIndex, ResourceLocation};
 use cs2_runtime::resource_router::{GameLanguage, LocalizedSceneEncoding, ResourceMode};
 use cs2_script::{CstDocument, CstRecord, Instruction, NativeReturn, Operand, Result, ScriptError, Vm};
 use cs2_script::cst_history::{HistorySnapshot, history_blocks, prepend_history_snapshot};
@@ -837,15 +837,13 @@ struct CstRawCopy {
 pub(super) struct LooseSceneEncoding {
     directory: PathBuf,
     corroborated_gbk: bool,
+    legacy_gbk_config: bool,
 }
 
 impl LooseSceneEncoding {
     pub(super) fn detect(resources: &ResourceIndex) -> Option<Self> {
-        let label = resources.startup_declared_encoding()?;
-        if ![b"GB2312".as_slice(), b"GBK", b"GB18030"].iter().any(|codec| label.eq_ignore_ascii_case(codec)) {
-            return None;
-        }
-
+        let legacy_gbk_config = resources.startup_declared_encoding().is_some_and(|label|
+            [b"GB2312".as_slice(), b"GBK", b"GB18030"].iter().any(|codec| label.eq_ignore_ascii_case(codec)));
         let names = resources.category_names(b"scene", "probe.cst").ok()?;
         let (prefix, _) = names.first()?.split_once(['/', '\\'])?;
         let slot = resources.resource_router()?.slots.iter().find(|slot| {
@@ -855,8 +853,8 @@ impl LooseSceneEncoding {
         let relative = PathBuf::from(String::from_utf16(&slot.loose_directory).ok()?);
         let directory = resources.root().join(&relative);
 
-        // A startup declaration describes the XML. Require evidence from the
-        // actual mounted directory before using it for dual-decodable scenes.
+        // The startup declaration describes the XML. Sample the mounted
+        // directory before using GBK for dual-decodable scenes.
         let corroborated_gbk = resources.files().iter().filter(|file| {
             file.relative_path.parent() == Some(relative.as_path())
                 && file.relative_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cst"))
@@ -872,13 +870,13 @@ impl LooseSceneEncoding {
             }
             resources.read_candidate_bounded(candidate, 256 * 1024).ok().flatten()
                 .and_then(|bytes| CstDocument::parse(&bytes).ok())
-                .is_some_and(|scene| has_gbk_dialogue(&scene))
+                .is_some_and(|scene| has_archive_gbk_dialogue(&scene))
         }).take(2).count() == 2;
 
-        Some(Self { directory, corroborated_gbk })
+        Some(Self { directory, corroborated_gbk, legacy_gbk_config })
     }
 
-    pub(super) fn corroborated_gbk(&self) -> bool { self.corroborated_gbk }
+    pub(super) fn corroborated_gbk(&self) -> bool { self.corroborated_gbk && self.legacy_gbk_config }
 
     fn encoding_for(&self, source: &SourcedResource, document: Option<&CstDocument>) -> Option<ScriptTextEncoding> {
         let ResourceLocation::File { path } = &source.source.location else { return None; };
@@ -887,11 +885,26 @@ impl LooseSceneEncoding {
         {
             return None;
         }
-        let use_gbk = |scene: &CstDocument| {
-            has_gbk_dialogue(scene) || self.corroborated_gbk && require_gbk_records(scene).is_ok()
+        let detect = |scene: &CstDocument| {
+            let utf8 = scene.records.iter().all(|record| std::str::from_utf8(&record.text).is_ok());
+            if utf8 && scene.records.iter().any(|record| matches!(record.kind, 0x20 | 0x21)
+                && cs2_runtime::message_object::decode_cp932_display(&record.text).is_none())
+            {
+                Some(ScriptTextEncoding::Utf8)
+            } else if has_archive_gbk_dialogue(scene)
+                || self.corroborated_gbk && require_gbk_records(scene).is_ok()
+                    && (self.legacy_gbk_config || !utf8 && scene.records.iter()
+                        .filter(|record| matches!(record.kind, 0x20 | 0x21))
+                        .filter_map(|record| cs2_runtime::message_object::decode_cp932_display(&record.text))
+                        .any(|text| text.contains(|ch| matches!(ch, '\u{e000}'..='\u{e757}'))
+                            && text.contains(|ch| matches!(ch, '\u{ff66}'..='\u{ff9f}'))))
+            {
+                Some(ScriptTextEncoding::Gbk)
+            } else {
+                None
+            }
         };
-        document.map_or_else(|| CstDocument::parse(&source.bytes).is_ok_and(|scene| use_gbk(&scene)), use_gbk)
-            .then_some(ScriptTextEncoding::Gbk)
+        document.map_or_else(|| CstDocument::parse(&source.bytes).ok().as_ref().and_then(detect), detect)
     }
 }
 
@@ -1032,21 +1045,27 @@ fn require_gbk_records(document: &CstDocument) -> Result<()> {
     Ok(())
 }
 
-fn has_gbk_dialogue(document: &CstDocument) -> bool {
-    document.records.iter().any(|record| {
-        matches!(record.kind, 0x20 | 0x21)
-            && encoding_rs::SHIFT_JIS
-                .decode_without_bom_handling_and_without_replacement(&record.text)
-                .is_none()
-    }) && require_gbk_records(document).is_ok()
-}
-
 fn has_archive_gbk_dialogue(document: &CstDocument) -> bool {
     document.records.iter().any(|record| {
         matches!(record.kind, 0x20 | 0x21)
             && std::str::from_utf8(&record.text).is_err()
             && cs2_runtime::message_object::decode_cp932_display(&record.text).is_none()
     }) && require_gbk_records(document).is_ok()
+}
+
+fn cst_outer_length_valid(bytes: &[u8]) -> bool {
+    let Some(length) = bytes.get(8..16) else { return false; };
+    let packed = u32::from_le_bytes(length[..4].try_into().unwrap()) as usize;
+    let plain = u32::from_le_bytes(length[4..].try_into().unwrap()) as usize;
+    16usize.checked_add(if packed == 0 { plain } else { packed }) == Some(bytes.len())
+}
+
+fn declared_cst_encoding(encoding: LocalizedSceneEncoding) -> ScriptTextEncoding {
+    match encoding {
+        LocalizedSceneEncoding::Cp932 => ScriptTextEncoding::Cp932,
+        LocalizedSceneEncoding::Gbk => ScriptTextEncoding::Gbk,
+        LocalizedSceneEncoding::Utf8 => ScriptTextEncoding::Utf8,
+    }
 }
 
 fn is_root_scene_archive(root: &Path, resource: &SourcedResource) -> bool {
@@ -1726,11 +1745,7 @@ impl LoggingHost<'_> {
         let bytes = &resource.bytes;
         if bytes.is_empty() { return Ok(NativeReturn::Value(0)); }
         let signature = bytes.get(..8) == Some(b"CatScene");
-        let valid_length = if signature && bytes.len() >= 16 {
-            let packed = read_u32(bytes, 8)? as usize;
-            let plain = read_u32(bytes, 12)? as usize;
-            16usize.checked_add(if packed == 0 { plain } else { packed }) == Some(bytes.len())
-        } else { false };
+        let valid_length = signature && cst_outer_length_valid(bytes);
         // A wrong signature keeps the old scene; a recognized container with
         // rejected outer length clears only its scene, not its history/position.
         let mut encoding = self.text_encoding;
@@ -1859,30 +1874,26 @@ impl LoggingHost<'_> {
             adjacent.truncate(dot);
         }
         adjacent.push_str(".cstl");
-        if let Some(SourcedResource { bytes, source }) = self.cst_read_resource(&adjacent, true)? {
-            if !bytes.is_empty() {
-                let (table, _) = measure_host_operation(HostPhase::ScriptParse, || CstlTable::parse_prefix(&bytes))
-                    .map_err(|_| native_state_error("CST adjacent localization table is malformed"))?;
-                if success && (neko_trace || happiness_probe) {
-                    let origin = match &source.location {
-                        ResourceLocation::File { .. } => source.name.replace('\\', "/"),
-                        ResourceLocation::Archive { path, .. } => format!("{}::{}",
-                            path.file_name().unwrap_or(path.as_os_str()).to_string_lossy(), source.name),
-                    };
-                    let digest = sha256(&bytes);
-                    if neko_trace {
-                        neko_main_table = neko_main.is_some_and(|(archive, member, _, expected)|
-                            origin.eq_ignore_ascii_case(&format!("{archive}::{member}l")) && digest == expected);
-                    }
-                    self.events.push(LogicEvent {
-                        frame: self.frame,
-                        kind: if happiness_probe { "happiness-cstl-load" } else { "neko-cstl-load" }.into(),
-                        detail: format!("handle={handle} requested={adjacent:?} source={origin:?} sha256={digest} columns={:?}",
-                            table.languages),
-                    });
+        if let Some((SourcedResource { bytes, source }, table)) = self.cst_read_localization(&adjacent)? {
+            if success && (neko_trace || happiness_probe) {
+                let origin = match &source.location {
+                    ResourceLocation::File { .. } => source.name.replace('\\', "/"),
+                    ResourceLocation::Archive { path, .. } => format!("{}::{}",
+                        path.file_name().unwrap_or(path.as_os_str()).to_string_lossy(), source.name),
+                };
+                let digest = sha256(&bytes);
+                if neko_trace {
+                    neko_main_table = neko_main.is_some_and(|(archive, member, _, expected)|
+                        origin.eq_ignore_ascii_case(&format!("{archive}::{member}l")) && digest == expected);
                 }
-                self.cst_contexts.get_mut(&handle).unwrap().localization = Some(table);
+                self.events.push(LogicEvent {
+                    frame: self.frame,
+                    kind: if happiness_probe { "happiness-cstl-load" } else { "neko-cstl-load" }.into(),
+                    detail: format!("handle={handle} requested={adjacent:?} source={origin:?} sha256={digest} columns={:?}",
+                        table.languages),
+                });
             }
+            self.cst_contexts.get_mut(&handle).unwrap().localization = Some(table);
         }
         if self.data_services.story_trace && signature {
             let mut loaded_at = self.frame;
@@ -2334,11 +2345,7 @@ impl LoggingHost<'_> {
             && let Some(encoding) = self.resources.resource_router()
                 .and_then(|router| router.localized_scene_encoding(self.resources, path))
         {
-            return Some(match encoding {
-                LocalizedSceneEncoding::Cp932 => ScriptTextEncoding::Cp932,
-                LocalizedSceneEncoding::Gbk => ScriptTextEncoding::Gbk,
-                LocalizedSceneEncoding::Utf8 => ScriptTextEncoding::Utf8,
-            });
+            return Some(declared_cst_encoding(encoding));
         }
         let gbk_archive = matches!(&resource.source.location, ResourceLocation::Archive { path, .. }
             if self.resources.resource_router().is_some_and(|router|
@@ -2372,12 +2379,79 @@ impl LoggingHost<'_> {
         let name = ScriptTextEncoding::Cp932.decode(name);
         let candidates = self.resources.category_names(category, &name)
             .map_err(|_| native_state_error("CST resource category resolution failed"))?;
+        let scene = category.eq_ignore_ascii_case(b"scene");
         for name in candidates {
-            if let Some(resource) = self.cst_read_resource(&name, category.eq_ignore_ascii_case(b"scene"))? {
+            let resource = if scene && self.resources.game_language() == GameLanguage::Automatic {
+                self.cst_automatic_scene(&name)?
+            } else {
+                self.cst_read_resource(&name, scene)?
+            };
+            if let Some(resource) = resource {
                 return Ok(Some((name, resource)));
             }
         }
         Ok(None)
+    }
+
+    fn cst_automatic_scene(&self, name: &str) -> Result<Option<SourcedResource>> {
+        let _timing = measure_host_phase(HostPhase::ScriptRead);
+        let mut rejected = None;
+        let scene = self.resources.read_mode_with(name, ResourceMode::LooseFirst, |candidate| {
+            let result = self.cst_read_resolved(name, candidate);
+            match result {
+                Ok(resource) if self.cst_scene_is_usable(&resource) => Some(resource),
+                rejected_result => {
+                    // Preserve the native load/result for a standalone scene with no fallback.
+                    if rejected.is_none() { rejected = Some(rejected_result); }
+                    None
+                }
+            }
+        }).map_err(|_| native_state_error("CST resource routing failed"))?;
+        if scene.is_some() { Ok(scene) } else { rejected.transpose() }
+    }
+
+    pub(super) fn cst_read_localization(&self, name: &str) -> Result<Option<(SourcedResource, CstlTable)>> {
+        let parse = |resource: SourcedResource| {
+            if resource.bytes.is_empty() { return Ok(None); }
+            let (table, _) = measure_host_operation(HostPhase::ScriptParse, || CstlTable::parse_prefix(&resource.bytes))
+                .map_err(|_| native_state_error("CST adjacent localization table is malformed"))?;
+            Ok(Some((resource, table)))
+        };
+        if self.resources.game_language() == GameLanguage::Automatic {
+            let _timing = measure_host_phase(HostPhase::ScriptRead);
+            return self.resources.read_mode_with(name, ResourceMode::LooseFirst, |candidate| {
+                self.cst_read_resolved(name, candidate).and_then(parse).ok().flatten()
+            }).map_err(|_| native_state_error("CST resource routing failed"));
+        }
+        self.cst_read_resource(name, true)?.map(parse).transpose().map(Option::flatten)
+    }
+
+    fn cst_scene_is_usable(&self, resource: &SourcedResource) -> bool {
+        let archive_encoding = if let ResourceLocation::Archive { path, .. } = &resource.source.location {
+            let Some(router) = self.resources.resource_router() else { return true; };
+            let encoding = router.localized_scene_encoding(self.resources, path).map(declared_cst_encoding);
+            if encoding.is_none() && !router.is_declared_localization_patch(self.resources, path) {
+                return true;
+            }
+            encoding
+        } else {
+            None
+        };
+        if !cst_outer_length_valid(&resource.bytes) { return false; }
+        let Ok(mut document) = CstDocument::parse(&resource.bytes) else { return false; };
+        repair_routed_scene_text(self.resources, resource, &mut document);
+        let encoding = match &resource.source.location {
+            ResourceLocation::File { .. } => Some(self.data_services.loose_scene_encoding.as_ref()
+                .and_then(|source| source.encoding_for(resource, Some(&document)))
+                .unwrap_or(self.text_encoding)),
+            ResourceLocation::Archive { .. } => archive_encoding,
+        };
+        match encoding {
+            Some(ScriptTextEncoding::Gbk) => require_gbk_records(&document).is_ok(),
+            Some(encoding) => document.records.iter().filter(|record| matches!(record.kind, 0x20 | 0x21))
+                .all(|record| decode_cst_dialogue(&record.text, encoding).is_ok()),
+            None => true,
+        }
     }
 
     fn cst_read_resource(&self, name: &str, scene: bool) -> Result<Option<SourcedResource>> {
@@ -2390,11 +2464,8 @@ impl LoggingHost<'_> {
         } else {
             None
         };
-        if let Some(resource) = self.data_services.ordinary.cached_resource_with_source(name)
-            .filter(|resource| preferred.is_none_or(|candidate| &resource.source == candidate))
-        {
-            if resource.bytes.len() > MAX_BYTES { return Err(native_state_error("CST cached resource exceeds 64 MiB")); }
-            return Ok(Some(resource.clone()));
+        if let Some(resource) = self.cst_cached_resource(name, preferred)? {
+            return Ok(Some(resource));
         }
         let candidate = match preferred {
             Some(candidate) => candidate,
@@ -2403,11 +2474,29 @@ impl LoggingHost<'_> {
                 None => return Ok(None),
             },
         };
+        self.cst_read_candidate(candidate).map(Some)
+    }
+
+    fn cst_cached_resource(&self, name: &str, candidate: Option<&ResourceCandidate>) -> Result<Option<SourcedResource>> {
+        let resource = self.data_services.ordinary.cached_resource_with_source(name)
+            .filter(|resource| candidate.is_none_or(|candidate| &resource.source == candidate));
+        if resource.is_some_and(|resource| resource.bytes.len() > MAX_BYTES) {
+            return Err(native_state_error("CST cached resource exceeds 64 MiB"));
+        }
+        Ok(resource.cloned())
+    }
+
+    fn cst_read_resolved(&self, name: &str, candidate: &ResourceCandidate) -> Result<SourcedResource> {
+        self.cst_cached_resource(name, Some(candidate))?
+            .map_or_else(|| self.cst_read_candidate(candidate), Ok)
+    }
+
+    fn cst_read_candidate(&self, candidate: &ResourceCandidate) -> Result<SourcedResource> {
         if candidate.size > MAX_BYTES as u64 { return Err(native_state_error("CST resource exceeds 64 MiB")); }
         let bytes = self.resources.read_candidate(candidate)
             .map_err(|_| native_state_error("CST resource read failed"))?;
         if bytes.len() > MAX_BYTES { return Err(native_state_error("CST resource exceeds 64 MiB")); }
-        Ok(Some(SourcedResource { source: candidate.clone(), bytes }))
+        Ok(SourcedResource { source: candidate.clone(), bytes })
     }
 }
 

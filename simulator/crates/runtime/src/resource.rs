@@ -850,6 +850,19 @@ impl ResourceIndex {
             |archive, internal| self.routed_archive_candidate(archive, internal))
     }
 
+    /// Read candidates in router order. A rejected payload lets the search continue.
+    pub fn read_mode_with<T>(
+        &self, name: &str, mode: ResourceMode, read: impl FnMut(&ResourceCandidate) -> Option<T>,
+    ) -> RuntimeResult<Option<T>> {
+        let mut scratch = [0; MAX_PATH_UNITS];
+        let name = encode_wide_name(name, &mut scratch)?;
+        let read = std::cell::RefCell::new(read);
+        self.router_for_lookup()?.route_value_utf16(name, mode,
+            |path| Ok(self.routed_file_candidate(path)?.and_then(|candidate| read.borrow_mut()(candidate))),
+            |archive, internal| Ok(self.routed_archive_candidate(archive, internal)?
+                .and_then(|candidate| read.borrow_mut()(candidate))))
+    }
+
     pub fn resolve_mode_utf16(&self, name: &[u16], mode: ResourceMode)
         -> RuntimeResult<Option<RoutedResource<&ResourceCandidate>>> {
         self.router_for_lookup()?.route_utf16(name, mode,

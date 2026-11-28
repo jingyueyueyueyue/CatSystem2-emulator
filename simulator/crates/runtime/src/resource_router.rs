@@ -85,6 +85,8 @@ pub struct ResourceRouter {
     campanella_glyph_patch: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     localized_scene_encodings: Vec<(usize, LocalizedSceneEncoding)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    declared_localization_patches: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,7 +116,8 @@ impl Default for ResourceRouter {
     fn default() -> Self {
         Self { slots: vec![ResourceSlot::default(); 256], groups: Vec::new(), patches: Vec::new(),
             island_chinese_scene: None, island_chinese_fes: None, daydream_gbk_scene_archive: None,
-            campanella_glyph_patch: None, localized_scene_encodings: Vec::new() }
+            campanella_glyph_patch: None, localized_scene_encodings: Vec::new(),
+            declared_localization_patches: Vec::new() }
     }
 }
 
@@ -167,6 +170,11 @@ impl ResourceRouter {
     ) -> Option<LocalizedSceneEncoding> {
         self.localized_scene_encodings.iter().find_map(|&(archive, encoding)|
             Self::matches_archive(Some(archive), index, path).then_some(encoding))
+    }
+
+    pub fn is_declared_localization_patch(&self, index: &crate::ResourceIndex, path: &Path) -> bool {
+        self.declared_localization_patches.iter()
+            .any(|&archive| Self::matches_archive(Some(archive), index, path))
     }
 
     fn matches_archive(archive: Option<usize>, index: &crate::ResourceIndex, path: &Path) -> bool {
@@ -568,8 +576,10 @@ impl MountBuilder<'_> {
         }
         let manifest: LocalizationManifest = serde_json::from_slice(&bytes)
             .map_err(|cause| error(&format!("cs2-localization.json: {cause}")))?;
-        let use_translation = self.index.game_language() != GameLanguage::Japanese;
+        let language = self.index.game_language();
+        let use_translation = language != GameLanguage::Japanese;
         let mut patches = Vec::with_capacity(manifest.patches.len());
+        let mut declared = BTreeSet::new();
         for patch in manifest.patches {
             let name = Path::new(&patch.archive);
             if name.file_name() != Some(name.as_os_str())
@@ -578,16 +588,24 @@ impl MountBuilder<'_> {
             {
                 return Err(error("cs2-localization.json requires a local .int archive filename"));
             }
-            let relative = self.base.join(name);
-            let (archive, entry) = self.index.archives().iter().enumerate()
-                .find(|(_, entry)| physical_path_equal(&entry.path, &relative) && entry.is_readable())
-                .ok_or_else(|| error(&format!("cs2-localization.json: unreadable archive {}", patch.archive)))?;
-            if patches.iter().any(|mount: &ArchiveMount| mount.archive == archive) {
+            if !declared.insert(patch.archive.to_ascii_lowercase()) {
                 return Err(error(&format!("cs2-localization.json: duplicate archive {}", patch.archive)));
             }
+            let relative = self.base.join(name);
+            let Some((archive, entry)) = self.index.archives().iter().enumerate()
+                .find(|(_, entry)| physical_path_equal(&entry.path, &relative) && entry.is_readable())
+            else {
+                if language == GameLanguage::Localized {
+                    return Err(error(&format!("cs2-localization.json: unreadable archive {}", patch.archive)));
+                }
+                continue;
+            };
             patches.push(ArchiveMount { archive, path: entry.path.to_string_lossy().encode_utf16().collect() });
-            if use_translation && let Some(encoding) = patch.scene_encoding {
-                self.router.localized_scene_encodings.push((archive, encoding));
+            if use_translation {
+                self.router.declared_localization_patches.push(archive);
+                if let Some(encoding) = patch.scene_encoding {
+                    self.router.localized_scene_encodings.push((archive, encoding));
+                }
             }
         }
         // Declared patches come first. Keep the original update order for the fallback.
@@ -1031,6 +1049,14 @@ mod localization_manifest_tests {
         drop(japanese);
         let localized = crate::ResourceIndex::scan_with_language(&root, GameLanguage::Localized).unwrap();
         assert_eq!(localized.read_mode("scene.int/opening.cst", mode).unwrap().unwrap(), b"translated");
+        drop(localized);
+        fs::remove_file(root.join("translation.int")).unwrap();
+        for language in [GameLanguage::Automatic, GameLanguage::Japanese] {
+            let index = crate::ResourceIndex::scan_with_language(&root, language).unwrap();
+            assert_eq!(index.read_mode("scene.int/opening.cst", mode).unwrap().unwrap(), b"Japanese update");
+        }
+        let localized = crate::ResourceIndex::scan_with_language(&root, GameLanguage::Localized).unwrap();
+        assert!(localized.read_mode("scene.int/opening.cst", mode).is_err());
         drop(localized);
         fs::remove_dir_all(root).unwrap();
     }

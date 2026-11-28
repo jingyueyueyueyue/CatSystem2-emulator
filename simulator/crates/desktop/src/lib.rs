@@ -13526,7 +13526,7 @@ mod tests {
     }
 
     #[test]
-    fn japanese_cst_prefers_archive_over_preloaded_loose_scene() -> Result<()> {
+    fn cst_language_modes_choose_valid_scenes_with_preload() -> Result<()> {
         use cs2_runtime::resource_router::GameLanguage;
 
         let root = TempDir::new();
@@ -13550,12 +13550,16 @@ mod tests {
         };
         let original = packed_cst(&[vec![(0x20, b"\x82\xa0")]]);
         let update = packed_cst(&[vec![(0x20, b"\x82\xa2")]]);
-        let loose = packed_cst(&[vec![(0x20, b"loose scene")]]);
+        let translated = packed_cst(&[vec![(0x20, b"\xd6\xd0\xb9\xfa")]]);
+        let original_text = packed_cst(&[vec![(0x20, b"\x82\xa0\x82\xa2")]]);
+        let bad_text = packed_cst(&[vec![(0x20, b"\x81")]]);
+        let bad_command = packed_cst(&[vec![(0x20, b"valid text"), (0x30, b"\x81")]]);
+        let bad_container = b"CatScene\0\0";
         write_archive("scene.int", b"opening.cst", &original)?;
         write_archive("update01.int", b"official.cst", &update)?;
-        fs::write(path.join("scene/opening.cst"), &loose)?;
-        fs::write(path.join("scene/official.cst"), &loose)?;
-        fs::write(path.join("scene/extra.cst"), &loose)?;
+        fs::write(path.join("scene/opening.cst"), &translated)?;
+        fs::write(path.join("scene/official.cst"), &translated)?;
+        fs::write(path.join("scene/extra.cst"), &original_text)?;
 
         for language in [GameLanguage::Automatic, GameLanguage::Japanese, GameLanguage::Localized] {
             let mut player = HeadlessPlayer::open_with_game_language(path, path.join("profile"), language)?;
@@ -13571,21 +13575,61 @@ mod tests {
                 host.call(436, &[], &mut vm)?;
                 let cached = host.data_services.ordinary.cached_resource_with_source("scene.int/opening.cst")
                     .context("expected preloaded scene")?;
-                assert_eq!(cached.bytes, loose);
+                assert_eq!(cached.bytes, translated);
 
-                let expected = if language == GameLanguage::Japanese { &original } else { &loose };
+                let expected = if language == GameLanguage::Japanese { &original } else { &translated };
                 for name in [b"opening".as_slice(), b"scene.int/opening.cst"] {
-                    let (_, scene) = host.cst_resource(b"scene", name)?.context("scene is missing")?;
-                    assert_eq!(&scene, expected);
+                    let (_, scene) = host.cst_resource_with_source(b"scene", name)?.context("scene is missing")?;
+                    assert_eq!(&scene.bytes, expected);
+                    assert_eq!(host.cst_scene_encoding_override(&scene), (language != GameLanguage::Japanese)
+                        .then_some(ScriptTextEncoding::Gbk));
                 }
                 for (name, expected) in [
                     (b"official.cst".as_slice(), &update),
-                    (b"extra.cst", &loose),
-                    (b"scene\\extra.cst", &loose),
+                    (b"extra.cst", &original_text),
+                    (b"scene\\extra.cst", &original_text),
                 ] {
-                    let (_, scene) = host.cst_resource(b"scene", name)?.context("scene is missing")?;
+                    let (_, scene) = host.cst_resource_with_source(b"scene", name)?.context("scene is missing")?;
+                    assert_eq!(&scene.bytes, expected);
+                    assert_eq!(host.cst_scene_encoding_override(&scene), None);
+                }
+                Ok(())
+            })?;
+        }
+
+        for (invalid_loose, invalid_archive) in [
+            (bad_container.as_slice(), bad_container.as_slice()),
+            (bad_text.as_slice(), bad_command.as_slice()),
+        ] {
+            fs::write(path.join("scene/opening.cst"), invalid_loose)?;
+            fs::write(path.join("scene/opening.cstl"), b"broken table")?;
+            write_archive("translation.int", b"official.cst", invalid_archive)?;
+            fs::write(path.join("cs2-localization.json"),
+                br#"{"patches":[{"archive":"translation.int","scene_encoding":"gbk"}]}"#)?;
+            let mut player = HeadlessPlayer::open_with_save_root(path, path.join("profile"))?;
+            player.with_host(|host| {
+                let mut vm = Vm::new();
+                vm.bind_external(vec![0; 4096])?;
+                let scene_name = 0x8000_0100u32;
+                let category = 0x8000_0200u32;
+                vm.write(scene_name, b"opening.cst\0")?;
+                vm.write(category, b"scene\0")?;
+                let preload_args = [scene_name, category, 1].map(u32::to_le_bytes).concat();
+                host.call(435, &preload_args, &mut vm)?;
+                host.call(436, &[], &mut vm)?;
+                let cached = host.data_services.ordinary.cached_resource_with_source("scene.int/opening.cst")
+                    .context("expected preloaded scene")?;
+                assert_eq!(&cached.bytes, invalid_loose);
+                for (name, expected) in [(b"opening.cst".as_slice(), &original), (b"official.cst", &update)] {
+                    let (_, scene) = host.cst_resource(b"scene", name)?.context("fallback is missing")?;
                     assert_eq!(&scene, expected);
                 }
+                let NativeReturn::Value(handle) = host.call(323, &[], &mut vm)? else {
+                    anyhow::bail!("native 323 did not return a CST handle");
+                };
+                let args = [handle, scene_name].map(u32::to_le_bytes).concat();
+                assert_eq!(host.call(325, &args, &mut vm)?, NativeReturn::Value(1));
+                assert!(host.cst_contexts[&handle].localization.is_none());
                 Ok(())
             })?;
         }

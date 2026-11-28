@@ -142,9 +142,13 @@ fn load_scene(host: &LoggingHost<'_>, source: &[u8]) -> Result<Scene> {
         adjacent.truncate(dot);
     }
     adjacent.push_str(".cstl");
-    let localization = host.backlog_read(&adjacent, false)?
-        .map(|bytes| CstlTable::parse_prefix(&bytes).map(|(table, _)| table))
-        .transpose().context("LOGSTRING remake adjacent CSTL is malformed")?;
+    let localization = if host.resources.game_language() == cs2_runtime::resource_router::GameLanguage::Automatic {
+        host.cst_read_localization(&adjacent)?.map(|(_, table)| table)
+    } else {
+        host.backlog_read(&adjacent, false)?
+            .map(|bytes| CstlTable::parse_prefix(&bytes).map(|(table, _)| table))
+            .transpose().context("LOGSTRING remake adjacent CSTL is malformed")?
+    };
     Ok(Scene { document, localization, encoding })
 }
 
