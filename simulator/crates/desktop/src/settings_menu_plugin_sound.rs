@@ -30,7 +30,7 @@ impl HeadlessPlayer {
     }
 
     pub(super) fn apply_configuration_plugin_settings(
-        &mut self, pages: &[HostSettingsPage], edits: &[HostSettingsEdit],
+        &mut self, pages: &[HostSettingsPage], edits: &[HostSettingsEdit], persist: bool,
     ) -> Result<()> {
         if pages.len() != 4 || edits.len() != 4 || pages[0].resource != 107
             || pages[1].resource != 130
@@ -66,7 +66,7 @@ impl HeadlessPlayer {
             // the sample uses645/630 -> MES_SHIFT -> existing PLANE position.
             host.data_services.fes_settings.set_message_window_position(position[0])?;
             //1df70 copies scratch,31c00(1) persists,483630 reloads shared fields.
-            host.persist_configuration()?;
+            if persist { host.persist_configuration()?; }
             //523090/5230c0 read the live global stereo flag for pan operations.
             // Keep the actual channel, handle, paused bit and source cursor.
             host.data_services.legacy_sound.stereo = sound[1] != 0;

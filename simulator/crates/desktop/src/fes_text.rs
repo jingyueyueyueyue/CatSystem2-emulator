@@ -2133,9 +2133,10 @@ fn render_bank_with_surface(
     let mut restore_completed_plane = false;
     if bank.dirty {
         let _stage = TextTimer::new(TextStage::Configure);
+        // A layout broadcast (such as choice focus changing the text color)
+        // can reach a completed bank without an accompanying draw command.
         let completed_plane = allocate_surface
-            && bank.novel.is_none()
-            && has_scene_projection(bank)
+            && uses_canvas_atlas(bank)
             && bank.visible
             && !bank.message.active()
             && bank.remaining == 0
@@ -2302,6 +2303,69 @@ fn render_bank_with_surface(
         owner: view.id, name: name.to_vec(), bank: index, frame, options, priority: bank.priority,
     });
 
+    Ok(())
+}
+
+#[test]
+#[cfg(windows)]
+fn fes_completed_choice_labels_survive_layout_broadcasts() -> Result<()> {
+    let mut store = FesTextStore::default();
+    let mut device = DesktopMessageDevice::default();
+    let windows = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:/Windows".into()));
+    device.bind_font("Arial", &std::fs::read(windows.join("Fonts/arial.ttf"))?, 0)?;
+    let mut defaults = defaults();
+    defaults.font_name = "Arial".encode_utf16().collect();
+    let mut runtime = FesRuntime::new(cs2_script::FesDocument { sections: Vec::new() });
+    runtime.planes.insert("panel".into(), super::FesPlaneLayer {
+        size: [180, 80], visible: true, ..Default::default()
+    });
+    let mut view = FesTaskView { id: 39, parent: 0, context: Vec::new(),
+        list: Some(super::fes_tasks::FesListBinding { task: 1, clip: [0, 0, 180, 80], offset: [0, 0] }),
+        now: 1, paused: 0 };
+    store.create(view.id, &FesObjectDefinition {
+        offset: 0, name: b"label".to_vec(), kind: b"STRING8".to_vec(), bank_expression: None, banks: 2,
+    }, &defaults, &mut device)?;
+    let has_ink = |bank: &TextBank| bank.projection.as_ref().is_some_and(|projection|
+        projection.frame.pixels().chunks_exact(4).any(|pixel| pixel[3] != 0));
+
+    for (index, label) in [(0, b"First".as_slice()), (1, b"Second")] {
+        let bank = store.banks.get_mut(&(view.id, b"label".to_vec(), index)).unwrap();
+        bank.set_size([180, 30])?;
+        bank.parent_plane = Some("panel".into());
+        bank.visible = true;
+        set(&mut bank.configuration, 0x10, 0xffff_ffff);
+        set(&mut bank.configuration, 0x74, 0);
+        set(&mut bank.configuration, 0x78, 0);
+        bank.replace(label)?;
+        bank.draw = Some(u32::MAX);
+        render_bank(&mut device, &view, &runtime, bank, b"label", index)?;
+        assert_eq!(bank.remaining, 0);
+        assert!(has_ink(bank));
+    }
+
+    view.now += 1;
+    let first = store.banks.get_mut(&(view.id, b"label".to_vec(), 0)).unwrap();
+    first.dirty = true;
+    set(&mut first.configuration, 0x10, 0xffff_e2b0);
+    first.replace(b"First")?;
+    first.draw = Some(u32::MAX);
+    render_bank(&mut device, &view, &runtime, first, b"label", 0)?;
+    assert!(has_ink(first));
+
+    let second = store.banks.get_mut(&(view.id, b"label".to_vec(), 1)).unwrap();
+    let generation = second.message.surface_generation();
+    second.dirty = true;
+    render_bank(&mut device, &view, &runtime, second, b"label", 1)?;
+    assert!(has_ink(second));
+    assert_eq!(second.message.surface_generation(), generation);
+
+    view.now += 1;
+    second.dirty = true;
+    set(&mut second.configuration, 0x10, 0xffb0_e2ff);
+    render_bank(&mut device, &view, &runtime, second, b"label", 1)?;
+    assert!(has_ink(second));
+    assert!(second.message.surface_generation() > generation);
+    assert_eq!(second.remaining, 0);
     Ok(())
 }
 

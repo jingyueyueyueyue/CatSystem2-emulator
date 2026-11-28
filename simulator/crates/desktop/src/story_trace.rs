@@ -229,7 +229,7 @@ impl HeadlessPlayer {
     }
 
     pub fn enable_host_story_trace(&mut self) {
-        self.data_services.story_trace = self.host_story_trace_profile().is_some();
+        self.data_services.story_trace = true;
     }
 
     pub fn host_story_trace(&self) -> (u64, &'static str, &str, i32, i32) {
@@ -317,17 +317,15 @@ impl HeadlessPlayer {
         if !self.data_services.story_trace {
             return unknown;
         }
-        let Some(profile) = self.host_story_trace_profile() else {
-            return unknown;
-        };
+        let profile = self.host_story_trace_profile();
         if self.data_services.host_quit_requested {
-            return if profile == StoryTraceProfile::Island {
+            return if profile == Some(StoryTraceProfile::Island) {
                 (frame, "ended", "-", -1, -1)
             } else {
                 unknown
             };
         }
-        if profile == StoryTraceProfile::Rebellions {
+        if profile == Some(StoryTraceProfile::Rebellions) {
             return if self.rebellions_title_ready(frame) {
                 (frame, "title", "-", -1, -1)
             } else if self.rebellions_episode_ready(frame) {
@@ -336,7 +334,7 @@ impl HeadlessPlayer {
                 unknown
             };
         }
-        if profile == StoryTraceProfile::Nekopara && self.cst_contexts.is_empty() {
+        if profile == Some(StoryTraceProfile::Nekopara) && self.cst_contexts.is_empty() {
             if let Some(owner) = self.host_neko_startup_owner(NekoStartupScreen::Language, frame) {
                 *window = Some(("langselect", owner));
                 return (frame, "language_select", "langselect", -1, -1);
@@ -358,6 +356,9 @@ impl HeadlessPlayer {
         if story.next().is_some() {
             return unknown;
         }
+        let Some(profile) = profile else {
+            return position.observation_only(frame);
+        };
         if matches!(profile, StoryTraceProfile::LegacyFesBodyObservation | StoryTraceProfile::Legacy07Observation
             | StoryTraceProfile::Legacy11Observation | StoryTraceProfile::Legacy13Observation
             | StoryTraceProfile::Djibril10Observation

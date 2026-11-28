@@ -197,7 +197,7 @@ impl FesRuntime {
             return Ok(true);
         }
         if subcommand == "getid" && driver.adapter.object(name_bytes)
-            .is_some_and(|object| object.definition.kind_name == b"BUTTON")
+            .is_some_and(|object| matches!(object.definition.kind_name.as_slice(), b"IMAGE" | b"BUTTON"))
         {
             let [target] = targets.as_slice() else { return Ok(true); };
             let destination = number(

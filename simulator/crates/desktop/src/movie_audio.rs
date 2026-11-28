@@ -101,6 +101,7 @@ mod winmm {
         closed: bool,
         sample_rate: u32,
         channels: u8,
+        muted: bool,
     }
 
     // Output is created/used/destroyed by one movie worker. Heap-owned PCM and
@@ -135,6 +136,7 @@ mod winmm {
                 closed: false,
                 sample_rate,
                 channels,
+                muted: std::env::var_os("CS2_REPLAY_MUTE").is_some_and(|value| value == "1"),
             })
         }
 
@@ -180,7 +182,11 @@ mod winmm {
                     "PCM buffer must contain bounded, aligned sample frames",
                 ));
             }
-            let mut samples = samples.to_vec();
+            let mut samples = if self.muted {
+                vec![0; samples.len()]
+            } else {
+                samples.to_vec()
+            };
             let mut header = Box::new(AlignedHeader(WAVEHDR {
                 lpData: samples.as_mut_ptr().cast(),
                 dwBufferLength: (samples.len() * 2) as u32,

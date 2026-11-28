@@ -518,6 +518,9 @@ impl ConfigurationState {
     pub(super) fn platform_value(&self,path:&str)->Option<u32> {
         self.values.get(path).copied()
     }
+    pub(super) fn set_settings_mode(&mut self, mode: u32) {
+        self.values.insert("CONFIG/type", mode);
+    }
     pub(super) fn general_defaults(&self) -> [u32; 4] { self.general_defaults }
     pub(super) fn plugin_sound_defaults(&self) -> [u32; 2] { self.plugin_sound_defaults }
     pub(super) fn set_plugin_sound_value(&mut self, field: &'static str, value: u32) -> Result<()> {

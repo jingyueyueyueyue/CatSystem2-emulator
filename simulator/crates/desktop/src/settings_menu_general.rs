@@ -7,9 +7,19 @@ impl HeadlessPlayer {
     pub(crate) fn prepare_general_settings(&mut self) -> Result<()> {
         //49153a ->483a20 persists before attempting even a missing plugin.
         self.with_host(|host| host.persist_configuration())?;
+        let pages = self.prepare_configuration_plugin_pages()?;
+        let request = HostEffectSettings { id: self.next_ui_id()?, title: pages[0].title.clone(), pages };
+        self.data_services.window_control.ui.effects = Some(request);
+        self.data_services.window_control.ui.effects_applied = false;
+        self.data_services.window_control.ui.general = true;
+        self.data_services.window_control.ui.plugin_page_start = Some(0);
+        Ok(())
+    }
+
+    pub(super) fn prepare_configuration_plugin_pages(&mut self) -> Result<Vec<HostSettingsPage>> {
         let binary = self.scan.engine.engine_binaries.iter().find(|binary|
             binary.relative_path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("cs2confx.dll")))
-            .context("40057 has no inspected configuration-plugin resource")?;
+            .context("no inspected configuration-plugin resource")?;
         if binary.relative_path.is_absolute() || binary.relative_path.components().any(|part|
             !matches!(part, std::path::Component::Normal(_))) { bail!("configuration-plugin resource escapes game root"); }
         let source = UiResources::read(&self.scan.root.join(&binary.relative_path))?;
@@ -29,17 +39,12 @@ impl HeadlessPlayer {
                 value: u32::from(current[index + 1] != 0), default: u32::from(defaults[index + 1] != 0), hidden: false, disabled: false,
                 enabled_by: None, reset_changes_value: true });
         }
-        let title = self.resolve_ui_label(&title);
-        let page = HostSettingsPage { resource: 107, title: title.clone(), reset_label: label(1102)?,
+        let page = HostSettingsPage { resource: 107, title: self.resolve_ui_label(&title), reset_label: label(1102)?,
             controls: fields, input: None, font: None, sound: None };
         let position = self.prepare_plugin_position_page(&source)?;
         let image = self.prepare_plugin_image_page(&source)?;
         let sound = self.prepare_plugin_sound_page(&source)?;
-        let request = HostEffectSettings { id: self.next_ui_id()?, title, pages: vec![page, position, image, sound] };
-        self.data_services.window_control.ui.effects = Some(request);
-        self.data_services.window_control.ui.effects_applied = false;
-        self.data_services.window_control.ui.general = true;
-        Ok(())
+        Ok(vec![page, position, image, sound])
     }
 
     /// Packed presentation policy, read directly from the shared settings.

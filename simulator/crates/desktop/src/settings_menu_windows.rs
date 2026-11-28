@@ -471,7 +471,7 @@ fn template(request: &HostSettingsPage) -> Vec<u32> {
         HostSettingKind::Toggle => 1, HostSettingKind::Choice(options) => options.len(),
         HostSettingKind::Integer { .. } | HostSettingKind::AutoPreset(_) | HostSettingKind::Decimal { .. } => 2,
     }).sum::<usize>();
-    let count = if request.sound.is_some() { 20 } else if request.font.is_some() { 10 } else if request.input.is_some() { 18 } else { rows as u16 + 1 };
+    let count = if request.sound.is_some() { 20 } else if request.font.is_some() { 10 } else if request.input.is_some() { 18 } else { rows as u16 + u16::from(!request.reset_label.is_empty()) };
     let height = if request.sound.is_some() { 260 } else if request.input.is_some() || request.font.is_some() { 220 } else { rows as u16 * 16 + 28 };
     let width = if request.sound.is_some() || request.input.is_some() || request.font.is_some() { 330 } else { 270 };
     for value in [count, 0, 0, width, height, 0, 0] { word(&mut bytes, value); }
@@ -556,7 +556,9 @@ fn template(request: &HostSettingsPage) -> Vec<u32> {
         item(1116, &sound.all_on, 0x50010000, [4, y + 88, 126, 16], "BUTTON");
         item(1118, &sound.all_off, 0x50010000, [138, y + 88, 126, 16], "BUTTON");
     }
-    item(1145, &request.reset_label, 0x50010000, [196, height - 18, 70, 14], "BUTTON");
+    if !request.reset_label.is_empty() {
+        item(1145, &request.reset_label, 0x50010000, [196, height - 18, 70, 14], "BUTTON");
+    }
     while bytes.len() % 4 != 0 { bytes.push(0); }
     bytes.chunks_exact(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect()
 }

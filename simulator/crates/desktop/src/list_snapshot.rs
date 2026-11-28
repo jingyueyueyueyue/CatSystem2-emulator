@@ -300,7 +300,7 @@ impl crate::HeadlessPlayer {
                 let image = &images[&e.frame_handles[&id]];
                 let bytes = frame.rgba.len().checked_add(image.pixels().len())
                     .context("saved list frame cache allocation size overflow")?;
-                frame_charges.insert(id, frame_cache.reserve(bytes)?);
+                frame_charges.insert(id, frame_cache.reserve(bytes, memory.retained_frame_limit())?);
                 frames.insert(id, restore_list_frame(frame, memory)?);
             }
             shared.push(Rc::new(RefCell::new(Entry {

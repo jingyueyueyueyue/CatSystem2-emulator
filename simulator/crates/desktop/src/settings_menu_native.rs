@@ -105,6 +105,7 @@ pub(super) struct SettingsMenuState {
     effects: Option<HostEffectSettings>,
     effects_applied: bool,
     general: bool,
+    plugin_page_start: Option<usize>,
     camouflage_title: Option<String>,
     pending_menu: Option<HostGameMenu>,
     menu_info: Option<HostMenuConfirmation>,
@@ -454,8 +455,9 @@ impl HeadlessPlayer {
     }
     pub(super) fn prepare_effect_settings(&mut self) -> Result<bool> {
         self.data_services.window_control.ui.general = false;
+        self.data_services.window_control.ui.plugin_page_start = None;
         self.with_host(|host| { host.ensure_configuration_state()?; host.ensure_fes_settings() })?;
-        let (effects, automatic, window, startup_drag, simple_alpha, alpha_only) = self.with_host(|host| {
+        let (effects, automatic, window, startup_drag, simple_alpha, alpha_only, allow_mode, system_config) = self.with_host(|host| {
             let startup = host.read_legacy_sound_xml("startup.xml")?;
             let enabled = |name| startup.as_ref().and_then(|xml|
                 super::xml_integer(xml, name)).unwrap_or(1) != 0;
@@ -463,11 +465,29 @@ impl HeadlessPlayer {
             let flag = |name, default| startup.as_ref().and_then(|xml| super::xml_integer(xml, name)).unwrap_or(default) != 0;
             Ok((enabled("document/CONFIG_B/eff"), flag("document/CONFIG_B/autoselect", 0),
                 enabled("document/CONFIG_B/wnd"), flag("document/GAME/enabledrag", 1),
-                flag("document/CONFIG_B/smp_wndalpha", 0), flag("document/CONFIG_B/wnd_alpha", 1)))
+                flag("document/CONFIG_B/smp_wndalpha", 0), flag("document/CONFIG_B/wnd_alpha", 1),
+                enabled("document/CONFIG_B/mode"), flag("document/CONFIG_B/sysconfig", 0)))
         })?;
         let source = self.original_ui_resources()?;
         let detailed = self.data_services.configuration.platform_value("CONFIG/type").unwrap_or(0) != 0;
         let mut pages = Vec::new();
+        if allow_mode && let Ok((title, controls)) = source.dialog(0x41d)
+            && let Some(options) = [1148, 1149].into_iter().map(|command| {
+                controls.iter().find(|(id, _)| *id == command)
+                    .map(|(_, text)| self.resolve_ui_label(text))
+                    .filter(|text| !text.is_empty())
+            }).collect::<Option<Vec<_>>>()
+        {
+            pages.push(HostSettingsPage {
+                resource: 0x41d, title: self.resolve_ui_label(&title), reset_label: String::new(),
+                controls: vec![HostSettingControl {
+                    command: 1148, label: String::new(), kind: HostSettingKind::Choice(options),
+                    value: u32::from(detailed), default: 0, hidden: false, disabled: false,
+                    enabled_by: None, reset_changes_value: false,
+                }],
+                input: None, font: None, sound: None,
+            });
+        }
         if detailed {
             if let Some(page) = self.prepare_input_settings_page(&source)? { pages.push(page); }
         }
@@ -625,6 +645,16 @@ impl HeadlessPlayer {
                     value: match self.data_services.fes_settings.auto_select { value @ 0..=2 => value, _ => 0 }, default: 0,
                     hidden: false, disabled: false, enabled_by: None, reset_changes_value: false }] });
         }
+        if system_config && source.dialog(0x42a).is_ok_and(|(_, controls)| controls.iter().any(|(id, _)| *id == 1324)) {
+            match self.prepare_configuration_plugin_pages() {
+                Ok(plugin_pages) => {
+                    self.data_services.window_control.ui.plugin_page_start = Some(pages.len());
+                    pages.extend(plugin_pages);
+                }
+                Err(error) => self.events.push(LogicEvent { frame: self.state.clock.frame,
+                    kind: "settings-page-unavailable".into(), detail: format!("457 system configuration: {error:#}") }),
+            }
+        }
         if pages.is_empty() {
             self.events.push(LogicEvent { frame: self.state.clock.frame, kind: "settings-page-unavailable".into(),
                 detail: "457: no configured settings pages are available".into() });
@@ -675,25 +705,22 @@ impl HeadlessPlayer {
                 bail!("sound Reset has no original default snapshot");
             }
         }
-        for (page, values) in snapshot.pages.iter().zip(values) {
+        let plugin_page_start = self.data_services.window_control.ui.plugin_page_start;
+        let general = self.data_services.window_control.ui.general;
+        let engine_page_count = plugin_page_start.unwrap_or(snapshot.pages.len());
+        for (page, values) in snapshot.pages.iter().zip(values).take(engine_page_count) {
             if page.input.is_some() { self.apply_input_settings_page(values)?; }
-        }
-        if self.data_services.window_control.ui.general {
-            self.apply_configuration_plugin_settings(&snapshot.pages, values)?;
-            if let Some(snapshot) = &mut self.data_services.window_control.ui.effects {
-                for (page, values) in snapshot.pages.iter_mut().zip(values) {
-                    for (control, &value) in page.controls.iter_mut().zip(&values.words) { control.value = value; }
-                }
-            }
-            self.data_services.window_control.ui.effects_applied = true;
-            return Ok(());
         }
         // The host only submits an edited page. Reset/click-back-to-the-same
         // value still sets the original edit dirty marker and is saved after
         // close; an unmodified OK never submits this operation.
-        self.with_host(|host| {
+        if engine_page_count != 0 { self.with_host(|host| {
             host.ensure_fes_settings()?;
-            for (page, values) in snapshot.pages.iter().zip(values) {
+            for (page, values) in snapshot.pages.iter().zip(values).take(engine_page_count) {
+                if page.resource == 0x41d {
+                    host.data_services.configuration.set_settings_mode(values.words[0]);
+                    continue;
+                }
                 if page.input.is_some() { continue; }
                 if let Some(font) = &page.font {
                     let words = &values.words;
@@ -776,7 +803,15 @@ impl HeadlessPlayer {
             }
             host.data_services.language.system_settings_dirty = 1;
             Ok(())
-        })?;
+        })?; }
+        if let Some(start) = plugin_page_start {
+            let plugin_pages = &snapshot.pages[start..];
+            let plugin_edits = &values[start..];
+            if general || plugin_pages.iter().zip(plugin_edits).any(|(page, edit)| edit.reset ||
+                page.controls.iter().zip(&edit.words).any(|(control, &word)| control.value != word)) {
+                self.apply_configuration_plugin_settings(plugin_pages, plugin_edits, general)?;
+            }
+        }
         if let Some(snapshot) = &mut self.data_services.window_control.ui.effects {
             for (page, values) in snapshot.pages.iter_mut().zip(values) {
                 for (control, &value) in page.controls.iter_mut().zip(&values.words) { control.value = value; }
@@ -818,6 +853,7 @@ impl HeadlessPlayer {
         self.data_services.window_control.ui.effects_applied = false;
         self.data_services.window_control.ui.input_defaults = None;
         self.data_services.window_control.ui.general = false;
+        self.data_services.window_control.ui.plugin_page_start = None;
         Ok(())
     }
     pub(super) fn prepare_game_menu(&mut self) -> Result<()> {

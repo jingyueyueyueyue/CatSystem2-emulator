@@ -118,6 +118,14 @@ pub fn eval_expression(source: &[u8], state: &mut ExpressionState) -> Result<i32
 }
 
 pub fn eval_expression_parameter(source: &[u8], state: &mut ExpressionState) -> Result<i32> {
+    eval_parameter(source, state, false)
+}
+
+fn eval_parameter(
+    source: &[u8],
+    state: &mut ExpressionState,
+    allow_incomplete_comma: bool,
+) -> Result<i32> {
     if source.len() > MAX_EXPRESSION_BYTES {
         return Err(expression_error(0, "expression is too long"));
     }
@@ -127,13 +135,15 @@ pub fn eval_expression_parameter(source: &[u8], state: &mut ExpressionState) -> 
     {
         return Ok(0);
     }
-    eval_expression_fallback_with_text(source.strip_suffix(b"%").unwrap_or(source), state)
+    let scalar = source.strip_suffix(b"%").unwrap_or(source);
+    evaluate_root(&parse_fallback_with_text(scalar, allow_incomplete_comma)?, state)
 }
 
 pub fn eval_kcs_expression_parameter(source: &[u8], state: &mut ExpressionState) -> Result<i32> {
     // Native 213 treats a standalone list of channel numbers, such as
     // `[0,1]` in a CST sound command, as zero in a scalar expression.
-    let parameter = source.strip_suffix(b"%").unwrap_or(source).trim_ascii();
+    let scalar = source.strip_suffix(b"%").unwrap_or(source);
+    let parameter = scalar.trim_ascii();
     if source.len() <= MAX_EXPRESSION_BYTES
         && let Some(items) = parameter.strip_prefix(b"[").and_then(|tail| tail.strip_suffix(b"]"))
         && items.contains(&b',')
@@ -145,16 +155,16 @@ pub fn eval_kcs_expression_parameter(source: &[u8], state: &mut ExpressionState)
     {
         return Ok(0);
     }
-    match eval_expression_parameter(source, state) {
+    match eval_parameter(source, state, true) {
         // Native 213 returns zero on a bracket mismatch, including fragments
         // such as `[2` and `3]` from an earlier comma-delimited split.
         Err(ScriptError::InvalidExpression { message, .. }) if message == UNMATCHED_BRACKET => Ok(0),
-        // The original scalar evaluator returns zero for an incomplete
-        // leading division or comma, as with CST command fragments.
+        // Preserve zero for leading separators with no left operand, including
+        // a slash introducing an option or a fragment of consecutive commas.
         Err(ScriptError::InvalidExpression { offset, message })
             if message == "expression operand is missing"
-                && matches!(source.get(offset), Some(b'/' | b','))
-                && source[..offset].trim_ascii().is_empty() =>
+                && matches!(scalar.get(offset), Some(b'/' | b','))
+                && scalar[..offset].trim_ascii().is_empty() =>
         {
             Ok(0)
         }
@@ -166,6 +176,10 @@ pub(crate) fn eval_expression_fallback_with_text(
     source: &[u8],
     state: &mut ExpressionState,
 ) -> Result<i32> {
+    evaluate_root(&parse_fallback_with_text(source, false)?, state)
+}
+
+fn parse_fallback_with_text(source: &[u8], allow_incomplete_comma: bool) -> Result<Node> {
     if source.len() > MAX_EXPRESSION_BYTES {
         return Err(expression_error(0, "expression is too long"));
     }
@@ -180,17 +194,17 @@ pub(crate) fn eval_expression_fallback_with_text(
         } else if matches!(byte, b'"' | b'\'') {
             quote = Some(byte);
         } else if byte >= 0x80 {
-            return Ok(0);
+            return Ok(Node::Number(0));
         }
     }
-    eval_expression_fallback(source, state)
+    FallbackParser::parse(source, allow_incomplete_comma)
 }
 
 pub fn eval_expression_fallback(source: &[u8], state: &mut ExpressionState) -> Result<i32> {
     if source.len() > MAX_EXPRESSION_BYTES {
         return Err(expression_error(0, "expression is too long"));
     }
-    let node = FallbackParser::parse(source)?;
+    let node = FallbackParser::parse(source, false)?;
     evaluate_root(&node, state)
 }
 
@@ -633,7 +647,7 @@ enum Previous {
 struct FallbackParser;
 
 impl FallbackParser {
-    fn parse(source: &[u8]) -> Result<Node> {
+    fn parse(source: &[u8], allow_incomplete_comma: bool) -> Result<Node> {
         let mut cursor = 0;
         let mut values = Vec::new();
         let mut operators = Vec::<(FallbackOperator, usize)>::new();
@@ -650,6 +664,14 @@ impl FallbackParser {
             }
             let at = cursor;
             let byte = source[cursor];
+            if allow_incomplete_comma && matches!(byte, b',' | b')') {
+                // Supply the missing operand inside its group so comma still
+                // produces zero and surrounding arithmetic can use that result.
+                let previous_byte = source[..at].trim_ascii_end().last();
+                if matches!((byte, previous_byte), (b',', None | Some(b'(')) | (b')', Some(b','))) {
+                    values.push(Node::Number(0));
+                }
+            }
             if byte.is_ascii_digit() {
                 let mut parser = Parser {
                     source,
@@ -766,6 +788,9 @@ impl FallbackParser {
             }
             operators.push((operator, at));
             previous = Previous::Operator;
+        }
+        if allow_incomplete_comma && source.trim_ascii_end().last() == Some(&b',') {
+            values.push(Node::Number(0));
         }
         while let Some((operator, at)) = operators.pop() {
             if matches!(operator, FallbackOperator::Open(_)) {
@@ -908,10 +933,21 @@ mod tests {
     }
 
     #[test]
-    fn kcs_expression_parameters_accept_a_leading_comma_fragment() {
+    fn kcs_expression_parameters_accept_incomplete_comma_fragments() {
         let mut state = ExpressionState::new(1);
-        for parameter in [b",1".as_slice(), b",", b" ,1+2", b",($0=7)"] {
+        for parameter in [
+            b",1".as_slice(), b",", b" ,1+2", b",($0=7)", b",,1", b"3,", b"3, %", b"($0=7),",
+        ] {
             assert_eq!(eval_kcs_expression_parameter(parameter, &mut state).unwrap(), 0);
+            assert!(eval_expression_parameter(parameter, &mut state).is_err());
+        }
+        for (parameter, expected) in [
+            (b"(,1)*1080/720".as_slice(), 0),
+            (b"2+( ,1)*1080/720", 2),
+            (b"7+($0=6, )*2", 7),
+            (b"1+(,)+2", 3),
+        ] {
+            assert_eq!(eval_kcs_expression_parameter(parameter, &mut state).unwrap(), expected);
             assert!(eval_expression_parameter(parameter, &mut state).is_err());
         }
         assert_eq!(state.shared[0], 0);

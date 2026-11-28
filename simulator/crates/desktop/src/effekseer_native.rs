@@ -457,13 +457,21 @@ impl LoggingHost<'_> {
         output: &mut u32,
         vm: Option<&mut Vm>,
     ) -> Result<Option<TaskCommandOutcome>> {
-        if !matches!(packet[1], 51 | 55 | 59 | 66 | 578..=582) {
+        let code = if matches!(packet[1], 51 | 55 | 59 | 66) {
+            packet[1]
+        } else if let Some(code) = self.data_services.ordinary_native_table.as_ref()
+            .and_then(OrdinaryNativeTable::effekseer_command_offset)
+            .and_then(|offset| packet[1].checked_sub(offset))
+            .filter(|code| (578..=582).contains(code))
+        {
+            code
+        } else {
             return Ok(None);
-        }
+        };
         let command = TaskCommand {
             target: id as i32,
             sender: packet[0] as i32,
-            code: packet[1],
+            code,
             data: [packet[2], packet[3], 0],
         };
         let mut buffers = if !queued {

@@ -507,6 +507,8 @@ const BASE_IMAGE_LIST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_IMAGE_LIST_BYTES: u64 = 512 * 1024 * 1024;
 // A 24x24 grid of 256x256 RGBA8 tiles can be entirely offscreen.
 const BASE_OFFSCREEN_BYTES: u64 = 144 * 1024 * 1024;
+const BASE_RETAINED_FRAME_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RETAINED_FRAME_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct ImageListMemory {
@@ -528,6 +530,12 @@ impl ImageListMemory {
         self.limit().max(BASE_OFFSCREEN_BYTES)
     }
 
+    pub(super) fn retained_frame_limit(&self) -> usize {
+        // A source and its writable wrapper share pixels until the first write.
+        // Reserve for both, with a floor that also covers full-screen image sets.
+        (self.available_bytes / 4).clamp(BASE_RETAINED_FRAME_BYTES, MAX_RETAINED_FRAME_BYTES) as usize
+    }
+
     #[cfg(windows)]
     pub(super) fn for_windows_host() -> Self {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -539,6 +547,18 @@ impl ImageListMemory {
         }
         Self::new(status.ullAvailPhys)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn retained_frame_budget_has_a_stable_floor_and_scales_with_available_memory() {
+    const MIB: u64 = 1024 * 1024;
+    for available in [0, 768 * MIB, 1200 * MIB] {
+        assert_eq!(ImageListMemory::new(available).retained_frame_limit(), 512 * MIB as usize);
+    }
+    assert_eq!(ImageListMemory::default().retained_frame_limit(), 512 * MIB as usize);
+    assert_eq!(ImageListMemory::new(3 * 1024 * MIB).retained_frame_limit(), 768 * MIB as usize);
+    assert_eq!(ImageListMemory::new(u64::MAX).retained_frame_limit(), 1024 * MIB as usize);
 }
 
 impl LoggingHost<'_> {
@@ -2675,7 +2695,7 @@ mod media_lifecycle_tests {
     }
 
     #[test]
-    fn fes_button_getid_reads_the_selected_frame_bank() -> Result<()> {
+    fn fes_media_getid_reads_the_selected_frame_bank() -> Result<()> {
         let commands: &[&[u8]] = &[
             b"ch_n[0] setid 2",
             b"ch_n[1] setid 7",
@@ -2683,16 +2703,19 @@ mod media_lifecycle_tests {
             b"ch_n[$851] getid 852",
             b"ch_n[1] getid -1",
         ];
-        with_script(b"BUTTON ch_n[2]", commands, |host, view, runtime, driver, shared| {
-            shared.shared[850..853].copy_from_slice(&[-1, 1, -1]);
-            for _ in commands {
-                command(host, view, runtime, driver, shared)?;
-            }
-            assert_eq!(shared.shared[850..853], [2, 1, 7]);
-            assert!(host.events.iter().any(|event| event.kind == "fes-media"
-                && event.detail == "object=\"ch_n\" bank=1 command=getid destination=852 value=7"));
-            Ok(())
-        })
+        for definition in [b"BUTTON ch_n[2]".as_slice(), b"IMAGE ch_n[2]"] {
+            with_script(definition, commands, |host, view, runtime, driver, shared| {
+                shared.shared[850..853].copy_from_slice(&[-1, 1, -1]);
+                for _ in commands {
+                    command(host, view, runtime, driver, shared)?;
+                }
+                assert_eq!(shared.shared[850..853], [2, 1, 7]);
+                assert!(host.events.iter().any(|event| event.kind == "fes-media"
+                    && event.detail == "object=\"ch_n\" bank=1 command=getid destination=852 value=7"));
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]

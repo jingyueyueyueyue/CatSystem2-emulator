@@ -609,7 +609,7 @@ pub struct OrdinaryNativeTable {
     hg_window_blend: Option<HgWindowBlend>,
     root_sound_query: Option<u32>,
     achievement_family: bool,
-    effekseer_family: bool,
+    effekseer_command_offset: Option<u32>,
     tweet_family: bool,
     wallpaper_package_wrapper: bool,
     root_clock_command: Option<u32>,
@@ -966,8 +966,9 @@ impl OrdinaryNativeTable {
             && javascript_save::callbacks(data, sections, image_base, file_bytes_at).is_some();
         let achievement_family = matches!(code_section, CodeSection::Executable)
             && achievements::registered_family(&entries, data, image_base, &file_bytes_at).is_some();
-        let effekseer_family = matches!(code_section, CodeSection::Executable)
-            && shell_tasks::effekseer_family(&entries, data, sections, image_base, |rva| file_bytes_at(rva, true));
+        let effekseer_command_offset = if matches!(code_section, CodeSection::Executable) {
+            shell_tasks::effekseer_family(&entries, data, sections, image_base, |rva| file_bytes_at(rva, true))
+        } else { None };
         let tweet_family = matches!(code_section, CodeSection::Executable)
             && shell_tasks::tweet_family(&entries, data, sections, image_base, |rva| file_bytes_at(rva, true));
         let wallpaper_package_wrapper = shell_tasks::wallpaper_package_wrapper(&entries);
@@ -1088,7 +1089,7 @@ impl OrdinaryNativeTable {
             hg_window_blend,
             root_sound_query,
             achievement_family,
-            effekseer_family,
+            effekseer_command_offset,
             tweet_family,
             wallpaper_package_wrapper,
             root_clock_command,
@@ -1306,7 +1307,11 @@ impl OrdinaryNativeTable {
     }
 
     pub fn has_effekseer_family(&self) -> bool {
-        self.effekseer_family
+        self.effekseer_command_offset.is_some()
+    }
+
+    pub fn effekseer_command_offset(&self) -> Option<u32> {
+        self.effekseer_command_offset
     }
 
     pub fn fes_control_wrappers(&self) -> [Option<u32>; 2] {

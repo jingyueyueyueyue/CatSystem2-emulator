@@ -948,6 +948,8 @@ def main():
                         help="without a progress ledger, skip games with an archived verified ending")
     parser.add_argument("--fast-text", action="store_true",
                         help="seed the fastest native text speed in each isolated replay profile")
+    parser.add_argument("--mute", action="store_true",
+                        help="silence Windows audio output while retaining playback timing")
     parser.add_argument("--reuse-attempts", action="store_true",
                         help="reuse a completed frame run, checkpoint, or diagnosed stop for identical inputs")
     parser.add_argument("--frames", type=int, default=12)
@@ -1124,6 +1126,8 @@ def run_selection(args, parser, games, indices, cache_root, now, ledger):
                 ledger.finish(games[index]["root"], cleared[index], output / f"{index:02}.json")
             print(f"{index:02}: skipped_cleared ({cleared[index]['ending']['id']})", flush=True)
     env = os.environ.copy()
+    if args.mute:
+        env["CS2_REPLAY_MUTE"] = "1"
     env.setdefault("CS2_MEDIA_CACHE", str(cache_root / "movie-input"))
     env.setdefault("RUST_BACKTRACE", "full")
     if os.name == "nt":

@@ -7,26 +7,33 @@ pub(super) fn effekseer_family<'a>(
     sections: &[Section],
     image_base: u32,
     code: impl Fn(u32) -> Option<&'a [u8]>,
-) -> bool {
-    let Some(slots) = slots.get(1014..=1016) else { return false; };
-    let wrappers: [&[u8]; 3] = [
-        b"\x68\x42\x02\0\0\xff\x36\x8b\xcf\xff\x77\x04\xff\x50\x10",
-        b"\x68\x43\x02\0\0\x52\xff\x71\x04\xff\x50\x10",
-        b"\x6a\0\xff\x72\x04\x6a\0\x68\x44\x02\0\0\xff\x32\xff\x71\x04\xff\x50\x10",
+) -> Option<u32> {
+    let slots = slots.get(1014..=1016)?;
+    let wrappers: [[&[u8]; 3]; 2] = [
+        [
+            b"\x68\x42\x02\0\0\xff\x36\x8b\xcf\xff\x77\x04\xff\x50\x10",
+            b"\x68\x43\x02\0\0\x52\xff\x71\x04\xff\x50\x10",
+            b"\x6a\0\xff\x72\x04\x6a\0\x68\x44\x02\0\0\xff\x32\xff\x71\x04\xff\x50\x10",
+        ],
+        [
+            b"\x68\x43\x02\0\0\xff\x36\x8b\xcf\xff\x77\x04\xff\x50\x10",
+            b"\x68\x44\x02\0\0\x52\xff\x71\x04\xff\x50\x10",
+            b"\x6a\0\xff\x72\x04\x6a\0\x68\x45\x02\0\0\xff\x32\xff\x71\x04\xff\x50\x10",
+        ],
     ];
-    if !slots.iter().zip(wrappers).all(|((_, wrapper), signature)| {
-        wrapper[..wrapper.len().min(0x80)].windows(signature.len()).any(|bytes| bytes == signature)
-    }) {
-        return false;
-    }
-    let Some(receiver) = primary_command_receiver(
+    let layout = wrappers.into_iter().position(|signatures| {
+        slots.iter().zip(signatures).all(|((_, wrapper), signature)| {
+            wrapper[..wrapper.len().min(0x80)].windows(signature.len()).any(|bytes| bytes == signature)
+        })
+    })?;
+    let receiver = primary_command_receiver(
         image, sections, image_base, b".?AVkcTaskEffekseer@@\0", &code,
-    ).and_then(&code) else { return false; };
+    ).and_then(&code)?;
     let receiver = &receiver[..receiver.len().min(0x480)];
-    // 578 branches directly. 579–582 share a jump table in this receiver.
-    let load = b"\x81\xf9\x42\x02\0\0\x0f\x8f";
-    let playback = b"\x8d\x81\xbd\xfd\xff\xff\x83\xf8\x03\x0f\x87";
-    receiver.windows(load.len()).any(|bytes| bytes == load)
+    // Load branches directly. The succeeding four commands share a jump table.
+    let load = [0x81, 0xf9, 0x42 + layout as u8, 2, 0, 0, 0x0f, 0x8f];
+    let playback = [0x8d, 0x81, 0xbd - layout as u8, 0xfd, 0xff, 0xff, 0x83, 0xf8, 3, 0x0f, 0x87];
+    (receiver.windows(load.len()).any(|bytes| bytes == load)
         && receiver.windows(playback.len()).position(|bytes| bytes == playback).is_some_and(|offset| {
             let jump = offset + playback.len() + 4;
             if receiver.get(jump..jump + 3) != Some(b"\xff\x24\x85") { return false; }
@@ -36,7 +43,7 @@ pub(super) fn effekseer_family<'a>(
                         read_word(entry, 0).and_then(|va| va.checked_sub(image_base)).and_then(&code).is_some()
                     })
                 })
-        })
+        })).then_some(layout as u32)
 }
 
 pub(super) fn tweet_family<'a>(

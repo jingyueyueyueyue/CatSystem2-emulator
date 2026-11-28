@@ -238,18 +238,16 @@ pub(super) struct ListNativeStore {
 
 type SharedEntry = Rc<RefCell<Entry>>;
 
-const MAX_LIST_FRAME_CACHE_BYTES: usize = 256 * 1024 * 1024;
-
 #[derive(Default)]
 struct ListFrameCache(Rc<Cell<usize>>);
 
 impl ListFrameCache {
-    fn reserve(&self, bytes: usize) -> Result<ListFrameCharge> {
+    fn reserve(&self, bytes: usize, limit: usize) -> Result<ListFrameCharge> {
         let live = self.0.get();
         let total = live.checked_add(bytes)
-            .filter(|&total| total <= MAX_LIST_FRAME_CACHE_BYTES)
+            .filter(|&total| total <= limit)
             .with_context(|| format!(
-                "retained list frame cache exceeds 256 MiB ({live} bytes live, {bytes} requested)"
+                "retained list frame cache exceeds {limit} bytes ({live} bytes live, {bytes} requested)"
             ))?;
         self.0.set(total);
         Ok(ListFrameCharge { total: Rc::clone(&self.0), bytes })
@@ -1365,7 +1363,8 @@ fn register_owned(
         let bytes = host.image_handles.get(&wrapper)
             .context("list replacement pixel wrapper disappeared")?.pixels().len()
             .checked_add(original_bytes).context("retained list frame cache allocation size overflow")?;
-        let charge = host.data_services.list_native.frame_cache.reserve(bytes)?;
+        let limit = host.data_services.image_list_memory.retained_frame_limit();
+        let charge = host.data_services.list_native.frame_cache.reserve(bytes, limit)?;
         let wrapper = host.share_image_wrapper(wrapper)?;
         Ok(Some((id, wrapper, charge)))
     })();
@@ -1546,7 +1545,8 @@ impl LoggingHost<'_> {
                 // holds an independent copy that callers may mutate.
                 let bytes = image.pixels().len().checked_mul(2)
                     .context("retained list frame cache allocation size overflow")?;
-                let charge = self.data_services.list_native.frame_cache.reserve(bytes)?;
+                let limit = self.data_services.image_list_memory.retained_frame_limit();
+                let charge = self.data_services.list_native.frame_cache.reserve(bytes, limit)?;
                 let wrapper = self.register_image_wrapper(image.clone(), false)?;
                 entry.frame_handles.insert(id, wrapper);
                 entry.frame_charges.insert(id, charge);
