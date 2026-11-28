@@ -2908,7 +2908,17 @@ fn decode_sourced_text_with_failure<'a>(
             text.push_str(display);
             continue;
         }
-        match decode_text(part.bytes, part.codec) {
+        let decoded = decode_text(part.bytes, part.codec).or_else(|error| {
+            // A FES template can mix UTF-8 literals with sourced variables.
+            // Keep valid legacy text and the legacy separator conversion above.
+            if part.variable.is_none() && part.codec != ScriptTextEncoding::Utf8
+                && let Ok(text) = std::str::from_utf8(part.bytes)
+            {
+                return Ok(text.to_owned());
+            }
+            Err(error)
+        });
+        match decoded {
             Ok(decoded) => text.push_str(&decoded),
             Err(error) => {
                 if !recover {
@@ -2921,6 +2931,32 @@ fn decode_sourced_text_with_failure<'a>(
         }
     }
     Ok(Some(text))
+}
+
+#[test]
+fn fes_sourced_speaker_recovers_utf8_literals_around_the_name() -> Result<()> {
+    let cp932 = ScriptTextEncoding::Cp932;
+    let utf8 = ScriptTextEncoding::Utf8;
+    let template = b"\xe3\x80\x90$str1001\xe3\x80\x91";
+    for (name, codec, expected) in [
+        ("\u{7531}\u{7f8e}\u{5b50}".as_bytes(), utf8, "\u{3010}\u{7531}\u{7f8e}\u{5b50}\u{3011}"),
+        (b"\x82\xa0".as_slice(), cp932, "\u{3010}\u{3042}\u{3011}"),
+    ] {
+        let raw = [b"\xe3\x80\x90".as_slice(), name, b"\xe3\x80\x91"].concat();
+        let text = decode_sourced_text(template, &raw, cp932, cp932, false, |id| {
+            assert_eq!(id, 1001);
+            (name, Some(codec))
+        })?;
+        assert_eq!(text.as_deref(), Some(expected));
+    }
+
+    let template = b"\x81\x40$str1000;\xe3\x80\x80\xff";
+    let raw = b"\x81\x40A\xe3\x80\x80\xff";
+    let text = decode_sourced_text(template, raw, cp932, cp932, false, |_| (b"A", Some(utf8)))?;
+    assert_eq!(text.as_deref(), Some("\u{3000}A\u{7e32}\u{80}\u{ffff}"));
+    assert!(decode_sourced_text(b"$str1000", b"\xe3\x80\x90", cp932, cp932, false,
+        |_| (b"\xe3\x80\x90", Some(cp932))).is_err());
+    Ok(())
 }
 
 #[test]
