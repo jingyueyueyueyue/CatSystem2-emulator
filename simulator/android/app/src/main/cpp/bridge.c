@@ -41,6 +41,7 @@ extern int32_t cs2_android_take_window_request(uint64_t);
 extern int32_t cs2_android_general_window_policy(uint64_t);
 extern int32_t cs2_android_general_window_caption(uint64_t, const uint8_t **, size_t *);
 extern int32_t cs2_android_window_mode(uint64_t, int32_t);
+extern int32_t cs2_android_request_fullscreen(uint64_t, int32_t);
 extern int32_t cs2_android_window_ui(uint64_t, const uint8_t **, size_t *);
 extern int32_t cs2_android_window_ui_action(uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t);
 extern int32_t cs2_android_settings_apply(uint64_t, uint64_t, const uint8_t *, size_t);
@@ -381,6 +382,12 @@ JNIEXPORT jint JNICALL JNI(nativeGeneralWindowPolicy)(JNIEnv *env, jclass type, 
 JNIEXPORT jint JNICALL JNI(nativeWindowMode)(JNIEnv *env, jclass type, jlong handle, jint windowed) {
     (void)env; UNUSED_TYPES;
     return cs2_android_window_mode((uint64_t)handle, (int32_t)windowed);
+}
+
+JNIEXPORT jint JNICALL JNI(nativeRequestFullscreen)(JNIEnv *env, jclass type, jlong handle, jboolean fullscreen) {
+    (void)env;
+    (void)type;
+    return cs2_android_request_fullscreen((uint64_t)handle, fullscreen == JNI_TRUE);
 }
 JNIEXPORT jcharArray JNICALL JNI(nativeClipboard)(JNIEnv *env, jclass type, jlong handle) {
     UNUSED_TYPES;

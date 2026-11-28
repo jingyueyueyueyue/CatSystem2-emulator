@@ -17,6 +17,8 @@ pub(super) struct FesGlobalStore {
     pending: BTreeMap<(u32, usize), QueryProgress>,
     #[serde(skip)]
     warned_sound_defaults: bool,
+    #[serde(skip)]
+    legacy_voice_channels: Option<Vec<i32>>,
 }
 
 #[derive(Default, cs2_runtime::graph_serde::Serialize, cs2_runtime::graph_serde::Deserialize)]
@@ -60,7 +62,8 @@ pub(super) fn apply_effect(
     let verb = lower_verb.as_slice();
     if !matches!(
         verb,
-        b"sysvoiceex"
+        b"sysvoice"
+            | b"sysvoiceex"
             | b"getsndconfex"
             | b"setsndconfex"
             | b"rand"
@@ -152,7 +155,7 @@ pub(super) fn apply_effect(
         let output = match progress.output {
             Some(output) => output,
             None => {
-                let current = if matches!(verb, b"sysvoiceex" | b"getsndconfex" | b"setsndconfex") {
+                let current = if matches!(verb, b"sysvoice" | b"sysvoiceex" | b"getsndconfex" | b"setsndconfex") {
                     0
                 } else {
                     command.context.current
@@ -217,6 +220,33 @@ pub(super) fn apply_effect(
                 _ => return Ok(()),
             };
             write(shared, output, value);
+            return Ok(());
+        }
+        if verb == b"sysvoice" {
+            host.ensure_fes_settings()?;
+            if host.data_services.fes_globals.legacy_voice_channels.is_none() {
+                let startup = host.resources.startup_configuration()?;
+                let channels = (0..48).filter(|index| {
+                    startup.as_ref().is_some_and(|document| {
+                        super::xml_text(document, &format!("document/SYSTEMVOICE/ch{index:02}/name"))
+                            .is_some_and(|name| !trim_nul(name).is_empty())
+                    })
+                }).collect();
+                host.data_services.fes_globals.legacy_voice_channels = Some(channels);
+            }
+            while progress.values.len() < args.len() - 1 {
+                let source = &args[1 + progress.values.len()];
+                progress.values.push(driver.evaluate_parameter(source, 0, shared)?);
+            }
+            let channels = host.data_services.fes_globals.legacy_voice_channels.as_deref().unwrap_or_default();
+            let requested = if args.len() == 1 { channels } else { &progress.values };
+            let candidates: Vec<_> = requested.iter().copied().filter(|id| {
+                channels.contains(id) && host.data_services.fes_settings.system_voice_enabled(*id)
+            }).collect();
+            let selected = if candidates.is_empty() { -1 } else {
+                candidates[host.script_random.next_integer() as usize % candidates.len()]
+            };
+            write(shared, output, selected);
             return Ok(());
         }
         if verb == b"sysvoiceex" {

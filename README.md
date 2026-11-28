@@ -20,12 +20,14 @@
 ### Android
 1. 安装 APK 后，在游戏库中选择存放本地游戏的文件夹（需授予文件访问权限）。
 2. 点击游戏封面或卡片即可开始游玩；长按条目可切换「自动 / 日语原文 / 本地汉化」语种模式。
+3. 游玩时按 Android 返回键打开「游戏控制」。选择「沉浸全屏」可隐藏状态栏和导航栏，也可在窗口模式下单独切换「隐藏状态栏」。
 
 ### Windows
 - **直接游玩**：使用构建好的 `cs2-player.exe` 打开游戏目录：
   ```powershell
   cs2-player.exe window "游戏目录路径"
   ```
+  游玩时按 F11 切换无边框全屏。
 - **手动构建**：
   - Windows：`python -B scripts/build/cs2_workspace.py build --integration`
   - Android：`python -B scripts/build/android_workspace.py build --integration`

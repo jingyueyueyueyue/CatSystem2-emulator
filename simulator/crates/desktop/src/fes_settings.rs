@@ -98,6 +98,9 @@ impl Default for FesSettingsStore {
 }
 
 impl FesSettingsStore {
+    pub(super) fn system_voice_enabled(&self, index: i32) -> bool {
+        self.system_voice.get(index as usize).is_some_and(|&play| play != 0)
+    }
     pub(crate) fn capture_checkpoint(&self, kinds: &BTreeMap<u32, u32>) -> Result<Vec<u8>> {
         self.validate_checkpoint(kinds)?;
         Ok(cs2_runtime::object_graph::encode_component(self)?)
@@ -176,6 +179,11 @@ impl LoggingHost<'_> {
         }
         let mut documents = Vec::new();
         if let Some(startup) = self.read_legacy_sound_xml("startup.xml")? {
+            for (index, play) in self.data_services.fes_settings.system_voice.iter_mut().enumerate() {
+                if let Some(value) = xml_integer(&startup, &format!("document/SYSTEMVOICE/ch{index:02}/play")) {
+                    *play = value;
+                }
+            }
             if let Some(value) = xml_integer(&startup, "document/GAME/use_jtalk") {
                 self.data_services.fes_settings.jtalk = value;
             }

@@ -965,6 +965,16 @@ pub extern "C" fn cs2_android_take_window_request(id: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn cs2_android_request_fullscreen(id: u64, fullscreen: i32) -> i32 {
+    call(-1, |sessions| {
+        let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;
+        player.request_host_fullscreen(fullscreen != 0)
+            .map_err(|error| format!("Fullscreen request: {error:#}"))?;
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn cs2_android_window_mode(id: u64, windowed: i32) -> i32 {
     call(-1, |sessions| {
         let player = sessions.players.get_mut(&id).ok_or("Android session is absent")?;

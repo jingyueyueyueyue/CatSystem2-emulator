@@ -137,6 +137,11 @@ fn exhausted_window_queue_records_the_failed_posts_and_retains_queued_work() -> 
 }
 
 impl HeadlessPlayer {
+    /// Queue a player's fullscreen choice alongside the game's window commands.
+    pub fn request_host_fullscreen(&mut self, fullscreen: bool) -> Result<()> {
+        self.queue_menu_window_mode(u32::from(!fullscreen))
+    }
+
     pub(super) fn require_window_request(&self, request: HostWindowRequest) -> Result<()> {
         if self.data_services.window_control.in_flight != Some(request) {
             bail!("host UI operation does not match pending ordered window request");

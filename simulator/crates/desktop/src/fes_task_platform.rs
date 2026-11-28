@@ -2653,6 +2653,38 @@ mod media_lifecycle_tests {
     }
 
     #[test]
+    fn legacy_sysvoice_writes_selected_role_to_config_sound_slot() -> Result<()> {
+        let commands: &[&[u8]] = &[
+            b"sysvoice 820",
+            b"sysvoice 821 -1 1 2 48",
+            b"setconf 1 sysplay 1",
+            b"sysvoice 822 1",
+            b"setconf 0 sysplay 0",
+            b"sysvoice 823",
+            b"setconf 0 sysplay 1",
+            b"sysvoice 824",
+        ];
+        let startup = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <document><SYSTEMVOICE>
+              <ch00><name>First</name><play>1</play></ch00>
+              <ch01><name>Second</name><play>0</play></ch01>
+              <ch02><name></name><play>1</play></ch02>
+            </SYSTEMVOICE></document>"#;
+        with_script_sections(
+            &[(b"DEFINE", &[b"IMAGE sysvoice"]), (b"START", commands)],
+            &[("startup.xml", startup)],
+            |host, view, runtime, driver, shared| {
+                shared.shared[820..825].fill(-99);
+                for _ in commands {
+                    command(host, view, runtime, driver, shared)?;
+                }
+                assert_eq!(shared.shared[820..825], [0, -1, 1, 1, -1]);
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
     fn fes_setsndconfex_updates_live_config_and_restores_defaults() -> Result<()> {
         let commands: &[&[u8]] = &[
             b"setsndconfex 65 volume master",
