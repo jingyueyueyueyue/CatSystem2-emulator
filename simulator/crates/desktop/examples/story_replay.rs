@@ -630,20 +630,26 @@ fn replay(
     }
 
     *error_status = "engine_error";
+    let android_memory = std::env::var_os("CS2_REPLAY_ANDROID_MEMORY_BYTES")
+        .map(|value| value.to_string_lossy().parse::<u64>())
+        .transpose().context("CS2_REPLAY_ANDROID_MEMORY_BYTES must be an unsigned byte count")?;
     let measure = std::env::var_os("CS2_REPLAY_PERF").is_some_and(|value| value == "1");
     let detail = measure && std::env::var_os("CS2_REPLAY_PERF_DETAIL").is_some_and(|value| value == "1");
-    let interactive = measure && std::env::var_os("CS2_REPLAY_INTERACTIVE").is_some_and(|value| value == "1");
+    let interactive = android_memory.is_some()
+        || measure && std::env::var_os("CS2_REPLAY_INTERACTIVE").is_some_and(|value| value == "1");
     let fixed_retry_sleep = std::env::var_os("CS2_REPLAY_FIXED_RETRY_SLEEP").is_some_and(|value| value == "1");
-    if measure {
+    if measure || android_memory.is_some() {
         HeadlessPlayer::enable_host_gpu_raster();
     }
     let profile = output.with_extension("profile");
-    let mut player = if session_random {
+    let mut player = if let Some(bytes) = android_memory {
+        HeadlessPlayer::open_with_android_memory(game, profile, GameLanguage::Japanese, bytes)?
+    } else if session_random {
         HeadlessPlayer::open_with_game_language(game, profile, GameLanguage::Automatic)?
     } else {
         HeadlessPlayer::open_with_save_root(game, profile)?
     };
-    if ctrl_after_ready || !ctrl_windows.is_empty() {
+    if android_memory.is_none() && (ctrl_after_ready || !ctrl_windows.is_empty()) {
         player.enable_host_fast_forward(0);
     }
     let mut happiness_load = happiness_resume_sha.map(|digest| happiness::Load::new(&player, digest)).transpose()?;

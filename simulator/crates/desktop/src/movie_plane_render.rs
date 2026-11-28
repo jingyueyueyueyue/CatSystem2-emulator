@@ -8,7 +8,6 @@ use cs2_renderer::{
 };
 use std::collections::BTreeMap;
 
-#[cfg(windows)]
 pub(super) struct ExclusiveMoviePixels {
     source: std::sync::Weak<crate::movie::MovieFrame>,
     rectangle: [i32; 4],
@@ -46,14 +45,12 @@ impl MpegMovieHost {
     pub(super) fn draw_exclusive_movie(&mut self, canvas: &mut Canvas) -> Result<bool> {
         let surface = self.frame_surface();
         if !surface.displaying_movie() {
-            #[cfg(windows)]
-            { self.planes.exclusive_pixels = None; }
+            self.planes.exclusive_pixels = None;
             return Ok(false);
         }
         self.planes.presentations.clear();
         let Some(snapshot) = self.exclusive_draw_snapshot()? else {
-            #[cfg(windows)]
-            { self.planes.exclusive_pixels = None; }
+            self.planes.exclusive_pixels = None;
             canvas.clear(Color::BLACK);
             return Ok(true);
         };
@@ -67,15 +64,13 @@ impl MpegMovieHost {
         let rectangle = rectangle.unwrap_or([0, 0, canvas.width() as i32, canvas.height() as i32]);
         let [x, y, width, height] = rectangle;
         if width <= 0 || height <= 0 {
-            #[cfg(windows)]
-            { self.planes.exclusive_pixels = None; }
+            self.planes.exclusive_pixels = None;
             canvas.clear(Color::BLACK);
             return Ok(true);
         }
 
         #[cfg(windows)]
         let timing = crate::perf_detail::enabled().then(std::time::Instant::now);
-        #[cfg(windows)]
         let cached = self.planes.exclusive_pixels.as_ref().filter(|pixels| {
             pixels.source.as_ptr() == std::sync::Arc::as_ptr(&frame)
                 && pixels.rectangle == rectangle
@@ -83,15 +78,10 @@ impl MpegMovieHost {
         });
         #[cfg(windows)]
         let reused = cached.is_some();
-        #[cfg(not(windows))]
-        let reused = false;
-        #[cfg(windows)]
         if let Some(pixels) = cached {
             *canvas = pixels.canvas.clone();
-        }
-        if !reused {
-            #[cfg(windows)]
-            { self.planes.exclusive_pixels = None; }
+        } else {
+            self.planes.exclusive_pixels = None;
             canvas.clear(Color::BLACK);
             let source = RgbaFrame::from_shared_rgba8(frame.width, frame.height, frame.rgba.clone())?;
             let mut options = ImageDrawOptions::new(Point::new(x, y));
@@ -107,19 +97,23 @@ impl MpegMovieHost {
                         .unwrap_or(4).clamp(1, 4)
                 })
             };
-            #[cfg(not(windows))]
+            #[cfg(target_os = "android")]
+            let workers = {
+                static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                *WORKERS.get_or_init(|| {
+                    std::thread::available_parallelism().map_or(1, |count| count.get().min(4))
+                })
+            };
+            #[cfg(not(any(windows, target_os = "android")))]
             let workers = 1;
             canvas
                 .draw_frame_with_workers(&source, &options, workers)
                 .context("compose native788 movie rectangle")?;
-            #[cfg(windows)]
-            {
-                self.planes.exclusive_pixels = Some(ExclusiveMoviePixels {
-                    source: std::sync::Arc::downgrade(&frame),
-                    rectangle,
-                    canvas: canvas.share_snapshot(),
-                });
-            }
+            self.planes.exclusive_pixels = Some(ExclusiveMoviePixels {
+                source: std::sync::Arc::downgrade(&frame),
+                rectangle,
+                canvas: canvas.share_snapshot(),
+            });
         }
         #[cfg(windows)]
         if let Some(start) = timing {
@@ -861,7 +855,7 @@ fn sample(frame: &RgbaFrame, uv: [f64; 2]) -> [f64; 4] {
     })
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[test]
 fn exclusive_movie_reuses_pixels_and_preserves_presentation() -> Result<()> {
     use crate::movie::{MovieFrame, MovieFramePresenter};

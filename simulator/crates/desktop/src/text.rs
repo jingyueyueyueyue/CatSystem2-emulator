@@ -201,6 +201,13 @@ impl LoadedFont {
         {
             return None;
         }
+        self.rasterizer().filter(|font| font.has_character(character))
+    }
+
+    pub(super) fn rasterizer(&self) -> Option<&FontRasterizer> {
+        if let Some(font) = self.rasterizer.get() {
+            return font.as_deref();
+        }
         let name = match self.origin.as_ref() {
             FontOrigin::Resource(name) => name.as_bytes(),
             #[cfg(any(windows, target_os = "android"))]
@@ -210,8 +217,7 @@ impl LoadedFont {
         self.rasterizer.get_or_init(|| {
             let _decode = TextTimer::new(TextStage::FaceDecode);
             FontRasterizer::from_shared_bytes(Arc::clone(&self.bytes), self.index).ok().map(Arc::new)
-        })
-            .as_deref().filter(|font| font.has_character(character))
+        }).as_deref()
     }
 }
 

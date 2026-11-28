@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cs2_formats::{ConfigXml, CstlTable};
 use cs2_runtime::{ResourceIndex, ResourceLocation};
-use cs2_runtime::resource_router::{LocalizedSceneEncoding, ResourceMode};
+use cs2_runtime::resource_router::{GameLanguage, LocalizedSceneEncoding, ResourceMode};
 use cs2_script::{CstDocument, CstRecord, Instruction, NativeReturn, Operand, Result, ScriptError, Vm};
 use cs2_script::cst_history::{HistorySnapshot, history_blocks, prepend_history_snapshot};
 
@@ -1859,7 +1859,7 @@ impl LoggingHost<'_> {
             adjacent.truncate(dot);
         }
         adjacent.push_str(".cstl");
-        if let Some(SourcedResource { bytes, source }) = self.cst_read_resource(&adjacent)? {
+        if let Some(SourcedResource { bytes, source }) = self.cst_read_resource(&adjacent, true)? {
             if !bytes.is_empty() {
                 let (table, _) = measure_host_operation(HostPhase::ScriptParse, || CstlTable::parse_prefix(&bytes))
                     .map_err(|_| native_state_error("CST adjacent localization table is malformed"))?;
@@ -2373,25 +2373,41 @@ impl LoggingHost<'_> {
         let candidates = self.resources.category_names(category, &name)
             .map_err(|_| native_state_error("CST resource category resolution failed"))?;
         for name in candidates {
-            if let Some(resource) = self.cst_read_resource(&name)? { return Ok(Some((name, resource))); }
+            if let Some(resource) = self.cst_read_resource(&name, category.eq_ignore_ascii_case(b"scene"))? {
+                return Ok(Some((name, resource)));
+            }
         }
         Ok(None)
     }
 
-    fn cst_read_resource(&self, name: &str) -> Result<Option<SourcedResource>> {
+    fn cst_read_resource(&self, name: &str, scene: bool) -> Result<Option<SourcedResource>> {
         let _timing = measure_host_phase(HostPhase::ScriptRead);
-        if let Some(resource) = self.data_services.ordinary.cached_resource_with_source(name) {
+        let resolve = |mode| self.resources.resolve_mode_candidate(name, mode)
+            .map_err(|_| native_state_error("CST resource routing failed"));
+        // Generic preloading may have selected a loose replacement for this scene.
+        let preferred = if scene && self.resources.game_language() == GameLanguage::Japanese {
+            resolve(ResourceMode::ArchiveFirst)?
+        } else {
+            None
+        };
+        if let Some(resource) = self.data_services.ordinary.cached_resource_with_source(name)
+            .filter(|resource| preferred.is_none_or(|candidate| &resource.source == candidate))
+        {
             if resource.bytes.len() > MAX_BYTES { return Err(native_state_error("CST cached resource exceeds 64 MiB")); }
             return Ok(Some(resource.clone()));
         }
-        let Some(found) = self.resources.resolve_mode_utf16(
-            &name.encode_utf16().collect::<Vec<_>>(), ResourceMode::LooseFirst,
-        ).map_err(|_| native_state_error("CST resource routing failed"))? else { return Ok(None); };
-        if found.value.size > MAX_BYTES as u64 { return Err(native_state_error("CST resource exceeds 64 MiB")); }
-        let bytes = self.resources.read_candidate(found.value)
+        let candidate = match preferred {
+            Some(candidate) => candidate,
+            None => match resolve(ResourceMode::LooseFirst)? {
+                Some(candidate) => candidate,
+                None => return Ok(None),
+            },
+        };
+        if candidate.size > MAX_BYTES as u64 { return Err(native_state_error("CST resource exceeds 64 MiB")); }
+        let bytes = self.resources.read_candidate(candidate)
             .map_err(|_| native_state_error("CST resource read failed"))?;
         if bytes.len() > MAX_BYTES { return Err(native_state_error("CST resource exceeds 64 MiB")); }
-        Ok(Some(SourcedResource { source: found.value.clone(), bytes }))
+        Ok(Some(SourcedResource { source: candidate.clone(), bytes }))
     }
 }
 

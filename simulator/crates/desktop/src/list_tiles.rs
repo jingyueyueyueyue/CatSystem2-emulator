@@ -564,22 +564,28 @@ fn compose_inner(
     Ok(())
 }
 
-/// List tiles are emitted in row order. Only skip reading the old image
-/// when the current clips form a complete and contiguous grid.
+/// Consecutive tile rows may overlap vertically. The current clips must
+/// still cover every output pixel before the old image can be discarded.
 fn covers_surface(areas: &[Rect], size: [u32; 2]) -> bool {
-    let (mut x, mut y, mut row_height) = (0, 0, 0);
+    let (mut x, mut covered_y, mut row_top, mut row_height) = (0, 0, 0, 0);
     for area in areas {
-        if x == 0 { row_height = area.height; }
-        if area.x != x as i32 || area.y != y as i32 || area.height != row_height {
+        if x == 0 {
+            if area.y < 0 || area.y as u32 > covered_y {
+                return false;
+            }
+            row_top = area.y;
+            row_height = area.height;
+        }
+        if area.x != x as i32 || area.y != row_top || area.height != row_height {
             return false;
         }
         x += area.width;
         if x == size[0] {
             x = 0;
-            y += row_height;
+            covered_y = covered_y.max(row_top as u32 + row_height);
         }
     }
-    x == 0 && y == size[1]
+    x == 0 && covered_y == size[1]
 }
 
 fn pixel_rows(width: u32, rect: Rect) -> impl Iterator<Item = std::ops::Range<usize>> {
@@ -676,6 +682,74 @@ fn draw_list_layers_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_tile_rows_cover_the_list_without_gaps() -> Result<()> {
+        let size = [8, 6];
+        let surface = ListSurface::new(size, [4, 2])?;
+        let areas: Vec<_> = surface.tiles.iter().filter_map(|tile| tile.dirty).collect();
+        assert!(covers_surface(&areas, size));
+
+        let clipped: Vec<_> = areas.iter().filter_map(|area| {
+            intersection(*area, Rect::new(0, 0, 7, 6))
+        }).collect();
+        assert!(!covers_surface(&clipped, size));
+
+        let mut gap = areas;
+        gap[0].height = 1;
+        gap[1].height = 1;
+        assert!(!covers_surface(&gap, size));
+        Ok(())
+    }
+
+    #[test]
+    fn list_redraw_preserves_overlap_order_and_pixels_outside_the_clip() -> Result<()> {
+        let root = crate::tests::TempDir::new();
+        let mut player = crate::HeadlessPlayer::open_with_save_root(&root.0, root.0.join("profile"))?;
+        player.with_host(|host| {
+            let id = host.create_task_object(15, host.current_task_id, b"tile overlap", b"")?;
+            host.initialize_fes_image_list(id, 8, 6)?;
+            let list = host.data_services.tasks.fes.platform.lists.get_mut(&id).unwrap();
+            let handle = list.output;
+            let full = Rect::new(0, 0, 8, 6);
+            let seed = || RgbaFrame::from_rgba8(8, 6, [66, 92, 53, 255].repeat(48));
+            let red = RgbaFrame::from_rgba8(8, 6, [177, 35, 15, 182].repeat(48))?;
+            let blue = RgbaFrame::from_rgba8(8, 6, [3, 69, 121, 144].repeat(48))?;
+            let options = ImageDrawOptions::new(Point::new(0, 0));
+            for (priority, frame) in [(1, red), (2, blue)] {
+                list.layers.insert((id, priority.to_string()), Layer {
+                    frame, options: options.clone(), priority, affine: None,
+                });
+            }
+
+            for clip in [None, Some(Rect::new(0, 0, 7, 6))] {
+                host.replace_image_wrapper_pixels(handle, seed()?)?;
+                let mut surface = ListSurface::new([8, 6], [4, 2])?;
+                let areas: Vec<_> = surface.tiles.iter().filter_map(|tile| {
+                    intersection(tile.bounds, clip.unwrap_or(full))
+                }).collect();
+                let mut expected = Canvas::from_rgba8(8, 6, seed()?.pixels().to_vec())?;
+                for area in &areas {
+                    for range in pixel_rows(8, *area) {
+                        expected.pixels_mut()[range].fill(0);
+                    }
+                }
+                let list = &host.data_services.tasks.fes.platform.lists[&id];
+                for (key, layer) in &list.layers {
+                    let mut opaque = None;
+                    for area in &areas {
+                        let mut options = layer.options.clone();
+                        options.clip = Some(*area);
+                        super::super::draw_layer(host, id, &mut expected,
+                            key, &layer.frame, &options, None, &mut opaque)?;
+                    }
+                }
+                compose_inner(host, id, false, clip, &mut surface)?;
+                assert_eq!(host.image_handles[&handle].pixels(), expected.pixels());
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn remastered_image_list_initializes_and_composes_at_native_size() -> Result<()> {

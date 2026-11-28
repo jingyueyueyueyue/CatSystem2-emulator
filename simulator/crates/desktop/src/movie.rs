@@ -728,8 +728,7 @@ impl MpegMovieHost {
         }
         if current_surface {
             self.surface.visible.store(false, Ordering::Release);
-            #[cfg(windows)]
-            { self.planes.exclusive_pixels = None; }
+            self.planes.exclusive_pixels = None;
         }
         result.and(surface_result)
     }
@@ -749,8 +748,7 @@ impl MpegMovieHost {
         }
         self.loaded = None;
         self.planes.exclusive_snapshot = None;
-        #[cfg(windows)]
-        { self.planes.exclusive_pixels = None; }
+        self.planes.exclusive_pixels = None;
         self.surface.visible.store(false, Ordering::Release);
         self.surface.game_drawing.store(false, Ordering::Release);
         *self

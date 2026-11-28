@@ -366,6 +366,15 @@ static double frame_time(CS2Media *media, int slot, double fallback) {
     return pts * av_q2d(stream->time_base) - media->origin;
 }
 
+static int resize_video_buffer(CS2Media *media, size_t bytes) {
+    if (bytes <= media->rgba_size) return 0;
+    uint8_t *replacement = av_realloc(media->rgba, bytes);
+    if (!replacement) return failure(media, AVERROR(ENOMEM), "allocate RGBA");
+    media->rgba = replacement;
+    media->rgba_size = bytes;
+    return 0;
+}
+
 static int video_frame(CS2Media *media, CS2MediaFrame *output) {
     AVFrame *frame = media->frame;
     if (frame->width <= 0 || frame->height <= 0 ||
@@ -382,12 +391,6 @@ static int video_frame(CS2Media *media, CS2MediaFrame *output) {
     if (video_transform(media, frame, display_width, display_height, &transform) < 0)
         return AVERROR_INVALIDDATA;
     size_t bytes = (size_t)transform.width * (size_t)transform.height * 4;
-    if (bytes > media->rgba_size) {
-        uint8_t *replacement = av_realloc(media->rgba, bytes);
-        if (!replacement) return failure(media, AVERROR(ENOMEM), "allocate RGBA");
-        media->rgba = replacement;
-        media->rgba_size = bytes;
-    }
     const AVCodecParameters *parameters = media->format->streams[media->stream[0]]->codecpar;
     if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) frame->colorspace = parameters->color_space;
     if (frame->color_range == AVCOL_RANGE_UNSPECIFIED) frame->color_range = parameters->color_range;
@@ -401,31 +404,44 @@ static int video_frame(CS2Media *media, CS2MediaFrame *output) {
         media->scale->threads = 2;
         media->scale->flags = SWS_BILINEAR;
     }
-    av_frame_unref(media->converted);
-    media->converted->format = AV_PIX_FMT_RGBA;
-    media->converted->width = frame->width;
-    media->converted->height = frame->height;
-    media->converted->color_range = AVCOL_RANGE_JPEG;
-    media->converted->colorspace = AVCOL_SPC_RGB;
-    media->converted->color_primaries = AVCOL_PRI_BT709;
-    media->converted->color_trc = AVCOL_TRC_IEC61966_2_1;
+    AVFrame *converted = media->converted;
+    if (!converted->buf[0] ||
+        converted->width != frame->width || converted->height != frame->height) {
+        av_frame_unref(converted);
+        converted->format = AV_PIX_FMT_RGBA;
+        converted->width = frame->width;
+        converted->height = frame->height;
+        converted->color_range = AVCOL_RANGE_JPEG;
+        converted->colorspace = AVCOL_SPC_RGB;
+        converted->color_primaries = AVCOL_PRI_BT709;
+        converted->color_trc = AVCOL_TRC_IEC61966_2_1;
+        int status = av_frame_get_buffer(converted, 0);
+        if (status < 0) return failure(media, status, "allocate aligned color converter frame");
+    }
     /* The pinned FFmpeg8 dynamic API consumes per-frame range, matrix,
      * primaries and transfer metadata and recreates its graph when they
      * change. A legacy cached sws_scale context does not do this. */
-    int status = sws_scale_frame(media->scale, media->converted, frame);
+    int status = sws_scale_frame(media->scale, converted, frame);
     if (status < 0) return failure(media, status, "convert video metadata to SDR sRGB RGBA");
+    if (interrupted(media))
+        return failure(media, AVERROR_EXIT, "display transform cancelled");
     /* Crop only the converted packed RGBA. This represents odd crop origins
      * exactly without handing unaligned YUV planes to FFmpeg or silently
      * rounding away a codec's display crop. */
-    const uint8_t *pixels = media->converted->data[0] +
-        (ptrdiff_t)frame->crop_top * media->converted->linesize[0] + frame->crop_left * 4;
-    for (int y = 0; y < transform.height; ++y) {
+    const int stride = converted->linesize[0];
+    const uint8_t *pixels = converted->data[0] +
+        (ptrdiff_t)frame->crop_top * stride + frame->crop_left * 4;
+    /* The ABI already allows callers to borrow this storage until the next
+     * decode. Copy only if stride, crop, or display transform requires it. */
+    const int packed = transform.identity && stride == transform.width * 4;
+    if (!packed && (status = resize_video_buffer(media, bytes)) < 0) return status;
+    for (int y = 0; !packed && y < transform.height; ++y) {
         if (!(y & 63) && interrupted(media))
             return failure(media, AVERROR_EXIT, "display transform cancelled");
         uint8_t *destination = media->rgba + (size_t)y * transform.width * 4;
         if (transform.identity) {
             memcpy(destination, pixels +
-                   (ptrdiff_t)y * media->converted->linesize[0], (size_t)transform.width * 4);
+                   (ptrdiff_t)y * stride, (size_t)transform.width * 4);
             continue;
         }
         for (int x = 0; x < transform.width; ++x) {
@@ -450,7 +466,7 @@ static int video_frame(CS2Media *media, CS2MediaFrame *output) {
                     if (iy < 0) iy = 0;
                     if (iy >= display_height) iy = display_height - 1;
                     const uint8_t *source = pixels +
-                        (ptrdiff_t)iy * media->converted->linesize[0];
+                        (ptrdiff_t)iy * stride;
                     for (int column = 0; column < 2; ++column) {
                         int ix = left + column;
                         if (ix < 0) ix = 0;
@@ -469,7 +485,7 @@ static int video_frame(CS2Media *media, CS2MediaFrame *output) {
     output->width = (uint32_t)transform.width;
     output->height = (uint32_t)transform.height;
     output->byte_length = bytes;
-    output->data = media->rgba;
+    output->data = packed ? pixels : media->rgba;
     output->pts_seconds = frame_time(media, 0, media->next_video);
     if (!isfinite(output->pts_seconds)) return failure(media, AVERROR_INVALIDDATA, "invalid video PTS");
     AVRational duration_base = frame->time_base;

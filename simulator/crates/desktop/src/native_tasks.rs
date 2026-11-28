@@ -2310,12 +2310,13 @@ impl LoggingHost<'_> {
     }
 
     pub(super) fn task_error(&mut self, id: u32, error: cs2_runtime::RuntimeError) -> cs2_script::ScriptError {
+        let detail = format!("task={id}: {error}");
         self.events.push(LogicEvent {
             frame: self.frame,
             kind: "task-error".into(),
-            detail: format!("task={id}: {error}"),
+            detail: detail.clone(),
         });
-        native_state_error("ordinary task operation failed; see task-error event")
+        super::native_state_error_owned(detail)
     }
 }
 

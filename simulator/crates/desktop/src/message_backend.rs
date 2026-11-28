@@ -354,6 +354,7 @@ struct SelectedFont<'a> {
     name: &'a str,
     bold: bool,
     italic: bool,
+    missing: bool,
 }
 
 fn message_glyph_error(stage: &str, requested: &str, actual: Option<&str>, character: char) -> ScriptError {
@@ -392,7 +393,7 @@ struct NamedFace {
 
 impl NamedFace {
     fn select<'a>(&'a self, font: &'a FontRasterizer) -> SelectedFont<'a> {
-        SelectedFont { font, name: &self.face_name, bold: self.weight == 700, italic: self.italic }
+        SelectedFont { font, name: &self.face_name, bold: self.weight == 700, italic: self.italic, missing: false }
     }
 
     fn get_if_covers(&self, characters: impl IntoIterator<Item = char> + Clone) -> Option<&FontRasterizer> {
@@ -1157,6 +1158,7 @@ impl DesktopMessageDevice {
         override_name: Option<&[u16]>,
     ) -> Result<SelectedFont<'_>> {
         let _select = TextTimer::new(TextStage::FontSelect);
+        let allow_missing_glyph = !character.is_control() && character != ' ';
         if configuration.font_backend() != 0 {
             let units = override_name.map_or_else(|| configuration.font_name(), |name| name.to_vec());
             let name = String::from_utf16(&units)
@@ -1178,11 +1180,12 @@ impl DesktopMessageDevice {
             let face = file.face().map_err(|error| {
                 message_glyph_error(error, &name, None, character)
             })?;
-            if !face.font.has_character(character) {
+            let missing = !face.font.has_character(character);
+            if missing && !allow_missing_glyph {
                 return Err(message_glyph_error("not covered", &name, Some(&face.name), character));
             }
             return Ok(SelectedFont {
-                font: &face.font, name: &face.name, bold: face.bold, italic: face.italic,
+                font: &face.font, name: &face.name, bold: face.bold, italic: face.italic, missing,
             });
         }
         // The extra DWORD is a Windows character-set selector in its LOW
@@ -1229,23 +1232,31 @@ impl DesktopMessageDevice {
                     (i32::from(face.weight) - requested_weight).abs(),
                 )
             });
-            for face in candidates {
+            for &face in &candidates {
                 if let Some(font) = face.get_if_covers([character]) {
                     return Ok(face.select(font));
                 }
             }
             // Font data without usable SFNT names can still be a valid
             // explicitly loaded glyph source.
-            return self
-                .fonts
-                .iter()
-                .filter(|_| self.fallback_faces.is_empty())
-                .find_map(|face| face.for_character(character).map(|font| SelectedFont {
-                    font, name: face.origin.name(), bold: false, italic: false,
-                }))
-                .ok_or_else(|| {
-                    message_glyph_error("no covering font", "<default>", None, character)
-                });
+            if self.fallback_faces.is_empty() {
+                if let Some((face, font)) = self.fonts.iter()
+                    .find_map(|face| face.for_character(character).map(|font| (face, font)))
+                {
+                    return Ok(SelectedFont { font, name: face.origin.name(), bold: false, italic: false, missing: false });
+                }
+                if allow_missing_glyph && let Some((face, font)) = self.fonts.iter()
+                    .find_map(|face| face.rasterizer().map(|font| (face, font)))
+                {
+                    return Ok(SelectedFont { font, name: face.origin.name(), bold: false, italic: false, missing: true });
+                }
+            }
+            if allow_missing_glyph
+                && let Some((face, font)) = candidates.into_iter().find_map(|face| face.get().map(|font| (face, font)))
+            {
+                return Ok(SelectedFont { missing: true, ..face.select(font) });
+            }
+            return Err(message_glyph_error("no covering font", "<default>", None, character));
         }
         let name = String::from_utf16(&units)
             .map_err(|_| invalid("message font name has an isolated UTF-16 surrogate"))?;
@@ -1270,6 +1281,17 @@ impl DesktopMessageDevice {
         #[cfg(any(windows, target_os = "android"))]
         if let Some(selected) = self.platform_substitute(&units, configuration, character, bold, italic) {
             return Ok(selected);
+        }
+        // Render the face's normal glyph zero after every covering face
+        // has been tried. The original character remains in the message.
+        if allow_missing_glyph {
+            if let Some((face, font)) = candidates.iter().find_map(|&face| face.get().map(|font| (face, font))) {
+                return Ok(SelectedFont { missing: true, ..face.select(font) });
+            }
+            #[cfg(any(windows, target_os = "android"))]
+            if let Some(selected) = self.platform_substitute(&units, configuration, ' ', bold, italic) {
+                return Ok(SelectedFont { missing: true, ..selected });
+            }
         }
         Err(message_glyph_error(
             "no covering font", &name, candidates.first().map(|face| face.face_name.as_str()), character,
@@ -1366,9 +1388,12 @@ impl DesktopMessageDevice {
         let bold = configuration.font_weight() == 700;
         let selected = self.font(configuration, character, bold, false, None)?;
         let _measure = TextTimer::new(TextStage::GlyphMeasure);
-        let measured = selected.font
-            .measure_styled(character, size, bold && !selected.bold, false)
-            .map_err(|error| message_glyph_error(
+        let bold = bold && !selected.bold;
+        let measured = if selected.missing {
+            selected.font.rasterize_missing_glyph(size, bold, false).map(|glyph| glyph.advance())
+        } else {
+            selected.font.measure_styled(character, size, bold, false)
+        }.map_err(|error| message_glyph_error(
                 &format!("measurement failed: {error}"),
                 &requested_font_name(configuration, None), Some(selected.name), character,
             ))?;
@@ -1473,7 +1498,7 @@ impl DesktopMessageDevice {
         let _raster = TextTimer::new(TextStage::GlyphRaster);
         let bold = bold && !selected.bold;
         let italic = italic && !selected.italic;
-        let glyph = if record_separator {
+        let glyph = if record_separator || selected.missing {
             selected.font.rasterize_missing_glyph(size, bold, italic)
         } else {
             selected.font.rasterize_styled(character, size, bold, italic)
@@ -2807,6 +2832,85 @@ mod game_font_tests {
     }
 
     #[test]
+    fn uncovered_message_character_uses_glyph_zero_and_reveals_later_text() {
+        use cs2_runtime::message_object::MessagePlaneDisplay;
+
+        let windows = PathBuf::from(std::env::var_os("WINDIR").unwrap());
+        let font = fs::read(windows.join("Fonts/arial.ttf")).unwrap();
+        let mut device = DesktopMessageDevice::default();
+        device.bind_font("Test face", &font, 0).unwrap();
+        let configuration = configuration("Test face", 0);
+        let missing = '\u{e71a}';
+        let selected = device.font(&configuration, missing, false, false, None).unwrap();
+        assert!(!selected.font.has_character(missing));
+        let placeholder = selected.font.rasterize_missing_glyph(24, false, false).unwrap();
+        let glyph = device.rasterize_mask(&configuration, missing, 24, false, false, None).unwrap();
+        assert_eq!(glyph.metrics(), placeholder.metrics());
+        assert_eq!(glyph.alpha(), placeholder.alpha());
+        assert!(glyph.alpha().iter().any(|&coverage| coverage > 0));
+        assert!(glyph.advance() > 0);
+        assert!(!device.font(&configuration, 'B', false, false, None).unwrap().missing);
+
+        let mut message = MessageObject::new(-1, MessageEncoding::Unicode);
+        let scale = Some(5);
+        let source = "A\u{e71a}B";
+        message.recreate(configuration.bytes(), scale, &mut device).unwrap();
+        message.append(source.as_bytes()).unwrap();
+        message.prepare(scale, &mut device).unwrap();
+        assert_eq!(message.source(), source);
+        let entries = &message.layout().unwrap().entries;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].size[0], glyph.advance());
+        let [start, top] = entries[2].position;
+
+        let display = MessagePlaneDisplay::Visible;
+        message.start(0, display, 100, scale, &mut device).unwrap();
+        message.force_complete(display, scale, &mut device).unwrap();
+        assert_eq!(message.remaining_all().unwrap(), 0);
+        let rendered = &device.surface(message.id()).unwrap().visible;
+        let width = rendered.width() as usize;
+        let start = start as usize;
+        let top = top as usize;
+        assert!(rendered.pixels().chunks_exact(width * 4).skip(top).take(24).any(|row| {
+            row[start * 4..].chunks_exact(4).any(|pixel| pixel[3] > 0)
+        }));
+
+        let font = Arc::new(font);
+        let file = GameFontFile::Archived(GameFontFace::decode(&font, "font/face.ttf"));
+        let file_font = Arc::clone(&file.face().unwrap().font);
+        device.resource_font_files.insert("face.ttf".into(), file);
+        let file_configuration = self::configuration("face.ttf", 1);
+        let glyph = device.rasterize_mask(&file_configuration, missing, 24, false, false, None).unwrap();
+        let placeholder = file_font.rasterize_missing_glyph(24, false, false).unwrap();
+        assert_eq!(glyph.metrics(), placeholder.metrics());
+        assert_eq!(glyph.alpha(), placeholder.alpha());
+
+        let invalid = GameFontFile::Archived(GameFontFace::decode(&Arc::new(Vec::new()), "font/invalid.ttf"));
+        device.resource_font_files.insert("invalid.ttf".into(), invalid);
+        let invalid_configuration = self::configuration("invalid.ttf", 1);
+        let error = device.measure(&invalid_configuration, missing, 24).unwrap_err();
+        assert!(error.to_string().contains("could not be decoded"));
+
+        let file_configuration = self::configuration("missing-font.ttf", 1);
+        let error = device.measure(&file_configuration, missing, 24).unwrap_err();
+        assert!(error.to_string().contains("not found"));
+
+        let device = DesktopMessageDevice {
+            fonts: vec![LoadedFont {
+                origin: Arc::new(FontOrigin::Resource("font/unnamed.ttf".into())),
+                index: 0,
+                bytes: Arc::clone(&font),
+                rasterizer: Arc::default(),
+            }].into(),
+            ..DesktopMessageDevice::default()
+        };
+        let unnamed = self::configuration("", 0);
+        let glyph = device.rasterize_mask(&unnamed, missing, 24, false, false, None).unwrap();
+        assert_eq!(glyph.metrics(), placeholder.metrics());
+        assert_eq!(glyph.alpha(), placeholder.alpha());
+    }
+
+    #[test]
     fn ansi_record_separator_preserves_source_and_paints_missing_glyph() {
         use cs2_runtime::message_object::MessagePlaneDisplay;
 
@@ -2934,8 +3038,15 @@ mod game_font_tests {
         let requested = configuration("Uninstalled game family", 0);
         let glyph = device.mask(&requested, '\u{2014}', 24, false, false).unwrap();
         assert!(glyph.alpha().iter().any(|&alpha| alpha != 0));
+        assert!(!device.font(&requested, '\u{2014}', false, false, None).unwrap().missing);
         assert!(device.font_substitutions()[0].selected_name.to_lowercase().contains("arial"));
-        let error = device.mask(&requested, '\u{10ffff}', 24, false, false).unwrap_err().to_string();
+        let selected = device.font(&requested, '\u{10ffff}', false, false, None).unwrap();
+        assert!(selected.missing);
+        let glyph = device.mask(&requested, '\u{10ffff}', 24, false, false).unwrap();
+        let placeholder = selected.font.rasterize_missing_glyph(24, false, false).unwrap();
+        assert_eq!(glyph.alpha(), placeholder.alpha());
+        let error = DesktopMessageDevice::default()
+            .mask(&requested, '\u{10ffff}', 24, false, false).unwrap_err().to_string();
         assert!(error.contains("codepoint=U+10FFFF"));
         assert!(error.contains("requested_font=\"Uninstalled game family\""));
         assert!(error.contains("actual_font=\"<none>\""));
@@ -3002,10 +3113,13 @@ mod game_font_tests {
         assert!(error("ambiguous", 'A').contains("not found"));
         assert!(error("Test family", 'A').contains("not found"));
         assert!(error("broken.ttf", 'A').contains("could not be decoded"));
-        let missing = error("face.ttf", '\u{10ffff}');
-        assert!(missing.contains("codepoint=U+10FFFF"));
-        assert!(missing.contains("requested_font=\"face.ttf\""));
-        assert!(missing.contains("actual_font=\"Arial"));
+        let missing = '\u{10ffff}';
+        let by_file = configuration("face.ttf", 1);
+        let selected = device.font(&by_file, missing, false, false, None).unwrap();
+        assert!(selected.missing);
+        let glyph = device.mask(&by_file, missing, 24, false, false).unwrap();
+        let placeholder = selected.font.rasterize_missing_glyph(24, false, false).unwrap();
+        assert_eq!(glyph.alpha(), placeholder.alpha());
     }
 }
 

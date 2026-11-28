@@ -407,7 +407,7 @@ mod tests {
                 for index in [688, 689] {
                     assert_eq!(host.portable_object_graph_native(index, &0u32.to_le_bytes())?, NativeReturn::Value(0));
                     let error = host.portable_object_graph_native(index, &present).unwrap_err();
-                    assert!(error.to_string().contains("see task-error event"));
+                    assert!(error.to_string().contains("no recovered positive-target state-tree receiver"));
                     let event = host.events.last().unwrap();
                     assert!(event.detail.contains("no recovered positive-target state-tree receiver"));
                 }

@@ -13526,6 +13526,73 @@ mod tests {
     }
 
     #[test]
+    fn japanese_cst_prefers_archive_over_preloaded_loose_scene() -> Result<()> {
+        use cs2_runtime::resource_router::GameLanguage;
+
+        let root = TempDir::new();
+        let path = &root.0;
+        fs::create_dir(path.join("scene"))?;
+        fs::write(path.join("startup.xml"), concat!(
+            "<?xml version='1.0' encoding='UTF-8'?>",
+            "<document><INT><int00><name>scene</name><int>scene.int</int>",
+            "<dir>scene</dir><ext>cst</ext></int00></INT></document>"
+        ))?;
+
+        let write_archive = |name: &str, entry: &[u8], data: &[u8]| -> Result<()> {
+            let mut archive = vec![0; 80];
+            archive[..8].copy_from_slice(b"KIF\0\x01\0\0\0");
+            archive[8..8 + entry.len()].copy_from_slice(entry);
+            archive[72..76].copy_from_slice(&80u32.to_le_bytes());
+            archive[76..80].copy_from_slice(&u32::try_from(data.len())?.to_le_bytes());
+            archive.extend_from_slice(data);
+            fs::write(path.join(name), archive)?;
+            Ok(())
+        };
+        let original = packed_cst(&[vec![(0x20, b"\x82\xa0")]]);
+        let update = packed_cst(&[vec![(0x20, b"\x82\xa2")]]);
+        let loose = packed_cst(&[vec![(0x20, b"loose scene")]]);
+        write_archive("scene.int", b"opening.cst", &original)?;
+        write_archive("update01.int", b"official.cst", &update)?;
+        fs::write(path.join("scene/opening.cst"), &loose)?;
+        fs::write(path.join("scene/official.cst"), &loose)?;
+        fs::write(path.join("scene/extra.cst"), &loose)?;
+
+        for language in [GameLanguage::Automatic, GameLanguage::Japanese, GameLanguage::Localized] {
+            let mut player = HeadlessPlayer::open_with_game_language(path, path.join("profile"), language)?;
+            player.with_host(|host| {
+                let mut vm = Vm::new();
+                vm.bind_external(vec![0; 4096])?;
+                let scene_name = 0x8000_0100u32;
+                let category = 0x8000_0200u32;
+                vm.write(scene_name, b"opening.cst\0")?;
+                vm.write(category, b"scene\0")?;
+                let preload_args = [scene_name, category, 1].map(u32::to_le_bytes).concat();
+                host.call(435, &preload_args, &mut vm)?;
+                host.call(436, &[], &mut vm)?;
+                let cached = host.data_services.ordinary.cached_resource_with_source("scene.int/opening.cst")
+                    .context("expected preloaded scene")?;
+                assert_eq!(cached.bytes, loose);
+
+                let expected = if language == GameLanguage::Japanese { &original } else { &loose };
+                for name in [b"opening".as_slice(), b"scene.int/opening.cst"] {
+                    let (_, scene) = host.cst_resource(b"scene", name)?.context("scene is missing")?;
+                    assert_eq!(&scene, expected);
+                }
+                for (name, expected) in [
+                    (b"official.cst".as_slice(), &update),
+                    (b"extra.cst", &loose),
+                    (b"scene\\extra.cst", &loose),
+                ] {
+                    let (_, scene) = host.cst_resource(b"scene", name)?.context("scene is missing")?;
+                    assert_eq!(&scene, expected);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn cst_table_current_and_legacy_formats_round_trip() {
         let mut name = [0; 32];
         name[..4].copy_from_slice(b"slot");

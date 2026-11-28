@@ -92,7 +92,12 @@ impl PresentationFrame {
         }
         match (self.device_revision, player.host_device_frame_revision()) {
             (Some(previous), Some(current)) => previous == current,
-            (None, None) => self.frame.size() == player.logical_size() && self.frame.rgba() == player.frame_rgba(),
+            (None, None) => {
+                let previous = self.frame.rgba();
+                let current = player.frame_rgba();
+                self.frame.size() == player.logical_size()
+                    && (std::ptr::eq(previous, current) || previous == current)
+            }
             _ => false,
         }
     }
@@ -241,18 +246,24 @@ fn call<T: Copy>(failure: T, operation: impl FnOnce(&mut Sessions) -> Result<T, 
 fn runtime_diagnostic(id: u64, player: &HeadlessPlayer, error: bool) -> String {
     use std::fmt::Write;
 
-    let mut output = format!("session={id} {}", player.host_runtime_diagnostic());
     let events = player.events();
+    let mut output = String::new();
     let mut important: Vec<_> = events.iter().rev().filter(|event| {
         event.kind == "save-slot-read" || error && event.kind.ends_with("-error")
     }).take(8).collect();
     important.reverse();
-    let tail = if error { &events[events.len().saturating_sub(20)..] } else { &[] };
-    for event in important.into_iter().filter(|event| !tail.iter().any(|other| std::ptr::eq(*event, other)))
-        .chain(tail)
-    {
+    for event in &important {
         let detail: String = event.detail.chars().take(400).collect();
         let _ = writeln!(output, "event frame={} {} {detail}", event.frame, event.kind);
+    }
+    let _ = write!(output, "session={id} {}", player.host_runtime_diagnostic());
+    if error {
+        for event in events.iter().rev().take(20).rev()
+            .filter(|event| !important.iter().any(|other| std::ptr::eq(*event, *other)))
+        {
+            let detail: String = event.detail.chars().take(400).collect();
+            let _ = writeln!(output, "event frame={} {} {detail}", event.frame, event.kind);
+        }
     }
     output
 }
